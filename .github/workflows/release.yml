@@ -109,7 +109,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: proxy-router-*
-          fail_on_unmatched_assets: false
+          fail_on_unmatched_files: false
 
   source:
     name: source
