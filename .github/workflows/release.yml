@@ -44,34 +44,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve and download sing-box
+      - name: Download sing-box
         shell: bash
         run: |
           set -euo pipefail
           bundle="sing-box-${SING_BOX_VERSION}-${{ matrix.asset }}.${{ matrix.archive }}"
-          release_json="$(curl -sL "https://api.github.com/repos/SagerNet/sing-box/releases/tags/v${SING_BOX_VERSION}")"
-          url="$(printf '%s' "$release_json" | jq -r --arg re "^${bundle}\$" '.assets[] | select(.name | test($re)) | .browser_download_url' | head -n 1)"
-          if [ -z "$url" ]; then
-            echo "::error::no sing-box asset matching ${bundle} for v${SING_BOX_VERSION}" >&2
-            exit 1
-          fi
-          curl -sL -o "$bundle" "$url"
+          # The release asset URL is deterministic; querying the API is not
+          # needed (unauthenticated API can be rate-limited, and jq is not
+          # guaranteed on every runner).
+          url="https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/${bundle}"
+          curl -fsSL --connect-timeout 20 --max-time 300 -o "$bundle" "$url"
           echo "BUNDLE_FILE=$bundle" >> "$GITHUB_ENV"
-          echo "Resolved sing-box asset: $bundle"
+          echo "Downloaded sing-box: $url"
 
       - name: Extract sing-box
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist/proxy-router/bin
+          mkdir -p dist/proxy-router/bin _sb
           if [ "${{ matrix.archive }}" = "tar.gz" ]; then
-            tar -xzf "$BUNDLE_FILE" -C dist/proxy-router/bin --strip-components=1 '*/sing-box'
+            tar -xzf "$BUNDLE_FILE" -C _sb
+            find _sb -type f -name 'sing-box' -exec cp {} dist/proxy-router/bin/ \;
             chmod +x dist/proxy-router/bin/sing-box
           else
             # GNU tar (Git Bash) cannot read .zip; use PowerShell Expand-Archive.
-            powershell -NoProfile -Command "Expand-Archive -Force -Path \"\$env:BUNDLE_FILE\" -DestinationPath sing-box-win"
-            find sing-box-win -name 'sing-box.exe' -exec cp {} dist/proxy-router/bin/ \;
+            powershell -NoProfile -Command "Expand-Archive -Force -Path \"\$env:BUNDLE_FILE\" -DestinationPath _sb"
+            find _sb -type f -name 'sing-box.exe' -exec cp {} dist/proxy-router/bin/ \;
           fi
+          ls -la dist/proxy-router/bin
 
       - name: Assemble bundle
         shell: bash
