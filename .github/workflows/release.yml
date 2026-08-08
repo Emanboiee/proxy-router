@@ -28,7 +28,10 @@ jobs:
             asset: darwin-arm64
             suffix: darwin-arm64
             archive: tar.gz
-          - os: macos-13
+          # Intel runner pool (macos-13) is heavily backlogged on GH; the
+          # darwin-amd64 bundle is download-only (never executed), so it can
+          # be assembled on any macOS runner.
+          - os: macos-15
             asset: darwin-amd64
             suffix: darwin-amd64
             archive: tar.gz
