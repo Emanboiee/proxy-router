@@ -1,0 +1,133 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      sing-box-version:
+        description: 'sing-box version to bundle in the archives'
+        required: false
+        default: '1.13.16'
+
+permissions:
+  contents: write
+
+env:
+  SING_BOX_VERSION: ${{ github.event.inputs.sing-box-version || '1.13.16' }}
+
+jobs:
+  build:
+    name: build ${{ matrix.suffix }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            asset: darwin-arm64
+            suffix: darwin-arm64
+            archive: tar.gz
+          - os: macos-13
+            asset: darwin-amd64
+            suffix: darwin-amd64
+            archive: tar.gz
+          - os: ubuntu-24.04
+            asset: linux-amd64-glibc
+            suffix: linux-amd64
+            archive: tar.gz
+          - os: windows-latest
+            asset: windows-amd64
+            suffix: windows-amd64
+            archive: zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve and download sing-box
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle="sing-box-${SING_BOX_VERSION}-${{ matrix.asset }}.${{ matrix.archive }}"
+          release_json="$(curl -sL "https://api.github.com/repos/SagerNet/sing-box/releases/tags/v${SING_BOX_VERSION}")"
+          url="$(printf '%s' "$release_json" | jq -r --arg re "^${bundle}\$" '.assets[] | select(.name | test($re)) | .browser_download_url' | head -n 1)"
+          if [ -z "$url" ]; then
+            echo "::error::no sing-box asset matching ${bundle} for v${SING_BOX_VERSION}" >&2
+            exit 1
+          fi
+          curl -sL -o "$bundle" "$url"
+          echo "BUNDLE_FILE=$bundle" >> "$GITHUB_ENV"
+          echo "Resolved sing-box asset: $bundle"
+
+      - name: Extract sing-box
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/proxy-router/bin
+          if [ "${{ matrix.archive }}" = "tar.gz" ]; then
+            tar -xzf "$BUNDLE_FILE" -C dist/proxy-router/bin --strip-components=1 '*/sing-box'
+            chmod +x dist/proxy-router/bin/sing-box
+          else
+            # GNU tar (Git Bash) cannot read .zip; use PowerShell Expand-Archive.
+            powershell -NoProfile -Command "Expand-Archive -Force -Path \"\$env:BUNDLE_FILE\" -DestinationPath sing-box-win"
+            find sing-box-win -name 'sing-box.exe' -exec cp {} dist/proxy-router/bin/ \;
+          fi
+
+      - name: Assemble bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp router.py README.md LICENSE .gitignore router.example.json dist/proxy-router/
+          if [ "${{ matrix.archive }}" = "tar.gz" ]; then
+            cp install.sh dist/proxy-router/
+          else
+            cp install.ps1 dist/proxy-router/
+          fi
+
+      - name: Copy macOS extras
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/proxy-router/examples
+          cp examples/keepalive.sh examples/com.proxy-router.keepalive.plist.template examples/install-launchd.sh examples/hermes-opencode.sh dist/proxy-router/examples/
+
+      - name: Archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.archive }}" = "tar.gz" ]; then
+            tar -czf "proxy-router-${GITHUB_REF_NAME}-${{ matrix.suffix }}.tar.gz" -C dist proxy-router
+          else
+            # GNU tar (Git Bash) cannot write .zip; use PowerShell Compress-Archive.
+            cd dist
+            powershell -NoProfile -Command "Compress-Archive -Force -Path proxy-router -DestinationPath \"..\\proxy-router-${GITHUB_REF_NAME}-${{ matrix.suffix }}.zip\""
+            cd ..
+          fi
+
+      - name: Upload
+        uses: softprops/action-gh-release@v2
+        with:
+          files: proxy-router-*
+          fail_on_unmatched_assets: false
+
+  source:
+    name: source
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build source tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/proxy-router
+          cp router.py README.md LICENSE .gitignore router.example.json dist/proxy-router/
+          cp -R tests examples install.sh install.ps1 .github dist/proxy-router/
+          tar -czf "proxy-router-${GITHUB_REF_NAME}-source.tar.gz" -C dist proxy-router
+
+      - name: Upload source
+        uses: softprops/action-gh-release@v2
+        with:
+          files: proxy-router-${{ github.ref_name }}-source.tar.gz
+          fail_on_unmatched_assets: false

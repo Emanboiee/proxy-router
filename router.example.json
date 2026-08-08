@@ -1,0 +1,32 @@
+{
+  "port": 2080,
+  "providers": {
+    "proton": {
+      "directory": "providers/proton",
+      "cooldown_seconds": 60
+    },
+    "cloudflare": {
+      "directory": "providers/cloudflare",
+      "cooldown_seconds": 60
+    }
+  },
+  "routes": [
+    {
+      "id": "opencode",
+      "domains": [
+        "opencode.ai"
+      ],
+      "provider": "proton"
+    },
+    {
+      "id": "roblox",
+      "domains": [
+        "roblox.com",
+        "rbxcdn.com",
+        "robloxlabs.com",
+        "rblx.com"
+      ],
+      "provider": "cloudflare"
+    }
+  ]
+}
