@@ -85,7 +85,9 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py down                 # disable macOS system proxy only (engine keeps running)
 ```
 
-Every command takes an exclusive lock, so concurrent calls are safe.
+Every state-changing command takes an exclusive lock, so concurrent calls
+are safe; read-only commands (`status`, `routes`, `provider-count`, `vpn
+status`, `init`) do not.
 
 ## VPN (TUN) mode
 
@@ -98,7 +100,7 @@ everything else exits `direct`. `vpn off` returns to proxy mode; `ensure`,
 
 Platform notes:
 
-- **Linux**: needs root for the TUN device + nftables rules
+- **Linux**: needs root for the TUN device + route table (iproute2)
   (`sudo proxy-router vpn on`).
 - **Windows**: needs an elevated shell and `wintun.dll` next to
   `sing-box.exe` (drop it from the official Wintun release).
@@ -113,8 +115,8 @@ TUN options live under `"vpn"` in `router.json`:
 ## Provider setup
 
 Each profile is a sing-box-compatible WireGuard config dropped into
-`providers/<provider>/` as `<name>.conf` (permissions enforced to 600).
-The profile key (e.g. `01-NL-FREE-140`) becomes the sing-box endpoint tag.
+`providers/<provider>/` as `<name>.conf`. The provider name (e.g. `proton`)
+becomes the sing-box endpoint tag.
 
 Proton VPN: export a WireGuard config for each server from the app/account
 page and drop the files in. Cloudflare WARP: generate a config with `wgcf`
@@ -127,8 +129,8 @@ page and drop the files in. Cloudflare WARP: generate a config with `wgcf`
 {
   "port": 2080,
   "providers": {
-    "proton":     { "cooldown_seconds": 60, "dns": "10.2.0.2" },
-    "cloudflare": { "cooldown_seconds": 60, "dns": "1.1.1.1" }
+    "proton":     { "cooldown_seconds": 60 },
+    "cloudflare": { "cooldown_seconds": 60 }
   },
   "routes": [
     { "id": "opencode", "domains": ["opencode.ai"], "provider": "proton" },
@@ -139,10 +141,20 @@ page and drop the files in. Cloudflare WARP: generate a config with `wgcf`
 
 - Route domains and IP CIDRs select which traffic enters a tunnel; everything
   else matches `direct` (unmatched) traffic.
-- Every active provider injects one DNS server (its own `dns` value, routed
-  through the tunnel) — matching domains resolve there.
+- Every active provider injects one DNS server taken from its WireGuard
+  profile's `[Interface] DNS` (fallback `1.1.1.1`) and routed through the
+  tunnel — matching domains resolve there.
 - A provider with no profiles is skipped entirely; its routes stay inert until
   a profile appears.
+
+Notes on claims vs reality:
+
+- The provider `"dns"` key in `router.json` is **not read** — DNS comes from
+  each profile's `[Interface] DNS` line.
+- Profile files are **not** chmod'd 600 (only state files and the generated
+  `sing-box.json` are); the install dir is chmod 700 instead.
+- `router.py init` refuses to overwrite an existing `router.json` unless you
+  pass `--force`; the installer never overwrites it either.
 
 ## Self-healing
 

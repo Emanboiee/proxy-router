@@ -80,7 +80,9 @@ def current_mode() -> str:
     """'proxy' (default) or 'tun'. Persisted in state/mode so ensure/reload
     keep running whatever the user last selected."""
     if MODE_FILE.is_file():
-        return MODE_FILE.read_text().strip()
+        mode = MODE_FILE.read_text().strip()
+        if mode in ("proxy", "tun"):
+            return mode
     return "proxy"
 
 
@@ -107,7 +109,9 @@ def load_config() -> int:
     return 0
 
 
-def write_default_config() -> None:
+def write_default_config(force: bool = False) -> int:
+    if CONFIG_FILE.is_file() and not force:
+        return fail(f"{CONFIG_FILE.name} already exists; use 'init --force' to overwrite")
     example = ROOT / "router.example.json"
     if example.is_file():
         data = json.loads(example.read_text())
@@ -135,6 +139,7 @@ def write_default_config() -> None:
     CONFIG_FILE.write_text(json.dumps(data, indent=2) + "\n")
     os.chmod(CONFIG_FILE, 0o600)
     print(f"wrote {CONFIG_FILE}")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -194,29 +199,50 @@ def set_active(name: str, profile: Path) -> None:
 def resolve_host(host: str) -> str:
     """Resolve a WireGuard peer host to an IP literal.
 
-    sing-box 1.12+ requires an explicit domain resolver when dialing a peer
-    by domain; resolving at build time (like Proton's IP endpoints) avoids
-    that and any DNS loop through the provider tunnel itself. Prefer IPv6:
-    the network this machine runs on silently drops the WARP IPv4 endpoint
-    (handshake never completes) while the IPv6 endpoint answers.
+    IPv6 literals (with or without brackets) and IPv4 literals pass through;
+    domains are resolved with a preference for IPv6: the network this machine
+    runs on silently drops the WARP IPv4 endpoint (handshake never completes)
+    while the IPv6 endpoint answers.
     """
+    host = host.strip().strip("[]")
+    try:
+        socket.inet_pton(socket.AF_INET6, host)
+        return host
+    except OSError:
+        pass
     try:
         socket.inet_aton(host)
         return host  # already an IPv4 literal
     except OSError:
         pass
-    infos = socket.getaddrinfo(host, None, socket.AF_UNSPEC)
+    try:
+        infos = socket.getaddrinfo(host, None, socket.AF_UNSPEC)
+    except socket.gaierror:
+        return host  # let sing-box's resolver deal with it
     for info in infos:
         if info[0] == socket.AF_INET6:
             return info[4][0]
     return infos[0][4][0]
 
 
+def parse_endpoint(endpoint: str) -> tuple[str, str]:
+    """Split a WireGuard ``host:port`` (or ``[v6]:port``) Endpoint into
+    (host, port) without breaking on IPv6 colons."""
+    endpoint = endpoint.strip()
+    if endpoint.startswith("["):
+        host, _, rest = endpoint[1:].partition("]")
+        return host, rest.lstrip(":")
+    host, sep, port = endpoint.rpartition(":")
+    if not sep:
+        raise SystemExit(f"bad Endpoint '{endpoint}' (expected host:port)")
+    return host, port
+
+
 def parse_wireguard(profile: Path) -> dict:
     parser = configparser.ConfigParser(interpolation=None)
     parser.read(profile)
     interface, peer = parser["Interface"], parser["Peer"]
-    host, port = peer["Endpoint"].strip().rsplit(":", 1)
+    host, port = parse_endpoint(peer["Endpoint"].strip())
     host = resolve_host(host)
     allowed_ips = [a.strip() for a in re.split(r"[,\s]+", peer.get("AllowedIPs", "").strip()) if a]
     if not allowed_ips:
@@ -304,6 +330,11 @@ def build_singbox_config() -> tuple[dict, set[str]]:
             "strict_route": False,
         }]
         route_final = "direct"
+        # In tun mode the OS resolver's queries enter the tunnel; hijack them
+        # into sing-box's DNS module so dns.rules still pin routed domains to
+        # the provider's own resolver instead of leaking through the physical
+        # network (valid on 1.13, where tun has no dns_mode option yet).
+        rules.append({"protocol": "dns", "action": "hijack-dns"})
     else:
         inbounds = [{"type": "mixed", "tag": "local-proxy", "listen": "127.0.0.1", "listen_port": _port}]
         route_final = "direct"
@@ -342,30 +373,106 @@ def listener_up() -> bool:
         return sock.connect_ex(("127.0.0.1", _port)) == 0
 
 
+def _pid_matches(pid: int) -> bool:
+    """True when PID is a sing-box we launched (cmdline contains our config,
+    so a recycled/foreign PID with the same number can never be killed)."""
+    try:
+        if os.name == "nt":
+            out = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=3,
+            ).stdout
+            return "sing-box" in out.lower()
+        out = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True, text=True, timeout=3,
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return f"sing-box run" in out and str(SING_BOX_CONFIG) in out
+
+
 def engine_alive() -> bool:
     """True when a sing-box started by us is still running (tun mode has no
-    TCP listener to probe, so process liveness is the health check)."""
+    TCP listener to probe, so process liveness is the health check). Also
+    refuses foreign/recycled PIDs so a stale pid file can't claim liveness."""
     if not PID_FILE.is_file():
         return False
     try:
         pid = int(PID_FILE.read_text().strip())
+    except (ValueError, OSError):
+        return False
+    if not _pid_matches(pid):
+        return False
+    try:
         if os.name == "nt":
-            result = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True)
-            return str(pid) in result.stdout
+            out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True, timeout=3).stdout
+            return str(pid) in out
         os.kill(pid, 0)
         return True
-    except (ProcessLookupError, ValueError):
+    except (ProcessLookupError, ValueError, OSError):
         return False
 
 
-def wait_engine(timeout: float = 8.0) -> bool:
+def engine_mode_consistent() -> bool:
+    """True when the running engine's config actually matches current_mode.
+
+    Prevents the H2 false-positive: a proxy-mode engine running while
+    state/mode says 'tun' (or vice versa) is NOT the state we claim."""
+    if not SING_BOX_CONFIG.is_file():
+        return False
+    try:
+        config = json.loads(SING_BOX_CONFIG.read_text())
+    except (json.JSONDecodeError, OSError):
+        return False
+    inbounds = config.get("inbounds", [])
+    if current_mode() == "tun":
+        return any(i.get("type") == "tun" for i in inbounds)
+    return any(i.get("type") in ("mixed", "socks", "http") for i in inbounds)
+
+
+def log_offset() -> int:
+    try:
+        return LOG_FILE.stat().st_size
+    except OSError:
+        return 0
+
+
+def log_has_fatal(after: int) -> bool:
+    """True when sing-box.log contains a FATAL line after byte offset ``after``.
+
+    tun mode fails fast with 'FATAL ... operation not permitted' when it lacks
+    root/wintun; the process can be alive for a few ms before dying, so the
+    log is the only reliable failure signal within the settle window."""
+    try:
+        with LOG_FILE.open("rb") as fh:
+            fh.seek(after)
+            tail = fh.read(64 * 1024).decode("utf-8", "replace")
+    except OSError:
+        return False
+    return "FATAL" in tail or "fatal" in tail
+
+
+def wait_engine(timeout: float = 8.0, log_from: int = 0) -> bool:
     """Mode-aware readiness: proxy mode waits for the mixed listener, tun mode
-    waits for a live process (interface setup has no socket to poll)."""
+    waits for a live process that survives the launch window without FATALing
+    (interface setup has no socket to poll, and a broken tun dies instantly)."""
     deadline = time.time() + timeout
+    first = True
     while time.time() < deadline:
         if current_mode() == "tun":
-            if engine_alive():
-                return True
+            if log_has_fatal(log_from):
+                return False
+            if engine_alive() and engine_mode_consistent():
+                # Require the process to survive a settle window: sing-box
+                # can exit milliseconds after a successful first poll when the
+                # tun interface fails to configure (no root / no wintun.dll).
+                if first:
+                    first = False
+                    time.sleep(0.5)
+                    continue
+                if not log_has_fatal(log_from) and engine_alive():
+                    return True
         else:
             if listener_up():
                 return True
@@ -405,7 +512,7 @@ def engine_start() -> int:
     process = subprocess.Popen([sing_box, "run", "-c", str(SING_BOX_CONFIG)], **popen_kwargs)
     PID_FILE.write_text(str(process.pid))
     os.chmod(PID_FILE, 0o600)
-    if not wait_engine():
+    if not wait_engine(log_from=log_offset()):
         engine_stop()
         return fail("sing-box failed to come up")
     return 0
@@ -425,6 +532,16 @@ def engine_stop() -> int:
     if PID_FILE.is_file():
         try:
             pid = int(PID_FILE.read_text().strip())
+        except (ValueError, OSError):
+            # Garbage pid file (H6): treat as stale, clean it up, carry on.
+            PID_FILE.unlink(missing_ok=True)
+            return 0
+        if not _pid_matches(pid):
+            # Foreign/recycled PID (H3): never signal a process we don't own.
+            # Remove the stale pid file so a later start can proceed.
+            PID_FILE.unlink(missing_ok=True)
+            return 0
+        try:
             if os.name == "nt":
                 # taskkill /T /F is a hard kill (TerminateProcess on the whole
                 # tree); the process may already be gone, so ignore its exit code.
@@ -451,7 +568,14 @@ def engine_reload() -> int:
         return fail("sing-box config check failed")
     if not PID_FILE.is_file():
         return engine_start()
-    pid = int(PID_FILE.read_text().strip())
+    try:
+        pid = int(PID_FILE.read_text().strip())
+    except (ValueError, OSError):
+        PID_FILE.unlink(missing_ok=True)
+        return engine_start()
+    if not _pid_matches(pid):
+        PID_FILE.unlink(missing_ok=True)
+        return engine_start()
     if os.name == "nt":
         # Windows has no SIGHUP; stop+start applies the fresh config.
         if engine_stop() != 0:
@@ -571,23 +695,62 @@ def vpn_note() -> None:
 
 def vpn_on() -> int:
     if current_mode() == "tun":
-        if engine_alive():
+        if engine_alive() and engine_mode_consistent():
             print("vpn: tun already up")
             return 0
+        # state says tun but nothing consistent is running: reset to proxy so a
+        # failed start below can't wedge a phantom tun, then fall through.
+        set_mode("proxy")
+
+    old_mode = current_mode()
+    sing_box = resolve_sing_box()
+    if sing_box is None:
+        return fail(_sing_box_missing_message())
+
+    # Pre-flight BEFORE persisting mode (H5): build + validate the tun config
+    # with the current providers. On failure, state/mode is restored and the
+    # keepalive keeps running the proxy instead of hammering a broken tun.
     set_mode("tun")
+    ok = False
+    try:
+        config, active = build_singbox_config()
+        if not active:
+            return fail("no provider profile available (drop *.conf into providers/<name>/)")
+        write_sing_box(config)
+        if not validate_config():
+            return fail("sing-box config check failed for tun mode")
+        ok = True
+    except SystemExit as exc:
+        return fail(str(exc) or "config build failed")
+    except Exception as exc:  # noqa: BLE001 - CLI boundary: report, don't crash
+        return fail(f"tun pre-flight failed: {exc}")
+    finally:
+        if not ok:
+            set_mode(old_mode)
+
     vpn_note()
-    return engine_start()
+    rc = engine_start()
+    if rc != 0:
+        # Engine failed to come up (e.g. no root for utun on macOS): restore
+        # the previous mode and let `ensure`/keepalive keep the proxy alive.
+        set_mode(old_mode)
+    return rc
 
 
 def vpn_off() -> int:
     set_mode("proxy")
-    return engine_stop()
+    rc = engine_stop()
+    if rc != 0:
+        return rc
+    # Returning to proxy mode should leave the user with working connectivity
+    # (M11): start the proxy engine so 127.0.0.1:<port> answers again.
+    return engine_start()
 
 
 def vpn_status() -> int:
     mode = current_mode()
     if mode == "tun":
-        if engine_alive():
+        if engine_alive() and engine_mode_consistent():
             print("vpn: up (tun mode)")
             return 0
         print("vpn: down (mode set to tun; run 'vpn on')")
@@ -656,7 +819,6 @@ def main() -> int:
     parser = argparse.ArgumentParser(prog="router", description="selective WireGuard proxy router")
     sub = parser.add_subparsers(dest="cmd")
 
-    sub.add_parser("init")
     sub.add_parser("ensure")
     sub.add_parser("start")
     sub.add_parser("stop")
@@ -665,6 +827,9 @@ def main() -> int:
     sub.add_parser("routes")
     sub.add_parser("up")
     sub.add_parser("down")
+
+    init = sub.add_parser("init")
+    init.add_argument("--force", action="store_true", help="overwrite an existing router.json")
 
     vpn = sub.add_parser("vpn", help="toggle TUN mode (vpn on|off|status)")
     vpn.add_argument("action", choices=["on", "off", "status"])
@@ -686,8 +851,7 @@ def main() -> int:
 
     args = parser.parse_args()
     if args.cmd == "init":
-        write_default_config()
-        return 0
+        return write_default_config(force=getattr(args, "force", False))
     if args.cmd is None:
         parser.print_help()
         return 2
@@ -716,7 +880,7 @@ def main() -> int:
         if resolve_sing_box() is None:
             print(f"router: {_sing_box_missing_message()}", file=sys.stderr)
         if current_mode() == "tun":
-            print("up (tun)" if engine_alive() else "down")
+            print("up (tun)" if engine_alive() and engine_mode_consistent() else "down")
         else:
             print("up" if listener_up() else "down")
         return 0

@@ -4,6 +4,11 @@
 set -euo pipefail
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# The scripts ship under examples/ next to router.py; locate the prefix either
+# from the examples dir (parent) or from a standalone copy of the script.
+if [ ! -f "$ROOT/router.py" ] && [ -f "$(dirname "$ROOT")/router.py" ]; then
+  ROOT="$(dirname "$ROOT")"
+fi
 ROUTER="$ROOT/router.py"
 HERMES_BIN="${HERMES_BIN:-hermes}"
 MAX_ATTEMPTS="${OPENCODE_MAX_ATTEMPTS:-}"

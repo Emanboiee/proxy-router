@@ -220,17 +220,58 @@ class VpnModeTests(unittest.TestCase):
         config, _ = router.build_singbox_config()
         self.assertEqual(config["inbounds"][0]["stack"], "gvisor")
 
+    def test_tun_mode_hijacks_dns(self):
+        router.set_mode("tun")
+        config, _ = router.build_singbox_config()
+        self.assertIn({"protocol": "dns", "action": "hijack-dns"}, config["route"]["rules"])
+
+    def test_proxy_mode_has_no_hijack_rule(self):
+        router.set_mode("proxy")
+        config, _ = router.build_singbox_config()
+        self.assertNotIn({"protocol": "dns", "action": "hijack-dns"}, config["route"]["rules"])
+
+    def test_mode_consistency_checks_config_inbounds(self):
+        router.set_mode("tun")
+        config, _ = router.build_singbox_config()
+        router.write_sing_box(config)
+        self.assertTrue(router.engine_mode_consistent())
+        router.set_mode("proxy")
+        # config still says tun, mode says proxy => inconsistent
+        self.assertFalse(router.engine_mode_consistent())
+
+
+class ParseEndpointTests(unittest.TestCase):
+    def test_ipv4_endpoint(self):
+        self.assertEqual(router.parse_endpoint("1.2.3.4:51820"), ("1.2.3.4", "51820"))
+
+    def test_ipv6_bracketed_endpoint(self):
+        self.assertEqual(router.parse_endpoint("[2606:4700::1]:51820"), ("2606:4700::1", "51820"))
+
+    def test_bad_endpoint_raises(self):
+        with self.assertRaises(SystemExit):
+            router.parse_endpoint("nocolons")
+
 
 class InitTests(unittest.TestCase):
     def test_init_writes_config_matching_example(self):
         with tempfile.TemporaryDirectory() as tmp:
             _relocate(router, Path(tmp))
-            router.write_default_config()
+            self.assertEqual(router.write_default_config(), 0)
             written = json.loads(router.CONFIG_FILE.read_text())
             example = json.loads(
                 (Path(__file__).resolve().parent.parent / "router.example.json").read_text()
             )
             self.assertEqual(written, example)
+
+    def test_init_refuses_overwrite_without_force(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _relocate(router, Path(tmp))
+            self.assertEqual(router.write_default_config(), 0)
+            written = router.CONFIG_FILE.read_text()
+            self.assertNotEqual(router.write_default_config(), 0)
+            # untouched on refusal
+            self.assertEqual(router.CONFIG_FILE.read_text(), written)
+            self.assertEqual(router.write_default_config(force=True), 0)
 
 
 class RootEnvTests(unittest.TestCase):
