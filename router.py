@@ -65,6 +65,58 @@ def _sing_box_missing_message() -> str:
     bundled = ROOT / "bin" / ("sing-box.exe" if os.name == "nt" else "sing-box")
     return f"sing-box not found; set SING_BOX, bundle it at {bundled}, or install it on PATH"
 
+
+# The generated sing-box.json uses features that do not exist before sing-box
+# 1.12.0 (dialer `domain_resolver`, route `default_domain_resolver`, and the
+# dns `hijack-dns` rule action - verified against the 1.12 and 1.11 release
+# binaries). An older binary fails `check` with a cryptic "unknown field"
+# error, so we reject it up front with a clear message (M8).
+MIN_SING_BOX_VERSION = (1, 12, 0)
+
+_sing_box_version_cache: tuple[int, int, int] | None = None
+_sing_box_version_resolved = False
+
+
+def sing_box_version() -> tuple[int, int, int] | None:
+    """Parse `sing-box version` output into a (major, minor, patch) tuple.
+
+    Returns None when the binary cannot be run or the banner does not contain
+    a parseable version (callers then fall back to `sing-box check`, which
+    still reports the concrete schema error instead of guessing)."""
+    global _sing_box_version_cache, _sing_box_version_resolved
+    if _sing_box_version_resolved:
+        return _sing_box_version_cache
+    version = None
+    sing_box = resolve_sing_box()
+    if sing_box is not None:
+        try:
+            result = subprocess.run(
+                [sing_box, "version"], capture_output=True, text=True, timeout=10
+            )
+            match = re.search(r"version\s+[vV]?(\d+)\.(\d+)\.(\d+)", result.stdout)
+            if match:
+                version = tuple(int(g) for g in match.groups())
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    _sing_box_version_cache = version
+    _sing_box_version_resolved = True
+    return version
+
+
+def sing_box_at_least(minimum: tuple[int, int, int]) -> bool:
+    """True when sing-box satisfies ``minimum``; an unknown version is not
+    rejected here (the generated config's `check` still catches real schema
+    problems, and refusing on a parse failure could lock out beta builds)."""
+    version = sing_box_version()
+    return version is None or version >= minimum
+
+
+def _sing_box_version_message(required: tuple[int, int, int]) -> str:
+    version = sing_box_version()
+    if version is None:
+        return f"cannot determine sing-box version; need >= {'.'.join(map(str, required))}"
+    return f"sing-box {'.'.join(map(str, version))} is too old (need >= {'.'.join(map(str, required))}); install a newer sing-box or point SING_BOX at one"
+
 _providers: dict = {}
 _routes: list = []
 _port: int = DEFAULT_PORT
@@ -203,6 +255,15 @@ def resolve_host(host: str) -> str:
     domains are resolved with a preference for IPv6: the network this machine
     runs on silently drops the WARP IPv4 endpoint (handshake never completes)
     while the IPv6 endpoint answers.
+
+    Note (M10): this preference is deliberately independent of the DNS
+    ``strategy`` in the generated config. `dns.strategy` governs how domain
+    *destinations* are resolved: the tunnels in this router are IPv4-only
+    (profiles assign e.g. 10.2.0.2/32), so destinations default to
+    ``ipv4_only``. Peer *endpoints*, on the other hand, may be IPv6 because
+    that is the only family some networks route to the WARP server. Both are
+    tunable via ``vpn.dns_strategy`` / ``vpn.prefer_ipv6_peers`` so a
+    deployment can express one consistent policy.
     """
     host = host.strip().strip("[]")
     try:
@@ -215,14 +276,21 @@ def resolve_host(host: str) -> str:
         return host  # already an IPv4 literal
     except OSError:
         pass
+    prefer_ipv6 = bool(_vpn.get("prefer_ipv6_peers", True))
     try:
         infos = socket.getaddrinfo(host, None, socket.AF_UNSPEC)
     except socket.gaierror:
         return host  # let sing-box's resolver deal with it
     for info in infos:
-        if info[0] == socket.AF_INET6:
+        if prefer_ipv6 and info[0] == socket.AF_INET6:
+            return info[4][0]
+        if not prefer_ipv6 and info[0] == socket.AF_INET:
             return info[4][0]
     return infos[0][4][0]
+
+
+def _bad_endpoint(endpoint: str) -> None:
+    raise SystemExit(f"bad Endpoint '{endpoint}' (expected host:port or [v6]:port)")
 
 
 def parse_endpoint(endpoint: str) -> tuple[str, str]:
@@ -231,10 +299,17 @@ def parse_endpoint(endpoint: str) -> tuple[str, str]:
     endpoint = endpoint.strip()
     if endpoint.startswith("["):
         host, _, rest = endpoint[1:].partition("]")
-        return host, rest.lstrip(":")
+        port = rest.lstrip(":")
+        if not host or not port:
+            _bad_endpoint(endpoint)
+        return host, port
     host, sep, port = endpoint.rpartition(":")
-    if not sep:
-        raise SystemExit(f"bad Endpoint '{endpoint}' (expected host:port)")
+    if not sep or not host or not port:
+        _bad_endpoint(endpoint)
+    try:
+        int(port)
+    except ValueError:
+        _bad_endpoint(endpoint)
     return host, port
 
 
@@ -270,6 +345,23 @@ def dns_server_for(profile: Path) -> str:
     if dns:
         dns = re.split(r"[,\s]+", dns)[0]
     return dns or "1.1.1.1"
+
+
+_DNS_STRATEGIES = ("ipv4_only", "ipv6_only", "ipv4_prefer", "ipv6_prefer")
+
+
+def dns_strategy() -> str:
+    """Address-family strategy for DNS resolution of domain *destinations*.
+
+    Defaults to ``ipv4_only`` because the WireGuard tunnels this router builds
+    carry only the IPv4 addresses assigned in each profile (e.g. 10.2.0.2/32).
+    Tunable per-machine with ``vpn.dns_strategy`` in router.json (see
+    resolve_host for why peer endpoints are handled separately, M10).
+    """
+    strategy = _vpn.get("dns_strategy", "ipv4_only")
+    if strategy not in _DNS_STRATEGIES:
+        return "ipv4_only"
+    return strategy
 
 
 def build_singbox_config() -> tuple[dict, set[str]]:
@@ -333,8 +425,12 @@ def build_singbox_config() -> tuple[dict, set[str]]:
         # In tun mode the OS resolver's queries enter the tunnel; hijack them
         # into sing-box's DNS module so dns.rules still pin routed domains to
         # the provider's own resolver instead of leaking through the physical
-        # network (valid on 1.13, where tun has no dns_mode option yet).
-        rules.append({"protocol": "dns", "action": "hijack-dns"})
+        # network. The hijack must come FIRST (before the domain/outbound
+        # rules): routes match DNS queries too, and a query sent to 'proton'
+        # outbound would bypass dns.rules. hijack-dns is a rule action added
+        # in sing-box 1.12 (confirmed against the 1.12 binary), so the tun
+        # config needs the same 1.12 minimum as proxy mode.
+        rules.insert(0, {"protocol": "dns", "action": "hijack-dns"})
     else:
         inbounds = [{"type": "mixed", "tag": "local-proxy", "listen": "127.0.0.1", "listen_port": _port}]
         route_final = "direct"
@@ -344,7 +440,7 @@ def build_singbox_config() -> tuple[dict, set[str]]:
         "inbounds": inbounds,
         "endpoints": list(active.values()),
         "outbounds": [{"type": "direct", "tag": "direct"}],
-        "dns": {"servers": dns_servers, "rules": dns_rules, "strategy": "ipv4_only"},
+        "dns": {"servers": dns_servers, "rules": dns_rules, "strategy": dns_strategy()},
         "route": {"auto_detect_interface": True, "default_domain_resolver": "dns-local", "rules": rules, "final": route_final},
     }
     return config, set(active)
@@ -378,6 +474,19 @@ def _pid_matches(pid: int) -> bool:
     so a recycled/foreign PID with the same number can never be killed)."""
     try:
         if os.name == "nt":
+            # tasklist only names the process, so any sing-box.exe with a
+            # recycled PID would pass; read the real command line first and
+            # require our generated config path in it (H3).
+            try:
+                out = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     f"(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine"],
+                    capture_output=True, text=True, timeout=5,
+                ).stdout
+            except (OSError, subprocess.TimeoutExpired):
+                out = ""
+            if out:
+                return "sing-box" in out.lower() and str(SING_BOX_CONFIG) in out
             out = subprocess.run(
                 ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
                 capture_output=True, text=True, timeout=3,
@@ -454,27 +563,35 @@ def log_has_fatal(after: int) -> bool:
 
 
 def wait_engine(timeout: float = 8.0, log_from: int = 0) -> bool:
-    """Mode-aware readiness: proxy mode waits for the mixed listener, tun mode
-    waits for a live process that survives the launch window without FATALing
-    (interface setup has no socket to poll, and a broken tun dies instantly)."""
+    """Mode-aware readiness: the engine must come up AND survive a settle
+    window without a FATAL in the log.
+
+    - proxy mode is ready when OUR process listens (engine_alive + the
+      listener probe): a foreign process answering on the port while our
+      sing-box dies on `bind: address already in use` is NOT a healthy
+      start (H2).
+    - tun mode is ready when OUR process survives the launch window
+      (interface setup has no socket to poll, and a broken tun dies
+      instantly with FATAL - no root / no wintun.dll).
+
+    Either way the first "up" poll just opens a 0.5s settle window instead of
+    returning immediately, because sing-box can emit its FATAL a moment after
+    the first successful poll (e.g. bind conflict or interface setup)."""
     deadline = time.time() + timeout
     first = True
     while time.time() < deadline:
+        if log_has_fatal(log_from):
+            return False
         if current_mode() == "tun":
-            if log_has_fatal(log_from):
-                return False
-            if engine_alive() and engine_mode_consistent():
-                # Require the process to survive a settle window: sing-box
-                # can exit milliseconds after a successful first poll when the
-                # tun interface fails to configure (no root / no wintun.dll).
-                if first:
-                    first = False
-                    time.sleep(0.5)
-                    continue
-                if not log_has_fatal(log_from) and engine_alive():
-                    return True
+            ok = engine_alive() and engine_mode_consistent()
         else:
-            if listener_up():
+            ok = listener_up() and engine_alive()
+        if ok:
+            if first:
+                first = False
+                time.sleep(0.5)
+                continue
+            if not log_has_fatal(log_from):
                 return True
         time.sleep(0.2)
     return False
@@ -497,6 +614,8 @@ def engine_start() -> int:
     sing_box = resolve_sing_box()
     if sing_box is None:
         return fail(_sing_box_missing_message())
+    if not sing_box_at_least(MIN_SING_BOX_VERSION):
+        return fail(f"{_sing_box_version_message(MIN_SING_BOX_VERSION)}")
     config, active = build_singbox_config()
     if not active:
         return fail("no provider profile available (drop *.conf into providers/<name>/)")
@@ -520,7 +639,10 @@ def engine_start() -> int:
 
 def engine_ensure() -> int:
     if current_mode() == "tun":
-        if engine_alive():
+        # A proxy engine running while state/mode says tun is NOT healthy
+        # (status/vpn status report it as down); restart into the persisted
+        # mode instead of declaring victory (M13).
+        if engine_alive() and engine_mode_consistent():
             return 0
         return engine_start()
     if listener_up():
@@ -560,6 +682,8 @@ def engine_reload() -> int:
     sing_box = resolve_sing_box()
     if sing_box is None:
         return fail(_sing_box_missing_message())
+    if not sing_box_at_least(MIN_SING_BOX_VERSION):
+        return fail(f"{_sing_box_version_message(MIN_SING_BOX_VERSION)}")
     config, active = build_singbox_config()
     if not active:
         return fail("no provider endpoint available")
@@ -706,6 +830,8 @@ def vpn_on() -> int:
     sing_box = resolve_sing_box()
     if sing_box is None:
         return fail(_sing_box_missing_message())
+    if not sing_box_at_least(MIN_SING_BOX_VERSION):
+        return fail(f"{_sing_box_version_message(MIN_SING_BOX_VERSION)}")
 
     # Pre-flight BEFORE persisting mode (H5): build + validate the tun config
     # with the current providers. On failure, state/mode is restored and the
@@ -732,8 +858,12 @@ def vpn_on() -> int:
     rc = engine_start()
     if rc != 0:
         # Engine failed to come up (e.g. no root for utun on macOS): restore
-        # the previous mode and let `ensure`/keepalive keep the proxy alive.
+        # the previous mode. engine_start already stopped whatever proxy was
+        # running, so bring the proxy engine back immediately instead of
+        # leaving the user without connectivity until keepalive re-arms it.
         set_mode(old_mode)
+        if old_mode == "proxy" and not listener_up():
+            engine_start()
     return rc
 
 
@@ -747,19 +877,32 @@ def vpn_off() -> int:
     return engine_start()
 
 
-def vpn_status() -> int:
+def _status_report() -> tuple[int, str]:
+    """Single liveness check shared by `status` and `vpn status` (M13): both
+    commands must report the same up/down state and exit code so automation
+    cannot disagree with a human reading one or the other.
+
+    Returns (rc, line) with rc == 0 only when the engine is running AND its
+    generated config matches the persisted mode (tun engine for tun mode,
+    proxy listener for proxy mode); anything else is a degraded/down state
+    with rc == 1.
+    """
     mode = current_mode()
     if mode == "tun":
         if engine_alive() and engine_mode_consistent():
-            print("vpn: up (tun mode)")
-            return 0
-        print("vpn: down (mode set to tun; run 'vpn on')")
-        return 1
+            return 0, "up (tun)"
+        if engine_alive():
+            return 1, "down (running engine does not match tun mode; run 'vpn on')"
+        return 1, "down (mode set to tun; run 'vpn on')"
     if listener_up():
-        print("vpn: proxy up (127.0.0.1:{})".format(_port))
-        return 0
-    print("vpn: down (proxy mode; run 'vpn on' for tun, 'start' for proxy)")
-    return 1
+        return 0, "up (proxy 127.0.0.1:{})".format(_port)
+    return 1, "down (proxy mode; run 'vpn on' for tun, 'start' for proxy)"
+
+
+def vpn_status() -> int:
+    rc, line = _status_report()
+    print(f"vpn: {line}")
+    return rc
 
 
 # ---------------------------------------------------------------------------
@@ -867,7 +1010,16 @@ def main() -> int:
         return fail("down requires macOS (v1 scope)")
 
     rc = load_config()
-    if rc and args.cmd != "status":
+    if rc:
+        # A broken/missing router.json is a degraded state: `status` and
+        # `vpn status` still print a state line and exit 1 (M13); the reason
+        # is already on stderr from load_config.
+        if args.cmd == "status":
+            print("down (unusable config; see error above)")
+            return 1
+        if args.cmd == "vpn":
+            print("vpn: down (unusable config; see error above)")
+            return 1
         return rc
 
     if args.cmd == "ensure":
@@ -879,11 +1031,9 @@ def main() -> int:
     if args.cmd == "status":
         if resolve_sing_box() is None:
             print(f"router: {_sing_box_missing_message()}", file=sys.stderr)
-        if current_mode() == "tun":
-            print("up (tun)" if engine_alive() and engine_mode_consistent() else "down")
-        else:
-            print("up" if listener_up() else "down")
-        return 0
+        rc, line = _status_report()
+        print(line)
+        return rc
     if args.cmd == "reload":
         return _with_lock(engine_reload)
     if args.cmd == "rotate":

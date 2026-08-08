@@ -1,11 +1,13 @@
 """Unit tests for router.py (stdlib only, no third-party deps, no network)."""
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -225,6 +227,13 @@ class VpnModeTests(unittest.TestCase):
         config, _ = router.build_singbox_config()
         self.assertIn({"protocol": "dns", "action": "hijack-dns"}, config["route"]["rules"])
 
+    def test_tun_hijack_rule_precedes_route_rules(self):
+        # The dns hijack must come FIRST: domain/outbound rules also match DNS
+        # queries and would route them out of the DNS module (M7).
+        router.set_mode("tun")
+        config, _ = router.build_singbox_config()
+        self.assertEqual(config["route"]["rules"][0], {"protocol": "dns", "action": "hijack-dns"})
+
     def test_proxy_mode_has_no_hijack_rule(self):
         router.set_mode("proxy")
         config, _ = router.build_singbox_config()
@@ -286,6 +295,341 @@ class RootEnvTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(Path(result.stdout.strip()), Path(tmp).resolve())
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+class SingBoxVersionTests(unittest.TestCase):
+    """M8: the generated config needs sing-box >= 1.12 (dialer
+    domain_resolver, route.default_domain_resolver, hijack-dns rule action)."""
+
+    FAKE_BIN = "/nonexistent/for-tests/sing-box"
+
+    def setUp(self):
+        router._sing_box_version_resolved = False
+        router._sing_box_version_cache = None
+        router._sing_box_resolved = False
+        router._sing_box_cache = None
+        self._rsb = mock.patch.object(router, "resolve_sing_box", return_value=self.FAKE_BIN)
+        self._rsb.start()
+
+    def tearDown(self):
+        self._rsb.stop()
+        router._sing_box_version_resolved = False
+
+    def _run(self, stdout):
+        return mock.patch.object(
+            router.subprocess, "run",
+            return_value=subprocess.CompletedProcess([], 0, stdout=stdout, stderr=""),
+        )
+
+    def test_parses_stable_version(self):
+        with self._run("sing-box version 1.13.16\n\nEnvironment: go1.26.5 darwin/arm64\n"):
+            self.assertEqual(router.sing_box_version(), (1, 13, 16))
+
+    def test_1_12_meets_minimum(self):
+        with self._run("sing-box version 1.12.0\n"):
+            self.assertEqual(router.sing_box_version(), (1, 12, 0))
+            self.assertTrue(router.sing_box_at_least(router.MIN_SING_BOX_VERSION))
+
+    def test_1_11_rejected(self):
+        with self._run("sing-box version 1.11.8\n"):
+            self.assertFalse(router.sing_box_at_least(router.MIN_SING_BOX_VERSION))
+
+    def test_unparseable_version_falls_open(self):
+        with self._run("weird banner without a version\n"):
+            self.assertIsNone(router.sing_box_version())
+            self.assertTrue(router.sing_box_at_least(router.MIN_SING_BOX_VERSION))
+
+    def test_engine_start_rejects_old_binary_before_writing_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _relocate(router, Path(tmp))
+            (Path(tmp) / "providers" / "proton").mkdir(parents=True)
+            _write_conf(Path(tmp) / "providers" / "proton" / "a.conf")
+            router._providers = {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}}
+            router._routes = [{"id": "opencode", "domains": ["opencode.ai"], "provider": "proton"}]
+            router._port = 2080
+            with self._run("sing-box version 1.11.8\n"):
+                self.assertEqual(router.engine_start(), 1)
+            self.assertFalse(router.PID_FILE.exists())
+            self.assertFalse(router.SING_BOX_CONFIG.exists())
+
+
+class ResolveHostTests(unittest.TestCase):
+    """M10: peer endpoint resolution prefers IPv6 but is tunable and never
+    hits the network in tests (getaddrinfo is mocked)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(router, self.root)
+        router._vpn = {}
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_ipv4_literal_passthrough(self):
+        self.assertEqual(router.resolve_host("1.2.3.4"), "1.2.3.4")
+
+    def test_ipv6_literal_passthrough(self):
+        self.assertEqual(router.resolve_host("2606:4700::1"), "2606:4700::1")
+        self.assertEqual(router.resolve_host("[2606:4700::1]"), "2606:4700::1")
+
+    def test_prefers_ipv6_when_both_present(self):
+        infos = [(socket.AF_INET, 0, 0, "", ("1.2.3.4", 0)),
+                 (socket.AF_INET6, 0, 0, "", ("2606:4700::1", 0))]
+        with mock.patch.object(router.socket, "getaddrinfo", return_value=infos):
+            self.assertEqual(router.resolve_host("peer.example"), "2606:4700::1")
+
+    def test_falls_back_to_ipv4_when_no_aaaa(self):
+        infos = [(socket.AF_INET, 0, 0, "", ("1.2.3.4", 0))]
+        with mock.patch.object(router.socket, "getaddrinfo", return_value=infos):
+            self.assertEqual(router.resolve_host("peer.example"), "1.2.3.4")
+
+    def test_prefer_ipv6_off_prefers_ipv4(self):
+        router._vpn = {"prefer_ipv6_peers": False}
+        infos = [(socket.AF_INET6, 0, 0, "", ("2606:4700::1", 0)),
+                 (socket.AF_INET, 0, 0, "", ("1.2.3.4", 0))]
+        with mock.patch.object(router.socket, "getaddrinfo", return_value=infos):
+            self.assertEqual(router.resolve_host("peer.example"), "1.2.3.4")
+
+    def test_gaierror_passthrough(self):
+        import socket as _socket
+        with mock.patch.object(router.socket, "getaddrinfo", side_effect=_socket.gaierror):
+            self.assertEqual(router.resolve_host("no.such.host.example"), "no.such.host.example")
+
+
+class DnsStrategyTests(unittest.TestCase):
+    """M10: dns.strategy (routed *destinations*) defaults to ipv4_only because
+    the tunnels are IPv4-only, and is configurable via router.json vpn."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(router, self.root)
+        router._vpn = {}
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_defaults_to_ipv4_only(self):
+        self.assertEqual(router.dns_strategy(), "ipv4_only")
+
+    def test_configured_strategy_used(self):
+        router._vpn = {"dns_strategy": "ipv6_prefer"}
+        self.assertEqual(router.dns_strategy(), "ipv6_prefer")
+
+    def test_invalid_strategy_falls_back(self):
+        router._vpn = {"dns_strategy": "bogus"}
+        self.assertEqual(router.dns_strategy(), "ipv4_only")
+
+    def test_build_uses_configured_strategy(self):
+        (self.root / "providers" / "proton").mkdir(parents=True)
+        _write_conf(self.root / "providers" / "proton" / "a.conf")
+        router._providers = {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}}
+        router._routes = [{"id": "opencode", "domains": ["opencode.ai"], "provider": "proton"}]
+        router._port = 2080
+        router._vpn = {"dns_strategy": "ipv4_prefer"}
+        config, _ = router.build_singbox_config()
+        self.assertEqual(config["dns"]["strategy"], "ipv4_prefer")
+
+
+class ParseEndpointEdgeTests(unittest.TestCase):
+    def test_bracketed_v6_requires_port(self):
+        with self.assertRaises(SystemExit):
+            router.parse_endpoint("[2606:4700::1]")
+
+    def test_non_numeric_port_rejected(self):
+        with self.assertRaises(SystemExit):
+            router.parse_endpoint("host.example:notaport")
+
+    def test_empty_port_rejected(self):
+        with self.assertRaises(SystemExit):
+            router.parse_endpoint("host.example:")
+
+
+class StatusReportTests(unittest.TestCase):
+    """M13: `status` and `vpn status` must agree on up/down and exit code."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(router, self.root)
+        router._port = 2080
+        router._vpn = {}
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_proxy_mode_without_engine_is_down(self):
+        with mock.patch.object(router, "listener_up", return_value=False):
+            rc, line = router._status_report()
+        self.assertEqual(rc, 1)
+        self.assertIn("down", line)
+
+    def test_tun_mode_without_engine_is_down(self):
+        router.set_mode("tun")
+        rc, line = router._status_report()
+        self.assertEqual(rc, 1)
+        self.assertIn("tun", line)
+
+    def test_tun_mode_with_mismatched_engine_is_down(self):
+        router.set_mode("tun")
+        with mock.patch.object(router, "engine_alive", return_value=True), \
+             mock.patch.object(router, "engine_mode_consistent", return_value=False):
+            rc, line = router._status_report()
+        self.assertEqual(rc, 1)
+        self.assertIn("does not match tun", line)
+
+    def test_tun_mode_up(self):
+        router.set_mode("tun")
+        with mock.patch.object(router, "engine_alive", return_value=True), \
+             mock.patch.object(router, "engine_mode_consistent", return_value=True):
+            rc, line = router._status_report()
+        self.assertEqual(rc, 0)
+        self.assertIn("up (tun)", line)
+
+    def test_proxy_mode_up(self):
+        with mock.patch.object(router, "listener_up", return_value=True):
+            rc, line = router._status_report()
+        self.assertEqual(rc, 0)
+        self.assertIn("up", line)
+
+    def test_vpn_status_uses_shared_report(self):
+        router.set_mode("tun")
+        with mock.patch.object(router, "engine_alive", return_value=True), \
+             mock.patch.object(router, "engine_mode_consistent", return_value=True), \
+             mock.patch("sys.stdout.write") as write:
+            rc = router.vpn_status()
+        self.assertEqual(rc, 0)
+        self.assertTrue(any("up (tun)" in str(c) for c in write.call_args_list))
+
+
+class EngineEnsureConsistencyTests(unittest.TestCase):
+    """M13: ensure must not declare a tun-mode system healthy when the running
+    engine does not match the persisted mode."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(router, self.root)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_proxy_listener_up_returns_without_start(self):
+        with mock.patch.object(router, "listener_up", return_value=True), \
+             mock.patch.object(router, "engine_start", side_effect=AssertionError("must not start")):
+            self.assertEqual(router.engine_ensure(), 0)
+
+    def test_tun_alive_and_consistent_is_healthy(self):
+        router.set_mode("tun")
+        with mock.patch.object(router, "engine_alive", return_value=True), \
+             mock.patch.object(router, "engine_mode_consistent", return_value=True), \
+             mock.patch.object(router, "engine_start", side_effect=AssertionError("must not start")):
+            self.assertEqual(router.engine_ensure(), 0)
+
+    def test_tun_alive_but_inconsistent_restarts(self):
+        router.set_mode("tun")
+        with mock.patch.object(router, "engine_alive", return_value=True), \
+             mock.patch.object(router, "engine_mode_consistent", return_value=False), \
+             mock.patch.object(router, "engine_start", return_value=77) as start:
+            self.assertEqual(router.engine_ensure(), 77)
+        start.assert_called_once()
+
+    def test_tun_down_starts(self):
+        router.set_mode("tun")
+        with mock.patch.object(router, "engine_alive", return_value=False), \
+             mock.patch.object(router, "engine_start", return_value=0) as start:
+            self.assertEqual(router.engine_ensure(), 0)
+        start.assert_called_once()
+
+
+class VpnOnRollbackTests(unittest.TestCase):
+    """H5: vpn on pre-flights, and on engine failure restores the previous
+    mode AND brings the proxy engine back so the user keeps connectivity."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(router, self.root)
+        (self.root / "providers" / "proton").mkdir(parents=True)
+        _write_conf(self.root / "providers" / "proton" / "a.conf")
+        router._providers = {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}}
+        router._routes = [{"id": "opencode", "domains": ["opencode.ai"], "provider": "proton"}]
+        router._port = 2080
+        router._vpn = {"address": ["172.19.0.1/30"], "mtu": 1500, "stack": "system"}
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_failed_vpn_on_restores_proxy_mode_and_engine(self):
+        with mock.patch.object(router, "resolve_sing_box", return_value="/bin/echo"), \
+             mock.patch.object(router, "validate_config", return_value=True), \
+             mock.patch.object(router, "engine_start", return_value=1) as start, \
+             mock.patch.object(router, "listener_up", return_value=False):
+            rc = router.vpn_on()
+        self.assertEqual(rc, 1)
+        self.assertEqual(router.current_mode(), "proxy")
+        # original failed engine_start + proxy restore
+        self.assertEqual(start.call_count, 2)
+
+    def test_successful_vpn_on_keeps_tun(self):
+        with mock.patch.object(router, "resolve_sing_box", return_value="/bin/echo"), \
+             mock.patch.object(router, "validate_config", return_value=True), \
+             mock.patch.object(router, "engine_start", return_value=0) as start:
+            rc = router.vpn_on()
+        self.assertEqual(rc, 0)
+        self.assertEqual(router.current_mode(), "tun")
+        start.assert_called_once()
+
+
+class WaitEngineTests(unittest.TestCase):
+    """H2: start must not claim success when a foreign process answers our
+    port while the engine we launched died."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(router, self.root)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_proxy_readiness_requires_our_process(self):
+        with mock.patch.object(router, "listener_up", return_value=True), \
+             mock.patch.object(router, "engine_alive", return_value=False):
+            self.assertFalse(router.wait_engine(timeout=0.4))
+
+    def test_proxy_readiness_with_our_process(self):
+        with mock.patch.object(router, "listener_up", return_value=True), \
+             mock.patch.object(router, "engine_alive", return_value=True):
+            self.assertTrue(router.wait_engine(timeout=2.0))
+
+    def test_proxy_readiness_false_without_listener(self):
+        with mock.patch.object(router, "listener_up", return_value=False), \
+             mock.patch.object(router, "engine_alive", return_value=True):
+            self.assertFalse(router.wait_engine(timeout=0.4))
+
+
+class CliStatusAgreementTests(unittest.TestCase):
+    """M13 at the CLI boundary: status and vpn status exit 1 with "down" when
+    nothing is running, in a throwaway PROXY_ROUTER_ROOT."""
+
+    def test_both_report_down_with_exit_1(self):
+        repo = Path(__file__).resolve().parent.parent
+        with tempfile.TemporaryDirectory() as tmp:
+            env = dict(os.environ)
+            env["PROXY_ROUTER_ROOT"] = tmp
+            env["SING_BOX"] = ""  # do not depend on this machine's binary
+            for cmd in (["status"], ["vpn", "status"]):
+                result = subprocess.run(
+                    [sys.executable, str(repo / "router.py"), *cmd],
+                    cwd=repo, env=env, capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 1, (cmd, result.stdout, result.stderr))
+                self.assertIn("down", result.stdout.lower(), (cmd, result.stdout))
 
 
 if __name__ == "__main__":

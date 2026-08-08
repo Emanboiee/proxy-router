@@ -21,8 +21,11 @@ and the launchd keep-alive) are guarded and print a clear message elsewhere.
 ## Requirements
 
 - Python 3.10+ (stdlib only — no pip install)
-- sing-box — bundled in the release archives (`bin/sing-box`), or available on
-  `PATH`, or pointed at via `SING_BOX` env var
+- sing-box **1.12.0 or newer** — bundled in the release archives
+  (`bin/sing-box`), or available on `PATH`, or pointed at via `SING_BOX` env
+  var. Older binaries are rejected up front: the generated config relies on
+  the 1.12+ dialer `domain_resolver`, route `default_domain_resolver` and the
+  `hijack-dns` rule action.
 
 ## Install
 
@@ -80,7 +83,7 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py remove <id>
 ./router.py rotate <provider>    # switch to next cooled-down profile, hot reload
 ./router.py provider-count proton # rotation candidates (retry budget)
-./router.py init                 # write a fresh router.json
+./router.py init                 # write a fresh router.json (exists => refused; add --force)
 ./router.py up                   # enable macOS system proxy (also ensures engine)
 ./router.py down                 # disable macOS system proxy only (engine keeps running)
 ```
@@ -88,6 +91,10 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 Every state-changing command takes an exclusive lock, so concurrent calls
 are safe; read-only commands (`status`, `routes`, `provider-count`, `vpn
 status`, `init`) do not.
+
+`status` and `vpn status` report the same state (exit 0 = engine up and
+matching the persisted mode; exit 1 = down, degraded, or unusable config), so
+scripts and humans can rely on either one.
 
 ## VPN (TUN) mode
 
@@ -111,6 +118,18 @@ Platform notes:
 
 TUN options live under `"vpn"` in `router.json`:
 `address` (CIDR list), `mtu`, `stack` (`system`, default | `gvisor`).
+
+Two more knobs in `"vpn"` control address-family policy:
+
+- `dns_strategy` — how domain *destinations* are resolved by the DNS module.
+  Default `ipv4_only` (the tunnels carry only the IPv4 addresses assigned in
+  each profile). Valid values: `ipv4_only`, `ipv6_only`, `ipv4_prefer`,
+  `ipv6_prefer`.
+- `prefer_ipv6_peers` — whether WireGuard *peer endpoints* that are domains
+  resolve to an IPv6 address when one exists (default `true`; some networks
+  drop the WARP IPv4 endpoint so the IPv6 one must be used). This is a
+  separate scope from `dns_strategy`: endpoints are the tunnel servers,
+  destinations are the sites you route.
 
 ## Provider setup
 
@@ -143,7 +162,8 @@ page and drop the files in. Cloudflare WARP: generate a config with `wgcf`
   else matches `direct` (unmatched) traffic.
 - Every active provider injects one DNS server taken from its WireGuard
   profile's `[Interface] DNS` (fallback `1.1.1.1`) and routed through the
-  tunnel — matching domains resolve there.
+  tunnel — matching domains resolve there (strategy `ipv4_only` by default;
+  see the `vpn.dns_strategy` option if your tunnels carry IPv6).
 - A provider with no profiles is skipped entirely; its routes stay inert until
   a profile appears.
 
