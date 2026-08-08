@@ -7,10 +7,13 @@ Spiritual successor to `tools/opencode-zen-vpn` (retired).
 
 Runs a local mixed HTTP/SOCKS proxy at `127.0.0.1:2080` and routes only
 matching domains/IPs through a WireGuard tunnel — everything else goes direct.
-Routes can point at different tunnel providers (e.g. `opencode.ai -> proton`,
-`roblox.com -> cloudflare`), and each provider keeps a pool of profiles that
-rotate on demand (rate limits, server death) while the listener stays up
-(config is hot-reloaded via SIGHUP, no restart).
+Routes can point at different tunnel providers (e.g. `roblox.com ->
+cloudflare`), and each provider keeps a pool of profiles that rotate on demand
+(rate limits, server death) while the listener stays up (config is hot-reloaded
+via SIGHUP, no restart). Domains with no route (including `opencode.ai`) match
+the final `direct` outbound: OpenCode Zen's API is Cloudflare-WAF-blocked
+(HTTP 403 error 1010) when egress leaves through a WireGuard tunnel, so it
+must keep direct egress + local DNS.
 
 On macOS the system proxy can be switched on/off (`up`/`down`) so the rest of
 the system also uses the selective proxy.
@@ -63,6 +66,7 @@ bin/sing-box(.exe)           bundled engine binary (release archives only)
 examples/keepalive.sh        re-arms the engine if the listener dies
 examples/com.proxy-router.keepalive.plist.template   launchd agent loading keepalive
 examples/hermes-opencode.sh  bounded model-run wrapper with automatic rotation
+examples/proxy-manager.sh   bridge for the Hermes opencode-server-rotation plugin
 tests/                       unit tests (unittest, no deps)
 providers/<provider>/        WireGuard configs, one file per profile (chmod 600)
 state/                       active profile + cooldown markers (gitignored)
@@ -152,11 +156,17 @@ page and drop the files in. Cloudflare WARP: generate a config with `wgcf`
     "cloudflare": { "cooldown_seconds": 60 }
   },
   "routes": [
-    { "id": "opencode", "domains": ["opencode.ai"], "provider": "proton" },
-    { "id": "roblox",   "domains": ["roblox.com", "rbxcdn.com", "robloxlabs.com", "rblx.com"], "provider": "cloudflare" }
+    { "id": "roblox", "domains": ["roblox.com", "rbxcdn.com", "robloxlabs.com", "rblx.com"], "provider": "cloudflare" }
   ]
 }
 ```
+
+`opencode.ai` deliberately has **no** route: OpenCode Zen's API is
+Cloudflare-WAF-blocked with HTTP 403 error 1010 whenever its traffic leaves
+via a WireGuard tunnel (Proton or WARP). It resolves fine over direct egress
+with local DNS, so it intentionally matches the default `direct` final. If you
+previously shipped an `opencode -> proton` route, remove it the same way
+(`proxy-router remove opencode`) so chat completions keep working.
 
 - Route domains and IP CIDRs select which traffic enters a tunnel; everything
   else matches `direct` (unmatched) traffic.
@@ -198,8 +208,19 @@ once per profile and retries the exact same command after 15s
 (`OPENCODE_RETRY_DELAY_SECONDS` to override, `OPENCODE_MAX_ATTEMPTS` to cap,
 `OPENCODE_PROVIDER` to change the pool).
 
+The Hermes `opencode_server_rotation` plugin expects a rotation manager at
+`tools/opencode-zen-vpn/proxy-manager.sh` (its `rotate` subcommand). That
+directory was retired; ship `examples/proxy-manager.sh` to that exact path to
+bridge the plugin onto this router's `rotate` command (which provider is
+rotated is `OPENCODE_PROVIDER`, defaulting to `proton`). No plugin or Hermes
+config changes are needed.
+
 ## Troubleshooting
 
+- `proxy-router: command not found` in interactive shells — the installer
+  links into `~/.local/bin`. If that isn't on your shell's PATH, add
+  `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc` (or equivalent) and
+  open a fresh login shell.
 - `FATAL start service: bind: address already in use` — another sing-box owns
   the port; stop it first, then `./proxy-router start`.
 - Route changes don't apply — `reload`/`add`/`remove` SIGHUP the running

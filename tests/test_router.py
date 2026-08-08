@@ -91,7 +91,7 @@ class ConfigBuildTests(unittest.TestCase):
             "cloudflare": {"directory": "providers/cloudflare", "cooldown_seconds": 60},
         }
         router._routes = [
-            {"id": "opencode", "domains": ["opencode.ai"], "provider": "proton"},
+            {"id": "example-com", "domains": ["example.com"], "provider": "proton"},
             {"id": "roblox", "domains": ["roblox.com"], "provider": "cloudflare"},
         ]
         router._port = 2080
@@ -111,10 +111,10 @@ class ConfigBuildTests(unittest.TestCase):
             next(s for s in config["dns"]["servers"] if s["tag"] == "dns-proton")["server"],
             "1.1.1.1",
         )
-        self.assertEqual(config["dns"]["rules"], [{"domain_suffix": ["opencode.ai"], "server": "dns-proton"}])
+        self.assertEqual(config["dns"]["rules"], [{"domain_suffix": ["example.com"], "server": "dns-proton"}])
         self.assertEqual(config["dns"]["strategy"], "ipv4_only")
         rules = config["route"]["rules"]
-        self.assertIn({"outbound": "proton", "domain_suffix": ["opencode.ai"]}, rules)
+        self.assertIn({"outbound": "proton", "domain_suffix": ["example.com"]}, rules)
         self.assertNotIn({"outbound": "cloudflare", "domain_suffix": ["roblox.com"]}, rules)
 
 
@@ -127,7 +127,7 @@ class RoutesTests(unittest.TestCase):
         router.CONFIG_FILE.write_text(json.dumps({
             "port": 2080,
             "providers": {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}},
-            "routes": [{"id": "opencode", "domains": ["opencode.ai"], "provider": "proton"}],
+            "routes": [{"id": "example-org", "domains": ["example.org"], "provider": "proton"}],
         }))
         self.assertEqual(router.load_config(), 0)
 
@@ -145,11 +145,11 @@ class RoutesTests(unittest.TestCase):
         self.assertIsNone(router._routes_add_entry("example.com", "domains", None, "nope"))
 
     def test_routes_remove_roundtrip(self):
-        self.assertTrue(router._routes_remove_entry("opencode"))
+        self.assertTrue(router._routes_remove_entry("example-org"))
         self.assertEqual(router.save_config(), 0)
         data = json.loads(router.CONFIG_FILE.read_text())
         self.assertEqual(data["routes"], [])
-        self.assertFalse(router._routes_remove_entry("opencode"))
+        self.assertFalse(router._routes_remove_entry("example-org"))
 
 
 class RotationTests(unittest.TestCase):
@@ -190,7 +190,7 @@ class VpnModeTests(unittest.TestCase):
         (self.root / "providers" / "proton").mkdir(parents=True)
         _write_conf(self.root / "providers" / "proton" / "a.conf")
         router._providers = {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}}
-        router._routes = [{"id": "opencode", "domains": ["opencode.ai"], "provider": "proton"}]
+        router._routes = [{"id": "example-com", "domains": ["example.com"], "provider": "proton"}]
         router._port = 2080
         router._vpn = {"address": ["172.19.0.1/30"], "mtu": 1500, "stack": "system"}
 
@@ -356,7 +356,7 @@ class SingBoxVersionTests(unittest.TestCase):
             (Path(tmp) / "providers" / "proton").mkdir(parents=True)
             _write_conf(Path(tmp) / "providers" / "proton" / "a.conf")
             router._providers = {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}}
-            router._routes = [{"id": "opencode", "domains": ["opencode.ai"], "provider": "proton"}]
+            router._routes = [{"id": "example-com", "domains": ["example.com"], "provider": "proton"}]
             router._port = 2080
             with self._run("sing-box version 1.11.8\n"):
                 self.assertEqual(router.engine_start(), 1)
@@ -436,7 +436,7 @@ class DnsStrategyTests(unittest.TestCase):
         (self.root / "providers" / "proton").mkdir(parents=True)
         _write_conf(self.root / "providers" / "proton" / "a.conf")
         router._providers = {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}}
-        router._routes = [{"id": "opencode", "domains": ["opencode.ai"], "provider": "proton"}]
+        router._routes = [{"id": "example-com", "domains": ["example.com"], "provider": "proton"}]
         router._port = 2080
         router._vpn = {"dns_strategy": "ipv4_prefer"}
         config, _ = router.build_singbox_config()
@@ -565,7 +565,7 @@ class VpnOnRollbackTests(unittest.TestCase):
         (self.root / "providers" / "proton").mkdir(parents=True)
         _write_conf(self.root / "providers" / "proton" / "a.conf")
         router._providers = {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}}
-        router._routes = [{"id": "opencode", "domains": ["opencode.ai"], "provider": "proton"}]
+        router._routes = [{"id": "example-com", "domains": ["example.com"], "provider": "proton"}]
         router._port = 2080
         router._vpn = {"address": ["172.19.0.1/30"], "mtu": 1500, "stack": "system"}
 

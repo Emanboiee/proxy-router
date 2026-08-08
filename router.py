@@ -175,7 +175,11 @@ def write_default_config(force: bool = False) -> int:
                 "cloudflare": {"directory": "providers/cloudflare", "cooldown_seconds": 60},
             },
             "routes": [
-                {"id": "opencode", "domains": ["opencode.ai"], "provider": "proton"},
+                # No default route for opencode.ai: OpenCode Zen's API is
+                # Cloudflare-WAF-blocked (HTTP 403 error 1010) whenever egress
+                # leaves through a WireGuard tunnel (Proton or WARP). It needs
+                # direct egress + local DNS, so it falls through to the final
+                # 'direct' outbound instead.
                 {
                     "id": "roblox",
                     "domains": ["roblox.com", "rbxcdn.com", "robloxlabs.com", "rblx.com"],
