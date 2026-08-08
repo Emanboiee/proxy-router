@@ -84,13 +84,12 @@ jobs:
             cp install.ps1 dist/proxy-router/
           fi
 
-      - name: Copy macOS extras
-        if: runner.os == 'macOS'
+      - name: Copy examples
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist/proxy-router/examples
-          cp examples/keepalive.sh examples/com.proxy-router.keepalive.plist.template examples/install-launchd.sh examples/hermes-opencode.sh dist/proxy-router/examples/
+          cp examples/* dist/proxy-router/examples/ 2>/dev/null || cp examples/keepalive.sh examples/com.proxy-router.keepalive.plist.template examples/install-launchd.sh examples/hermes-opencode.sh dist/proxy-router/examples/
 
       - name: Archive
         shell: bash

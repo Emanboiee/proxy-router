@@ -30,7 +30,7 @@ MacOS / Linux:
 
 ```sh
 tar xzf proxy-router-<version>-<os>.tar.gz
-cd proxy-router-<version>-<os>
+cd proxy-router
 ./install.sh          # installs to ~/.local/share/proxy-router, links `proxy-router` on PATH
 ```
 
@@ -38,7 +38,7 @@ Windows (PowerShell):
 
 ```powershell
 Expand-Archive proxy-router-<version>-windows-amd64.zip
-cd proxy-router-<version>-windows-amd64
+cd proxy-router
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
