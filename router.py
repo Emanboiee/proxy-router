@@ -30,7 +30,11 @@ SING_BOX_CONFIG = ROOT / "sing-box.json"
 PID_FILE = ROOT / "sing-box.pid"
 LOG_FILE = ROOT / "sing-box.log"
 LOCK_FILE = ROOT / "state" / "engine.lock"
+MODE_FILE = ROOT / "state" / "mode"
 DEFAULT_PORT = 2080
+DEFAULT_TUN_ADDRESS = ["172.19.0.1/30"]
+DEFAULT_TUN_MTU = 1500
+DEFAULT_TUN_STACK = "system"
 
 _sing_box_cache: str | None = None
 _sing_box_resolved = False
@@ -64,6 +68,7 @@ def _sing_box_missing_message() -> str:
 _providers: dict = {}
 _routes: list = []
 _port: int = DEFAULT_PORT
+_vpn: dict = {}
 
 
 def fail(message: str) -> int:
@@ -71,8 +76,22 @@ def fail(message: str) -> int:
     return 1
 
 
+def current_mode() -> str:
+    """'proxy' (default) or 'tun'. Persisted in state/mode so ensure/reload
+    keep running whatever the user last selected."""
+    if MODE_FILE.is_file():
+        return MODE_FILE.read_text().strip()
+    return "proxy"
+
+
+def set_mode(mode: str) -> None:
+    MODE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    MODE_FILE.write_text(mode)
+    os.chmod(MODE_FILE, 0o600)
+
+
 def load_config() -> int:
-    global _providers, _routes, _port
+    global _providers, _routes, _port, _vpn
     if not CONFIG_FILE.is_file():
         return fail(f"missing {CONFIG_FILE.name}; run 'router.py init' first")
     try:
@@ -82,6 +101,7 @@ def load_config() -> int:
     _port = int(data.get("port", DEFAULT_PORT))
     _providers = data.get("providers", {})
     _routes = data.get("routes", [])
+    _vpn = data.get("vpn", {})
     if not _providers:
         return fail("no providers configured")
     return 0
@@ -106,6 +126,11 @@ def write_default_config() -> None:
                     "provider": "cloudflare",
                 },
             ],
+            "vpn": {
+                "address": DEFAULT_TUN_ADDRESS,
+                "mtu": DEFAULT_TUN_MTU,
+                "stack": DEFAULT_TUN_STACK,
+            },
         }
     CONFIG_FILE.write_text(json.dumps(data, indent=2) + "\n")
     os.chmod(CONFIG_FILE, 0o600)
@@ -267,13 +292,29 @@ def build_singbox_config() -> tuple[dict, set[str]]:
         {"ip_cidr": ["127.0.0.0/8", "::1/128"], "outbound": "direct"},
     ])
 
+    mode = current_mode()
+    if mode == "tun":
+        inbounds = [{
+            "type": "tun",
+            "tag": "tun-in",
+            "address": _vpn.get("address", DEFAULT_TUN_ADDRESS),
+            "mtu": int(_vpn.get("mtu", DEFAULT_TUN_MTU)),
+            "stack": _vpn.get("stack", DEFAULT_TUN_STACK),
+            "auto_route": True,
+            "strict_route": False,
+        }]
+        route_final = "direct"
+    else:
+        inbounds = [{"type": "mixed", "tag": "local-proxy", "listen": "127.0.0.1", "listen_port": _port}]
+        route_final = "direct"
+
     config = {
         "log": {"level": "info"},
-        "inbounds": [{"type": "mixed", "tag": "local-proxy", "listen": "127.0.0.1", "listen_port": _port}],
+        "inbounds": inbounds,
         "endpoints": list(active.values()),
         "outbounds": [{"type": "direct", "tag": "direct"}],
         "dns": {"servers": dns_servers, "rules": dns_rules, "strategy": "ipv4_only"},
-        "route": {"auto_detect_interface": True, "default_domain_resolver": "dns-local", "rules": rules, "final": "direct"},
+        "route": {"auto_detect_interface": True, "default_domain_resolver": "dns-local", "rules": rules, "final": route_final},
     }
     return config, set(active)
 
@@ -299,6 +340,37 @@ def listener_up() -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.settimeout(0.5)
         return sock.connect_ex(("127.0.0.1", _port)) == 0
+
+
+def engine_alive() -> bool:
+    """True when a sing-box started by us is still running (tun mode has no
+    TCP listener to probe, so process liveness is the health check)."""
+    if not PID_FILE.is_file():
+        return False
+    try:
+        pid = int(PID_FILE.read_text().strip())
+        if os.name == "nt":
+            result = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True)
+            return str(pid) in result.stdout
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, ValueError):
+        return False
+
+
+def wait_engine(timeout: float = 8.0) -> bool:
+    """Mode-aware readiness: proxy mode waits for the mixed listener, tun mode
+    waits for a live process (interface setup has no socket to poll)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if current_mode() == "tun":
+            if engine_alive():
+                return True
+        else:
+            if listener_up():
+                return True
+        time.sleep(0.2)
+    return False
 
 
 def wait_listener(timeout: float = 8.0) -> bool:
@@ -333,13 +405,17 @@ def engine_start() -> int:
     process = subprocess.Popen([sing_box, "run", "-c", str(SING_BOX_CONFIG)], **popen_kwargs)
     PID_FILE.write_text(str(process.pid))
     os.chmod(PID_FILE, 0o600)
-    if not wait_listener():
+    if not wait_engine():
         engine_stop()
-        return fail("sing-box failed to open the listener")
+        return fail("sing-box failed to come up")
     return 0
 
 
 def engine_ensure() -> int:
+    if current_mode() == "tun":
+        if engine_alive():
+            return 0
+        return engine_start()
     if listener_up():
         return 0
     return engine_start()
@@ -385,7 +461,7 @@ def engine_reload() -> int:
         os.kill(pid, signal.SIGHUP)  # SIGHUP: sing-box hot-reloads the config in place
     except ProcessLookupError:
         return engine_start()
-    if wait_listener(2.0):
+    if wait_engine(2.0):
         return 0
     return engine_start()
 
@@ -479,6 +555,51 @@ def routes_remove(id_: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# VPN (TUN) toggle
+# ---------------------------------------------------------------------------
+
+def vpn_note() -> None:
+    """Per-OS caveats when switching to tun mode; prints to stderr, not an error."""
+    if current_mode() != "tun":
+        return
+    if sys.platform == "darwin":
+        print("router: tun mode on macOS needs root (create utun interface); run with sudo", file=sys.stderr)
+        print("router: tun mode on macOS is NOT a System Settings VPN entry (requires a signed NE app); it is a utun interface", file=sys.stderr)
+    elif os.name == "nt":
+        print("router: tun mode on Windows needs an elevated shell (admin) and wintun.dll next to sing-box.exe", file=sys.stderr)
+
+
+def vpn_on() -> int:
+    if current_mode() == "tun":
+        if engine_alive():
+            print("vpn: tun already up")
+            return 0
+    set_mode("tun")
+    vpn_note()
+    return engine_start()
+
+
+def vpn_off() -> int:
+    set_mode("proxy")
+    return engine_stop()
+
+
+def vpn_status() -> int:
+    mode = current_mode()
+    if mode == "tun":
+        if engine_alive():
+            print("vpn: up (tun mode)")
+            return 0
+        print("vpn: down (mode set to tun; run 'vpn on')")
+        return 1
+    if listener_up():
+        print("vpn: proxy up (127.0.0.1:{})".format(_port))
+        return 0
+    print("vpn: down (proxy mode; run 'vpn on' for tun, 'start' for proxy)")
+    return 1
+
+
+# ---------------------------------------------------------------------------
 # macOS system proxy toggle
 # ---------------------------------------------------------------------------
 
@@ -545,6 +666,9 @@ def main() -> int:
     sub.add_parser("up")
     sub.add_parser("down")
 
+    vpn = sub.add_parser("vpn", help="toggle TUN mode (vpn on|off|status)")
+    vpn.add_argument("action", choices=["on", "off", "status"])
+
     r_add = sub.add_parser("add")
     r_add.add_argument("--id")
     r_add.add_argument("--domain")
@@ -591,7 +715,10 @@ def main() -> int:
     if args.cmd == "status":
         if resolve_sing_box() is None:
             print(f"router: {_sing_box_missing_message()}", file=sys.stderr)
-        print("up" if listener_up() else "down")
+        if current_mode() == "tun":
+            print("up (tun)" if engine_alive() else "down")
+        else:
+            print("up" if listener_up() else "down")
         return 0
     if args.cmd == "reload":
         return _with_lock(engine_reload)
@@ -602,6 +729,12 @@ def main() -> int:
         return 0
     if args.cmd == "routes":
         return routes_list()
+    if args.cmd == "vpn":
+        if args.action == "on":
+            return _with_lock(vpn_on)
+        if args.action == "off":
+            return _with_lock(vpn_off)
+        return vpn_status()
     if args.cmd == "add":
         return _with_lock(lambda: routes_add(args))
     if args.cmd == "remove":

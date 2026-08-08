@@ -28,5 +28,12 @@
       ],
       "provider": "cloudflare"
     }
-  ]
+  ],
+  "vpn": {
+    "address": [
+      "172.19.0.1/30"
+    ],
+    "mtu": 1500,
+    "stack": "system"
+  }
 }

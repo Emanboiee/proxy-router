@@ -71,18 +71,44 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ```sh
 ./router.py ensure                # start engine if the listener is down (idempotent)
 ./router.py start / stop / status
-./router.py routes                # list route table
+./router.py routes               # list route table
+./router.py vpn on               # full TUN mode: route everything via the engines' rules
+./router.py vpn off              # stop the TUN, back to proxy mode
+./router.py vpn status           # show current mode and liveness
 ./router.py add --domain example.com --provider proton [--id my-route]
 ./router.py add --ip 1.2.3.0/24 --provider proton [--id my-route]
 ./router.py remove <id>
-./router.py rotate <provider>     # switch to next cooled-down profile, hot reload
+./router.py rotate <provider>    # switch to next cooled-down profile, hot reload
 ./router.py provider-count proton # rotation candidates (retry budget)
-./router.py init                  # write a fresh router.json
-./router.py up                    # enable macOS system proxy (also ensures engine)
-./router.py down                  # disable macOS system proxy only (engine keeps running)
+./router.py init                 # write a fresh router.json
+./router.py up                   # enable macOS system proxy (also ensures engine)
+./router.py down                 # disable macOS system proxy only (engine keeps running)
 ```
 
 Every command takes an exclusive lock, so concurrent calls are safe.
+
+## VPN (TUN) mode
+
+`vpn on` switches the engine from a local mixed proxy (`127.0.0.1:2080`) to a
+system TUN interface. sing-box `auto_route` then captures **all** traffic at
+the IP layer — including apps that ignore system proxy settings — while the
+same route rules still decide which domains go through which provider and
+everything else exits `direct`. `vpn off` returns to proxy mode; `ensure`,
+`reload`, `add`/`remove` and `rotate` all respect whatever mode is active.
+
+Platform notes:
+
+- **Linux**: needs root for the TUN device + nftables rules
+  (`sudo proxy-router vpn on`).
+- **Windows**: needs an elevated shell and `wintun.dll` next to
+  `sing-box.exe` (drop it from the official Wintun release).
+- **macOS**: needs root to create the `utun` interface
+  (`sudo proxy-router vpn on`). This is NOT a System Settings VPN provider
+  entry — that would require a signed NetworkExtension app. It is a TUN
+  interface managed from the terminal.
+
+TUN options live under `"vpn"` in `router.json`:
+`address` (CIDR list), `mtu`, `stack` (`system`, default | `gvisor`).
 
 ## Provider setup
 

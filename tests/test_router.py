@@ -20,6 +20,7 @@ def _relocate(module, root: Path) -> None:
     module.PID_FILE = module.ROOT / "sing-box.pid"
     module.LOG_FILE = module.ROOT / "sing-box.log"
     module.LOCK_FILE = module.ROOT / "state" / "engine.lock"
+    module.MODE_FILE = module.ROOT / "state" / "mode"
 
 
 def _write_conf(path: Path, *, psk: bool = True, mtu: bool = True, keepalive: bool = True) -> None:
@@ -169,6 +170,55 @@ class RotationTests(unittest.TestCase):
         for name in ("a", "b"):
             router.mark_cooldown("proton", self.root / "providers" / "proton" / f"{name}.conf", 60)
         self.assertIsNone(router.resolve_active("proton"))
+
+
+class VpnModeTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(router, self.root)
+        (self.root / "providers" / "proton").mkdir(parents=True)
+        _write_conf(self.root / "providers" / "proton" / "a.conf")
+        router._providers = {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}}
+        router._routes = [{"id": "opencode", "domains": ["opencode.ai"], "provider": "proton"}]
+        router._port = 2080
+        router._vpn = {"address": ["172.19.0.1/30"], "mtu": 1500, "stack": "system"}
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_mode_defaults_to_proxy(self):
+        self.assertEqual(router.current_mode(), "proxy")
+
+    def test_set_mode_roundtrips(self):
+        router.set_mode("tun")
+        self.assertEqual(router.current_mode(), "tun")
+        router.set_mode("proxy")
+        self.assertEqual(router.current_mode(), "proxy")
+
+    def test_tun_mode_builds_tun_inbound(self):
+        router.set_mode("tun")
+        config, _ = router.build_singbox_config()
+        inbounds = config["inbounds"]
+        self.assertEqual(len(inbounds), 1)
+        self.assertEqual(inbounds[0]["type"], "tun")
+        self.assertEqual(inbounds[0]["address"], ["172.19.0.1/30"])
+        self.assertEqual(inbounds[0]["stack"], "system")
+        self.assertTrue(inbounds[0]["auto_route"])
+        self.assertEqual(config["route"]["final"], "direct")
+
+    def test_proxy_mode_builds_mixed_inbound(self):
+        router.set_mode("proxy")
+        config, _ = router.build_singbox_config()
+        self.assertEqual(config["inbounds"], [
+            {"type": "mixed", "tag": "local-proxy", "listen": "127.0.0.1", "listen_port": 2080}
+        ])
+
+    def test_vpn_custom_stack_from_config(self):
+        router._vpn = {"stack": "gvisor"}
+        router.set_mode("tun")
+        config, _ = router.build_singbox_config()
+        self.assertEqual(config["inbounds"][0]["stack"], "gvisor")
 
 
 class InitTests(unittest.TestCase):
