@@ -731,7 +731,12 @@ def rotate(name: str) -> int:
     current = resolve_active(name)
     if current is not None and not is_cooled_down(name, current):
         mark_cooldown(name, current, seconds)
-    for profile in profiles:
+    if current in profiles:
+        start = profiles.index(current) + 1
+        candidates = profiles[start:] + profiles[:start]
+    else:
+        candidates = profiles
+    for profile in candidates:
         if not is_cooled_down(name, profile):
             set_active(name, profile)
             print(f"switched {name} -> {profile.stem}")

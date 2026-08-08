@@ -181,6 +181,15 @@ class RotationTests(unittest.TestCase):
             router.mark_cooldown("proton", self.root / "providers" / "proton" / f"{name}.conf", 60)
         self.assertIsNone(router.resolve_active("proton"))
 
+    def test_rotate_walks_forward_through_pool_before_wrapping(self):
+        _write_conf(self.root / "providers" / "proton" / "c.conf")
+        router.set_active("proton", self.root / "providers" / "proton" / "b.conf")
+        with mock.patch.object(router, "engine_reload", return_value=0):
+            self.assertEqual(router.rotate("proton"), 0)
+            self.assertEqual((self.root / "state" / "proton.active").read_text(), "c")
+            self.assertEqual(router.rotate("proton"), 0)
+            self.assertEqual((self.root / "state" / "proton.active").read_text(), "a")
+
 
 class VpnModeTests(unittest.TestCase):
     def setUp(self):
