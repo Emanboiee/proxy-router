@@ -2,7 +2,7 @@
 sing-box.json
 sing-box.log
 sing-box.pid
-router.json        # live config (tracked example: router.example.json)
+router.json
 state/
 logs/
 configs/
