@@ -344,6 +344,11 @@ def dns_server_for(profile: Path) -> str:
     dns = parser.get("Interface", "DNS", fallback="").strip()
     if dns:
         dns = re.split(r"[,\s]+", dns)[0]
+    # Proton's private tunnel resolver intermittently blackholes DNS on macOS
+    # (10.2.0.1 / 2a07:b944::). Resolve through Cloudflare DNS over the same
+    # WireGuard endpoint instead; the destination traffic remains provider-routed.
+    if dns.startswith("10.") or dns.lower().startswith("2a07:b944:"):
+        return "1.1.1.1"
     return dns or "1.1.1.1"
 
 

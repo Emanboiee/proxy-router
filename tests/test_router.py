@@ -69,6 +69,14 @@ class WireGuardParseTests(unittest.TestCase):
             self.assertNotIn("persistent_keepalive_interval", endpoint["peers"][0])
             self.assertNotIn("mtu", endpoint)
 
+    def test_dns_server_for_avoids_private_proton_resolver(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conf = Path(tmp) / "profile.conf"
+            _write_conf(conf)
+            self.assertEqual(router.dns_server_for(conf), "1.1.1.1")
+            conf.write_text(conf.read_text().replace("DNS = 10.2.0.1", "DNS = 2a07:b944::2:1"))
+            self.assertEqual(router.dns_server_for(conf), "1.1.1.1")
+
 
 class ConfigBuildTests(unittest.TestCase):
     def setUp(self):
@@ -101,7 +109,7 @@ class ConfigBuildTests(unittest.TestCase):
         self.assertIn("dns-local", dns_tags)
         self.assertEqual(
             next(s for s in config["dns"]["servers"] if s["tag"] == "dns-proton")["server"],
-            "10.2.0.1",
+            "1.1.1.1",
         )
         self.assertEqual(config["dns"]["rules"], [{"domain_suffix": ["opencode.ai"], "server": "dns-proton"}])
         self.assertEqual(config["dns"]["strategy"], "ipv4_only")
