@@ -17,7 +17,7 @@
   <key>EnvironmentVariables</key>
   <dict>
     <key>HOME</key>
-    <string>@LOGIN@</string>
+    <string>@HOME@</string>
     <key>LANG</key>
     <string>en_US.UTF-8</string>
     <key>PATH</key>

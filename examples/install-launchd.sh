@@ -2,7 +2,7 @@
 # Bootstraps the macOS launchd keepalive agent for proxy-router.
 #
 # Fills the placeholders in com.proxy-router.keepalive.plist.template
-# (@ROOT@, @LOGIN@, @PATH@, @LOG_DIR@), writes the agent plist into
+# (@ROOT@, @HOME@, @PATH@, @LOG_DIR@), writes the agent plist into
 # ~/Library/LaunchAgents, and loads it with launchctl. Idempotent: rerunning
 # re-writes the plist and re-bootstraps. Pass --remove to tear the agent down.
 set -euo pipefail
@@ -28,7 +28,7 @@ fi
 mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR" "$PREFIX"
 
 sed -e "s|@ROOT@|$PREFIX|g" \
-    -e "s|@LOGIN@|$USER|g" \
+    -e "s|@HOME@|$HOME|g" \
     -e "s|@PATH@|$PATH_DEFAULT|g" \
     -e "s|@LOG_DIR@|$LOG_DIR|g" \
     "$TEMPLATE" > "$PLIST"
