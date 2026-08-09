@@ -2,6 +2,7 @@
 import json
 import os
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -150,6 +151,35 @@ class RoutesTests(unittest.TestCase):
         data = json.loads(router.CONFIG_FILE.read_text())
         self.assertEqual(data["routes"], [])
         self.assertFalse(router._routes_remove_entry("example-org"))
+
+    def test_save_config_restores_private_mode(self):
+        os.chmod(router.CONFIG_FILE, 0o644)
+        self.assertEqual(router.save_config(), 0)
+        self.assertEqual(stat.S_IMODE(router.CONFIG_FILE.stat().st_mode), 0o600)
+
+
+class ConfigValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        _relocate(router, self.root)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_load_config_rejects_invalid_port_without_throwing(self):
+        router.CONFIG_FILE.write_text(json.dumps({"port": 70000, "providers": {"proton": {}}, "routes": []}))
+        self.assertEqual(router.load_config(), 1)
+
+    def test_load_config_rejects_non_object_routes(self):
+        router.CONFIG_FILE.write_text(json.dumps({"port": 2080, "providers": {"proton": {}}, "routes": ["bad"]}))
+        self.assertEqual(router.load_config(), 1)
+
+    def test_load_config_rejects_provider_path_escape(self):
+        router.CONFIG_FILE.write_text(json.dumps({
+            "port": 2080, "providers": {"proton": {"directory": "../outside"}}, "routes": []
+        }))
+        self.assertEqual(router.load_config(), 1)
 
 
 class RotationTests(unittest.TestCase):
@@ -456,6 +486,11 @@ class ParseEndpointEdgeTests(unittest.TestCase):
     def test_bracketed_v6_requires_port(self):
         with self.assertRaises(SystemExit):
             router.parse_endpoint("[2606:4700::1]")
+
+    def test_port_range_rejected(self):
+        for endpoint in ("host.example:0", "host.example:65536", "host.example:-1"):
+            with self.subTest(endpoint=endpoint), self.assertRaises(SystemExit):
+                router.parse_endpoint(endpoint)
 
     def test_non_numeric_port_rejected(self):
         with self.assertRaises(SystemExit):

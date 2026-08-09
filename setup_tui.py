@@ -812,7 +812,8 @@ def _render_guide(state: TuiState) -> list[str]:
     }
     title = titles.get(state.guide_provider, "Guide")
     lines = ["\u250c" + "\u2500" * inner + "\u2510"]
-    lines.append("\u2502" + _style(_fit(f" {_tint_provider(title)} ", inner), _Ansi.BOLD, _Ansi.CYAN) + "\u2502")
+    title_fit = _fit(f" {title} ", inner)
+    lines.append("\u2502" + _style(_tint_provider(title_fit), _Ansi.BOLD, _Ansi.CYAN) + "\u2502")
     lines.append("\u251c" + "\u2500" * inner + "\u2524")
     visible = max(state.rows - 5, 1)
     scroll = min(state.guide_scroll, max(0, len(state.guide_lines) - visible))
@@ -835,7 +836,8 @@ def _render_import(state: TuiState) -> list[str]:
         else "Import Cloudflare WARP profiles"
     )
     lines = ["\u250c" + "\u2500" * inner + "\u2510"]
-    lines.append("\u2502" + _style(_fit(f" {_tint_provider(title)} ", inner), _Ansi.BOLD, _Ansi.CYAN) + "\u2502")
+    title_fit = _fit(f" {title} ", inner)
+    lines.append("\u2502" + _style(_tint_provider(title_fit), _Ansi.BOLD, _Ansi.CYAN) + "\u2502")
     lines.append("\u251c" + "\u2500" * inner + "\u2524")
     path_display = state.import_text or "no path yet"
     lines.append("\u2502" + _fit(" path: " + path_display, inner) + "\u2502")

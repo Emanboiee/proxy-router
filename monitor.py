@@ -14,6 +14,7 @@ import os
 import platform
 import re
 import signal
+import shlex
 import subprocess
 import sys
 import time
@@ -66,6 +67,14 @@ def _error(message: str, **extra) -> dict:
     return result
 
 
+def _network_error(exc: Exception, url: str, **extra) -> dict:
+    """Keep exception details useful without persisting a credential-bearing URL."""
+    url_text = str(url)
+    message = str(exc).replace(url_text, "[REDACTED_URL]")
+    message = re.sub(r"https?://[^\s'\"]+", "[REDACTED_URL]", message)
+    return _error(f"{type(exc).__name__}: {message}", **extra)
+
+
 def _close(response) -> None:
     close = getattr(response, "close", None)
     if callable(close):
@@ -102,9 +111,9 @@ def parse_ping_output(text: str) -> dict:
 
 def _safe_target(url: str) -> str:
     try:
-        parsed = urlsplit(url)
+        parsed = urlsplit(str(url))
         return parsed.hostname or "configured-target"
-    except ValueError:
+    except (TypeError, ValueError):
         return "configured-target"
 
 
@@ -122,7 +131,7 @@ def measure_http_latency(url: str = DEFAULT_HTTP_URL, *, opener=urllib.request.u
         }
         return result
     except Exception as exc:  # network errors are data, not monitor crashes
-        return _error(f"{type(exc).__name__}: {exc}", target=_safe_target(url))
+        return _network_error(exc, url, target=_safe_target(url))
     finally:
         if response is not None:
             _close(response)
@@ -151,7 +160,7 @@ def measure_download(url: str = DEFAULT_DOWNLOAD_URL, *, max_bytes: int = DEFAUL
         elapsed = clock() - started
         return {"bytes": total, "mbps": _throughput(total, elapsed)}
     except Exception as exc:
-        return _error(f"{type(exc).__name__}: {exc}", bytes=total)
+        return _network_error(exc, url, bytes=total)
     finally:
         if response is not None:
             _close(response)
@@ -162,17 +171,17 @@ def measure_upload(url: str = DEFAULT_UPLOAD_URL, *, max_bytes: int = DEFAULT_MA
                    timeout: float = DEFAULT_TIMEOUT) -> dict:
     max_bytes = max(1, int(max_bytes))
     payload = b"0" * max_bytes
-    request = urllib.request.Request(url, data=payload, headers=DEFAULT_HEADERS, method="POST")
     started = clock()
     response = None
     try:
+        request = urllib.request.Request(url, data=payload, headers=DEFAULT_HEADERS, method="POST")
         response = opener(request, timeout=timeout)
         response.read(1)
         elapsed = clock() - started
         return {"bytes": max_bytes, "mbps": _throughput(max_bytes, elapsed),
                 "status": int(getattr(response, "status", getattr(response, "code", 200)))}
     except Exception as exc:
-        return _error(f"{type(exc).__name__}: {exc}", bytes=max_bytes)
+        return _network_error(exc, url, bytes=max_bytes)
     finally:
         if response is not None:
             _close(response)
@@ -211,17 +220,41 @@ def _monitor_settings(root: Path) -> dict:
     config = root / "router.json"
     try:
         data = json.loads(config.read_text())
-        custom = data.get("monitor", {})
+        custom = data.get("monitor", {}) if isinstance(data, dict) else {}
         if isinstance(custom, dict):
             for key in settings:
                 if key in custom:
                     settings[key] = custom[key]
     except (OSError, json.JSONDecodeError):
         pass
-    settings["interval_seconds"] = max(5, int(settings["interval_seconds"]))
-    settings["max_bytes"] = min(max(1, int(settings["max_bytes"])), 10_000_000)
-    settings["timeout_seconds"] = min(max(1, float(settings["timeout_seconds"])), 60)
-    settings["ping_hosts"] = [str(x) for x in settings["ping_hosts"]][:8]
+    for key in ("http_url", "download_url", "upload_url"):
+        value = settings[key]
+        try:
+            parsed = urlsplit(value) if isinstance(value, str) else None
+        except ValueError:
+            parsed = None
+        if parsed is None or parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            settings[key] = {
+                "http_url": DEFAULT_HTTP_URL,
+                "download_url": DEFAULT_DOWNLOAD_URL,
+                "upload_url": DEFAULT_UPLOAD_URL,
+            }[key]
+    try:
+        settings["interval_seconds"] = max(5, int(settings["interval_seconds"]))
+    except (TypeError, ValueError):
+        settings["interval_seconds"] = DEFAULT_INTERVAL
+    try:
+        settings["max_bytes"] = min(max(1, int(settings["max_bytes"])), 10_000_000)
+    except (TypeError, ValueError):
+        settings["max_bytes"] = DEFAULT_MAX_BYTES
+    try:
+        settings["timeout_seconds"] = min(max(1, float(settings["timeout_seconds"])), 60)
+    except (TypeError, ValueError):
+        settings["timeout_seconds"] = DEFAULT_TIMEOUT
+    hosts = settings["ping_hosts"]
+    if not isinstance(hosts, (list, tuple)):
+        hosts = DEFAULT_PING_HOSTS
+    settings["ping_hosts"] = [str(x) for x in hosts if str(x)][:8]
     return settings
 
 
@@ -249,14 +282,50 @@ def collect_sample(root: Path | None = None, *, opener=urllib.request.urlopen,
     return sample
 
 
-def _pid_running(pid: int) -> bool:
+def _pid_matches(pid: int, root: Path) -> bool:
+    """Confirm a PID belongs to this monitor worker before trusting/killing it."""
+    if pid <= 0:
+        return False
+    root = Path(root).resolve()
+    try:
+        if os.name == "nt":
+            command = [
+                "powershell", "-NoProfile", "-Command",
+                f"(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine",
+            ]
+        else:
+            command = ["ps", "-p", str(pid), "-o", "command="]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    command_line = result.stdout or ""
+    try:
+        tokens = shlex.split(command_line)
+    except ValueError:
+        tokens = command_line.split()
+    script_ok = any(Path(token).name == "monitor.py" for token in tokens)
+    root_arg = None
+    if "--root" in tokens:
+        index = tokens.index("--root")
+        if index + 1 < len(tokens):
+            root_arg = tokens[index + 1]
+    return (
+        result.returncode == 0
+        and script_ok
+        and "--worker" in tokens
+        and root_arg == str(root)
+    )
+
+
+def _pid_running(pid: int, root: Path | None = None) -> bool:
     if pid <= 0:
         return False
     try:
         os.kill(pid, 0)
     except (OSError, ProcessLookupError):
         return False
-    return True
+    return root is None or _pid_matches(pid, Path(root))
+
 
 
 def _read_pid(root: Path) -> int | None:
@@ -266,13 +335,17 @@ def _read_pid(root: Path) -> int | None:
         return None
 
 
-def status(root: Path | None = None, *, pid_checker=_pid_running) -> dict:
+def status(root: Path | None = None, *, pid_checker=None) -> dict:
     """Read state only; never performs network probes."""
     root = Path(root) if root is not None else ROOT
     pid = _read_pid(root)
+    if pid_checker is None:
+        running = bool(pid and _pid_running(pid, root))
+    else:
+        running = bool(pid and pid_checker(pid))
     return {
         "enabled": enabled_file(root).is_file(),
-        "running": bool(pid and pid_checker(pid)),
+        "running": running,
         "pid": pid,
         "samples": samples_file(root).is_file(),
     }
@@ -309,7 +382,7 @@ def start(root: Path | None = None, *, interval: int | None = None) -> dict:
 def stop(root: Path | None = None) -> dict:
     root = Path(root) if root is not None else ROOT
     pid = _read_pid(root)
-    if pid and _pid_running(pid):
+    if pid and _pid_running(pid, root):
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError:

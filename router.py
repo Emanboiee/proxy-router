@@ -21,6 +21,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -121,6 +122,7 @@ _providers: dict = {}
 _routes: list = []
 _port: int = DEFAULT_PORT
 _vpn: dict = {}
+_PROVIDER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 
 
 def fail(message: str) -> int:
@@ -150,14 +152,41 @@ def load_config() -> int:
         return fail(f"missing {CONFIG_FILE.name}; run 'router.py init' first")
     try:
         data = json.loads(CONFIG_FILE.read_text())
-    except (json.JSONDecodeError, OSError) as exc:
+        if not isinstance(data, dict):
+            return fail(f"bad {CONFIG_FILE.name}: top level must be an object")
+        port = int(data.get("port", DEFAULT_PORT))
+    except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
         return fail(f"bad {CONFIG_FILE.name}: {exc}")
-    _port = int(data.get("port", DEFAULT_PORT))
-    _providers = data.get("providers", {})
-    _routes = data.get("routes", [])
-    _vpn = data.get("vpn", {})
-    if not _providers:
+    if not 1 <= port <= 65535:
+        return fail(f"bad {CONFIG_FILE.name}: port must be between 1 and 65535")
+    providers = data.get("providers", {})
+    routes = data.get("routes", [])
+    vpn = data.get("vpn", {})
+    if not isinstance(providers, dict) or not providers:
         return fail("no providers configured")
+    if not all(isinstance(name, str) and _PROVIDER_NAME.fullmatch(name) and isinstance(entry, dict)
+               for name, entry in providers.items()):
+        return fail(f"bad {CONFIG_FILE.name}: provider names/entries are invalid")
+    for name, entry in providers.items():
+        directory = entry.get("directory", f"providers/{name}")
+        if not isinstance(directory, str):
+            return fail(f"bad {CONFIG_FILE.name}: provider '{name}' directory must be a string")
+        try:
+            (ROOT / directory).resolve().relative_to(ROOT)
+        except ValueError:
+            return fail(f"bad {CONFIG_FILE.name}: provider '{name}' directory escapes the router root")
+    if not isinstance(routes, list) or not all(isinstance(route, dict) for route in routes) or not isinstance(vpn, dict):
+        return fail(f"bad {CONFIG_FILE.name}: providers/routes/vpn have invalid types")
+    for route in routes:
+        if not isinstance(route.get("provider"), str):
+            return fail(f"bad {CONFIG_FILE.name}: every route needs a provider")
+        for key in ("domains", "ip_cidr"):
+            if key in route and (not isinstance(route[key], list) or not all(isinstance(v, str) for v in route[key])):
+                return fail(f"bad {CONFIG_FILE.name}: route {key} must be a string list")
+    _port = port
+    _providers = providers
+    _routes = routes
+    _vpn = vpn
     return 0
 
 
@@ -204,7 +233,17 @@ def write_default_config(force: bool = False) -> int:
 
 def provider_dir(name: str) -> Path:
     entry = _providers.get(name, {})
-    return (ROOT / entry.get("directory", f"providers/{name}")).resolve()
+    if not isinstance(entry, dict):
+        raise ValueError(f"provider '{name}' entry must be an object")
+    configured = entry.get("directory", f"providers/{name}")
+    if not isinstance(configured, str):
+        raise ValueError(f"provider '{name}' directory must be a string")
+    path = (ROOT / configured).resolve()
+    try:
+        path.relative_to(ROOT)
+    except ValueError as exc:
+        raise ValueError(f"provider '{name}' directory escapes the router root") from exc
+    return path
 
 
 def provider_files(name: str) -> list[Path]:
@@ -304,17 +343,20 @@ def parse_endpoint(endpoint: str) -> tuple[str, str]:
     if endpoint.startswith("["):
         host, _, rest = endpoint[1:].partition("]")
         port = rest.lstrip(":")
-        if not host or not port:
+    else:
+        host, sep, port = endpoint.rpartition(":")
+        if not sep:
             _bad_endpoint(endpoint)
-        return host, port
-    host, sep, port = endpoint.rpartition(":")
-    if not sep or not host or not port:
+    if not host or not port:
         _bad_endpoint(endpoint)
+    port_number = 0
     try:
-        int(port)
+        port_number = int(port)
     except ValueError:
         _bad_endpoint(endpoint)
-    return host, port
+    if not 1 <= port_number <= 65535:
+        _bad_endpoint(endpoint)
+    return host, str(port_number)
 
 
 def parse_wireguard(profile: Path) -> dict:
@@ -456,8 +498,22 @@ def build_singbox_config() -> tuple[dict, set[str]]:
 
 
 def write_sing_box(config: dict) -> None:
-    SING_BOX_CONFIG.write_text(json.dumps(config, indent=2) + "\n")
-    os.chmod(SING_BOX_CONFIG, 0o600)
+    SING_BOX_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=SING_BOX_CONFIG.parent,
+            prefix=f".{SING_BOX_CONFIG.name}.", suffix=".tmp", delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(json.dumps(config, indent=2) + "\n")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, SING_BOX_CONFIG)
+        temporary = None
+        os.chmod(SING_BOX_CONFIG, 0o600)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def validate_config() -> bool:
@@ -465,10 +521,20 @@ def validate_config() -> bool:
     if sing_box is None:
         print(_sing_box_missing_message(), file=sys.stderr)
         return False
-    result = subprocess.run([sing_box, "check", "-c", str(SING_BOX_CONFIG)], capture_output=True, text=True)
+    try:
+        result = subprocess.run(
+            [sing_box, "check", "-c", str(SING_BOX_CONFIG)],
+            capture_output=True, text=True, timeout=20,
+        )
+    except subprocess.TimeoutExpired:
+        print("router: sing-box config check timed out", file=sys.stderr)
+        return False
+    except OSError as exc:
+        print(f"router: could not run sing-box config check: {exc}", file=sys.stderr)
+        return False
     if result.returncode == 0:
         return True
-    print(result.stderr, file=sys.stderr)
+    print(result.stderr or result.stdout, file=sys.stderr)
     return False
 
 
@@ -625,19 +691,30 @@ def engine_start() -> int:
         return fail(_sing_box_missing_message())
     if not sing_box_at_least(MIN_SING_BOX_VERSION):
         return fail(f"{_sing_box_version_message(MIN_SING_BOX_VERSION)}")
-    config, active = build_singbox_config()
+    try:
+        config, active = build_singbox_config()
+    except (SystemExit, KeyError, ValueError, OSError, configparser.Error) as exc:
+        return fail(f"could not build sing-box config: {exc}")
     if not active:
         return fail("no provider profile available (drop *.conf into providers/<name>/)")
     write_sing_box(config)
     if not validate_config():
         return fail("sing-box config check failed")
     engine_stop()
-    popen_kwargs = {"stdout": LOG_FILE.open("ab"), "stderr": subprocess.STDOUT, "cwd": ROOT}
-    if os.name == "nt":
-        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    else:
-        popen_kwargs["start_new_session"] = True
-    process = subprocess.Popen([sing_box, "run", "-c", str(SING_BOX_CONFIG)], **popen_kwargs)
+    log_handle = None
+    try:
+        log_handle = LOG_FILE.open("ab")
+        popen_kwargs = {"stdout": log_handle, "stderr": subprocess.STDOUT, "cwd": ROOT}
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
+        process = subprocess.Popen([sing_box, "run", "-c", str(SING_BOX_CONFIG)], **popen_kwargs)
+    except OSError as exc:
+        return fail(f"could not start sing-box: {exc}")
+    finally:
+        if log_handle is not None:
+            log_handle.close()
     PID_FILE.write_text(str(process.pid))
     os.chmod(PID_FILE, 0o600)
     if not wait_engine(log_from=log_offset()):
@@ -693,7 +770,10 @@ def engine_reload() -> int:
         return fail(_sing_box_missing_message())
     if not sing_box_at_least(MIN_SING_BOX_VERSION):
         return fail(f"{_sing_box_version_message(MIN_SING_BOX_VERSION)}")
-    config, active = build_singbox_config()
+    try:
+        config, active = build_singbox_config()
+    except (SystemExit, KeyError, ValueError, OSError, configparser.Error) as exc:
+        return fail(f"could not build sing-box config: {exc}")
     if not active:
         return fail("no provider endpoint available")
     write_sing_box(config)
@@ -755,9 +835,27 @@ def provider_count(name: str) -> int:
 # ---------------------------------------------------------------------------
 
 def save_config() -> int:
-    data = json.loads(CONFIG_FILE.read_text())
-    data["routes"] = _routes
-    CONFIG_FILE.write_text(json.dumps(data, indent=2) + "\n")
+    try:
+        data = json.loads(CONFIG_FILE.read_text())
+        data["routes"] = _routes
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", dir=CONFIG_FILE.parent,
+                prefix=f".{CONFIG_FILE.name}.", suffix=".tmp", delete=False,
+            ) as handle:
+                temporary = Path(handle.name)
+                handle.write(json.dumps(data, indent=2) + "\n")
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, CONFIG_FILE)
+            temporary = None
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        os.chmod(CONFIG_FILE, 0o600)
+    except (json.JSONDecodeError, OSError, TypeError) as exc:
+        return fail(f"could not save {CONFIG_FILE.name}: {exc}")
     return 0
 
 
@@ -793,7 +891,8 @@ def routes_add(args) -> int:
         if not target:
             return fail("need --domain or --ip")
         return fail(f"unknown provider '{args.provider}' (have {', '.join(_providers)})")
-    save_config()
+    if save_config() != 0:
+        return 1
     if engine_reload() != 0:
         return fail("route saved but engine reload failed")
     routes_list()
@@ -810,7 +909,8 @@ def _routes_remove_entry(id_: str) -> bool:
 def routes_remove(id_: str) -> int:
     if not _routes_remove_entry(id_):
         return fail(f"no route with id '{id_}'")
-    save_config()
+    if save_config() != 0:
+        return 1
     if engine_reload() != 0:
         return fail("route removed but engine reload failed")
     return 0
@@ -924,15 +1024,22 @@ def vpn_status() -> int:
 # ---------------------------------------------------------------------------
 
 def active_service_name() -> str | None:
-    iface = None
-    out = subprocess.run(["route", "-n", "get", "default"], capture_output=True, text=True).stdout
-    for line in out.splitlines():
-        if "interface:" in line:
-            iface = line.split()[-1]
-    if not iface:
+    try:
+        iface = None
+        out = subprocess.run(
+            ["route", "-n", "get", "default"], capture_output=True, text=True, timeout=5,
+        ).stdout
+        for line in out.splitlines():
+            if "interface:" in line:
+                iface = line.split()[-1]
+        if not iface:
+            return None
+        service = None
+        out = subprocess.run(
+            ["networksetup", "-listallhardwareports"], capture_output=True, text=True, timeout=5,
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired):
         return None
-    service = None
-    out = subprocess.run(["networksetup", "-listallhardwareports"], capture_output=True, text=True).stdout
     for line in out.splitlines():
         if line.startswith("Hardware Port:"):
             service = line.split(":", 1)[1].strip()
@@ -952,8 +1059,11 @@ def system_proxy_on() -> int:
         ["networksetup", "-setsecurewebproxystate", service, "on"],
         ["networksetup", "-setproxybypassdomains", service, "*.local", "localhost", "127.0.0.1", "::1"],
     ]
-    for command in commands:
-        subprocess.run(command, check=True, capture_output=True)
+    try:
+        for command in commands:
+            subprocess.run(command, check=True, capture_output=True, timeout=10)
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        return fail(f"could not enable system proxy: {exc}")
     print(f"system proxy enabled on '{service}' -> 127.0.0.1:{_port}")
     return 0
 
@@ -962,8 +1072,17 @@ def system_proxy_off() -> int:
     service = active_service_name()
     if not service:
         return fail("could not determine the active network service")
-    subprocess.run(["networksetup", "-setwebproxystate", service, "off"], capture_output=True)
-    subprocess.run(["networksetup", "-setsecurewebproxystate", service, "off"], capture_output=True)
+    try:
+        subprocess.run(
+            ["networksetup", "-setwebproxystate", service, "off"],
+            check=True, capture_output=True, timeout=10,
+        )
+        subprocess.run(
+            ["networksetup", "-setsecurewebproxystate", service, "off"],
+            check=True, capture_output=True, timeout=10,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        return fail(f"could not disable system proxy: {exc}")
     print(f"system proxy disabled ({service})")
     return 0
 

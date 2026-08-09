@@ -2,6 +2,7 @@
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -90,12 +91,51 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(result["bytes"], 32)
         self.assertEqual(len(captured["data"]), 32)
 
+    def test_network_errors_redact_credential_bearing_url(self):
+        url = "https://user:secret@example.invalid/check?token=super-secret"
+
+        def opener(request_url, timeout):
+            raise RuntimeError(f"request failed for {request_url}")
+
+        result = monitor.measure_http_latency(url, opener=opener)
+        self.assertNotIn("secret", result["error"])
+        self.assertNotIn(url, result["error"])
+        self.assertEqual(result["target"], "example.invalid")
+
+    def test_worker_pid_identity_requires_monitor_worker_command(self):
+        root = Path("/tmp/proxy-router-monitor")
+        good = subprocess.CompletedProcess(
+            [], 0, stdout=f"python monitor.py --worker --root {root.resolve()} --interval 60\n", stderr=""
+        )
+        with mock.patch.object(monitor.subprocess, "run", return_value=good):
+            self.assertTrue(monitor._pid_matches(1234, root))
+        bad = subprocess.CompletedProcess([], 0, stdout="python unrelated.py --root /tmp/proxy-router-monitor\n", stderr="")
+        with mock.patch.object(monitor.subprocess, "run", return_value=bad):
+            self.assertFalse(monitor._pid_matches(1234, root))
+
     def test_worker_command_is_explicit_and_detached(self):
         command = monitor.worker_command(Path("/tmp/router"), 77)
         self.assertIn("--worker", command)
         self.assertIn("--interval", command)
         self.assertIn("77", command)
         self.assertIn("/tmp/router", command)
+
+    def test_malformed_monitor_settings_fall_back_to_safe_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "router.json").write_text(json.dumps({
+                "monitor": {
+                    "http_url": "file:///etc/passwd",
+                    "download_url": 123,
+                    "interval_seconds": "bad",
+                    "ping_hosts": "1.1.1.1",
+                }
+            }))
+            settings = monitor._monitor_settings(root)
+        self.assertEqual(settings["http_url"], monitor.DEFAULT_HTTP_URL)
+        self.assertEqual(settings["download_url"], monitor.DEFAULT_DOWNLOAD_URL)
+        self.assertEqual(settings["interval_seconds"], monitor.DEFAULT_INTERVAL)
+        self.assertEqual(settings["ping_hosts"], list(monitor.DEFAULT_PING_HOSTS))
 
 
 class StateTests(unittest.TestCase):
@@ -122,6 +162,17 @@ class StateTests(unittest.TestCase):
         self.assertTrue((self.root / "state" / "monitor" / "enabled").exists())
         command = popen.call_args.args[0]
         self.assertIn("--worker", command)
+
+    def test_stop_does_not_signal_unowned_pid(self):
+        path = monitor.pid_file(self.root)
+        path.parent.mkdir(parents=True)
+        path.write_text("4321")
+        monitor.enabled_file(self.root).touch()
+        with mock.patch.object(monitor, "_pid_running", return_value=False), \
+             mock.patch.object(monitor.os, "kill") as kill:
+            monitor.stop(self.root)
+        kill.assert_not_called()
+        self.assertFalse(path.exists())
 
     def test_logs_tail_is_bounded(self):
         path = self.root / "state" / "monitor" / "samples.jsonl"

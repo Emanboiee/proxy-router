@@ -427,6 +427,13 @@ class FullScreenTuiTests(unittest.TestCase):
         self.assertIn("Show Proton VPN guide", text)      # guide pager rendered
         self.assertIn("\u250c", text)
         self.assertTrue(text.rstrip().endswith("\x1b[?25h\x1b[?1049l"))  # restored
+    def test_provider_tint_keeps_guide_frame_width(self):
+        state = setup_tui.TuiState(view="guide", guide_provider="proton", cols=40, rows=18)
+        state.guide_lines = ["guide"]
+        with mock.patch.object(setup_tui, "ANSI", True):
+            frame = setup_tui.render_frame(state)
+        self.assertEqual(len(setup_tui._strip_ansi(frame[1])), state.cols)
+        self.assertIn("Proton", setup_tui._strip_ansi(frame[1]))
 
 
 if __name__ == "__main__":
