@@ -1,4 +1,5 @@
 """Tests for setup_tui.py (stdlib only, no network, no private keys printed)."""
+import io
 import json
 import stat
 import sys
@@ -209,6 +210,127 @@ class CheckTests(unittest.TestCase):
         result = setup_tui.check(self.root)
         self.assertEqual(result["ok"], False)
         self.assertIn("proton", result["issues"][0].lower())
+
+
+class FullScreenTuiTests(unittest.TestCase):
+    """Pure render/apply_key functions and wizard entry paths (no real TTY)."""
+
+    def test_render_menu_frame_has_borders_and_items(self):
+        state = setup_tui.TuiState()
+        frame = setup_tui.render_frame(state)
+        joined = "\n".join(frame)
+        self.assertIn("\u250c", joined)
+        self.assertIn("\u2514", joined)
+        self.assertIn("\u2502", joined)
+        self.assertIn("proxy-router setup", joined)
+        self.assertIn("Show Proton guide", joined)
+        self.assertIn("Show Cloudflare guide", joined)
+        self.assertIn("Show both guides", joined)
+        self.assertIn("Apply route presets", joined)
+        self.assertIn("Check provider health", joined)
+        self.assertIn("Quit", joined)
+        self.assertIn("\u2191\u2193 navigate", joined)
+
+    def test_apply_key_moves_cursor_and_returns_new_state(self):
+        state = setup_tui.TuiState()
+        down = setup_tui.apply_key(state, "\x1b[B")
+        self.assertEqual(down.cursor, 1)
+        self.assertEqual(state.cursor, 0)  # original state untouched (pure)
+        self.assertNotEqual(id(down), id(state))
+        j = setup_tui.apply_key(down, "j")
+        self.assertEqual(j.cursor, 2)
+        up = setup_tui.apply_key(j, "\x1b[A")
+        self.assertEqual(up.cursor, 1)
+        k = setup_tui.apply_key(up, "k")
+        self.assertEqual(k.cursor, 0)
+        wrapped = setup_tui.apply_key(state, "\x1b[A")
+        self.assertEqual(wrapped.cursor, len(setup_tui.TUI_MENU) - 1)
+
+    def test_enter_on_guide_builds_pager_with_guide_text(self):
+        state = setup_tui.apply_key(setup_tui.TuiState(), "\r")
+        self.assertEqual(state.view, "guide")
+        self.assertEqual(state.guide_provider, "proton")
+        self.assertTrue(state.guide_lines)
+        frame = setup_tui.render_frame(state)
+        joined = "\n".join(frame)
+        self.assertIn("Show Proton VPN guide", joined)
+        self.assertIn("q back", joined)
+        self.assertIn("WireGuard", joined)  # guide body is visible inside the pager
+
+    def test_guide_scroll_and_back_to_menu(self):
+        state = setup_tui.apply_key(setup_tui.TuiState(), "3")
+        self.assertEqual(state.view, "guide")
+        self.assertEqual(state.guide_provider, "all")
+        scrolled = setup_tui.apply_key(state, "\x1b[B")
+        self.assertEqual(scrolled.guide_scroll, 1)
+        scrolled = setup_tui.apply_key(scrolled, "\x1b[A")
+        self.assertEqual(scrolled.guide_scroll, 0)
+        back = setup_tui.apply_key(scrolled, "q")
+        self.assertEqual(back.view, "menu")
+
+    def test_q_esc_ctrl_c_and_zero_quit(self):
+        for key in ("q", "Q", "\x1b", "\x03", "0"):
+            state = setup_tui.apply_key(setup_tui.TuiState(), key)
+            self.assertTrue(state.quit, repr(key))
+
+    def test_import_editing_and_enter_records_action(self):
+        state = setup_tui.apply_key(setup_tui.TuiState(), "4")
+        self.assertEqual(state.view, "import")
+        self.assertEqual(state.import_provider, "proton")
+        for ch in "/tmp/conf.d":
+            state = setup_tui.apply_key(state, ch)
+        self.assertEqual(state.import_text, "/tmp/conf.d")
+        state = setup_tui.apply_key(state, "\x7f")
+        self.assertEqual(state.import_text, "/tmp/conf.")
+        state = setup_tui.apply_key(state, "\r")
+        self.assertEqual(state.view, "menu")
+        self.assertEqual(state.action, ("import", "proton", "/tmp/conf."))
+
+    def test_import_escape_cancels(self):
+        state = setup_tui.apply_key(setup_tui.TuiState(), "5")
+        state = setup_tui.apply_key(state, "/some/path")
+        state = setup_tui.apply_key(state, "\x1b")
+        self.assertEqual(state.view, "menu")
+        self.assertIsNone(state.action)
+
+    def test_non_tty_falls_back_to_plain_line_menu(self):
+        root = Path(tempfile.mkdtemp())
+        fake_in = io.StringIO("q\n")
+        fake_out = io.StringIO()
+        with mock.patch("sys.stdin", fake_in), mock.patch("sys.stdout", fake_out):
+            rc = setup_tui.wizard(root)
+        self.assertEqual(rc, 0)
+        text = fake_out.getvalue()
+        self.assertIn("proxy-router setup wizard", text)  # old plain banner
+        self.assertNotIn("\x1b[?1049h", text)  # alternate screen never opened
+        self.assertNotIn("\x1b[?25l", text)
+
+    def test_tui_session_renders_frames_and_restores_screen(self):
+        class FakeTTY(io.StringIO):
+            def isatty(self):
+                return True
+
+            def fileno(self):
+                return 1
+
+        root = Path(tempfile.mkdtemp())
+        fake_in = FakeTTY()
+        fake_out = FakeTTY()
+        events = iter(["\r", "\x1b[B", "q", "q"])  # enter guide, scroll, back, quit
+        with mock.patch("sys.stdin", fake_in), \
+             mock.patch("sys.stdout", fake_out), \
+             mock.patch("setup_tui._read_key", side_effect=lambda: next(events)), \
+             mock.patch("setup_tui.tty.setraw"), \
+             mock.patch("setup_tui.termios.tcgetattr", return_value=[1, 2, 3, 4, 5, 6]), \
+             mock.patch("setup_tui.termios.tcsetattr"):
+            rc = setup_tui.wizard(root)
+        self.assertEqual(rc, 0)
+        text = fake_out.getvalue()
+        self.assertTrue(text.startswith("\x1b[?1049h"))  # entered alternate screen
+        self.assertIn("Show Proton guide", text)          # frame rendered
+        self.assertIn("Show Proton VPN guide", text)      # guide pager rendered
+        self.assertIn("\u250c", text)
+        self.assertTrue(text.rstrip().endswith("\x1b[?25h\x1b[?1049l"))  # restored
 
 
 if __name__ == "__main__":

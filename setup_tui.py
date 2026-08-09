@@ -7,7 +7,8 @@ Stdlib only. Owns the non-engine half of ``proxy-router setup``:
 - ``import_profiles`` - validates/dedupes/copies WireGuard ``.conf`` files
 - ``apply_presets``   - idempotent safe route presets (opencode.ai, Roblox)
 - ``check``           - reports provider profile availability (no network)
-- ``main`` / ``wizard`` - non-interactive CLI flags and an ANSI line-input menu
+- ``main`` / ``wizard`` - non-interactive CLI flags and a full-screen TUI
+  (alternate screen, arrow-key navigation; plain line menu when not a TTY)
 
 This module never starts sing-box, enables TUN, or touches networking on its
 own. The only engine lifecycle call (menu item 8) shells out to the existing
@@ -17,14 +18,30 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import contextlib
+import copy
+import dataclasses
 import glob
+import io
 import json
 import os
 import re
+import select
 import shutil
 import subprocess
 import sys
+import tempfile
+import textwrap
 from pathlib import Path
+
+try:
+    import termios
+    import tty
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    termios = None
+    tty = None
+
+_HAVE_TERMIOS = termios is not None and tty is not None
 
 ROOT = Path(os.environ.get("PROXY_ROUTER_ROOT") or Path(__file__).resolve().parent).resolve()
 
@@ -62,6 +79,7 @@ class _Ansi:
     GREEN = "\x1b[32m"
     YELLOW = "\x1b[33m"
     CYAN = "\x1b[36m"
+    REVERSE = "\x1b[7m"
 
 
 def _style(text: str, *codes: str) -> str:
@@ -437,9 +455,8 @@ def _prompt_import(root: Path, provider: str) -> None:
     _cmd_import(root, provider, [answer])
 
 
-def wizard(root=None) -> int:
-    """Bare ``setup`` menu: ANSI when both streams are TTYs, line-input always."""
-    root = Path(root) if root is not None else ROOT
+def _line_wizard(root: Path) -> int:
+    """Line-based fallback: used whenever either stream is not a real TTY."""
     while True:
         _print_menu()
         try:
@@ -475,6 +492,406 @@ def wizard(root=None) -> int:
                 print(_style("  engine failed to start (see router output above)", _Ansi.RED))
         else:
             print(f"  unknown choice '{choice}' (enter a number or 'q')")
+
+
+# ---------------------------------------------------------------------------
+# full-screen TUI: state, pure key handling and frame rendering
+# ---------------------------------------------------------------------------
+
+# TUI menu keeps the same 8 actions plus Quit (digit 0; q/Q/ESC also quit).
+TUI_MENU = [
+    ("1", "Show Proton guide"),
+    ("2", "Show Cloudflare guide"),
+    ("3", "Show both guides"),
+    ("4", "Import Proton profiles"),
+    ("5", "Import Cloudflare profiles"),
+    ("6", "Apply route presets (opencode.ai -> proton, roblox -> cloudflare)"),
+    ("7", "Check provider health"),
+    ("8", "Start/reload the proxy engine"),
+    ("0", "Quit"),
+]
+TUI_MENU_INDEX = {key: index for index, (key, _) in enumerate(TUI_MENU)}
+
+UP = "\x1b[A"
+DOWN = "\x1b[B"
+ESC = "\x1b"
+ENTER = "\r"
+BACKSPACE = "\x7f"
+
+_ANSI_ESC_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _strip_ansi(text: str) -> str:
+    """Remove ANSI SGR sequences so captured action output stays box-safe."""
+    return _ANSI_ESC_RE.sub("", text)
+
+
+@dataclasses.dataclass
+class TuiState:
+    """Pure TUI state; view is one of "menu" | "guide" | "import"."""
+
+    view: str = "menu"
+    cursor: int = 0
+    guide_provider: str = "proton"
+    guide_lines: list = dataclasses.field(default_factory=list)
+    guide_scroll: int = 0
+    import_provider: str = "proton"
+    import_text: str = ""
+    status: str = ""
+    status_ok: bool = True
+    action: tuple | None = None  # recorded machine action for the wizard loop
+    quit: bool = False
+    cols: int = 80
+    rows: int = 24
+
+
+def _initial_state() -> TuiState:
+    size = shutil.get_terminal_size((80, 24))
+    return TuiState(cols=max(size.columns, 40), rows=max(size.lines, 18))
+
+
+def _fit(text: str, width: int) -> str:
+    """Truncate/pad ``text`` to exactly ``width`` columns."""
+    if len(text) > width:
+        if width <= 1:
+            return text[:width]
+        return text[: width - 1] + "\u2026"  # horizontal ellipsis
+    return text + " " * (width - len(text))
+
+
+def _wrap_guide(text: str, width: int) -> list[str]:
+    """Split guide markdown into screen lines wrapped to ``width``."""
+    width = max(width, 10)
+    lines: list[str] = []
+    for line in text.splitlines():
+        if not line.strip():
+            lines.append("")
+        else:
+            lines.extend(textwrap.wrap(line, width) or [""])
+    return lines
+
+
+def _render_menu(state: TuiState) -> list[str]:
+    inner = max(state.cols - 2, 30)
+    lines = ["\u250c" + "\u2500" * inner + "\u2510"]
+    header = _style(_fit(" proxy-router setup ", inner), _Ansi.BOLD, _Ansi.CYAN)
+    lines.append("\u2502" + header + "\u2502")
+    lines.append("\u2502" + _fit(" Guides \u00b7 imports \u00b7 presets \u00b7 health checks ", inner) + "\u2502")
+    lines.append("\u251c" + "\u2500" * inner + "\u2524")
+    for index, (key, label) in enumerate(TUI_MENU):
+        right = f" {key} "
+        left = _fit(f"  {key}  {label}", inner - len(right))
+        row = "\u2502" + left + right + "\u2502"
+        if index == state.cursor:
+            row = _style(row, _Ansi.REVERSE)
+        lines.append(row)
+    lines.append("\u251c" + "\u2500" * inner + "\u2524")
+    status_lines = [ln for ln in state.status.splitlines() if ln.strip()] or ["Ready \u2014 pick an item."]
+    for ln in status_lines[-2:]:
+        lines.append("\u2502" + _fit(" " + _strip_ansi(ln), inner) + "\u2502")
+    lines.append("\u2502" + _fit(" \u2191\u2193 navigate \u00b7 Enter select \u00b7 q/ESC quit ", inner) + "\u2502")
+    lines.append("\u2514" + "\u2500" * inner + "\u2518")
+    return lines
+
+
+def _render_guide(state: TuiState) -> list[str]:
+    inner = max(state.cols - 2, 30)
+    titles = {
+        "proton": "Show Proton VPN guide",
+        "warp": "Show Cloudflare WARP guide",
+        "all": "Show both guides",
+    }
+    title = titles.get(state.guide_provider, "Guide")
+    lines = ["\u250c" + "\u2500" * inner + "\u2510"]
+    lines.append("\u2502" + _style(_fit(f" {title} ", inner), _Ansi.BOLD, _Ansi.CYAN) + "\u2502")
+    lines.append("\u251c" + "\u2500" * inner + "\u2524")
+    visible = max(state.rows - 5, 1)
+    scroll = min(state.guide_scroll, max(0, len(state.guide_lines) - visible))
+    for index in range(visible):
+        src = state.guide_lines[scroll + index] if scroll + index < len(state.guide_lines) else ""
+        lines.append("\u2502" + _fit(src, inner) + "\u2502")
+    lines.append("\u251c" + "\u2500" * inner + "\u2524")
+    total = len(state.guide_lines)
+    shown = min(scroll + 1, total) if total else 0
+    lines.append("\u2502" + _fit(f" line {shown}/{total} \u00b7 \u2191\u2193 scroll \u00b7 q back ", inner) + "\u2502")
+    lines.append("\u2514" + "\u2500" * inner + "\u2518")
+    return lines
+
+
+def _render_import(state: TuiState) -> list[str]:
+    inner = max(state.cols - 2, 30)
+    title = (
+        "Import Proton VPN profiles"
+        if state.import_provider == "proton"
+        else "Import Cloudflare WARP profiles"
+    )
+    lines = ["\u250c" + "\u2500" * inner + "\u2510"]
+    lines.append("\u2502" + _style(_fit(f" {title} ", inner), _Ansi.BOLD, _Ansi.CYAN) + "\u2502")
+    lines.append("\u251c" + "\u2500" * inner + "\u2524")
+    lines.append("\u2502" + _fit(" path: " + state.import_text, inner) + "\u2502")
+    lines.append("\u2502" + _fit(" Enter submits \u00b7 ESC cancels \u00b7 backspace edits ", inner) + "\u2502")
+    lines.append("\u2514" + "\u2500" * inner + "\u2518")
+    return lines
+
+
+def render_frame(state: TuiState) -> list[str]:
+    """Build the full frame (header, body, footer) as a list of screen lines."""
+    if state.view == "guide":
+        return _render_guide(state)
+    if state.view == "import":
+        return _render_import(state)
+    return _render_menu(state)
+
+
+def _open_guide(state: TuiState, provider: str) -> None:
+    text = guide_text(provider)
+    if not text:
+        state.status = f"no {provider} guide available"
+        state.status_ok = False
+        return
+    state.view = "guide"
+    state.guide_provider = provider
+    state.guide_lines = _wrap_guide(text, max(state.cols - 4, 20))
+    state.guide_scroll = 0
+
+
+def _select_item(state: TuiState, index: int) -> TuiState:
+    """Enter/digit selection: switch view or record a machine action."""
+    key, _ = TUI_MENU[index]
+    if key == "0":
+        state.quit = True
+    elif key == "1":
+        _open_guide(state, "proton")
+    elif key == "2":
+        _open_guide(state, "warp")
+    elif key == "3":
+        _open_guide(state, "all")
+    elif key == "4":
+        state.view, state.import_provider, state.import_text = "import", "proton", ""
+    elif key == "5":
+        state.view, state.import_provider, state.import_text = "import", "cloudflare", ""
+    elif key == "6":
+        state.action = ("preset",)
+    elif key == "7":
+        state.action = ("check",)
+    elif key == "8":
+        state.action = ("engine",)
+    return state
+
+
+def apply_key(state: TuiState, key: str) -> TuiState:
+    """Advance the TUI by one key event; returns a new state.
+
+    Pure with respect to the terminal: never writes to the screen and never
+    runs machine actions directly. Imports/presets/check/engine record
+    ``state.action`` for the wizard loop to execute through the existing
+    ``_cmd_*`` helpers, keeping business logic identical to today.
+    """
+    state = copy.copy(state)
+    state.action = None
+
+    if state.view == "guide":
+        if key in ("q", "Q", ESC, ENTER, "\n"):
+            state.view = "menu"
+        elif key in (UP, "k", "K"):
+            state.guide_scroll = max(0, state.guide_scroll - 1)
+        elif key in (DOWN, "j", "J"):
+            visible = max(1, state.rows - 5)
+            max_scroll = max(0, len(state.guide_lines) - visible)
+            state.guide_scroll = min(state.guide_scroll + 1, max_scroll)
+        return state
+
+    if state.view == "import":
+        if key == ESC:
+            state.view = "menu"
+        elif key in (ENTER, "\n"):
+            path = state.import_text.strip()
+            state.view = "menu"
+            if not path:
+                state.status = "import cancelled: empty path"
+                state.status_ok = False
+            else:
+                state.action = ("import", state.import_provider, path)
+        elif key in (BACKSPACE, "\x08"):
+            state.import_text = state.import_text[:-1]
+        elif key and len(key) == 1 and ord(key) >= 32:
+            if len(state.import_text) < max(state.cols * 4, 256):
+                state.import_text += key
+        return state
+
+    # menu view
+    if key in (UP, "k", "K"):
+        state.cursor = (state.cursor - 1) % len(TUI_MENU)
+    elif key in (DOWN, "j", "J"):
+        state.cursor = (state.cursor + 1) % len(TUI_MENU)
+    elif key in ("q", "Q", ESC, "\x03", "\x04"):
+        state.quit = True
+    elif key in (ENTER, "\n"):
+        return _select_item(state, state.cursor)
+    elif key in "0123456789" and key in TUI_MENU_INDEX:
+        state.cursor = TUI_MENU_INDEX[key]
+        return _select_item(state, state.cursor)
+    return state
+
+
+@contextlib.contextmanager
+def _capture_output():
+    """Capture parent prints and child-process fd output into one buffer."""
+    buf = io.StringIO()
+    saved_out = saved_err = None
+    sys.stdout.flush()
+    sys.stderr.flush()
+    try:
+        saved_out, saved_err = os.dup(1), os.dup(2)
+        with tempfile.TemporaryFile() as tmp:
+            os.dup2(tmp.fileno(), 1)
+            os.dup2(tmp.fileno(), 2)
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                yield buf
+            tmp.seek(0)
+            buf.write(tmp.read().decode("utf-8", errors="replace"))
+    finally:
+        if saved_out is not None:
+            os.dup2(saved_out, 1)
+            os.close(saved_out)
+        if saved_err is not None:
+            os.dup2(saved_err, 2)
+            os.close(saved_err)
+
+
+def _execute_action(action: tuple, root: Path) -> tuple[str, int]:
+    """Run a recorded action through the existing helpers, capturing output.
+
+    Exactly the same helpers and call shapes as the non-interactive CLI and
+    the line wizard use; the screen simply stays up and the result lands in
+    the status area instead of the terminal scrollback.
+    """
+    kind = action[0]
+    with _capture_output() as buf:
+        if kind == "import":
+            rc = _cmd_import(root, action[1], [action[2]])
+        elif kind == "preset":
+            rc = _cmd_preset(root)
+        elif kind == "check":
+            rc = _cmd_check(root)
+        elif kind == "engine":
+            rc = _router_command(root, "ensure")
+            if rc == 0:
+                buf.write("engine up")
+            else:
+                buf.write("engine failed to start (see output above)")
+        else:  # pragma: no cover - defensive
+            rc = 0
+    return _strip_ansi(buf.getvalue()).strip(), rc
+
+
+def _paint(state: TuiState) -> None:
+    """Paint one full frame: home + lines + home, single write burst."""
+    out = sys.stdout
+    frame = render_frame(state)
+    if len(frame) < state.rows:
+        frame = frame + [""] * (state.rows - len(frame))
+    out.write("\x1b[H")
+    out.write("\r\n".join(frame))
+    out.write("\x1b[H")
+    if state.view == "import":
+        row = 4  # 1-based line of the " path: " input row (frame index 3)
+        col = min(1 + len(" path: ") + len(state.import_text), state.cols - 1)
+        out.write(f"\x1b[{row};{col}H\x1b[?25h")
+    else:
+        out.write("\x1b[?25l")
+    out.flush()
+
+
+def _read_key(timeout: float = 0.05) -> str:
+    """Read one key event from raw stdin; resolves ESC-prefixed sequences."""
+    fd = sys.stdin.fileno()
+
+    def _read1() -> str:
+        try:
+            data = os.read(fd, 1)
+        except OSError:
+            return ""
+        if not data:
+            return "\x04"  # EOF behaves like quit
+        return data.decode("utf-8", errors="replace")
+
+    ch = _read1()
+    if ch != ESC:
+        return ch
+    # ESC: possibly the start of an arrow/function sequence; peek for more.
+    try:
+        ready, _, _ = select.select([fd], [], [], timeout)
+    except (OSError, ValueError):
+        ready = []
+    if not ready:
+        return ESC
+    seq = _read1()
+    if seq in ("[", "O"):
+        try:
+            ready, _, _ = select.select([fd], [], [], timeout)
+        except (OSError, ValueError):
+            ready = []
+        if ready:
+            seq += _read1()
+    return ESC + seq
+
+
+def _tui_wizard(root: Path) -> int:
+    """Full-screen alternate-screen wizard (both streams must be TTYs)."""
+    state = _initial_state()
+    fd = sys.stdin.fileno()
+    try:
+        saved = termios.tcgetattr(fd)
+    except (termios.error, OSError, ValueError):
+        saved = None
+    interrupted = False
+    try:
+        try:
+            tty.setraw(fd)
+        except Exception:
+            return _line_wizard(root)
+        sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[2J")
+        sys.stdout.flush()
+        while not state.quit:
+            _paint(state)
+            key = _read_key()
+            state = apply_key(state, key)
+            if state.action is not None:
+                text, rc = _execute_action(state.action, root)
+                state.action = None
+                state.view = "menu"
+                state.status = text or ("command finished" if rc == 0 else "command failed")
+                state.status_ok = rc == 0
+    except KeyboardInterrupt:
+        interrupted = True
+    finally:
+        # Always restore the terminal, even on errors or Ctrl-C.
+        try:
+            sys.stdout.write("\x1b[?25h\x1b[?1049l\n\n")
+            sys.stdout.flush()
+        except Exception:
+            pass
+        if saved is not None:
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+            except Exception:
+                pass
+    return 130 if interrupted else 0
+
+
+def wizard(root=None) -> int:
+    """Interactive setup: full-screen TUI on a real TTY, line fallback otherwise.
+
+    Falls back to the plain line menu when stdin or stdout is not a TTY
+    (pipes, CI, tests) or when POSIX raw mode (termios/tty) is unavailable.
+    """
+    root = Path(root) if root is not None else ROOT
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return _line_wizard(root)
+    if not _HAVE_TERMIOS:
+        return _line_wizard(root)
+    return _tui_wizard(root)
 
 
 def main(argv=None, root=None) -> int:
