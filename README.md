@@ -108,6 +108,7 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py provider-count proton # rotation candidates (retry budget)
 ./router.py egress probe [provider]  # probe current exit(s) through the tunnel, persist health
 ./router.py egress show [provider]   # print persisted egress records (JSON)
+./router.py egress check [--provider <name>] [--json]  # read-only live check: exit 1 ONLY when an active exit is DEAD
 ./router.py status --json         # machine-readable status for scripts/Hermes
 ./router.py setup                  # custom setup TUI
 ./router.py setup --guide all      # print Proton + WARP guides
@@ -160,6 +161,22 @@ Rotation is then egress-aware instead of blind round-robin:
 - After switching, the new exit is probed; if it does not come up cleanly the
   router restores the previous good profile (one bounded rollback step).
 - `egress probe` refreshes health on demand without rotating.
+- `egress check` is the read-only liveness view used by the keepalive self-heal
+  loop: it probes the ACTIVE exit(s) through the running tunnel and classifies
+  each one `alive` (HTTP response rode the tunnel), `degraded` (an HTTP status
+  arrived but was not ok - e.g. a Cloudflare 1010/403 reputation block or 5xx,
+  i.e. NOT a dead tunnel), or `dead` (transport-level failure, no HTTP status
+  at all - the tunnel path itself is broken). A companion DNS probe records
+  `dns_ok` in the egress record when determinable: `dead` with `dns_ok: false`
+  means resolution through the tunnel failed, `dns_ok: true` means a later
+  dial/read stage failed. Exit code is 1 only when an exit is `dead`, so
+  automation never rotates on a reputation-block HTTP status.
+- A `sing-box.json.last-good` snapshot (atomic, 0600) is written whenever a
+  freshly built config validates AND the engine demonstrably comes up with it;
+  if a later reload's config fails validation or the engine fails to come up,
+  the router restores the last-good config and reloads/starts once - never
+  looping, and failing with a clear message when no last-good exists or the
+  restore itself fails.
 
 Tunables live in `router.json` under `"egress"` (see `router.example.json`).
 
@@ -308,6 +325,21 @@ up to `PROXY_KEEPALIVE_MAX_BACKOFF` (default 300s), so a dead engine is not
 hammered; one successful check resets the wait. `sing-box.log` is also rotated
 to `sing-box.log.1` once it exceeds 10 MB (at engine start, when no engine
 holds the log).
+
+`ensure` only proves the process is alive, so the keepalive ALSO self-heals a
+dead-but-listening tunnel (WireGuard handshake/route dead while the port still
+accepts): every `PROXY_KEEPALIVE_PROBE_EVERY` successful ensures (default 4,
+roughly 60s at the base interval) it runs `router.py egress check`, which
+probes the ACTIVE exit through the tunnel. After
+`PROXY_KEEPALIVE_DEAD_STRIKES` consecutive dead checks (default 2 - a single
+transient blip never rotates) it runs `router.py rotate <provider> --reason
+timeout` (respecting cooldown/block semantics, never `--force`); a successful
+check resets the dead-counter. On start, the first successful ensure triggers
+one boot self-test: a dead tunnel logs a loud warning and gets ONE early
+rotation; a healthy tunnel logs `router: boot self-test ok`. Keepalive
+rotations are capped at `PROXY_KEEPALIVE_MAX_ROTATIONS` (default 2) per
+`PROXY_KEEPALIVE_STORM_WINDOW` seconds (default 600), so a genuinely broken
+pool can never rotation-storm.
 
 ## Hermes integration
 

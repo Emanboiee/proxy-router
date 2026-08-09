@@ -22,6 +22,7 @@ def _relocate(module, root: Path) -> None:
     module.ROOT = Path(root).resolve()
     module.CONFIG_FILE = module.ROOT / "router.json"
     module.SING_BOX_CONFIG = module.ROOT / "sing-box.json"
+    module.LAST_GOOD_FILE = module.ROOT / "sing-box.json.last-good"
     module.PID_FILE = module.ROOT / "sing-box.pid"
     module.LOG_FILE = module.ROOT / "sing-box.log"
     module.LOCK_FILE = module.ROOT / "state" / "engine.lock"
@@ -1183,3 +1184,348 @@ class CliStatusJsonTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             data = json.loads(result.stdout)
             self.assertEqual(data, {"proton": {}})
+
+class EgressDnsProbeTests(unittest.TestCase):
+    """Feature 3: the tunnel-DNS companion signal records dns_ok and
+    distinguishes a dead DNS path from a repo-block HTTP status."""
+
+    class _FakeResponse:
+        def __init__(self, body=b"ok", status=200):
+            self._body = body
+            self.status = status
+
+        def read(self, n):
+            return self._body
+
+        def close(self):
+            pass
+
+    def _probe(self, *, ok=False, status=None, error=None):
+        result = {"ok": ok, "latency_ms": None, "status": status, "error": error,
+                  "block_reason": None}
+        return result
+
+    def test_direct_resolve_failure_is_inconclusive(self):
+        with mock.patch.object(router, "_bounded_getaddrinfo", return_value=None):
+            self.assertIsNone(router.egress_dns_probe("example.com"))
+
+    def test_response_through_tunnel_means_dns_ok(self):
+        with mock.patch.object(router, "_bounded_getaddrinfo", return_value=["1.2.3.4"]), \
+             mock.patch.object(router, "probe_egress", return_value=self._probe(ok=True, status=200)):
+            self.assertTrue(router.egress_dns_probe("example.com"))
+
+    def test_dns_marked_error_means_tunnel_dns_dead(self):
+        with mock.patch.object(router, "_bounded_getaddrinfo", return_value=["1.2.3.4"]), \
+             mock.patch.object(router, "probe_egress", return_value=self._probe(
+                 error="URLError: <urlopen error [Errno 8] nodename nor servname provided, or not known>")):
+            self.assertFalse(router.egress_dns_probe("example.com"))
+
+    def test_transport_error_is_inconclusive(self):
+        with mock.patch.object(router, "_bounded_getaddrinfo", return_value=["1.2.3.4"]), \
+             mock.patch.object(router, "probe_egress", return_value=self._probe(
+                 error="TimeoutError: timed out")):
+            self.assertIsNone(router.egress_dns_probe("example.com"))
+
+
+class EgressLiveCheckTests(unittest.TestCase):
+    """check_egress_live classification: alive / degraded / dead + dns_ok."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(router, self.root)
+        (self.root / "providers" / "proton").mkdir(parents=True)
+        self.profile = self.root / "providers" / "proton" / "a.conf"
+        _write_conf(self.profile)
+        router._providers = {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}}
+        router._routes = [{"id": "example-com", "domains": ["example.com"], "provider": "proton"}]
+        router._port = 2080
+        router._vpn = {}
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _probe(self, *, ok=False, status=None, error=None, block_reason=None):
+        return {"ok": ok, "latency_ms": None, "status": status, "error": error,
+                "block_reason": block_reason}
+
+    def test_probe_ok_is_alive_and_records_dns_ok(self):
+        with mock.patch.object(router, "probe_egress",
+                               return_value=self._probe(ok=True, status=200)):
+            status, record = router.check_egress_live("proton", self.profile)
+        self.assertEqual(status, "alive")
+        self.assertTrue(record["ok"])
+        self.assertIs(record["dns_ok"], True)
+
+    def test_http_status_failure_is_degraded_not_dead(self):
+        # 403 from Cloudflare = reputation block: tunnel path works, so the
+        # exit must NOT be classified dead (keepalive must not rotate).
+        with mock.patch.object(router, "probe_egress",
+                               return_value=self._probe(status=403, error="cloudflare-403",
+                                                        block_reason="cloudflare-403")):
+            status, record = router.check_egress_live("proton", self.profile)
+        self.assertEqual(status, "degraded")
+        self.assertFalse(record["ok"])
+        self.assertIs(record["dns_ok"], True)
+        self.assertTrue(router.egress_is_blocked("proton", self.profile))
+
+    def test_transport_failure_with_dead_tunnel_dns_is_dead(self):
+        with mock.patch.object(router, "probe_egress", return_value=self._probe(
+                error="URLError: tunnel down")), \
+             mock.patch.object(router, "egress_dns_probe", return_value=False):
+            status, record = router.check_egress_live("proton", self.profile)
+        self.assertEqual(status, "dead")
+        self.assertFalse(record["ok"])
+        self.assertIs(record["dns_ok"], False)
+
+    def test_transport_failure_alone_is_still_dead(self):
+        # no HTTP status at all = the tunnel path is broken even when the DNS
+        # companion check cannot be determined - never leave it unhealed.
+        with mock.patch.object(router, "probe_egress", return_value=self._probe(
+                error="TimeoutError: timed out")), \
+             mock.patch.object(router, "egress_dns_probe", return_value=None):
+            status, record = router.check_egress_live("proton", self.profile)
+        self.assertEqual(status, "dead")
+        self.assertFalse(record["ok"])
+        self.assertNotIn("dns_ok", record)  # only persisted when determined
+
+    def test_no_routed_domain_counts_as_alive(self):
+        router._routes = []
+        with mock.patch.object(router, "probe_egress", side_effect=AssertionError("must not probe")):
+            status, record = router.check_egress_live("proton", self.profile)
+        self.assertEqual(status, "alive")
+        self.assertIsNone(record)
+
+    def test_record_egress_omits_dns_ok_when_unspecified(self):
+        record = router.record_egress("proton", self.profile, ok=True, latency_ms=10.0)
+        self.assertNotIn("dns_ok", record)
+        record = router.record_egress("proton", self.profile, ok=False, error="boom", dns_ok=False)
+        self.assertIs(record["dns_ok"], False)
+
+
+class EgressCheckCommandTests(unittest.TestCase):
+    """egress check CLI semantics: exit codes, dead: line, json shape, and
+    stop-at-first-dead."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(router, self.root)
+        (self.root / "providers" / "proton").mkdir(parents=True)
+        (self.root / "providers" / "cloudflare").mkdir(parents=True)
+        _write_conf(self.root / "providers" / "proton" / "a.conf")
+        _write_conf(self.root / "providers" / "cloudflare" / "b.conf")
+        router._providers = {
+            "proton": {"directory": "providers/proton", "cooldown_seconds": 60},
+            "cloudflare": {"directory": "providers/cloudflare", "cooldown_seconds": 60},
+        }
+        router._routes = [
+            {"id": "example-com", "domains": ["example.com"], "provider": "proton"},
+            {"id": "roblox", "domains": ["roblox.com"], "provider": "cloudflare"},
+        ]
+        router._port = 2080
+        router._vpn = {}
+        self.listener = mock.patch.object(router, "listener_up", return_value=True)
+        self.listener.start()
+        self.live_patch = mock.patch.object(router, "check_egress_live",
+                                            return_value=("alive", {"ok": True, "dns_ok": True}))
+        self.live = self.live_patch.start()
+
+    def tearDown(self):
+        self.live_patch.stop()
+        self.listener.stop()
+        self._tmp.cleanup()
+
+    def _live(self, *results):
+        self.live_patch.stop()
+        self.live_patch = mock.patch.object(router, "check_egress_live", side_effect=list(results))
+        self.live = self.live_patch.start()
+
+    def test_requires_proxy_mode(self):
+        router.set_mode("tun")
+        with mock.patch("sys.stdout.write"):
+            rc = router.egress_check()
+        self.assertEqual(rc, 1)
+
+    def test_requires_listener(self):
+        self.listener.stop()
+        with mock.patch.object(router, "listener_up", return_value=False), \
+             mock.patch("sys.stdout.write"):
+            rc = router.egress_check()
+        self.assertEqual(rc, 1)
+
+    def test_unknown_provider_fails(self):
+        rc = router.egress_check("ghost")
+        self.assertEqual(rc, 1)
+
+    def test_all_alive_exit_zero(self):
+        router.set_active("proton", self.root / "providers" / "proton" / "a.conf")
+        router.set_active("cloudflare", self.root / "providers" / "cloudflare" / "b.conf")
+        rc = router.egress_check(as_json=True)
+        self.assertEqual(rc, 0)
+
+    def test_dead_exit_one_and_dead_line(self):
+        router.set_active("proton", self.root / "providers" / "proton" / "a.conf")
+        router.set_active("cloudflare", self.root / "providers" / "cloudflare" / "b.conf")
+        self._live(("dead", {"ok": False, "dns_ok": False}), ("dead", {"ok": False}))
+        with mock.patch("sys.stdout.write") as write:
+            rc = router.egress_check()
+        self.assertEqual(rc, 1)
+        joined = "".join(str(c) for c in write.call_args_list)
+        self.assertIn("dead: proton", joined)
+        # stop at first dead: cloudflare must not be checked
+        self.assertEqual(self.live.call_count, 1)
+
+    def test_degraded_exit_zero_not_dead(self):
+        router.set_active("proton", self.root / "providers" / "proton" / "a.conf")
+        router.set_active("cloudflare", self.root / "providers" / "cloudflare" / "b.conf")
+        self._live(("degraded", {"ok": False, "status": 403, "dns_ok": True}),
+                   ("alive", {"ok": True, "dns_ok": True}))
+        rc = router.egress_check()
+        self.assertEqual(rc, 0)
+
+    def test_json_shape(self):
+        router.set_active("proton", self.root / "providers" / "proton" / "a.conf")
+        router.set_active("cloudflare", self.root / "providers" / "cloudflare" / "b.conf")
+        self._live(("dead", {"ok": False, "dns_ok": False}))
+        with mock.patch("sys.stdout.write") as write:
+            rc = router.egress_check(as_json=True)
+        self.assertEqual(rc, 1)
+        text = "".join(c.args[0] for c in write.call_args_list)
+        data = json.loads(text)
+        self.assertEqual(data["dead"], ["proton"])
+        self.assertEqual(data["results"]["proton"]["status"], "dead")
+
+    def test_provider_filter(self):
+        router.set_active("proton", self.root / "providers" / "proton" / "a.conf")
+        rc = router.egress_check("proton")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.live.call_count, 1)
+
+    def test_provider_without_profiles_is_skipped_not_dead(self):
+        # empty provider dir: no active profile, nothing to probe, so it must
+        # be skipped rather than counted as a dead tunnel.
+        (self.root / "providers" / "proton" / "a.conf").unlink()
+        self._live()
+        with mock.patch("sys.stdout.write") as write:
+            rc = router.egress_check("proton")
+        self.assertEqual(rc, 0)
+        joined = "".join(c.args[0] for c in write.call_args_list)
+        self.assertIn("skipped", joined)
+        self.assertEqual(self.live.call_count, 0)
+
+
+class LastGoodConfigTests(unittest.TestCase):
+    """Feature 2: sing-box.json.last-good snapshot + one-step restore when a
+    reload's new config fails validation or the engine fails to come up."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(router, self.root)
+        (self.root / "providers" / "proton").mkdir(parents=True)
+        self.profile = self.root / "providers" / "proton" / "a.conf"
+        _write_conf(self.profile)
+        (self.root / "sing-box.pid").write_text("1234")
+        router._providers = {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}}
+        router._routes = [{"id": "example", "domains": ["example.com"], "provider": "proton"}]
+        router._port = 2080
+        router._vpn = {}
+        self.patches = [
+            mock.patch.object(router, "resolve_sing_box", return_value="/bin/sing-box"),
+            mock.patch.object(router, "sing_box_at_least", return_value=True),
+            mock.patch.object(router, "_pid_matches", return_value=True),
+            mock.patch.object(router, "log_offset", return_value=0),
+            mock.patch.object(router.os, "kill"),
+        ]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        self._tmp.cleanup()
+
+    def test_start_writes_last_good_after_success(self):
+        class _Proc:
+            pid = 4242
+        with mock.patch.object(router, "validate_config", return_value=True), \
+             mock.patch.object(router, "wait_engine", return_value=True), \
+             mock.patch.object(router.subprocess, "Popen", return_value=_Proc()):
+            self.assertEqual(router.engine_start(), 0)
+        self.assertTrue(router.LAST_GOOD_FILE.is_file())
+        self.assertEqual(router.LAST_GOOD_FILE.read_text(), router.SING_BOX_CONFIG.read_text())
+        self.assertEqual(stat.S_IMODE(router.LAST_GOOD_FILE.stat().st_mode), 0o600)
+
+    def test_start_failure_never_writes_last_good(self):
+        class _Proc:
+            pid = 4242
+        with mock.patch.object(router, "validate_config", return_value=True), \
+             mock.patch.object(router, "wait_engine", return_value=False), \
+             mock.patch.object(router.subprocess, "Popen", return_value=_Proc()):
+            self.assertEqual(router.engine_start(), 1)
+        self.assertFalse(router.LAST_GOOD_FILE.exists())
+
+    def test_reload_invalid_config_restores_last_good_and_reloads(self):
+        known_good = json.dumps({"inbounds": [], "known": True})
+        router.LAST_GOOD_FILE.write_text(known_good)
+        with mock.patch.object(router, "validate_config", side_effect=[False, True]), \
+             mock.patch.object(router, "wait_engine", side_effect=[True]) as wait:
+            self.assertEqual(router.engine_reload(), 0)
+        # restored file == last-good content
+        self.assertEqual(router.SING_BOX_CONFIG.read_text(), known_good)
+        seen_kills = [c for c in router.os.kill.mock_calls]  # noqa: F841
+        # engine was hot-reloaded onto the restore
+        self.assertEqual(wait.call_count, 1)
+
+    def test_reload_restore_without_last_good_fails_cleanly(self):
+        router.LAST_GOOD_FILE.unlink(missing_ok=True)
+        with mock.patch.object(router, "validate_config", return_value=False), \
+             mock.patch("sys.stderr.write") as err:
+            rc = router.engine_reload()
+        self.assertEqual(rc, 1)
+        joined = "".join(str(c) for c in err.call_args_list)
+        self.assertIn("no sing-box.json.last-good", joined)
+
+    def test_restored_last_good_also_failing_stops_with_message(self):
+        router.LAST_GOOD_FILE.write_text(json.dumps({"inbounds": []}))
+        with mock.patch.object(router, "validate_config", return_value=False), \
+             mock.patch("sys.stderr.write") as err:
+            rc = router.engine_reload()
+        self.assertEqual(rc, 1)
+        joined = "".join(str(c) for c in err.call_args_list)
+        self.assertIn("restored sing-box.json.last-good failed sing-box check", joined)
+
+    def test_reload_start_failure_restores_and_starts_from_last_good(self):
+        known_good = json.dumps({"inbounds": [], "known": True})
+        router.LAST_GOOD_FILE.write_text(known_good)
+        with mock.patch.object(router, "validate_config", side_effect=[True, True]), \
+             mock.patch.object(router, "engine_start", return_value=1), \
+             mock.patch.object(router, "restore_last_good", return_value=0) as restore:
+            # no pid file -> reload must start the engine
+            router.PID_FILE.unlink(missing_ok=True)
+            rc = router.engine_reload()
+        self.assertEqual(rc, 0)
+        restore.assert_called_once()
+
+    def test_successful_reload_refreshes_last_good(self):
+        with mock.patch.object(router, "validate_config", return_value=True), \
+             mock.patch.object(router, "wait_engine", return_value=True) as wait:
+            self.assertEqual(router.engine_reload(), 0)
+        self.assertTrue(router.LAST_GOOD_FILE.is_file())
+        self.assertEqual(router.LAST_GOOD_FILE.read_text(), router.SING_BOX_CONFIG.read_text())
+        self.assertEqual(wait.call_count, 1)
+
+    def test_restore_starts_engine_with_existing_config_when_engine_gone(self):
+        known_good = json.dumps({"inbounds": [], "known": True})
+        router.LAST_GOOD_FILE.write_text(known_good)
+        router.PID_FILE.unlink(missing_ok=True)
+        with mock.patch.object(router, "validate_config", side_effect=[False, True]), \
+             mock.patch.object(router, "engine_start", return_value=0) as start:
+            rc = router.engine_reload()
+        self.assertEqual(rc, 0)
+        start.assert_called_once_with(use_existing_config=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

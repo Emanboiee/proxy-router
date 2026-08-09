@@ -32,6 +32,7 @@ from pathlib import Path
 ROOT = Path(os.environ.get("PROXY_ROUTER_ROOT") or Path(__file__).resolve().parent).resolve()
 CONFIG_FILE = ROOT / "router.json"
 SING_BOX_CONFIG = ROOT / "sing-box.json"
+LAST_GOOD_FILE = ROOT / "sing-box.json.last-good"
 PID_FILE = ROOT / "sing-box.pid"
 LOG_FILE = ROOT / "sing-box.log"
 LOCK_FILE = ROOT / "state" / "engine.lock"
@@ -396,10 +397,12 @@ def write_egress(name: str, profile: Path, record: dict) -> None:
 
 
 def record_egress(name: str, profile: Path, *, ok: bool, latency_ms: float | None = None,
-                  status: int | None = None, error: str | None = None) -> dict:
+                  status: int | None = None, error: str | None = None,
+                  dns_ok: bool | None = None) -> dict:
     """Merge one probe outcome into the profile's egress record. A passing
     probe clears the fail streak and any blocked marker; a failure bumps the
-    streak so rotation deprioritizes the exit."""
+    streak so rotation deprioritizes the exit. ``dns_ok`` (True/False from the
+    tunnel-DNS companion check) is persisted when it could be determined."""
     record = read_egress(name, profile)
     now = int(time.time())
     record["ok"] = bool(ok)
@@ -419,6 +422,8 @@ def record_egress(name: str, profile: Path, *, ok: bool, latency_ms: float | Non
         record["latency_ms"] = None
         record["status"] = status
         record["error"] = error or record.get("error")
+    if dns_ok is not None:
+        record["dns_ok"] = bool(dns_ok)
     write_egress(name, profile, record)
     return record
 
@@ -561,6 +566,102 @@ def probe_profile(name: str, profile: Path, *, port: int | None = None) -> tuple
     if result["block_reason"]:
         mark_blocked(name, profile, result["block_reason"])
     return result["ok"], record
+
+
+_DNS_ERROR_RE = re.compile(
+    r"(getaddrinfo|no such host|nodename nor servname|name or service not known|"
+    r"temporary failure in name resolution|could not resolve|servfail)",
+    re.IGNORECASE,
+)
+
+
+def _dns_error_markers(text: str) -> bool:
+    """True when an error string describes a failed DNS resolution rather than
+    a transport/connect failure (used to classify probe failures)."""
+    return bool(text) and bool(_DNS_ERROR_RE.search(text))
+
+
+def _bounded_getaddrinfo(host: str, port: int, timeout: float) -> list[str] | None:
+    """Resolve ``host`` on a daemon worker so a broken resolver can never
+    stall the check (mirrors resolve_host's bounded pattern). None on
+    failure/timeout."""
+    resolved: list[str] = []
+
+    def _resolve() -> None:
+        try:
+            infos = socket.getaddrinfo(host, port, socket.AF_UNSPEC)
+        except (socket.gaierror, OSError):
+            return
+        for info in infos:
+            resolved.append(info[4][0])
+
+    worker = threading.Thread(target=_resolve, name=f"dnscheck-{host}", daemon=True)
+    worker.start()
+    worker.join(timeout=timeout)
+    return resolved or None
+
+
+def egress_dns_probe(host: str, *, port: int | None = None, timeout: float | None = None,
+                     opener=None) -> bool | None:
+    """Secondary tunnel-DNS signal for the egress live check: does resolution
+    of ``host`` work THROUGH the tunnel?
+
+    - Direct-resolver baseline first: if the hostname does not resolve
+      directly at all, nothing can be attributed to the tunnel (None).
+    - Then a tiny proxied GET forces the engine to resolve+connect ``host``
+      through the tunnel; a response proves the resolution path worked
+      (True), a DNS-flavored error (getaddrinfo/no such host/...) means the
+      tunnel's resolution path is dead (False), and any other transport
+      error is inconclusive (None).
+
+    Bounded (getaddrinfo worker timeout + short request timeout), injectable
+    openers for tests, no new dependencies.
+    """
+    timeout = timeout if timeout is not None else max(2.0, min(egress_settings()["probe_timeout"], 5.0))
+    if _bounded_getaddrinfo(host, 443, min(timeout, 3.0)) is None:
+        return None  # hostname itself unresolvable: not a tunnel signal
+    result = probe_egress(port=port, url=f"http://{host}/", timeout=timeout, opener=opener)
+    if result["ok"] or result["status"] is not None:
+        return True  # a response rode the tunnel: resolution worked
+    if _dns_error_markers(result["error"]):
+        return False
+    return None
+
+
+def check_egress_live(name: str, profile: Path, *, port: int | None = None) -> tuple[str, dict | None]:
+    """Live check of ``profile`` (provider ``name``'s active exit) THROUGH the
+    running tunnel. Returns (status, record):
+
+    - ``alive``: the HTTPS probe got an HTTP response through the tunnel.
+    - ``degraded``: an HTTP response arrived but was not ok (e.g. Cloudflare
+      1010/403 reputation block or 5xx). The tunnel path works, so this is
+      NOT a dead tunnel and keepalive must not rotate on it.
+    - ``dead``: the probe failed at transport level (no HTTP status at all),
+      i.e. the tunnel path itself is broken. The DNS signal sharpens the
+      reason: ``dns_ok is False`` means resolution through the tunnel failed,
+      otherwise a later dial/read stage failed.
+
+    The outcome is persisted in the normal egress health record (including
+    ``dns_ok`` when determined) and reputation-block reasons still raise a
+    blocked marker, exactly like probe_profile.
+    """
+    url = probe_url_for(name)
+    if url is None:
+        return "alive", None
+    probe = probe_egress(port=port, url=url)
+    if probe["ok"]:
+        status, dns_ok = "alive", True
+    elif probe["status"] is not None:
+        status, dns_ok = "degraded", True  # HTTP response rode the tunnel
+    else:
+        status = "dead"
+        host = urllib.parse.urlsplit(url).hostname or ""
+        dns_ok = egress_dns_probe(host, port=port) if host else None
+    record = record_egress(name, profile, ok=probe["ok"], latency_ms=probe["latency_ms"],
+                           status=probe["status"], error=probe["error"], dns_ok=dns_ok)
+    if probe["block_reason"]:
+        mark_blocked(name, profile, probe["block_reason"])
+    return status, record
 
 
 def _egress_rank(record: dict, now: int | None = None) -> tuple[int, float]:
@@ -958,6 +1059,54 @@ def validate_config() -> bool:
     return False
 
 
+def write_last_good() -> None:
+    """Snapshot the current generated config as ``sing-box.json.last-good``.
+
+    Only called after the engine demonstrably came up with a freshly built +
+    validated config, so last-good is always a config the engine HAS RUN (a
+    config that fails validation/start is never snapshotted). Atomic write,
+    mode 0600, same as every other config write."""
+    try:
+        content = SING_BOX_CONFIG.read_text()
+    except OSError:
+        return
+    _atomic_write(LAST_GOOD_FILE, content, 0o600)
+
+
+def restore_last_good() -> int:
+    """Restore ``sing-box.json.last-good`` and get the engine back up on it.
+
+    Called when a freshly generated config fails validation or the engine
+    fails to come up after it was written. One bounded restore, never a
+    loop: a missing last-good, or a last-good that also fails validation or
+    refuses to start, fails with a clear message."""
+    if not LAST_GOOD_FILE.is_file():
+        return fail(f"no {LAST_GOOD_FILE.name} to restore; leaving the engine alone")
+    try:
+        content = LAST_GOOD_FILE.read_text()
+    except OSError as exc:
+        return fail(f"could not read {LAST_GOOD_FILE.name}: {exc}")
+    _atomic_write(SING_BOX_CONFIG, content, 0o600)
+    if not validate_config():
+        return fail(f"restored {LAST_GOOD_FILE.name} failed sing-box check; engine not started")
+    pid = None
+    try:
+        if PID_FILE.is_file():
+            pid = int(PID_FILE.read_text().strip())
+    except (ValueError, OSError):
+        pid = None
+    if pid is not None and _pid_matches(pid):
+        reload_log_from = log_offset()
+        try:
+            os.kill(pid, signal.SIGHUP)  # hot-reload the restored config in place
+        except ProcessLookupError:
+            return engine_start(use_existing_config=True)
+        if wait_engine(2.0, log_from=reload_log_from):
+            return 0
+    print("router: starting engine with the restored last-good config", file=sys.stderr)
+    return engine_start(use_existing_config=True)
+
+
 def listener_up() -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.settimeout(0.5)
@@ -1122,21 +1271,29 @@ def rotate_log_if_needed() -> None:
         pass
 
 
-def engine_start() -> int:
+def engine_start(use_existing_config: bool = False) -> int:
     sing_box = resolve_sing_box()
     if sing_box is None:
         return fail(_sing_box_missing_message())
     if not sing_box_at_least(MIN_SING_BOX_VERSION):
         return fail(f"{_sing_box_version_message(MIN_SING_BOX_VERSION)}")
-    try:
-        config, active = build_singbox_config()
-    except (SystemExit, KeyError, ValueError, OSError, configparser.Error) as exc:
-        return fail(f"could not build sing-box config: {exc}")
-    if not active:
-        return fail("no provider profile available (drop *.conf into providers/<name>/)")
-    write_sing_box(config)
-    if not validate_config():
-        return fail("sing-box config check failed")
+    if use_existing_config:
+        # restore_last_good path: boot the sing-box.json file as it now
+        # stands (already validated + written from last-good), without
+        # regenerating it from router.json/profiles (which produced the
+        # config that just failed).
+        if not SING_BOX_CONFIG.is_file():
+            return fail(f"no {SING_BOX_CONFIG.name} to start (use_existing_config)")
+    else:
+        try:
+            config, active = build_singbox_config()
+        except (SystemExit, KeyError, ValueError, OSError, configparser.Error) as exc:
+            return fail(f"could not build sing-box config: {exc}")
+        if not active:
+            return fail("no provider profile available (drop *.conf into providers/<name>/)")
+        write_sing_box(config)
+        if not validate_config():
+            return fail("sing-box config check failed")
     engine_stop()
     # Only rotate here, with the old engine already stopped: renaming a live
     # engine's log would detach its (still open) fd and growth would continue
@@ -1161,6 +1318,10 @@ def engine_start() -> int:
     if not wait_engine(log_from=log_offset()):
         engine_stop()
         return fail("sing-box failed to come up")
+    if not use_existing_config:
+        # The engine demonstrably runs this config: snapshot it as last-good
+        # (a later failed reload/start can restore from it).
+        write_last_good()
     return 0
 
 
@@ -1217,35 +1378,64 @@ def engine_reload() -> int:
     try:
         config, active = build_singbox_config()
     except (SystemExit, KeyError, ValueError, OSError, configparser.Error) as exc:
+        # Nothing was written or reloaded, so the running engine keeps its
+        # old in-memory config; fail cleanly (no last-good restore needed).
         return fail(f"could not build sing-box config: {exc}")
     if not active:
         return fail("no provider endpoint available")
     write_sing_box(config)
     if not validate_config():
-        return fail("sing-box config check failed")
+        # The bad config is already on disk; restore the last known-good one
+        # so a crash/restart can never boot it (F2: bad generated config must
+        # not leave the proxy dead while a known-good config exists).
+        print("router: new sing-box config failed validation; restoring last-good", file=sys.stderr)
+        return restore_last_good()
     if not PID_FILE.is_file():
-        return engine_start()
+        if engine_start() != 0:
+            print("router: engine failed to start with new config; restoring last-good", file=sys.stderr)
+            return restore_last_good()
+        return 0
     try:
         pid = int(PID_FILE.read_text().strip())
     except (ValueError, OSError):
         PID_FILE.unlink(missing_ok=True)
-        return engine_start()
+        if engine_start() != 0:
+            print("router: engine failed to start with new config; restoring last-good", file=sys.stderr)
+            return restore_last_good()
+        return 0
     if not _pid_matches(pid):
         PID_FILE.unlink(missing_ok=True)
-        return engine_start()
+        if engine_start() != 0:
+            print("router: engine failed to start with new config; restoring last-good", file=sys.stderr)
+            return restore_last_good()
+        return 0
     if os.name == "nt":
         # Windows has no SIGHUP; stop+start applies the fresh config.
         if engine_stop() != 0:
             return fail("engine stop failed during reload")
-        return engine_start()
+        if engine_start() != 0:
+            print("router: engine failed to start with new config; restoring last-good", file=sys.stderr)
+            return restore_last_good()
+        return 0
     reload_log_from = log_offset()
     try:
         os.kill(pid, signal.SIGHUP)  # SIGHUP: sing-box hot-reloads the config in place
     except ProcessLookupError:
-        return engine_start()
-    if wait_engine(2.0, log_from=reload_log_from):
+        if engine_start() != 0:
+            print("router: engine failed to start with new config; restoring last-good", file=sys.stderr)
+            return restore_last_good()
         return 0
-    return engine_start()
+    if wait_engine(2.0, log_from=reload_log_from):
+        # The new config demonstrably runs: snapshot it as last-good.
+        write_last_good()
+        return 0
+    # SIGHUP did not come up cleanly; try a full (re)start of the new config
+    # before giving up and restoring last-good.
+    print("router: engine did not come up after SIGHUP; trying a full start", file=sys.stderr)
+    if engine_start() != 0:
+        print("router: engine failed to start with new config; restoring last-good", file=sys.stderr)
+        return restore_last_good()
+    return 0
 
 
 def rotate(name: str, *, reason: str | None = None, force: bool = False, probe: bool = True) -> int:
@@ -1632,6 +1822,69 @@ def egress_probe(name: str | None = None) -> int:
     return 1 if any_failed else 0
 
 
+def egress_check(name: str | None = None, as_json: bool = False) -> int:
+    """Read-only liveness check of the ACTIVE exit of every provider (or just
+    ``name``) through the running tunnel.
+
+    Unlike `egress probe` (which exits 1 on any probe failure), this
+    classifies each exit alive/degraded/dead (see check_egress_live) and
+    exits 1 only when an exit is DEAD - i.e. the tunnel path itself is broken
+    - so a caller like keepalive can auto-rotate on a genuinely dead tunnel
+    without reacting to reputation-block HTTP statuses (403/1010), TUN mode,
+    or a temporarily down engine.
+
+    Never rotates, never touches the engine; the only write is the normal
+    egress health record. Bounded probes make it safe to run every 30-60s.
+    Stops at the first dead provider. In human mode a trailing ``dead:
+    <provider>`` line (and exit code 1) is the machine contract keepalive
+    parses; ``--json`` emits the same data as one JSON document.
+    """
+    mode = current_mode()
+    if mode != "proxy":
+        return fail(f"egress check requires proxy mode (mode is '{mode}'; no 127.0.0.1 tunnel listener)")
+    if not listener_up():
+        return fail(f"engine not listening on 127.0.0.1:{_port}; tunnel is down")
+    if name is not None and name not in _providers:
+        return fail(f"unknown provider '{name}' (have {', '.join(_providers)})")
+    providers = [name] if name is not None else list(_providers)
+    results: dict[str, dict] = {}
+    dead: list[str] = []
+    for provider in providers:
+        active = resolve_active(provider)
+        if active is None:
+            results[provider] = {"profile": None, "ok": True, "status": "skipped",
+                                 "detail": "no active profile"}
+            continue
+        status, record = check_egress_live(provider, active)
+        entry: dict = {"profile": active.stem, "ok": status != "dead", "status": status}
+        if record is not None and record.get("dns_ok") is not None:
+            entry["dns_ok"] = record["dns_ok"]
+        if status == "dead":
+            entry["detail"] = "dns" if entry.get("dns_ok") is False else "probe connection"
+            dead.append(provider)
+        elif status == "degraded" and record is not None and record.get("status") is not None:
+            entry["detail"] = f"HTTP {record['status']}"
+        results[provider] = entry
+        if dead:
+            break  # stop at the first dead provider so keepalive rotates it
+    if as_json:
+        print(json.dumps({"dead": dead, "results": results}, indent=2, sort_keys=True))
+    else:
+        for provider, entry in results.items():
+            status = entry["status"]
+            if status == "skipped":
+                print(f"{provider}: skipped (no active profile)")
+            elif status == "alive":
+                print(f"{provider}: alive ({entry['profile']})")
+            elif status == "degraded":
+                print(f"{provider}: degraded ({entry['profile']}; {entry.get('detail', 'HTTP response')})")
+            else:
+                print(f"{provider}: dead ({entry['profile']}; {entry.get('detail', 'probe connection')})")
+        if dead:
+            print(f"dead: {dead[0]}")
+    return 1 if dead else 0
+
+
 def egress_show(name: str | None = None) -> int:
     """Print persisted egress records (state/egress/**) as JSON."""
     providers = [name] if name is not None else list(_providers)
@@ -1735,8 +1988,13 @@ def main() -> int:
     sub.add_parser("down")
 
     egress = sub.add_parser("egress", help="egress health for provider exits")
-    egress.add_argument("action", choices=["probe", "show"])
-    egress.add_argument("provider", nargs="?", default=None)
+    egress.add_argument("action", choices=["probe", "show", "check"])
+    egress.add_argument("provider", nargs="?", default=None,
+                        help="provider name (positional, for probe/show)")
+    egress.add_argument("--provider", dest="provider_opt", default=None,
+                        help="provider name to check (egress check)")
+    egress.add_argument("--json", action="store_true",
+                        help="egress check: machine-readable JSON output")
 
     init = sub.add_parser("init")
     init.add_argument("--force", action="store_true", help="overwrite an existing router.json")
@@ -1839,6 +2097,8 @@ def main() -> int:
     if args.cmd == "egress":
         if args.action == "probe":
             return egress_probe(args.provider)
+        if args.action == "check":
+            return egress_check(args.provider_opt or args.provider, as_json=args.json)
         return egress_show(args.provider)
     if args.cmd == "provider-count":
         print(provider_count(args.provider))
