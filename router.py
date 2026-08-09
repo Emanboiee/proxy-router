@@ -794,11 +794,12 @@ def engine_reload() -> int:
         if engine_stop() != 0:
             return fail("engine stop failed during reload")
         return engine_start()
+    reload_log_from = log_offset()
     try:
         os.kill(pid, signal.SIGHUP)  # SIGHUP: sing-box hot-reloads the config in place
     except ProcessLookupError:
         return engine_start()
-    if wait_engine(2.0):
+    if wait_engine(2.0, log_from=reload_log_from):
         return 0
     return engine_start()
 

@@ -665,6 +665,34 @@ class WaitEngineTests(unittest.TestCase):
             self.assertFalse(router.wait_engine(timeout=0.4))
 
 
+class EngineReloadTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        _relocate(router, self.root)
+        (self.root / "providers" / "proton").mkdir(parents=True)
+        _write_conf(self.root / "providers" / "proton" / "a.conf")
+        (self.root / "sing-box.pid").write_text("1234")
+        router._providers = {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}}
+        router._routes = [{"id": "example", "domains": ["example.com"], "provider": "proton"}]
+        router._port = 2080
+        router._vpn = {}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_reload_ignores_historical_fatal_log_lines(self):
+        with mock.patch.object(router, "resolve_sing_box", return_value="/bin/sing-box"), \
+             mock.patch.object(router, "sing_box_at_least", return_value=True), \
+             mock.patch.object(router, "validate_config", return_value=True), \
+             mock.patch.object(router, "_pid_matches", return_value=True), \
+             mock.patch.object(router, "log_offset", return_value=987), \
+             mock.patch.object(router, "wait_engine", return_value=True) as wait_engine, \
+             mock.patch.object(router.os, "kill"):
+            self.assertEqual(router.engine_reload(), 0)
+        wait_engine.assert_called_once_with(2.0, log_from=987)
+
+
 class CliStatusAgreementTests(unittest.TestCase):
     """M13 at the CLI boundary: status and vpn status exit 1 with "down" when
     nothing is running, in a throwaway PROXY_ROUTER_ROOT."""
