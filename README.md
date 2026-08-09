@@ -180,6 +180,61 @@ Rotation is then egress-aware instead of blind round-robin:
 
 Tunables live in `router.json` under `"egress"` (see `router.example.json`).
 
+## Error policy table (`error_policy`)
+
+What happens to a lane after an upstream failure is configurable per reason via
+a top-level `"error_policy"` table in `router.json`. Each reason maps to an
+action and a duration:
+
+```json
+"error_policy": {
+  "default": { "action": "cooldown", "seconds": 300 },
+  "429":     { "action": "exhaust", "seconds": 900 },
+  "503":     { "action": "cooldown", "seconds": 120 },
+  "timeout": { "action": "cooldown", "seconds": 60 },
+  "tls":     { "action": "cooldown", "seconds": 300 },
+  "connection": { "action": "cooldown", "seconds": 300 },
+  "1010":    { "action": "block", "seconds": 3600 },
+  "403":     { "action": "block", "seconds": 3600 }
+}
+```
+
+Semantics:
+
+- `cooldown` — normal cooldown (`mark_cooldown`): rotation skips the lane
+  until the timer resets.
+- `exhaust` — cooldown **plus** `exhausted: true`, `exhausted_at` and an
+  ISO-8601 `exhausted_until` written into the profile's egress record, so
+  `status --json` and external scripts see the lane is dead for this turn
+  (e.g. a free-tier quota lane that should not be retried for 15 minutes).
+- `block` — reputation block (`mark_blocked`): rotation skips the lane
+  entirely until the marker expires or `rotate --force` clears it (used for
+  Cloudflare 1010/403 egress-IP reputation blocks).
+
+Merge precedence (smallest merge surface, no breaking config changes): a
+per-provider `providers.<name>.error_policy` beats the global top-level
+`error_policy`, which beats the built-in defaults above. Missing reasons fall
+back to the effective `default` entry. A reason is matched loosely before
+exact lookup: `cloudflare-1010` → `1010`, `HTTP 503` / `503` → `503`,
+SSL/TLS errors → `tls`, timeouts → `timeout`, dial/connect/reset errors →
+`connection`, anything else by its slugified text (so custom reason keys like
+`"429"` overrides still work).
+
+Where it is consumed:
+
+- `rotate --reason <x>` — `_apply_upstream_failure` now applies the policy
+  entry (seconds + action) for `<x>` instead of the flat
+  `upstream_cooldown_seconds or max(...)` computation. 1010/403 text always
+  blocks regardless of the table.
+- `probe_profile` / `check_egress_live` — a transport/TLS death (no HTTP
+  status) is cooled with the policy's `tls`/`connection` seconds (built-in
+  300s, which is the merged TLS-cooldown rule). A degraded HTTP status
+  (reputation block / 5xx) is never cooled.
+- `status --json` — echoes the effective policy for every provider under the
+  top-level `"error_policy"` key, and each profile's egress record carries
+  `exhausted`/`exhausted_at`/`exhausted_until` when an exhaust policy has
+  fired, so automation can read the exact reset time.
+
 ## VPN (TUN) mode
 
 `vpn on` switches the engine from a local mixed proxy (`127.0.0.1:2080`) to a

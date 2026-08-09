@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import datetime
 import json
 import os
 import re
@@ -50,6 +51,22 @@ DEFAULT_EGRESS_SETTINGS = {
     "fail_threshold": 2,
     "slow_latency_ms": 1200.0,
     "ok_window": 86400,
+}
+# Per-reason upstream-error policy (router.json top-level ``error_policy``,
+# then per-provider ``providers.<name>.error_policy``, then these built-in
+# defaults; closest scope wins). action: cooldown (rotate skips the lane until
+# reset), exhaust (cooldown + ``exhausted``/``exhausted_until`` marker with a
+# machine-readable reset time in the egress record), block (reputation block:
+# rotate skips the lane entirely until expiry or --force).
+DEFAULT_ERROR_POLICY = {
+    "default": {"action": "cooldown", "seconds": 300},
+    "429": {"action": "exhaust", "seconds": 900},
+    "503": {"action": "cooldown", "seconds": 120},
+    "timeout": {"action": "cooldown", "seconds": 60},
+    "tls": {"action": "cooldown", "seconds": 300},
+    "connection": {"action": "cooldown", "seconds": 300},
+    "1010": {"action": "block", "seconds": 3600},
+    "403": {"action": "block", "seconds": 3600},
 }
 # Rotate sing-box.log once it outgrows this (mirrors monitor.py sample
 # rotation); the live log grows a line per connection and is unbounded.
@@ -141,6 +158,7 @@ _routes: list = []
 _port: int = DEFAULT_PORT
 _vpn: dict = {}
 _egress_settings: dict = {}
+_error_policy: dict | None = None
 _PROVIDER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 
 
@@ -231,6 +249,10 @@ def load_config() -> int:
         for key in ("domains", "ip_cidr"):
             if key in route and (not isinstance(route[key], list) or not all(isinstance(v, str) for v in route[key])):
                 return fail(f"bad {CONFIG_FILE.name}: route '{route.get('id', '<unnamed>')}' {key} must be a string list")
+    try:
+        _load_error_policy(data, providers)
+    except ValueError as exc:
+        return fail(f"bad {CONFIG_FILE.name}: {exc}")
     _load_egress_settings(data)
     _port = port
     _providers = providers
@@ -250,7 +272,8 @@ def write_default_config(force: bool = False) -> int:
             "port": DEFAULT_PORT,
             "providers": {
                 "proton": {"directory": "providers/proton", "cooldown_seconds": 60},
-                "cloudflare": {"directory": "providers/cloudflare", "cooldown_seconds": 60},
+                "cloudflare": {"directory": "providers/cloudflare", "cooldown_seconds": 60,
+                               "error_policy": {"429": {"action": "cooldown", "seconds": 300}}},
             },
             "routes": [
                 {
@@ -277,6 +300,16 @@ def write_default_config(force: bool = False) -> int:
                 "fail_threshold": 2,
                 "slow_latency_ms": 1200,
                 "ok_window": 86400,
+            },
+            "error_policy": {
+                "default": {"action": "cooldown", "seconds": 300},
+                "429": {"action": "exhaust", "seconds": 900},
+                "503": {"action": "cooldown", "seconds": 120},
+                "timeout": {"action": "cooldown", "seconds": 60},
+                "tls": {"action": "cooldown", "seconds": 300},
+                "connection": {"action": "cooldown", "seconds": 300},
+                "1010": {"action": "block", "seconds": 3600},
+                "403": {"action": "block", "seconds": 3600},
             },
         }
     _atomic_write(CONFIG_FILE, json.dumps(data, indent=2) + "\n", 0o600)
@@ -333,6 +366,113 @@ def egress_settings() -> dict:
     merged over module defaults). Rotation consults these to avoid
     known-blocked/slow exits without hardcoding thresholds."""
     return _egress_settings or DEFAULT_EGRESS_SETTINGS
+
+
+def _parse_error_policy(supplied) -> dict:
+    """Validate one error-policy table: {reason: {action, seconds}}. Returns
+    the cleaned table ({} when absent). Raises ValueError with a precise
+    message on malformed input so load_config rejects the config instead of
+    silently guessing."""
+    if supplied is None:
+        return {}
+    if not isinstance(supplied, dict):
+        raise ValueError("'error_policy' must be an object of reason -> {\"action\", \"seconds\"}")
+    cleaned: dict[str, dict] = {}
+    for key, entry in supplied.items():
+        if not isinstance(entry, dict):
+            raise ValueError(f"'error_policy.{key}' must be an object with 'action' and 'seconds'")
+        action = entry.get("action", "cooldown")
+        if action not in ("cooldown", "exhaust", "block"):
+            raise ValueError(f"'error_policy.{key}.action' must be 'cooldown'|'exhaust'|'block' (got {action!r})")
+        try:
+            seconds = max(0, int(entry.get("seconds", 300)))
+        except (TypeError, ValueError):
+            raise ValueError(f"'error_policy.{key}.seconds' must be a non-negative integer") from None
+        cleaned[str(key)] = {"action": action, "seconds": seconds}
+    return cleaned
+
+
+def _load_error_policy(data: dict, providers: dict) -> None:
+    """Store the validated top-level ``error_policy`` table and each provider's
+    ``providers.<name>.error_policy`` override. Raises ValueError on malformed
+    entries; load_config turns that into a hard config failure so a policy
+    mistake can never silently change rotation behavior."""
+    global _error_policy
+    _error_policy = _parse_error_policy(data.get("error_policy") if isinstance(data, dict) else None)
+    for name, entry in providers.items():
+        if isinstance(entry, dict) and "error_policy" in entry:
+            entry["error_policy"] = _parse_error_policy(entry["error_policy"])
+
+
+def error_policy_for(name: str) -> dict:
+    """Effective error-policy table for provider ``name``.
+
+    Merge precedence (closest scope wins): ``providers.<name>.error_policy``
+    beats the top-level ``error_policy`` beats the built-in defaults in
+    DEFAULT_ERROR_POLICY. Returns a fresh independent table each call so
+    callers can never mutate module state."""
+    policy = {key: dict(entry) for key, entry in DEFAULT_ERROR_POLICY.items()}
+    for scope in (_error_policy, _provider_error_policy(name)):
+        if not isinstance(scope, dict):
+            continue
+        for key, entry in scope.items():
+            if isinstance(entry, dict):
+                policy[key] = dict(entry)
+    return policy
+
+
+def _provider_error_policy(name: str) -> dict | None:
+    """Per-provider ``error_policy`` override (None when unset)."""
+    entry = _providers.get(name) if isinstance(_providers, dict) else None
+    if not isinstance(entry, dict):
+        return None
+    supplied = entry.get("error_policy")
+    return supplied if isinstance(supplied, dict) else None
+
+
+def _normalize_reason(reason) -> str:
+    """Map a failure reason string to the policy key it governs: HTTP status
+    codes (1010/403/429/503) and transport classes (tls/connection/timeout).
+    Unrecognized reasons keep their slugified text so exact-match overrides
+    still work; empty/unknown reasons fall back to ``default``."""
+    text = str(reason or "").lower()
+    for code in ("1010", "403", "429", "503"):
+        if re.search(rf"\b{code}\b", text):
+            return code
+    if any(token in text for token in ("tls", "ssl", "handshake", "certificate")):
+        return "tls"
+    if "timed out" in text or "timeout" in text:
+        return "timeout"
+    if any(token in text for token in ("connection", "refused", "reset", "unreachable", "eof")):
+        return "connection"
+    slug = re.sub(r"[^a-z0-9]+", "-", text).strip("-")
+    return slug or "default"
+
+
+def policy_action(name: str, reason) -> tuple[str, int]:
+    """(action, seconds) for a failure ``reason`` under provider ``name``'s
+    effective policy: normalized reason key, then ``default``, then the
+    built-in cooldown 300s fallback."""
+    policy = error_policy_for(name)
+    entry = policy.get(_normalize_reason(reason))
+    if entry is None:
+        entry = policy.get("default") or dict(DEFAULT_ERROR_POLICY["default"])
+    return entry["action"], int(entry["seconds"])
+
+
+def _iso_ts(epoch: int) -> str:
+    """ISO-8601 UTC timestamp for machine-readable egress markers."""
+    return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).isoformat()
+
+
+def _transport_reason(error_text) -> str:
+    """Classify a transport-level probe failure (no HTTP status) into a policy
+    reason: TLS/SSL/handshake/certificate errors are ``tls``, everything else
+    (dial/connect/reset/read) is ``connection``."""
+    text = str(error_text or "").lower()
+    if any(token in text for token in ("tls", "ssl", "handshake", "certificate", "eof", "alert")):
+        return "tls"
+    return "connection"
 
 
 def _load_egress_settings(data: dict) -> None:
@@ -417,6 +557,9 @@ def record_egress(name: str, profile: Path, *, ok: bool, latency_ms: float | Non
         record["block_reason"] = None
         record["blocked_at"] = None
         record["blocked_until"] = None
+        record["exhausted"] = False
+        record["exhausted_at"] = None
+        record["exhausted_until"] = None
     else:
         record["fails"] = int(record.get("fails") or 0) + 1
         record["latency_ms"] = None
@@ -569,9 +712,12 @@ def probe_profile(name: str, profile: Path, *, port: int | None = None) -> tuple
         # Transport-level failure (TLS/connection/read) with no HTTP status:
         # the exit is failed for real traffic. Cool it so rotation and
         # resolve_active avoid it instead of re-picking the same dead exit.
-        seconds = int(egress_settings()["upstream_cooldown_seconds"]) or 300
+        # Seconds come from the effective error policy for the reason class
+        # (tls/connection; built-in default matches the merged 300s rule).
+        reason = _transport_reason(result["error"])
+        _action, seconds = policy_action(name, reason)
         mark_cooldown(name, profile, seconds)
-        print(f"router: marked {profile.stem} failed (transport/TLS; cooldown {seconds}s)", file=sys.stderr)
+        print(f"router: marked {profile.stem} failed (transport/{reason}; cooldown {seconds}s)", file=sys.stderr)
     return result["ok"], record
 
 
@@ -671,8 +817,11 @@ def check_egress_live(name: str, profile: Path, *, port: int | None = None) -> t
     elif status == "dead" and not is_cooled_down(name, profile):
         # TLS/transport-level death (no HTTP status): the exit is failed for
         # real traffic. Cool it so resolve_active/rotation stop re-picking the
-        # same dead exit within the upstream cooldown window (default 300s).
-        seconds = int(egress_settings()["upstream_cooldown_seconds"]) or 300
+        # same dead exit. Seconds come from the effective error policy for the
+        # reason class (tls/connection; built-in default is the merged 300s
+        # rule for TLS/transport deaths).
+        reason = _transport_reason(probe["error"])
+        _action, seconds = policy_action(name, reason)
         mark_cooldown(name, profile, seconds)
         print(f"router: marked {profile.stem} dead (cooldown {seconds}s)", file=sys.stderr)
     return status, record
@@ -712,23 +861,59 @@ def _clear_cooldown(name: str, profile: Path) -> None:
 
 def _apply_upstream_failure(name: str, profile: Path | None, reason: str, cooldown_seconds: int) -> None:
     """rotate --reason: the CURRENT profile just failed upstream (429/503/
-    timeout/1010...). Give it a longer cooldown so the next rotation prefers a
-    different exit, record the reason, and for reputation blocks (Cloudflare
-    1010/403) add a blocked marker so rotation skips the exit entirely until
-    the marker expires or --force."""
+    timeout/1010...). Apply the configured error policy for the reason:
+    cooldown (rotation skips until reset), exhaust (cooldown + an
+    ``exhausted`` marker with a machine-readable reset time in the egress
+    record, so status --json/external scripts see the lane is dead for this
+    turn), or block (reputation block: rotation skips the exit entirely until
+    the marker expires or --force). ``cooldown_seconds`` is the legacy per-
+    provider rotate hint and is kept for call compatibility; policy seconds
+    are authoritative when configured."""
     if profile is None:
         return
-    settings = egress_settings()
-    seconds = int(settings["upstream_cooldown_seconds"]) or max(cooldown_seconds * 2, 300)
+    action, seconds = policy_action(name, reason)
+    if action != "block" and _is_block_reason(reason):
+        action = "block"  # 1010/403 text always blocks, matching the old rule
     mark_cooldown(name, profile, seconds)
     record = read_egress(name, profile)
     record["upstream_error"] = str(reason)
     record["upstream_error_at"] = int(time.time())
     record["error"] = f"upstream:{reason}"
+    if action == "exhaust":
+        record["exhausted"] = True
+        record["exhausted_at"] = int(time.time())
+        record["exhausted_until"] = _iso_ts(int(time.time()) + seconds)
+    else:
+        record["exhausted"] = False
+        record["exhausted_at"] = None
+        record["exhausted_until"] = None
     write_egress(name, profile, record)
-    if _is_block_reason(reason):
-        mark_blocked(name, profile, reason)
-    print(f"router: marked {profile.stem} upstream error '{reason}' (cooldown {seconds}s)", file=sys.stderr)
+    if action == "block":
+        mark_blocked(name, profile, reason, seconds)
+    print(f"router: marked {profile.stem} upstream error '{reason}' ({action} {seconds}s)", file=sys.stderr)
+
+
+def persisted_active(name: str) -> Path | None:
+    """The profile the running tunnel was last configured with
+    (state/<name>.active), regardless of cooldown/block state.
+
+    Cooldown marks and blocked markers never reload the engine: the live
+    tunnel keeps routing via the persisted active profile even after a probe
+    cools it. Attribution/probing therefore must use THIS profile —
+    ``resolve_active`` skips cooled profiles and would blame a different
+    exit for the tunnel's health (one dead exit poisoning the whole pool's
+    records). Returns the profile from the state file, or None when there is
+    no state file / the stem has no matching *.conf (callers fall back to
+    resolve_active without a preference).
+    """
+    profiles = provider_files(name)
+    if not profiles:
+        return None
+    state = ROOT / "state" / f"{name}.active"
+    if state.is_file():
+        stem = state.read_text().strip()
+        return next((p for p in profiles if p.stem == stem), None)
+    return None
 
 
 def resolve_active(name: str) -> Path | None:
@@ -1484,7 +1669,7 @@ def rotate(name: str, *, reason: str | None = None, force: bool = False, probe: 
         seconds = int(_providers.get(name, {}).get("cooldown_seconds", 60))
     except (TypeError, ValueError):
         return fail(f"provider '{name}': cooldown_seconds must be an integer")
-    current = resolve_active(name)
+    current = persisted_active(name) or resolve_active(name)
     if reason is not None:
         _apply_upstream_failure(name, current, reason, seconds)
     elif current is not None and not is_cooled_down(name, current) and not force:
@@ -1527,7 +1712,15 @@ def rotate(name: str, *, reason: str | None = None, force: bool = False, probe: 
         print("router: no usable previous profile to roll back to", file=sys.stderr)
         return 0
     mark_cooldown(name, chosen, max(seconds * 2, int(egress_settings()["upstream_cooldown_seconds"])))
-    _clear_cooldown(name, previous)
+    if reason is None:
+        # Plain rotations cooldown the previous profile only as a mild
+        # preference; restoring it must undo that so the last-good exit is
+        # immediately usable again. A --reason rotation marks the previous
+        # profile as FAILED upstream (429/503/TLS...); its cooldown is the
+        # whole point of the mark and must survive the rollback, otherwise
+        # we ping-pong A -> B -> A -> C -> A forever, burning the pool while
+        # the tunnel keeps returning to the broken exit.
+        _clear_cooldown(name, previous)
     set_active(name, previous)
     record_rotation(name, previous)
     print(f"switched {name} -> {previous.stem} (rollback)")
@@ -1799,6 +1992,7 @@ def status_json() -> dict:
     except (ValueError, OSError):
         pass
     data["providers"] = {name: _provider_status(name) for name in _providers}
+    data["error_policy"] = {name: error_policy_for(name) for name in _providers}
     data["routes"] = [{
         "id": route.get("id"),
         "provider": route.get("provider"),
@@ -1824,7 +2018,7 @@ def egress_probe(name: str | None = None) -> int:
             results[provider] = {"error": "unknown provider"}
             any_failed = True
             continue
-        active = resolve_active(provider)
+        active = persisted_active(provider) or resolve_active(provider)
         if active is None:
             results[provider] = {"error": "no active profile"}
             any_failed = True
@@ -1864,7 +2058,7 @@ def egress_check(name: str | None = None, as_json: bool = False) -> int:
     results: dict[str, dict] = {}
     dead: list[str] = []
     for provider in providers:
-        active = resolve_active(provider)
+        active = persisted_active(provider) or resolve_active(provider)
         if active is None:
             results[provider] = {"profile": None, "ok": True, "status": "skipped",
                                  "detail": "no active profile"}

@@ -988,7 +988,7 @@ class RotationEgressTests(unittest.TestCase):
         record = router.read_egress("proton", self._profile("a"))
         self.assertEqual(record["upstream_error"], "503")
         until = int((self.root / "state" / "cooldowns" / "proton" / "a.until").read_text().strip())
-        self.assertGreaterEqual(until, int(time.time()) + 290)  # 300s default
+        self.assertGreaterEqual(until, int(time.time()) + 110)  # 503 default = cooldown 120s
 
     def test_rotate_reason_block_marks_current_blocked(self):
         router.set_active("proton", self._profile("a"))
@@ -1005,6 +1005,27 @@ class RotationEgressTests(unittest.TestCase):
         probe.assert_called_once()
         # first reload for the switch, second for the rollback
         self.assertEqual(self.engine_reload.call_count, 2)
+
+    def test_rotate_reason_probe_failure_keeps_reason_cooldown(self):
+        # A --reason rotation marks the current profile FAILED upstream; the
+        # rollback restore must NOT clear that mark (ping-pong A->B->A->C->A).
+        router.set_active("proton", self._profile("a"))
+        with mock.patch.object(router, "probe_profile", return_value=(False, {"ok": False})):
+            self.assertEqual(router.rotate("proton", reason="503"), 0)
+        self.assertEqual(self._active(), "a")  # rolled back to previous
+        self.assertTrue(router.is_cooled_down("proton", self._profile("a")))  # mark survived
+        self.assertTrue(router.is_cooled_down("proton", self._profile("b")))  # failed switch also cooled
+        record = router.read_egress("proton", self._profile("a"))
+        self.assertEqual(record["upstream_error"], "503")
+
+    def test_rotate_plain_probe_failure_clears_previous_cooldown(self):
+        # Plain rotations only mildly cool the previous profile as preference;
+        # restoring it on rollback MUST undo that so last-good is usable now.
+        router.set_active("proton", self._profile("a"))
+        with mock.patch.object(router, "probe_profile", return_value=(False, {"ok": False})):
+            self.assertEqual(router.rotate("proton"), 0)
+        self.assertEqual(self._active(), "a")
+        self.assertFalse(router.is_cooled_down("proton", self._profile("a")))
 
     def test_rotate_probe_failure_without_previous_keeps_switch(self):
         with mock.patch.object(router, "probe_profile", return_value=(False, {"ok": False})):
@@ -1460,6 +1481,32 @@ class EgressCheckCommandTests(unittest.TestCase):
         self.assertIn("skipped", joined)
         self.assertEqual(self.live.call_count, 0)
 
+    def test_check_attributes_to_persisted_active_even_when_cooled(self):
+        # Cooldown marks never reload the engine: the tunnel still routes via
+        # the persisted active profile, so egress check must probe THAT exit
+        # and not resolve_active's preferred non-cooled pick (which would
+        # blame a different profile for the tunnel's health).
+        router.set_active("proton", self.root / "providers" / "proton" / "a.conf")
+        router.mark_cooldown("proton", self.root / "providers" / "proton" / "a.conf", 300)
+        with mock.patch("sys.stdout.write") as write:
+            rc = router.egress_check("proton")
+        self.assertEqual(rc, 0)
+        _, kwargs = self.live.call_args
+        self.assertEqual(self.live.call_args[0][1].stem, "a")
+        persisted = router.persisted_active("proton")
+        self.assertIsNotNone(persisted)
+        self.assertEqual(persisted.stem, "a")
+
+    def test_probe_attributes_to_persisted_active_even_when_cooled(self):
+        router.set_active("proton", self.root / "providers" / "proton" / "a.conf")
+        router.mark_cooldown("proton", self.root / "providers" / "proton" / "a.conf", 300)
+        with mock.patch.object(router, "probe_profile",
+                               return_value=(True, {"ok": True})) as probe:
+            rc = router.egress_probe("proton")
+        self.assertEqual(rc, 0)
+        _, kwargs = probe.call_args
+        self.assertEqual(probe.call_args[0][1].stem, "a")
+
 
 class LastGoodConfigTests(unittest.TestCase):
     """Feature 2: sing-box.json.last-good snapshot + one-step restore when a
@@ -1571,6 +1618,168 @@ class LastGoodConfigTests(unittest.TestCase):
             rc = router.engine_reload()
         self.assertEqual(rc, 0)
         start.assert_called_once_with(use_existing_config=True)
+
+
+class ErrorPolicyTests(unittest.TestCase):
+    """error_policy table: merge precedence (provider > global > built-in),
+    action+seconds overrides honored by rotate, exhaust marker in egress +
+    status --json, block marker, tls/connection defaults matching the merged
+    300s rule, missing-reason fallback, config validation."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(router, self.root)
+        (self.root / "providers" / "proton").mkdir(parents=True)
+        for stem in ("a", "b", "c"):
+            _write_conf(self.root / "providers" / "proton" / f"{stem}.conf")
+        self.profile = self.root / "providers" / "proton" / "a.conf"
+        router._providers = {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}}
+        router._routes = [{"id": "example-com", "domains": ["example.com"], "provider": "proton"}]
+        router._port = 2080
+        router._vpn = {}
+        router._error_policy = None
+        router._egress_settings = dict(router.DEFAULT_EGRESS_SETTINGS)
+        self.reload_patch = mock.patch.object(router, "engine_reload", return_value=0)
+        self.reload_patch.start()
+
+    def tearDown(self):
+        self.reload_patch.stop()
+        router._error_policy = None
+        self._tmp.cleanup()
+
+    def _cooldown_until(self, stem="a"):
+        return int((self.root / "state" / "cooldowns" / "proton" / f"{stem}.until").read_text().strip())
+
+    def test_builtin_defaults_applied_without_config(self):
+        self.assertEqual(router.policy_action("proton", "429"), ("exhaust", 900))
+        self.assertEqual(router.policy_action("proton", "503"), ("cooldown", 120))
+        self.assertEqual(router.policy_action("proton", "timeout"), ("cooldown", 60))
+        self.assertEqual(router.policy_action("proton", "tls"), ("cooldown", 300))
+        self.assertEqual(router.policy_action("proton", "connection"), ("cooldown", 300))
+        self.assertEqual(router.policy_action("proton", "1010"), ("block", 3600))
+        self.assertEqual(router.policy_action("proton", "403"), ("block", 3600))
+
+    def test_merge_precedence_default_vs_global_vs_provider(self):
+        router._error_policy = {
+            "503": {"action": "exhaust", "seconds": 600},
+            "timeout": {"action": "cooldown", "seconds": 30},
+        }
+        # global overrides built-in defaults
+        self.assertEqual(router.policy_action("proton", "503"), ("exhaust", 600))
+        self.assertEqual(router.policy_action("proton", "timeout"), ("cooldown", 30))
+        # untouched keys keep their built-in defaults
+        self.assertEqual(router.policy_action("proton", "429"), ("exhaust", 900))
+        # per-provider beats global
+        router._providers["proton"]["error_policy"] = {"503": {"action": "cooldown", "seconds": 90}}
+        self.assertEqual(router.policy_action("proton", "503"), ("cooldown", 90))
+        self.assertEqual(router.policy_action("proton", "timeout"), ("cooldown", 30))
+        self.assertEqual(router.policy_action("proton", "429"), ("exhaust", 900))
+
+    def test_reason_normalization_maps_transport_and_http(self):
+        self.assertEqual(router.policy_action("proton", "cloudflare-1010"), ("block", 3600))
+        self.assertEqual(router.policy_action("proton", "cloudflare-403"), ("block", 3600))
+        self.assertEqual(router.policy_action("proton", "HTTP 503 Service Unavailable"), ("cooldown", 120))
+        self.assertEqual(router.policy_action("proton", "[SSL: TLSV1_ALERT_INTERNAL_ERROR]"), ("cooldown", 300))
+        self.assertEqual(router.policy_action("proton", "TimeoutError: timed out"), ("cooldown", 60))
+        self.assertEqual(router.policy_action("proton", "Connection reset by peer"), ("cooldown", 300))
+
+    def test_missing_reason_falls_back_to_default(self):
+        router._error_policy = {"default": {"action": "exhaust", "seconds": 45}}
+        self.assertEqual(router.policy_action("proton", "some-custom-reason"), ("exhaust", 45))
+        router._error_policy = None
+        self.assertEqual(router.policy_action("proton", "some-custom-reason"), ("cooldown", 300))
+
+    def test_seconds_override_honored_by_rotate_reason(self):
+        router.set_active("proton", self.profile)
+        router._providers["proton"]["error_policy"] = {"503": {"action": "cooldown", "seconds": 45}}
+        with mock.patch.object(router, "probe_profile", return_value=(True, {"ok": True})):
+            self.assertEqual(router.rotate("proton", reason="503"), 0)
+        self.assertEqual(self._cooldown_until(), int(time.time()) + 45)  # exact policy seconds
+        record = router.read_egress("proton", self.profile)
+        self.assertEqual(record["upstream_error"], "503")
+        self.assertFalse(record.get("exhausted"))
+
+    def test_exhaust_writes_marker_visible_in_status_json(self):
+        router._error_policy = {"429": {"action": "exhaust", "seconds": 900}}
+        router.set_active("proton", self.profile)
+        router._apply_upstream_failure("proton", self.profile, "429", 60)
+        record = router.read_egress("proton", self.profile)
+        self.assertTrue(record["exhausted"])
+        self.assertIsInstance(record["exhausted_until"], str)
+        self.assertTrue(router.is_cooled_down("proton", self.profile))
+        with mock.patch.object(router, "_status_report", return_value=(0, "up (proxy 127.0.0.1:2080)")):
+            data = router.status_json()
+        egress = data["providers"]["proton"]["egress"]["a"]
+        self.assertTrue(egress["exhausted"])
+        self.assertEqual(egress["exhausted_until"], record["exhausted_until"])
+        # status --json echoes the effective policy per provider
+        self.assertEqual(data["error_policy"]["proton"]["429"], {"action": "exhaust", "seconds": 900})
+
+    def test_block_action_marks_blocked(self):
+        router.set_active("proton", self.profile)
+        router._apply_upstream_failure("proton", self.profile, "1010", 60)
+        self.assertTrue(router.egress_is_blocked("proton", self.profile))
+        record = router.read_egress("proton", self.profile)
+        self.assertEqual(record["block_reason"], "1010")
+        self.assertGreaterEqual(record["blocked_until"], int(time.time()) + 3599)
+
+    def test_tls_reason_matches_merged_300s_rule(self):
+        # A TLS transport death through probe_profile cools for the policy's
+        # tls seconds; the built-in 300s must match the merged TLS rule.
+        with mock.patch.object(router, "probe_egress", return_value={
+                "ok": False, "latency_ms": None, "status": None,
+                "error": "URLError: <urlopen error [SSL: TLSV1_ALERT_INTERNAL_ERROR]>",
+                "block_reason": None}):
+            ok, _ = router.probe_profile("proton", self.profile)
+        self.assertFalse(ok)
+        until = self._cooldown_until()
+        self.assertGreaterEqual(until, int(time.time()) + 290)
+        self.assertLess(until, int(time.time()) + 310)
+        self.assertFalse(router.egress_is_blocked("proton", self.profile))
+        # a configured tls override is honored by the probe path too
+        router._clear_cooldown("proton", self.profile)
+        router._error_policy = {"tls": {"action": "cooldown", "seconds": 45}}
+        with mock.patch.object(router, "probe_egress", return_value={
+                "ok": False, "latency_ms": None, "status": None,
+                "error": "URLError: <urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING]>",
+                "block_reason": None}):
+            router.probe_profile("proton", self.profile)
+        self.assertGreaterEqual(self._cooldown_until(), int(time.time()) + 40)
+
+    def test_check_egress_live_dead_uses_connection_seconds(self):
+        router._error_policy = {"connection": {"action": "cooldown", "seconds": 20}}
+        with mock.patch.object(router, "probe_egress", return_value={
+                "ok": False, "latency_ms": None, "status": None,
+                "error": "URLError: <urlopen error timed out>",
+                "block_reason": None}), \
+             mock.patch.object(router, "egress_dns_probe", return_value=None):
+            status, _ = router.check_egress_live("proton", self.profile)
+        self.assertEqual(status, "dead")
+        self.assertGreaterEqual(self._cooldown_until(), int(time.time()) + 15)
+
+    def test_load_config_validates_and_merges_error_policy(self):
+        (self.root / "router.json").write_text(json.dumps({
+            "port": 2080,
+            "providers": {
+                "proton": {"directory": "providers/proton",
+                           "error_policy": {"429": {"action": "cooldown", "seconds": 11}}},
+            },
+            "routes": [{"id": "r", "domains": ["example.com"], "provider": "proton"}],
+            "error_policy": {"503": {"action": "exhaust", "seconds": 222}},
+        }))
+        self.assertEqual(router.load_config(), 0)
+        self.assertEqual(router.policy_action("proton", "503"), ("exhaust", 222))
+        self.assertEqual(router.policy_action("proton", "429"), ("cooldown", 11))
+        self.assertEqual(router.policy_action("proton", "1010"), ("block", 3600))
+        # malformed policy fails the config load instead of silently guessing
+        (self.root / "router.json").write_text(json.dumps({
+            "port": 2080,
+            "providers": {"proton": {"directory": "providers/proton"}},
+            "routes": [{"id": "r", "domains": ["example.com"], "provider": "proton"}],
+            "error_policy": {"503": {"action": "nope", "seconds": 5}},
+        }))
+        self.assertEqual(router.load_config(), 1)
 
 
 if __name__ == "__main__":
