@@ -431,8 +431,15 @@ def build_singbox_config() -> tuple[dict, set[str]]:
         active[name] = endpoint
         dns_map[name] = dns_server_for(profile)
 
+    # DNS resolution must NOT ride the tunnel: a WireGuard blip would then
+    # take down resolution for the very request we're trying to route, which
+    # surfaces as "Connection error" storms upstream. DNS queries go out the
+    # direct physical path (no detour; sing-box 1.13 rejects detouring a DNS
+    # server to the "direct" outbound with "empty direct outbound" at start).
+    # The resolved IP still gets dialed through the provider's endpoint
+    # outbound, so the destination traffic stays provider-routed.
     dns_servers = [
-        {"type": "udp", "tag": f"dns-{name}", "server": dns_map[name], "detour": name}
+        {"type": "udp", "tag": f"dns-{name}", "server": dns_map[name]}
         for name in active
     ]
     # sing-box 1.12+: any dial without an explicit resolver needs

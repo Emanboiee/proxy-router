@@ -112,6 +112,15 @@ class ConfigBuildTests(unittest.TestCase):
             next(s for s in config["dns"]["servers"] if s["tag"] == "dns-proton")["server"],
             "1.1.1.1",
         )
+        # DNS must resolve over the direct physical path, not ride the tunnel:
+        # a WireGuard blip must not take down resolution (seen as upstream
+        # "Connection error" storms) before the dial is even attempted. No
+        # detour key = sing-box default dials via the system path; detouring
+        # to the "direct" outbound is rejected at start ("detour to an empty
+        # direct outbound makes no sense", sing-box 1.13).
+        for server in config["dns"]["servers"]:
+            if server["tag"].startswith("dns-") and server["tag"] != "dns-local":
+                self.assertNotIn("detour", server, server["tag"])
         self.assertEqual(config["dns"]["rules"], [{"domain_suffix": ["example.com"], "server": "dns-proton"}])
         self.assertEqual(config["dns"]["strategy"], "ipv4_only")
         rules = config["route"]["rules"]
