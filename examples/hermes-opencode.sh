@@ -28,6 +28,12 @@ retry_kind() {
     printf '%s\n' "rate-limit"
     return 0
   fi
+  # Cloudflare egress-IP reputation block (1010/403 "Access denied"): the exit
+  # itself is unusable for this zone, so block it and pick a different one.
+  if grep -Eiq 'error[[:space:]]*code[[:space:]]*[:=]?[[:space:]]*1010|1010[^[:alnum:]]*(block|denied|error)|access[[:space:]]*denied' "$file"; then
+    printf '%s\n' "blocked"
+    return 0
+  fi
   if grep -Eiq 'HTTP[[:space:]/:-]+(408|425|429|500|502|503|504)([^0-9]|$)|(status|status_code|response_code|http_code)[[:space:]]*[=:][[:space:]]*(408|425|429|500|502|503|504)([^0-9]|$)|(408|425|429|500|502|503|504)[[:space:]]-+(request timeout|too early|too many requests|internal server error|bad gateway|service unavailable|gateway timeout)' "$file"; then
     printf '%s\n' "transient-http"
     return 0
@@ -68,7 +74,9 @@ while ((attempt < MAX_ATTEMPTS)); do
   fi
 
   printf '[opencode] %s; rotating %s provider (%s/%s)\n' "$kind" "$PROVIDER" "$attempt" "$MAX_ATTEMPTS" >&2
-  if ! "$ROUTER" rotate "$PROVIDER" >/dev/null 2>&1; then
+  # Tell the router WHY the current exit failed: it applies a longer cooldown
+  # (and a blocked marker for egress-IP reputation blocks) before switching.
+  if ! "$ROUTER" rotate "$PROVIDER" --reason "$kind" >/dev/null 2>&1; then
     printf '[opencode] failover exhausted: no eligible alternate profile\n' >&2
     ((rc != 0)) && exit "$rc"
     exit 75

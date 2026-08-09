@@ -101,8 +101,14 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py add --domain example.com --provider proton [--id my-route]
 ./router.py add --ip 1.2.3.0/24 --provider proton [--id my-route]
 ./router.py remove <id>
-./router.py rotate <provider>    # switch to next cooled-down profile, hot reload
+./router.py rotate <provider>    # switch to next healthy profile, hot reload
+./router.py rotate <provider> --reason 503|429|timeout|1010  # mark CURRENT exit failed upstream, prefer a different one
+./router.py rotate <provider> --force   # switch anyway, ignoring cooldowns and blocked exits
+./router.py rotate <provider> --no-probe # skip the post-switch egress probe
 ./router.py provider-count proton # rotation candidates (retry budget)
+./router.py egress probe [provider]  # probe current exit(s) through the tunnel, persist health
+./router.py egress show [provider]   # print persisted egress records (JSON)
+./router.py status --json         # machine-readable status for scripts/Hermes
 ./router.py setup                  # custom setup TUI
 ./router.py setup --guide all      # print Proton + WARP guides
 ./router.py setup --preset         # enable OpenCode->Proton and Roblox->WARP presets
@@ -125,7 +131,37 @@ status`, `init`) do not.
 
 `status` and `vpn status` report the same state (exit 0 = engine up and
 matching the persisted mode; exit 1 = down, degraded, or unusable config), so
-scripts and humans can rely on either one.
+scripts and humans can rely on either one. `status --json` adds the active
+profile, per-profile cooldowns and egress records, last rotation, and route
+table as JSON (same exit code) so automation can make decisions without
+parsing human text.
+
+## Egress health & rotation smarts
+
+Each provider exit tracks health under `state/egress/<provider>/<profile>.json`
+(atomic, mode 0600): last probe latency, consecutive failures, and an optional
+`blocked` marker. A probe is a small GET to the first domain the provider
+routes, sent THROUGH `127.0.0.1:<port>` so it exercises the real tunnel
+end-to-end (a URL matching no route would go out direct and measure the wrong
+path).
+
+Rotation is then egress-aware instead of blind round-robin:
+
+- Profiles with a fresh OK probe are preferred, fastest latency first;
+  unknown profiles come next; profiles with repeated failures (`fail_threshold`,
+  default 2) rank last.
+- Profiles with a `blocked` marker (Cloudflare 1010/403 egress-IP reputation
+  blocks, recorded by `rotate --reason 1010` or the probe itself) are skipped
+  until the marker expires (`egress.block_seconds`, default 1h) or you run
+  `rotate --force`.
+- `rotate --reason <what>` gives the CURRENT profile a longer cooldown
+  (`egress.upstream_cooldown_seconds`, default 300s) plus a recorded reason, so
+  503/429/timeout storms steer away from the exit that just failed upstream.
+- After switching, the new exit is probed; if it does not come up cleanly the
+  router restores the previous good profile (one bounded rollback step).
+- `egress probe` refreshes health on demand without rotating.
+
+Tunables live in `router.json` under `"egress"` (see `router.example.json`).
 
 ## VPN (TUN) mode
 
@@ -265,6 +301,13 @@ launchctl bootout gui/$(id -u)/com.proxy-router.keepalive   # remove
 
 Linux/Windows: run `examples/keepalive.sh` under a supervisor of your choice
 (systemd service / Task Scheduler / tmux).
+
+The keepalive waits `PROXY_KEEPALIVE_INTERVAL` (default 15s) between checks,
+but while `ensure` keeps failing the wait grows exponentially (15, 30, 60, ...)
+up to `PROXY_KEEPALIVE_MAX_BACKOFF` (default 300s), so a dead engine is not
+hammered; one successful check resets the wait. `sing-box.log` is also rotated
+to `sing-box.log.1` once it exceeds 10 MB (at engine start, when no engine
+holds the log).
 
 ## Hermes integration
 

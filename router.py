@@ -24,6 +24,9 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(os.environ.get("PROXY_ROUTER_ROOT") or Path(__file__).resolve().parent).resolve()
@@ -37,6 +40,19 @@ DEFAULT_PORT = 2080
 DEFAULT_TUN_ADDRESS = ["172.19.0.1/30"]
 DEFAULT_TUN_MTU = 1500
 DEFAULT_TUN_STACK = "system"
+DEFAULT_PROBE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
+DEFAULT_EGRESS_SETTINGS = {
+    "probe_url": DEFAULT_PROBE_URL,
+    "probe_timeout": 8.0,
+    "block_seconds": 3600,
+    "upstream_cooldown_seconds": 300,
+    "fail_threshold": 2,
+    "slow_latency_ms": 1200.0,
+    "ok_window": 86400,
+}
+# Rotate sing-box.log once it outgrows this (mirrors monitor.py sample
+# rotation); the live log grows a line per connection and is unbounded.
+LOG_MAX_BYTES = 10_000_000
 
 _sing_box_cache: str | None = None
 _sing_box_resolved = False
@@ -123,6 +139,7 @@ _providers: dict = {}
 _routes: list = []
 _port: int = DEFAULT_PORT
 _vpn: dict = {}
+_egress_settings: dict = {}
 _PROVIDER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 
 
@@ -213,6 +230,7 @@ def load_config() -> int:
         for key in ("domains", "ip_cidr"):
             if key in route and (not isinstance(route[key], list) or not all(isinstance(v, str) for v in route[key])):
                 return fail(f"bad {CONFIG_FILE.name}: route '{route.get('id', '<unnamed>')}' {key} must be a string list")
+    _load_egress_settings(data)
     _port = port
     _providers = providers
     _routes = routes
@@ -249,6 +267,15 @@ def write_default_config(force: bool = False) -> int:
                 "address": DEFAULT_TUN_ADDRESS,
                 "mtu": DEFAULT_TUN_MTU,
                 "stack": DEFAULT_TUN_STACK,
+            },
+            "egress": {
+                "probe_url": DEFAULT_PROBE_URL,
+                "probe_timeout": 8,
+                "block_seconds": 3600,
+                "upstream_cooldown_seconds": 300,
+                "fail_threshold": 2,
+                "slow_latency_ms": 1200,
+                "ok_window": 86400,
             },
         }
     _atomic_write(CONFIG_FILE, json.dumps(data, indent=2) + "\n", 0o600)
@@ -294,6 +321,299 @@ def mark_cooldown(name: str, profile: Path, seconds: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(str(int(time.time()) + seconds))
     os.chmod(path, 0o600)
+
+
+# ---------------------------------------------------------------------------
+# egress health per profile
+# ---------------------------------------------------------------------------
+
+def egress_settings() -> dict:
+    """Effective egress-tuning settings (router.json top-level ``egress``
+    merged over module defaults). Rotation consults these to avoid
+    known-blocked/slow exits without hardcoding thresholds."""
+    return _egress_settings or DEFAULT_EGRESS_SETTINGS
+
+
+def _load_egress_settings(data: dict) -> None:
+    """Merge router.json's optional top-level ``egress`` dict over defaults
+    with the same bounded leniency monitor.py applies to its settings."""
+    global _egress_settings
+    settings = dict(DEFAULT_EGRESS_SETTINGS)
+    supplied = data.get("egress") if isinstance(data, dict) else None
+    if isinstance(supplied, dict):
+        for key in DEFAULT_EGRESS_SETTINGS:
+            if key in supplied:
+                settings[key] = supplied[key]
+    try:
+        settings["probe_timeout"] = min(max(1.0, float(settings["probe_timeout"])), 60.0)
+    except (TypeError, ValueError):
+        settings["probe_timeout"] = DEFAULT_EGRESS_SETTINGS["probe_timeout"]
+    for key in ("block_seconds", "upstream_cooldown_seconds", "ok_window"):
+        try:
+            settings[key] = max(0, int(settings[key]))
+        except (TypeError, ValueError):
+            settings[key] = DEFAULT_EGRESS_SETTINGS[key]
+    try:
+        settings["fail_threshold"] = min(max(1, int(settings["fail_threshold"])), 20)
+    except (TypeError, ValueError):
+        settings["fail_threshold"] = DEFAULT_EGRESS_SETTINGS["fail_threshold"]
+    try:
+        settings["slow_latency_ms"] = max(0.0, float(settings["slow_latency_ms"]))
+    except (TypeError, ValueError):
+        settings["slow_latency_ms"] = DEFAULT_EGRESS_SETTINGS["slow_latency_ms"]
+    url = settings["probe_url"]
+    try:
+        parsed = urllib.parse.urlsplit(str(url))
+        sane = parsed.scheme in ("http", "https") and bool(parsed.hostname)
+    except (TypeError, ValueError):
+        sane = False
+    if not sane:
+        settings["probe_url"] = DEFAULT_EGRESS_SETTINGS["probe_url"]
+    _egress_settings = settings
+
+
+def egress_record_path(name: str, profile: Path) -> Path:
+    """state/egress/<provider>/<profile>.json with a path-traversal guard."""
+    stem = profile.stem
+    if not _PROVIDER_NAME.fullmatch(stem):
+        raise ValueError(f"profile name '{stem}' is invalid")
+    return ROOT / "state" / "egress" / name / f"{stem}.json"
+
+
+def read_egress(name: str, profile: Path) -> dict:
+    path = egress_record_path(name, profile)
+    if not path.is_file():
+        return {}
+    try:
+        record = json.loads(path.read_text())
+        return record if isinstance(record, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def write_egress(name: str, profile: Path, record: dict) -> None:
+    _atomic_write(egress_record_path(name, profile), json.dumps(record, indent=2, sort_keys=True) + "\n", 0o600)
+
+
+def record_egress(name: str, profile: Path, *, ok: bool, latency_ms: float | None = None,
+                  status: int | None = None, error: str | None = None) -> dict:
+    """Merge one probe outcome into the profile's egress record. A passing
+    probe clears the fail streak and any blocked marker; a failure bumps the
+    streak so rotation deprioritizes the exit."""
+    record = read_egress(name, profile)
+    now = int(time.time())
+    record["ok"] = bool(ok)
+    record["checked_at"] = now
+    if ok:
+        record["fails"] = 0
+        record["last_ok_at"] = now
+        record["latency_ms"] = round(float(latency_ms), 2) if latency_ms is not None else None
+        record["status"] = status
+        record["error"] = None
+        record["blocked"] = False
+        record["block_reason"] = None
+        record["blocked_at"] = None
+        record["blocked_until"] = None
+    else:
+        record["fails"] = int(record.get("fails") or 0) + 1
+        record["latency_ms"] = None
+        record["status"] = status
+        record["error"] = error or record.get("error")
+    write_egress(name, profile, record)
+    return record
+
+
+def clear_blocked(name: str, profile: Path) -> None:
+    """Drop a blocked marker (rotate --force, or a fresh passing probe)."""
+    record = read_egress(name, profile)
+    if not record:
+        return
+    record["blocked"] = False
+    record["block_reason"] = None
+    record["blocked_at"] = None
+    record["blocked_until"] = None
+    write_egress(name, profile, record)
+
+
+def mark_blocked(name: str, profile: Path, reason: str, seconds: int | None = None) -> dict:
+    """Persist a blocked-exit marker (Cloudflare 1010/403 egress-IP
+    reputation block) so rotation skips the profile until the marker expires
+    or an explicit rotate --force."""
+    seconds = int(seconds) if seconds is not None else int(egress_settings()["block_seconds"])
+    now = int(time.time())
+    record = read_egress(name, profile)
+    record["blocked"] = True
+    record["block_reason"] = str(reason)
+    record["blocked_at"] = now
+    record["blocked_until"] = now + max(0, seconds)
+    write_egress(name, profile, record)
+    return record
+
+
+def egress_is_blocked(name: str, profile: Path, now: int | None = None) -> bool:
+    record = read_egress(name, profile)
+    if not record.get("blocked"):
+        return False
+    until = record.get("blocked_until")
+    if until is None:
+        return True  # no expiry recorded: blocked until cleared
+    return (now if now is not None else int(time.time())) < int(until)
+
+
+def _is_block_reason(reason: str) -> bool:
+    """True when an upstream failure reason describes an egress-IP reputation
+    block (Cloudflare 1010/403) rather than a transient error."""
+    text = str(reason).lower()
+    return "1010" in text or "403" in text or "blocked" in text or "cloudflare" in text
+
+
+def _egress_error_text(exc: Exception) -> str:
+    text = str(exc)
+    text = re.sub(r"https?://[^\s'\"]+", "[REDACTED_URL]", text)
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+
+
+def _open_probe(opener, request, timeout: float):
+    """Open ``request`` through an opener that may be a urllib OpenerDirector
+    (use .open) or a plain callable injected by tests, mirroring monitor.py."""
+    open_method = getattr(opener, "open", None)
+    if callable(open_method):
+        return open_method(request, timeout=timeout)
+    return opener(request, timeout=timeout)
+
+
+def probe_url_for(name: str) -> str | None:
+    """Probe target for a provider: the first routed domain of that provider,
+    so the probe actually rides the tunnel end-to-end (a URL that matches no
+    route would go out direct and measure the wrong path). None when the
+    provider has no route domain to probe through."""
+    for route in _routes:
+        if route.get("provider") != name:
+            continue
+        for host in route.get("domains", []):
+            host = host.lstrip("*.").strip()
+            if host and "." in host and not host.startswith("."):
+                return f"https://{host}"
+    return None
+
+
+def probe_egress(*, port: int | None = None, url: str | None = None, timeout: float | None = None,
+                 opener=None, clock=time.monotonic) -> dict:
+    """One small HTTP GET through the router's proxy listener (the tunnel) and
+    a parsed outcome: ok, latency, status, error. ``opener``/``clock`` are
+    injectable for tests, mirroring monitor.py."""
+    port = port or _port
+    url = url or egress_settings()["probe_url"]
+    timeout = timeout if timeout is not None else egress_settings()["probe_timeout"]
+    if opener is None:
+        proxy = f"http://127.0.0.1:{port}"
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+        )
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "proxy-router-egress/1.0", "Accept": "*/*"}
+    )
+    started = clock()
+    response = None
+    try:
+        response = _open_probe(opener, request, timeout)
+        body = response.read(4096)
+        latency = (clock() - started) * 1000.0
+        status = int(getattr(response, "status", getattr(response, "code", 200)))
+        text = body.decode("utf-8", "replace")
+        reason = None
+        if re.search(r"error\s*code\s*[:=]?\s*1010|cloudflare.{0,20}1010", text, re.IGNORECASE):
+            reason = "cloudflare-1010"
+        elif (status in (403, 1010)) and "cloudflare" in text.lower():
+            reason = "cloudflare-403"
+        return {
+            "ok": reason is None,
+            "latency_ms": round(latency, 2),
+            "status": status,
+            "error": reason,
+            "block_reason": reason,
+        }
+    except Exception as exc:  # network errors are data, never a crash
+        return {
+            "ok": False,
+            "latency_ms": None,
+            "status": None,
+            "error": _egress_error_text(exc),
+            "block_reason": None,
+        }
+    finally:
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
+
+
+def probe_profile(name: str, profile: Path, *, port: int | None = None) -> tuple[bool, dict | None]:
+    """Probe egress for ``profile`` (the provider's active exit) through the
+    tunnel, persist the outcome, and add a blocked marker when the probe itself
+    hit a Cloudflare reputation block. Returns (ok, record); record is None
+    when the provider has no routed domain to probe through."""
+    url = probe_url_for(name)
+    if url is None:
+        return True, None
+    result = probe_egress(port=port, url=url)
+    record = record_egress(name, profile, ok=result["ok"], latency_ms=result["latency_ms"],
+                           status=result["status"], error=result["error"])
+    if result["block_reason"]:
+        mark_blocked(name, profile, result["block_reason"])
+    return result["ok"], record
+
+
+def _egress_rank(record: dict, now: int | None = None) -> tuple[int, float]:
+    """Rotation preference: lower is better. Recently-OK profiles rank by
+    latency (fastest first); known-slow-but-OK and unknown profiles rank
+    second; profiles with repeated failures rank last."""
+    if not record:
+        return (1, float("inf"))
+    now = int(now if now is not None else time.time())
+    ok = record.get("ok")
+    last_ok = record.get("last_ok_at") or record.get("checked_at")
+    fails = int(record.get("fails") or 0)
+    settings = egress_settings()
+    if ok and last_ok and now - int(last_ok) < int(settings["ok_window"]):
+        latency = float(record.get("latency_ms") or float("inf"))
+        if latency < float(settings["slow_latency_ms"]):
+            return (0, latency)
+        return (2, latency)
+    if fails >= int(settings["fail_threshold"]):
+        return (3, float("inf"))
+    return (1, float("inf"))
+
+
+def record_rotation(name: str, profile: Path) -> None:
+    """Persist the last switch (profile + epoch) for status --json."""
+    record = {"profile": profile.stem, "at": int(time.time())}
+    _atomic_write(ROOT / "state" / f"{name}.rotation", json.dumps(record, indent=2, sort_keys=True) + "\n", 0o600)
+
+
+def _clear_cooldown(name: str, profile: Path) -> None:
+    """Drop a profile's persisted cooldown (last-good rollback restore)."""
+    (ROOT / "state" / "cooldowns" / name / f"{profile.stem}.until").unlink(missing_ok=True)
+
+
+def _apply_upstream_failure(name: str, profile: Path | None, reason: str, cooldown_seconds: int) -> None:
+    """rotate --reason: the CURRENT profile just failed upstream (429/503/
+    timeout/1010...). Give it a longer cooldown so the next rotation prefers a
+    different exit, record the reason, and for reputation blocks (Cloudflare
+    1010/403) add a blocked marker so rotation skips the exit entirely until
+    the marker expires or --force."""
+    if profile is None:
+        return
+    settings = egress_settings()
+    seconds = int(settings["upstream_cooldown_seconds"]) or max(cooldown_seconds * 2, 300)
+    mark_cooldown(name, profile, seconds)
+    record = read_egress(name, profile)
+    record["upstream_error"] = str(reason)
+    record["upstream_error_at"] = int(time.time())
+    record["error"] = f"upstream:{reason}"
+    write_egress(name, profile, record)
+    if _is_block_reason(reason):
+        mark_blocked(name, profile, reason)
+    print(f"router: marked {profile.stem} upstream error '{reason}' (cooldown {seconds}s)", file=sys.stderr)
 
 
 def resolve_active(name: str) -> Path | None:
@@ -785,6 +1105,23 @@ def wait_listener(timeout: float = 8.0) -> bool:
 # engine lifecycle
 # ---------------------------------------------------------------------------
 
+def rotate_log_if_needed() -> None:
+    """Archive an oversized sing-box.log to sing-box.log.1 (mirrors monitor.py's
+    samples rotation). Called from engine_start only, when no engine holds the
+    log fd."""
+    try:
+        if LOG_FILE.stat().st_size < LOG_MAX_BYTES:
+            return
+    except OSError:
+        return
+    archive = Path(str(LOG_FILE) + ".1")
+    archive.unlink(missing_ok=True)
+    try:
+        LOG_FILE.rename(archive)
+    except OSError:
+        pass
+
+
 def engine_start() -> int:
     sing_box = resolve_sing_box()
     if sing_box is None:
@@ -801,6 +1138,10 @@ def engine_start() -> int:
     if not validate_config():
         return fail("sing-box config check failed")
     engine_stop()
+    # Only rotate here, with the old engine already stopped: renaming a live
+    # engine's log would detach its (still open) fd and growth would continue
+    # invisibly instead of being bounded.
+    rotate_log_if_needed()
     log_handle = None
     try:
         log_handle = LOG_FILE.open("ab")
@@ -907,7 +1248,20 @@ def engine_reload() -> int:
     return engine_start()
 
 
-def rotate(name: str) -> int:
+def rotate(name: str, *, reason: str | None = None, force: bool = False, probe: bool = True) -> int:
+    """Switch to the next healthy profile for ``name``.
+
+    - Egress-aware selection: cooled-down profiles are skipped as before, and
+      blocked exits (Cloudflare 1010/403) too unless ``force``; the remaining
+      candidates are ranked so recently-OK, lower-latency exits are preferred
+      over unknown ones and known-failing ones.
+    - ``reason`` (rotate --reason): the CURRENT profile just failed upstream;
+      it gets a longer cooldown + recorded reason (and a blocked marker for
+      reputation-block reasons) so the next rotation prefers a different exit.
+    - Last-good rollback: after switching, the new exit is probed through the
+      tunnel (proxy mode); if it fails to come up cleanly, the previous good
+      profile is restored.
+    """
     profiles = provider_files(name)
     if not profiles:
         return fail(f"provider '{name}' has no profiles")
@@ -927,19 +1281,53 @@ def rotate(name: str) -> int:
     except (TypeError, ValueError):
         return fail(f"provider '{name}': cooldown_seconds must be an integer")
     current = resolve_active(name)
-    if current is not None and not is_cooled_down(name, current):
+    if reason is not None:
+        _apply_upstream_failure(name, current, reason, seconds)
+    elif current is not None and not is_cooled_down(name, current) and not force:
         mark_cooldown(name, current, seconds)
     if current in valid:
         start = valid.index(current) + 1
-        candidates = valid[start:] + valid[:start]
+        ordered = valid[start:] + valid[:start]
     else:
-        candidates = valid
-    for profile in candidates:
-        if not is_cooled_down(name, profile):
-            set_active(name, profile)
-            print(f"switched {name} -> {profile.stem}")
-            return engine_reload()
-    return fail(f"provider '{name}': all profiles cooling down")
+        ordered = valid
+    if force:
+        chosen = ordered[0]
+    else:
+        cooled = [p for p in ordered if not is_cooled_down(name, p)]
+        if not cooled:
+            return fail(f"provider '{name}': all profiles cooling down")
+        unblocked = [p for p in cooled if not egress_is_blocked(name, p)]
+        if not unblocked:
+            return fail(f"provider '{name}': no unblocked profile available (use 'rotate --force' to override)")
+        chosen = min(unblocked, key=lambda p: _egress_rank(read_egress(name, p)))
+    if force:
+        clear_blocked(name, chosen)
+    previous = current
+    set_active(name, chosen)
+    record_rotation(name, chosen)
+    print(f"switched {name} -> {chosen.stem}")
+    rc = engine_reload()
+    if rc != 0:
+        return rc
+    if probe and current_mode() != "proxy":
+        probe = False  # tun mode has no 127.0.0.1 listener to probe through
+    if not probe:
+        return 0
+    ok, _ = probe_profile(name, chosen)
+    if ok:
+        return 0
+    # The new exit did not come up cleanly: restore the last good profile
+    # (one bounded step, never a loop) so the listener keeps working.
+    print(f"router: egress probe failed for {chosen.stem}; restoring '{name}' to previous profile", file=sys.stderr)
+    if previous is None or previous == chosen or previous not in valid or egress_is_blocked(name, previous):
+        print("router: no usable previous profile to roll back to", file=sys.stderr)
+        return 0
+    mark_cooldown(name, chosen, max(seconds * 2, int(egress_settings()["upstream_cooldown_seconds"])))
+    _clear_cooldown(name, previous)
+    set_active(name, previous)
+    record_rotation(name, previous)
+    print(f"switched {name} -> {previous.stem} (rollback)")
+    return engine_reload()
 
 
 def provider_count(name: str) -> int:
@@ -1154,6 +1542,112 @@ def vpn_status() -> int:
     return rc
 
 
+def _provider_status(name: str) -> dict:
+    """Machine-readable view of one provider: profiles, active, cooldowns,
+    last rotation, and persisted egress records."""
+    profiles = [p.stem for p in provider_files(name)]
+    # Report the PERSISTED active profile (what the engine is configured with)
+    # rather than resolve_active(), which skips a cooled-down active when
+    # picking the next candidate.
+    active_stem = None
+    state = ROOT / "state" / f"{name}.active"
+    try:
+        if state.is_file():
+            stem = state.read_text().strip()
+            if stem in profiles:
+                active_stem = stem
+    except (OSError, ValueError):
+        pass
+    entry = {"profiles": profiles, "active": active_stem}
+    cooldowns = {}
+    for stem in profiles:
+        path = ROOT / "state" / "cooldowns" / name / f"{stem}.until"
+        try:
+            if path.is_file():
+                cooldowns[stem] = int(path.read_text().strip())
+        except (ValueError, OSError):
+            pass
+    if cooldowns:
+        entry["cooldown_until"] = cooldowns
+    rotation = ROOT / "state" / f"{name}.rotation"
+    try:
+        if rotation.is_file():
+            entry["last_rotation"] = json.loads(rotation.read_text())
+    except (json.JSONDecodeError, OSError):
+        pass
+    egress = {}
+    for stem in profiles:
+        record = read_egress(name, Path(stem + ".conf"))
+        if record:
+            egress[stem] = record
+    if egress:
+        entry["egress"] = egress
+    return entry
+
+
+def status_json() -> dict:
+    """Full machine-readable status for `status --json`."""
+    rc, line = _status_report()
+    data = {"up": rc == 0, "state": line, "mode": current_mode(), "port": _port}
+    try:
+        if PID_FILE.is_file():
+            data["pid"] = int(PID_FILE.read_text().strip())
+    except (ValueError, OSError):
+        pass
+    data["providers"] = {name: _provider_status(name) for name in _providers}
+    data["routes"] = [{
+        "id": route.get("id"),
+        "provider": route.get("provider"),
+        "domains": route.get("domains", []),
+        "ip_cidr": route.get("ip_cidr", []),
+    } for route in _routes]
+    return data
+
+
+def egress_probe(name: str | None = None) -> int:
+    """Probe the active exit of every provider (or just ``name``) through the
+    tunnel, persist the outcome, print it as JSON; exit 1 when any probe
+    failed."""
+    if current_mode() != "proxy":
+        return fail("egress probe requires proxy mode (tun has no 127.0.0.1 listener)")
+    if not listener_up():
+        return fail(f"engine not listening on 127.0.0.1:{_port}; start it first")
+    providers = [name] if name is not None else list(_providers)
+    results = {}
+    any_failed = False
+    for provider in providers:
+        if provider not in _providers:
+            results[provider] = {"error": "unknown provider"}
+            any_failed = True
+            continue
+        active = resolve_active(provider)
+        if active is None:
+            results[provider] = {"error": "no active profile"}
+            any_failed = True
+            continue
+        ok, _record = probe_profile(provider, active)
+        results[provider] = {"profile": active.stem, "ok": ok}
+        any_failed = any_failed or not ok
+    print(json.dumps(results, indent=2, sort_keys=True))
+    return 1 if any_failed else 0
+
+
+def egress_show(name: str | None = None) -> int:
+    """Print persisted egress records (state/egress/**) as JSON."""
+    providers = [name] if name is not None else list(_providers)
+    if name is not None and name not in _providers:
+        return fail(f"unknown provider '{name}' (have {', '.join(_providers)})")
+    records = {}
+    for provider in providers:
+        records[provider] = {}
+        for profile in provider_files(provider):
+            record = read_egress(provider, profile)
+            if record:
+                records[provider][profile.stem] = record
+    print(json.dumps(records, indent=2, sort_keys=True))
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # macOS system proxy toggle
 # ---------------------------------------------------------------------------
@@ -1233,11 +1727,16 @@ def main() -> int:
     sub.add_parser("ensure")
     sub.add_parser("start")
     sub.add_parser("stop")
-    sub.add_parser("status")
+    status = sub.add_parser("status")
+    status.add_argument("--json", action="store_true", help="machine-readable status (JSON)")
     sub.add_parser("reload")
     sub.add_parser("routes")
     sub.add_parser("up")
     sub.add_parser("down")
+
+    egress = sub.add_parser("egress", help="egress health for provider exits")
+    egress.add_argument("action", choices=["probe", "show"])
+    egress.add_argument("provider", nargs="?", default=None)
 
     init = sub.add_parser("init")
     init.add_argument("--force", action="store_true", help="overwrite an existing router.json")
@@ -1262,6 +1761,12 @@ def main() -> int:
 
     r_rot = sub.add_parser("rotate")
     r_rot.add_argument("provider")
+    r_rot.add_argument("--reason", default=None,
+                       help="mark the current profile with an upstream error/cooldown before rotating (e.g. 503, 429, timeout, 1010)")
+    r_rot.add_argument("--force", action="store_true",
+                       help="ignore cooldowns and blocked-exit markers and switch anyway")
+    r_rot.add_argument("--no-probe", action="store_true",
+                       help="skip the post-switch egress probe")
 
     r_count = sub.add_parser("provider-count")
     r_count.add_argument("provider")
@@ -1299,7 +1804,12 @@ def main() -> int:
         # `vpn status` still print a state line and exit 1 (M13); the reason
         # is already on stderr from load_config.
         if args.cmd == "status":
-            print("down (unusable config; see error above)")
+            if args.json:
+                print(json.dumps({"up": False, "state": "down (unusable config; see error above)",
+                                  "mode": None, "port": None, "providers": {}, "routes": []},
+                                 indent=2, sort_keys=True))
+            else:
+                print("down (unusable config; see error above)")
             return 1
         if args.cmd == "vpn":
             print("vpn: down (unusable config; see error above)")
@@ -1316,12 +1826,20 @@ def main() -> int:
         if resolve_sing_box() is None:
             print(f"router: {_sing_box_missing_message()}", file=sys.stderr)
         rc, line = _status_report()
-        print(line)
+        if args.json:
+            print(json.dumps(status_json(), indent=2, sort_keys=True))
+        else:
+            print(line)
         return rc
     if args.cmd == "reload":
         return _with_lock(engine_reload)
     if args.cmd == "rotate":
-        return _with_lock(lambda: rotate(args.provider))
+        return _with_lock(lambda: rotate(args.provider, reason=args.reason, force=args.force,
+                                         probe=not args.no_probe))
+    if args.cmd == "egress":
+        if args.action == "probe":
+            return egress_probe(args.provider)
+        return egress_show(args.provider)
     if args.cmd == "provider-count":
         print(provider_count(args.provider))
         return 0

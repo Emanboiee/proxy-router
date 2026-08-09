@@ -6,7 +6,9 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -200,8 +202,12 @@ class RotationTests(unittest.TestCase):
         for name in ("a", "b"):
             _write_conf(self.root / "providers" / "proton" / f"{name}.conf")
         router._providers = {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}}
+        # rotate() probes egress through the tunnel; tests never touch the network.
+        self._probe = mock.patch.object(router, "probe_profile", return_value=(True, {"ok": True}))
+        self._probe.start()
 
     def tearDown(self):
+        self._probe.stop()
         self._tmp.cleanup()
 
     def test_fresh_profile_chosen_when_active_is_hot(self):
@@ -725,3 +731,455 @@ class CliStatusAgreementTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EgressRecordTests(unittest.TestCase):
+    """state/egress/<provider>/<profile>.json persistence, atomic 0600."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(router, self.root)
+        (self.root / "providers" / "proton").mkdir(parents=True)
+        self.profile = self.root / "providers" / "proton" / "a.conf"
+        _write_conf(self.profile)
+        router._providers = {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}}
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_roundtrip_and_private_mode(self):
+        router.write_egress("proton", self.profile, {"ok": True, "latency_ms": 12.5})
+        self.assertEqual(router.read_egress("proton", self.profile)["latency_ms"], 12.5)
+        self.assertEqual(stat.S_IMODE((self.root / "state" / "egress" / "proton" / "a.json").stat().st_mode), 0o600)
+
+    def test_invalid_stem_rejected(self):
+        with self.assertRaises(ValueError):
+            router.egress_record_path("proton", Path("a!.conf"))
+        with self.assertRaises(ValueError):
+            router.egress_record_path("proton", Path("a b.conf"))
+
+    def test_record_fail_then_ok_clears_streak(self):
+        first = router.record_egress("proton", self.profile, ok=False, error="connection refused")
+        self.assertEqual(first["fails"], 1)
+        self.assertFalse(first["ok"])
+        second = router.record_egress("proton", self.profile, ok=True, latency_ms=12.5, status=200)
+        self.assertEqual(second["fails"], 0)
+        self.assertEqual(second["latency_ms"], 12.5)
+        self.assertIsNone(second["error"])
+        self.assertTrue(int(second["last_ok_at"]) > 0)
+
+    def test_mark_blocked_expiry_and_clear(self):
+        now = int(time.time())
+        router.mark_blocked("proton", self.profile, "cloudflare-1010", seconds=60)
+        self.assertTrue(router.egress_is_blocked("proton", self.profile, now=now))
+        self.assertFalse(router.egress_is_blocked("proton", self.profile, now=now + 61))
+        router.clear_blocked("proton", self.profile)
+        self.assertFalse(router.egress_is_blocked("proton", self.profile, now=now))
+
+    def test_blocked_without_expiry_stays_blocked(self):
+        router.write_egress("proton", self.profile, {"blocked": True})
+        self.assertTrue(router.egress_is_blocked("proton", self.profile, now=10 ** 12))
+
+    def test_default_block_seconds_used(self):
+        router.mark_blocked("proton", self.profile, "403")
+        record = router.read_egress("proton", self.profile)
+        self.assertGreaterEqual(record["blocked_until"], int(time.time()) + router.egress_settings()["block_seconds"] - 1)
+
+
+class EgressRankTests(unittest.TestCase):
+    """Rotation preference: fast+recent OK < unknown < slow-but-OK < failing."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(router, self.root)
+        router._egress_settings = dict(router.DEFAULT_EGRESS_SETTINGS)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_rank_order(self):
+        now = 1_000_000
+        ok_fast = {"ok": True, "last_ok_at": now, "latency_ms": 40}
+        ok_slow = {"ok": True, "last_ok_at": now, "latency_ms": 9000}
+        unknown = {}
+        failing = {"ok": False, "fails": 3}
+        ranked = sorted([unknown, failing, ok_slow, ok_fast], key=lambda r: router._egress_rank(r, now=now))
+        self.assertEqual(ranked, [ok_fast, unknown, ok_slow, failing])
+
+    def test_single_failure_not_deprioritized(self):
+        self.assertEqual(router._egress_rank({"ok": False, "fails": 1}),
+                         router._egress_rank({}))
+
+    def test_stale_ok_deprioritized(self):
+        window = router.egress_settings()["ok_window"]
+        record = {"ok": True, "last_ok_at": 1_000_000 - int(window) - 1, "latency_ms": 40}
+        self.assertNotEqual(router._egress_rank(record, now=1_000_000)[0], 0)
+
+
+class ProbeEgressTests(unittest.TestCase):
+    """probe_egress/probe_profile: parsing, block detection, error redaction."""
+
+    class _FakeClock:
+        def __init__(self, values):
+            self._values = list(values)
+
+        def __call__(self):
+            return self._values.pop(0)
+
+    class _FakeResponse:
+        def __init__(self, body, status=200):
+            self._body = body
+            self.status = status
+            self.closed = False
+
+        def read(self, n):
+            return self._body
+
+        def close(self):
+            self.closed = True
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(router, self.root)
+        (self.root / "providers" / "proton").mkdir(parents=True)
+        self.profile = self.root / "providers" / "proton" / "a.conf"
+        _write_conf(self.profile)
+        router._providers = {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}}
+        router._routes = [{"id": "example-com", "domains": ["example.com"], "provider": "proton"}]
+        router._port = 2080
+        router._vpn = {}
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_probe_ok_parses_latency(self):
+        fake = self._FakeResponse(b"fl=flXXX\r\nip=1.2.3.4\r\n")
+        clock = self._FakeClock([0.0, 0.123])
+        result = router.probe_egress(port=2080, url="https://example.com",
+                                     opener=lambda req, timeout: fake, clock=clock)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["latency_ms"], 123.0)
+        self.assertEqual(result["status"], 200)
+        self.assertTrue(fake.closed)
+
+    def test_probe_detects_1010_block(self):
+        fake = self._FakeResponse(b"<html>error code: 1010</html>", status=403)
+        result = router.probe_egress(port=2080, url="https://example.com",
+                                     opener=lambda req, timeout: fake)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["block_reason"], "cloudflare-1010")
+
+    def test_probe_detects_403_cloudflare_page(self):
+        fake = self._FakeResponse(b"Cloudflare Ray ID ... Access denied", status=403)
+        result = router.probe_egress(port=2080, url="https://example.com",
+                                     opener=lambda req, timeout: fake)
+        self.assertEqual(result["block_reason"], "cloudflare-403")
+
+    def test_probe_network_error_redacts_urls(self):
+        def failing_opener(req, timeout):
+            raise urllib.error.URLError("boom https://secret.invalid/path")
+
+        result = router.probe_egress(port=2080, url="https://secret.invalid/path", opener=failing_opener)
+        self.assertFalse(result["ok"])
+        self.assertIn("URLError", result["error"])
+        self.assertNotIn("secret.invalid", result["error"])
+
+    def test_probe_profile_writes_and_blocks(self):
+        with mock.patch.object(router, "probe_egress", return_value={
+                "ok": False, "latency_ms": None, "status": 403,
+                "error": "cloudflare-1010", "block_reason": "cloudflare-1010"}) as probe:
+            ok, record = router.probe_profile("proton", self.profile)
+        self.assertFalse(ok)
+        self.assertEqual(record["fails"], 1)
+        self.assertTrue(router.egress_is_blocked("proton", self.profile))
+        probe.assert_called_once()
+
+    def test_probe_profile_ok_clears_existing_block(self):
+        router.mark_blocked("proton", self.profile, "cloudflare-1010")
+        with mock.patch.object(router, "probe_egress", return_value={
+                "ok": True, "latency_ms": 80.0, "status": 200,
+                "error": None, "block_reason": None}):
+            ok, record = router.probe_profile("proton", self.profile)
+        self.assertTrue(ok)
+        self.assertFalse(router.egress_is_blocked("proton", self.profile))
+        self.assertEqual(record["fails"], 0)
+
+    def test_probe_profile_skips_without_routed_domain(self):
+        router._routes = []
+        with mock.patch.object(router, "probe_egress", side_effect=AssertionError("must not probe")):
+            ok, record = router.probe_profile("proton", self.profile)
+        self.assertTrue(ok)
+        self.assertIsNone(record)
+
+    def test_probe_url_for_strips_wildcard(self):
+        router._routes = [{"id": "w", "domains": ["*.example.com", "opencode.ai"], "provider": "proton"},
+                          {"id": "other", "domains": ["roblox.com"], "provider": "cloudflare"}]
+        self.assertEqual(router.probe_url_for("proton"), "https://example.com")
+        self.assertEqual(router.probe_url_for("cloudflare"), "https://roblox.com")
+        self.assertIsNone(router.probe_url_for("ghost"))
+
+
+class RotationEgressTests(unittest.TestCase):
+    """Egress-aware rotation: blocked skip, latency ranking, --reason smart
+    cooldown, --force override, last-good rollback."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(router, self.root)
+        (self.root / "providers" / "proton").mkdir(parents=True)
+        for name in ("a", "b", "c"):
+            _write_conf(self.root / "providers" / "proton" / f"{name}.conf")
+        router._providers = {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}}
+        router._routes = [{"id": "example-com", "domains": ["example.com"], "provider": "proton"}]
+        router._port = 2080
+        router._vpn = {}
+        self.reload_patch = mock.patch.object(router, "engine_reload", return_value=0)
+        self.engine_reload = self.reload_patch.start()
+        self.probe_patch = mock.patch.object(router, "probe_profile", return_value=(True, {"ok": True}))
+        self.probe = self.probe_patch.start()
+
+    def tearDown(self):
+        self.probe_patch.stop()
+        self.reload_patch.stop()
+        self._tmp.cleanup()
+
+    def _profile(self, stem):
+        return self.root / "providers" / "proton" / f"{stem}.conf"
+
+    def _active(self):
+        return (self.root / "state" / "proton.active").read_text()
+
+    def test_rotate_skips_blocked_profile(self):
+        router.set_active("proton", self._profile("a"))
+        router.mark_blocked("proton", self._profile("b"), "cloudflare-1010")
+        self.assertEqual(router.rotate("proton"), 0)
+        self.assertEqual(self._active(), "c")
+
+    def test_rotate_prefers_low_latency_ok_profile(self):
+        router.set_active("proton", self._profile("a"))
+        router.record_egress("proton", self._profile("b"), ok=True, latency_ms=200)
+        router.record_egress("proton", self._profile("c"), ok=True, latency_ms=50)
+        self.assertEqual(router.rotate("proton"), 0)
+        self.assertEqual(self._active(), "c")
+
+    def test_rotate_unknown_pool_order_kept(self):
+        router.set_active("proton", self._profile("a"))
+        self.assertEqual(router.rotate("proton"), 0)
+        self.assertEqual(self._active(), "b")
+        self.assertEqual(router.rotate("proton"), 0)
+        self.assertEqual(self._active(), "c")
+
+    def test_rotate_force_overrides_blocked_and_clears_marker(self):
+        router.set_active("proton", self._profile("a"))
+        router.mark_blocked("proton", self._profile("b"), "cloudflare-1010")
+        self.assertEqual(router.rotate("proton", force=True), 0)
+        self.assertEqual(self._active(), "b")
+        self.assertFalse(router.egress_is_blocked("proton", self._profile("b")))
+
+    def test_rotate_reason_marks_current_with_upstream_cooldown(self):
+        router.set_active("proton", self._profile("a"))
+        self.assertEqual(router.rotate("proton", reason="503"), 0)
+        self.assertEqual(self._active(), "b")
+        record = router.read_egress("proton", self._profile("a"))
+        self.assertEqual(record["upstream_error"], "503")
+        until = int((self.root / "state" / "cooldowns" / "proton" / "a.until").read_text().strip())
+        self.assertGreaterEqual(until, int(time.time()) + 290)  # 300s default
+
+    def test_rotate_reason_block_marks_current_blocked(self):
+        router.set_active("proton", self._profile("a"))
+        self.assertEqual(router.rotate("proton", reason="1010"), 0)
+        self.assertTrue(router.egress_is_blocked("proton", self._profile("a")))
+        self.assertEqual(self._active(), "b")
+
+    def test_rotate_probe_failure_rolls_back(self):
+        router.set_active("proton", self._profile("a"))
+        with mock.patch.object(router, "probe_profile", return_value=(False, {"ok": False})) as probe:
+            self.assertEqual(router.rotate("proton"), 0)
+        self.assertEqual(self._active(), "a")
+        self.assertTrue(router.is_cooled_down("proton", self._profile("b")))
+        probe.assert_called_once()
+        # first reload for the switch, second for the rollback
+        self.assertEqual(self.engine_reload.call_count, 2)
+
+    def test_rotate_probe_failure_without_previous_keeps_switch(self):
+        with mock.patch.object(router, "probe_profile", return_value=(False, {"ok": False})):
+            self.assertEqual(router.rotate("proton"), 0)
+        self.assertEqual(self._active(), "a")
+
+    def test_rotate_no_probe_skips_probe(self):
+        router.set_active("proton", self._profile("a"))
+        with mock.patch.object(router, "probe_profile", side_effect=AssertionError("must not probe")):
+            self.assertEqual(router.rotate("proton", probe=False), 0)
+        self.assertEqual(self._active(), "b")
+
+    def test_rotate_tun_mode_does_not_probe(self):
+        router.set_mode("tun")
+        router.set_active("proton", self._profile("a"))
+        with mock.patch.object(router, "probe_profile", side_effect=AssertionError("must not probe")):
+            self.assertEqual(router.rotate("proton"), 0)
+        self.assertEqual(self._active(), "b")
+
+    def test_rotate_records_last_rotation(self):
+        router.set_active("proton", self._profile("a"))
+        self.assertEqual(router.rotate("proton"), 0)
+        rotation = json.loads((self.root / "state" / "proton.rotation").read_text())
+        self.assertEqual(rotation["profile"], "b")
+        self.assertIsInstance(rotation["at"], int)
+
+    def test_all_blocked_fails_with_force_hint(self):
+        router.set_active("proton", self._profile("a"))
+        router.mark_blocked("proton", self._profile("b"), "cloudflare-1010")
+        router.mark_blocked("proton", self._profile("c"), "cloudflare-1010")
+        self.assertEqual(router.rotate("proton"), 1)
+
+
+class EgressSettingsTests(unittest.TestCase):
+    def test_load_bounds_supplied_values(self):
+        router._load_egress_settings({"egress": {
+            "probe_timeout": 999, "block_seconds": -5, "fail_threshold": 99,
+            "probe_url": "not a url", "upstream_cooldown_seconds": "x",
+        }})
+        settings = router.egress_settings()
+        self.assertEqual(settings["probe_timeout"], 60.0)
+        self.assertEqual(settings["block_seconds"], 0)
+        self.assertEqual(settings["fail_threshold"], 20)
+        self.assertEqual(settings["probe_url"], router.DEFAULT_PROBE_URL)
+        self.assertEqual(settings["upstream_cooldown_seconds"], router.DEFAULT_EGRESS_SETTINGS["upstream_cooldown_seconds"])
+
+    def test_load_keeps_valid_url(self):
+        router._load_egress_settings({"egress": {"probe_url": "https://opencode.ai"}})
+        self.assertEqual(router.egress_settings()["probe_url"], "https://opencode.ai")
+
+
+class StatusJsonTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(router, self.root)
+        (self.root / "providers" / "proton").mkdir(parents=True)
+        (self.root / "providers" / "cloudflare").mkdir(parents=True)
+        self.profile = self.root / "providers" / "proton" / "a.conf"
+        _write_conf(self.profile)
+        router._providers = {
+            "proton": {"directory": "providers/proton", "cooldown_seconds": 60},
+            "cloudflare": {"directory": "providers/cloudflare", "cooldown_seconds": 60},
+        }
+        router._routes = [{"id": "example-com", "domains": ["example.com"], "provider": "proton"}]
+        router._port = 2080
+        router._vpn = {}
+        self.report = mock.patch.object(router, "_status_report", return_value=(0, "up (proxy 127.0.0.1:2080)"))
+        self.report.start()
+
+    def tearDown(self):
+        self.report.stop()
+        self._tmp.cleanup()
+
+    def test_status_json_shape(self):
+        router.set_active("proton", self.profile)
+        router.mark_cooldown("proton", self.profile, 60)
+        router.record_egress("proton", self.profile, ok=True, latency_ms=88.5, status=200)
+        router.record_rotation("proton", self.profile)
+        data = router.status_json()
+        self.assertTrue(data["up"])
+        self.assertEqual(data["mode"], "proxy")
+        self.assertEqual(data["port"], 2080)
+        proton = data["providers"]["proton"]
+        self.assertEqual(proton["active"], "a")
+        self.assertIn("a", proton["cooldown_until"])
+        self.assertEqual(proton["last_rotation"]["profile"], "a")
+        self.assertTrue(proton["egress"]["a"]["ok"])
+        self.assertEqual(proton["egress"]["a"]["latency_ms"], 88.5)
+        self.assertEqual(data["routes"], [{"id": "example-com", "provider": "proton",
+                                           "domains": ["example.com"], "ip_cidr": []}])
+        self.assertEqual(data["providers"]["cloudflare"]["active"], None)
+
+    def test_status_json_down(self):
+        with mock.patch.object(router, "_status_report", return_value=(1, "down (proxy mode)")):
+            data = router.status_json()
+        self.assertFalse(data["up"])
+        self.assertIn("down", data["state"])
+
+
+class LogRotationTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(router, self.root)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_rotates_oversized_log(self):
+        router.LOG_FILE.write_text("x" * (router.LOG_MAX_BYTES + 10))
+        router.rotate_log_if_needed()
+        self.assertFalse(router.LOG_FILE.exists())
+        self.assertTrue(Path(str(router.LOG_FILE) + ".1").exists())
+
+    def test_leaves_small_log_alone(self):
+        router.LOG_FILE.write_text("small")
+        router.rotate_log_if_needed()
+        self.assertTrue(router.LOG_FILE.exists())
+        self.assertFalse(Path(str(router.LOG_FILE) + ".1").exists())
+
+    def test_missing_log_is_noop(self):
+        router.rotate_log_if_needed()  # must not raise
+
+
+class CliStatusJsonTests(unittest.TestCase):
+    def test_status_json_down_with_exit_1(self):
+        repo = Path(__file__).resolve().parent.parent
+        with tempfile.TemporaryDirectory() as tmp:
+            env = dict(os.environ)
+            env["PROXY_ROUTER_ROOT"] = tmp
+            env["SING_BOX"] = ""
+            result = subprocess.run(
+                [sys.executable, str(repo / "router.py"), "status", "--json"],
+                cwd=repo, env=env, capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 1, result.stderr)
+            data = json.loads(result.stdout)
+            self.assertFalse(data["up"])
+            self.assertIn("down", data["state"])
+
+    def test_status_json_unusable_config(self):
+        repo = Path(__file__).resolve().parent.parent
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "router.json").write_text(json.dumps({"port": 99999}))
+            env = dict(os.environ)
+            env["PROXY_ROUTER_ROOT"] = tmp
+            env["SING_BOX"] = ""
+            result = subprocess.run(
+                [sys.executable, str(repo / "router.py"), "status", "--json"],
+                cwd=repo, env=env, capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 1)
+            data = json.loads(result.stdout)
+            self.assertFalse(data["up"])
+            self.assertIn("unusable config", data["state"])
+
+    def test_egress_show_empty_json(self):
+        repo = Path(__file__).resolve().parent.parent
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider_dir = root / "providers" / "proton"
+            provider_dir.mkdir(parents=True)
+            _write_conf(provider_dir / "a.conf")
+            root.joinpath("router.json").write_text(json.dumps({
+                "port": 2080,
+                "providers": {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}},
+                "routes": [],
+            }))
+            env = dict(os.environ)
+            env["PROXY_ROUTER_ROOT"] = tmp
+            env["SING_BOX"] = ""
+            result = subprocess.run(
+                [sys.executable, str(repo / "router.py"), "egress", "show"],
+                cwd=repo, env=env, capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)
+            self.assertEqual(data, {"proton": {}})
