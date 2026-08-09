@@ -1782,5 +1782,250 @@ class ErrorPolicyTests(unittest.TestCase):
         self.assertEqual(router.load_config(), 1)
 
 
+class RoutingModeTests(unittest.TestCase):
+    """Feature: routing modes (safe-list / vpn-list) adjust route.final and
+    prepend direct-domain pins; default mode stays byte-compatible."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(router, self.root)
+        (self.root / "providers" / "proton").mkdir(parents=True)
+        (self.root / "providers" / "cloudflare").mkdir(parents=True)
+        _write_conf(self.root / "providers" / "proton" / "a.conf")
+        router._providers = {
+            "proton": {"directory": "providers/proton", "cooldown_seconds": 60},
+            "cloudflare": {"directory": "providers/cloudflare", "cooldown_seconds": 60},
+        }
+        router._routes = [{"id": "example-com", "domains": ["example.com"], "provider": "proton"}]
+        router._port = 2080
+        router._vpn = {}
+        router._routing = {}
+        router.set_mode("proxy")  # never inherit tun from another test
+
+    def tearDown(self):
+        router._routing = {}  # never leak a routing mode into later classes
+        self._tmp.cleanup()
+
+    def test_default_mode_byte_compatible(self):
+        config, active = router.build_singbox_config()
+        self.assertEqual(active, {"proton"})
+        self.assertEqual(config["route"]["final"], "direct")
+        self.assertEqual(config["route"]["rules"], [
+            {"outbound": "proton", "domain_suffix": ["example.com"]},
+            {"domain": ["localhost"], "outbound": "direct"},
+            {"ip_cidr": ["127.0.0.0/8", "::1/128"], "outbound": "direct"},
+        ])
+        self.assertEqual(config["dns"]["rules"], [
+            {"domain_suffix": ["example.com"], "server": "dns-proton"},
+        ])
+
+    def test_explicit_default_mode_is_accepted(self):
+        router._routing = {"mode": "default"}
+        config, _ = router.build_singbox_config()
+        self.assertEqual(config["route"]["final"], "direct")
+        self.assertEqual(config["route"]["rules"][0], {"outbound": "proton", "domain_suffix": ["example.com"]})
+
+    def test_safe_list_final_and_direct_pins_first(self):
+        router._routing = {"mode": "safe-list", "direct_domains": ["youtube.com", "google.com"],
+                           "default_provider": "proton"}
+        config, _ = router.build_singbox_config()
+        self.assertEqual(config["route"]["final"], "proton")
+        rules = config["route"]["rules"]
+        # direct-domain pins come FIRST, before every provider route
+        self.assertEqual(rules[0], {"domain_suffix": ["youtube.com", "google.com"], "outbound": "direct"})
+        self.assertEqual(rules[1], {"outbound": "proton", "domain_suffix": ["example.com"]})
+        # loopback/localhost direct pins still present at the end
+        self.assertEqual(rules[-2], {"domain": ["localhost"], "outbound": "direct"})
+        self.assertEqual(rules[-1], {"ip_cidr": ["127.0.0.0/8", "::1/128"], "outbound": "direct"})
+
+    def test_safe_list_direct_domains_resolve_via_dns_local(self):
+        # youtube.com is direct-only; example.com is ALSO in a provider route.
+        router._routing = {"mode": "safe-list", "direct_domains": ["youtube.com", "example.com"],
+                           "default_provider": "proton"}
+        config, _ = router.build_singbox_config()
+        # direct domains pin to dns-local FIRST, never to a provider resolver
+        self.assertEqual(config["dns"]["rules"][0],
+                         {"domain_suffix": ["youtube.com", "example.com"], "server": "dns-local"})
+        # example.com lives in a provider route too; that route must still pin
+        # it to dns-proton (but the direct pin wins in rule order).
+        self.assertIn({"domain_suffix": ["example.com"], "server": "dns-proton"}, config["dns"]["rules"])
+
+    def test_probe_url_for_skips_direct_whitelisted_domains_in_safe_list(self):
+        # Probe must ride the TUNNEL: a direct-whitelisted host measures the
+        # direct path and false-alives a dead exit. probe_url_for must skip
+        # it and pick the next tunneled route domain.
+        router._routing = {"mode": "safe-list", "direct_domains": ["example.com"],
+                           "default_provider": "proton"}
+        self.assertIsNone(router.probe_url_for("proton"))  # only domain is direct → no tunneled path
+        router._routes = [
+            {"id": "example-com", "domains": ["example.com"], "provider": "proton"},
+            {"id": "opencode-ai", "domains": ["opencode.ai"], "provider": "proton"},
+        ]
+        self.assertEqual(router.probe_url_for("proton"), "https://opencode.ai")
+
+    def test_probe_url_for_does_not_skip_in_default_or_vpn_list(self):
+        # direct_domains only pin direct in safe-list mode; in default/vpn-list
+        # the list is ignored, so the normal first-domain probe must remain.
+        router._routing = {"mode": "vpn-list", "direct_domains": ["example.com"]}
+        self.assertEqual(router.probe_url_for("proton"), "https://example.com")
+        router._routing = {}
+        self.assertEqual(router.probe_url_for("proton"), "https://example.com")
+
+    def test_safe_list_tun_keeps_hijack_first(self):
+        router.set_mode("tun")
+        router._routing = {"mode": "safe-list", "direct_domains": ["youtube.com"], "default_provider": "proton"}
+        config, _ = router.build_singbox_config()
+        rules = config["route"]["rules"]
+        self.assertEqual(rules[0], {"protocol": "dns", "action": "hijack-dns"})
+        self.assertEqual(rules[1], {"domain_suffix": ["youtube.com"], "outbound": "direct"})
+        self.assertEqual(config["route"]["final"], "proton")
+
+    def test_safe_list_bad_default_provider_fails_build(self):
+        # 'cloudflare' is a known provider but has no usable profile: the
+        # build must fail loudly instead of emitting a dangling final.
+        router._routing = {"mode": "safe-list", "direct_domains": [], "default_provider": "cloudflare"}
+        with self.assertRaises(SystemExit) as ctx:
+            router.build_singbox_config()
+        self.assertIn("cloudflare", str(ctx.exception))
+        self.assertIn("no active profile", str(ctx.exception))
+
+    def test_safe_list_unknown_default_provider_fails_load(self):
+        router.CONFIG_FILE.write_text(json.dumps({
+            "port": 2080,
+            "providers": {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}},
+            "routes": [],
+            "routing": {"mode": "safe-list", "default_provider": "banana"},
+        }))
+        self.assertEqual(router.load_config(), 1)
+        self.assertEqual(router._routing, {})  # nothing silently accepted
+
+    def test_safe_list_missing_default_provider_fails_load(self):
+        router.CONFIG_FILE.write_text(json.dumps({
+            "port": 2080,
+            "providers": {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}},
+            "routes": [],
+            "routing": {"mode": "safe-list", "direct_domains": ["youtube.com"]},
+        }))
+        self.assertEqual(router.load_config(), 1)
+
+    def test_vpn_list_final_direct_and_pins_intact(self):
+        router._routing = {"mode": "vpn-list", "vpn_domains": ["blocked.example"]}
+        config, _ = router.build_singbox_config()
+        self.assertEqual(config["route"]["final"], "direct")
+        # tunnel pins intact and no direct-pin/dns rules were added
+        self.assertEqual(config["route"]["rules"], [
+            {"outbound": "proton", "domain_suffix": ["example.com"]},
+            {"domain": ["localhost"], "outbound": "direct"},
+            {"ip_cidr": ["127.0.0.0/8", "::1/128"], "outbound": "direct"},
+        ])
+        self.assertEqual(config["dns"]["rules"], [
+            {"domain_suffix": ["example.com"], "server": "dns-proton"},
+        ])
+
+    def test_bad_mode_fails_load(self):
+        router.CONFIG_FILE.write_text(json.dumps({
+            "port": 2080,
+            "providers": {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}},
+            "routes": [],
+            "routing": {"mode": "banana"},
+        }))
+        self.assertEqual(router.load_config(), 1)
+
+    def test_non_list_domains_fail_load(self):
+        router.CONFIG_FILE.write_text(json.dumps({
+            "port": 2080,
+            "providers": {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}},
+            "routes": [],
+            "routing": {"mode": "safe-list", "direct_domains": "youtube.com", "default_provider": "proton"},
+        }))
+        self.assertEqual(router.load_config(), 1)
+
+
+class RoutingCliTests(unittest.TestCase):
+    """CLI surface for routing modes: atomic 0600 writes, no engine reload."""
+
+    REPO = Path(__file__).resolve().parent.parent
+
+    def _run(self, tmp: str, *args: str) -> subprocess.CompletedProcess:
+        env = dict(os.environ)
+        env["PROXY_ROUTER_ROOT"] = tmp
+        env["SING_BOX"] = ""
+        return subprocess.run(
+            [sys.executable, str(self.REPO / "router.py"), *args],
+            cwd=self.REPO, env=env, capture_output=True, text=True,
+        )
+
+    def _seed(self, tmp: str) -> None:
+        root = Path(tmp)
+        (root / "providers" / "proton").mkdir(parents=True)
+        _write_conf(root / "providers" / "proton" / "a.conf")
+        root.joinpath("router.json").write_text(json.dumps({
+            "port": 2080,
+            "providers": {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}},
+            "routes": [{"id": "example-com", "domains": ["example.com"], "provider": "proton"}],
+        }))
+
+    def test_routing_set_add_remove_roundtrip_with_0600(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed(tmp)
+            result = self._run(tmp, "routing", "set", "--mode", "safe-list", "--default-provider", "proton")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("engine was NOT reloaded", result.stderr)
+            config_path = Path(tmp) / "router.json"
+            self.assertEqual(stat.S_IMODE(config_path.stat().st_mode), 0o600)
+            data = json.loads(config_path.read_text())
+            self.assertEqual(data["routing"]["mode"], "safe-list")
+            self.assertEqual(data["routing"]["default_provider"], "proton")
+            self.assertEqual(self._run(tmp, "routing", "add", "--mode", "safe-list", "--domain", "youtube.com").returncode, 0)
+            self.assertEqual(json.loads(config_path.read_text())["routing"]["direct_domains"], ["youtube.com"])
+            self.assertEqual(self._run(tmp, "routing", "remove", "--mode", "safe-list", "--domain", "youtube.com").returncode, 0)
+            self.assertEqual(json.loads(config_path.read_text())["routing"]["direct_domains"], [])
+            self.assertEqual(stat.S_IMODE(config_path.stat().st_mode), 0o600)
+
+    def test_routing_show_echoes_effective_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed(tmp)
+            self.assertEqual(self._run(tmp, "routing", "set", "--mode", "vpn-list").returncode, 0)
+            self.assertEqual(self._run(tmp, "routing", "add", "--mode", "vpn-list", "--domain", "blocked.example").returncode, 0)
+            result = self._run(tmp, "routing", "show")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)  # stdout is pure JSON
+            self.assertEqual(data["mode"], "vpn-list")
+            self.assertEqual(data["vpn_domains"], ["blocked.example"])
+            self.assertEqual(data["direct_domains"], [])
+
+    def test_status_json_includes_routing_echo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed(tmp)
+            self.assertEqual(self._run(tmp, "routing", "set", "--mode", "safe-list", "--default-provider", "proton").returncode, 0)
+            # engine is not running in the tmp root, so status exits 1 with
+            # "down" - the routing echo must still be in the JSON.
+            result = self._run(tmp, "status", "--json")
+            self.assertEqual(result.returncode, 1)
+            data = json.loads(result.stdout)
+            self.assertEqual(data["routing"]["mode"], "safe-list")
+            self.assertEqual(data["routing"]["default_provider"], "proton")
+            self.assertEqual(data["routing"]["direct_domains"], [])
+
+    def test_routing_set_rejects_unknown_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed(tmp)
+            result = self._run(tmp, "routing", "set", "--mode", "safe-list", "--default-provider", "banana")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("not a known provider", result.stderr)
+            data = json.loads((Path(tmp) / "router.json").read_text())
+            self.assertNotIn("routing", data)  # rejected config never written
+
+    def test_routing_set_default_resets_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed(tmp)
+            self.assertEqual(self._run(tmp, "routing", "set", "--mode", "safe-list", "--default-provider", "proton").returncode, 0)
+            result = self._run(tmp, "routing", "set", "--mode", "default")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads((Path(tmp) / "router.json").read_text())
+            self.assertEqual(data["routing"]["mode"], "default")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -436,5 +436,73 @@ class FullScreenTuiTests(unittest.TestCase):
         self.assertIn("Proton", setup_tui._strip_ansi(frame[1]))
 
 
+class RoutingTuiTests(unittest.TestCase):
+    """TUI surface for routing modes: menu item, read-only view, and routing
+    changes executed through the single ``router.py routing`` CLI writer."""
+
+    def _seed(self, root: Path, routing=None) -> None:
+        (root / "providers" / "proton").mkdir(parents=True)
+        data = {"port": 2080, "providers": {"proton": {"directory": "providers/proton"}}, "routes": []}
+        if routing is not None:
+            data["routing"] = routing
+        (root / "router.json").write_text(json.dumps(data))
+
+    def test_menu_lists_routing_modes(self):
+        self.assertEqual(setup_tui._MENU[-2][0], "r")
+        self.assertIn(("r", "Routing modes (show / switch / add-remove domain)"), setup_tui.TUI_MENU)
+
+    def test_routing_view_opens_and_reflects_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._seed(root, {"mode": "safe-list", "direct_domains": ["youtube.com"],
+                              "default_provider": "proton"})
+            state = setup_tui.apply_key(setup_tui.TuiState(root=root), "r")
+            self.assertEqual(state.view, "routing")
+            joined = "\n".join(setup_tui.render_frame(state))
+            self.assertIn("mode: safe-list", joined)
+            self.assertIn("youtube.com", joined)
+            esc = setup_tui.apply_key(state, "\x1b")
+            self.assertEqual(esc.view, "menu")
+
+    def test_routing_prompt_records_cli_action(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._seed(root)
+            state = setup_tui.apply_key(setup_tui.TuiState(root=root), "r")
+            state = setup_tui.apply_key(state, "3")  # add direct domain
+            self.assertEqual(state.view, "routing_prompt")
+            for ch in "youtube.com":
+                state = setup_tui.apply_key(state, ch)
+            state = setup_tui.apply_key(state, "\r")
+            self.assertEqual(state.action,
+                             ("routing", "add", "--mode", "safe-list", "--domain", "youtube.com"))
+            # empty input cancels instead of recording an action
+            state = setup_tui.apply_key(setup_tui.TuiState(root=root), "r")
+            state = setup_tui.apply_key(state, "3")
+            state = setup_tui.apply_key(state, "\r")
+            self.assertIsNone(state.action)
+            self.assertFalse(state.status_ok)
+
+    def test_routing_change_goes_through_router_cli(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._seed(root)
+            text, rc = setup_tui._execute_action(
+                ("routing", "set", "--mode", "safe-list", "--default-provider", "proton"), root)
+            self.assertEqual(rc, 0, text)
+            data = json.loads((root / "router.json").read_text())
+            self.assertEqual(data["routing"]["mode"], "safe-list")
+            text, rc = setup_tui._execute_action(
+                ("routing", "add", "--mode", "safe-list", "--domain", "youtube.com"), root)
+            self.assertEqual(rc, 0, text)
+            data = json.loads((root / "router.json").read_text())
+            self.assertEqual(data["routing"]["direct_domains"], ["youtube.com"])
+            self.assertIn("NOT reloaded", text)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
 if __name__ == "__main__":
     unittest.main()

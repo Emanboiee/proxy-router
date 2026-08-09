@@ -157,6 +157,7 @@ _providers: dict = {}
 _routes: list = []
 _port: int = DEFAULT_PORT
 _vpn: dict = {}
+_routing: dict = {}
 _egress_settings: dict = {}
 _error_policy: dict | None = None
 _PROVIDER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
@@ -205,7 +206,7 @@ def _atomic_write(path: Path, text: str, mode: int = 0o600) -> None:
 
 
 def load_config() -> int:
-    global _providers, _routes, _port, _vpn
+    global _providers, _routes, _port, _vpn, _routing
     if not CONFIG_FILE.is_file():
         return fail(f"missing {CONFIG_FILE.name}; run 'router.py init' first")
     try:
@@ -235,6 +236,11 @@ def load_config() -> int:
             return fail(f"bad {CONFIG_FILE.name}: provider '{name}' directory escapes the router root")
     if not isinstance(routes, list) or not all(isinstance(route, dict) for route in routes) or not isinstance(vpn, dict):
         return fail(f"bad {CONFIG_FILE.name}: providers/routes/vpn have invalid types")
+    routing = data.get("routing", {})
+    if routing is None:
+        routing = {}
+    if not isinstance(routing, dict):
+        return fail(f"bad {CONFIG_FILE.name}: routing must be an object")
     known_providers = set(providers)
     for route in routes:
         if not isinstance(route.get("provider"), str):
@@ -249,6 +255,12 @@ def load_config() -> int:
         for key in ("domains", "ip_cidr"):
             if key in route and (not isinstance(route[key], list) or not all(isinstance(v, str) for v in route[key])):
                 return fail(f"bad {CONFIG_FILE.name}: route '{route.get('id', '<unnamed>')}' {key} must be a string list")
+    # Routing modes (safe-list / vpn-list): validated eagerly so a malformed
+    # section fails load with a precise message, never a silent guess. Shared
+    # with the `routing` CLI writer so both paths enforce the same rules.
+    routing_error = _routing_error(routing, known_providers)
+    if routing_error is not None:
+        return fail(f"bad {CONFIG_FILE.name}: {routing_error}")
     try:
         _load_error_policy(data, providers)
     except ValueError as exc:
@@ -258,6 +270,7 @@ def load_config() -> int:
     _providers = providers
     _routes = routes
     _vpn = vpn
+    _routing = dict(routing)
     return 0
 
 
@@ -287,6 +300,9 @@ def write_default_config(force: bool = False) -> int:
                     "provider": "cloudflare",
                 },
             ],
+            # vpn-list with an empty list is the safe default: route.final
+            # stays "direct" and nothing is tunneled unless listed.
+            "routing": {"mode": "vpn-list", "vpn_domains": []},
             "vpn": {
                 "address": DEFAULT_TUN_ADDRESS,
                 "mtu": DEFAULT_TUN_MTU,
@@ -634,13 +650,27 @@ def probe_url_for(name: str) -> str | None:
     """Probe target for a provider: the first routed domain of that provider,
     so the probe actually rides the tunnel end-to-end (a URL that matches no
     route would go out direct and measure the wrong path). None when the
-    provider has no route domain to probe through."""
+    provider has no route domain to probe through.
+
+    In safe-list routing mode, domains whitelisted as ``direct_domains`` are
+    sent DIRECT by the route table; probing such a host would measure the
+    direct path, not the tunnel, and false-alive a dead exit — so those are
+    skipped here and the next tunneled route domain is picked (only in
+    safe-list mode: in default/vpn-list the list is not pinned direct). When
+    every route domain of the provider is direct-whitelisted there is no
+    tunneled path to probe; None is returned (egress check then skips the
+    provider instead of trusting a direct-path result).
+    """
+    direct = frozenset((routing_state().get("direct_domains") or [])) \
+        if routing_state().get("mode") == "safe-list" else frozenset()
     for route in _routes:
         if route.get("provider") != name:
             continue
         for host in route.get("domains", []):
             host = host.lstrip("*.").strip()
             if host and "." in host and not host.startswith("."):
+                if host in direct:
+                    continue  # safe-list mode: routed direct, not the tunnel
                 return f"https://{host}"
     return None
 
@@ -1161,12 +1191,26 @@ def build_singbox_config() -> tuple[dict, set[str]]:
     # implicit fallback. Route DNS rules still pin tunneled domains to the
     # provider's own server.
     dns_servers.append({"type": "local", "tag": "dns-local"})
+    routing = routing_state()
+    routing_mode = routing["mode"]
     dns_rules = []
+    if routing_mode == "safe-list" and routing["direct_domains"]:
+        # Safe-list: trusted domains go DIRECT, so their DNS must resolve via
+        # the local resolver, never a provider's DNS server - pinning them to
+        # a provider resolver would leak direct traffic's DNS through the
+        # tunnel. The rule comes first so a domain listed both here and in a
+        # provider route always wins the direct resolver.
+        dns_rules.append({"domain_suffix": list(routing["direct_domains"]), "server": "dns-local"})
     for route in _routes:
         if route["provider"] in active and route.get("domains"):
             dns_rules.append({"domain_suffix": route["domains"], "server": f"dns-{route['provider']}"})
 
-    rules = []
+    # Route rules: safe-list direct-domain pins first (a trusted domain is
+    # never tunneled even if a provider route also mentions it), then the
+    # per-domain provider routes, then the loopback/localhost pins. With no
+    # routing section (default mode) direct_pins is empty and the rule list
+    # is byte-identical to the pre-routing-modes output.
+    provider_rules = []
     for route in _routes:
         if route["provider"] not in active:
             continue
@@ -1175,11 +1219,14 @@ def build_singbox_config() -> tuple[dict, set[str]]:
             rule["domain_suffix"] = route["domains"]
         if route.get("ip_cidr"):
             rule["ip_cidr"] = route["ip_cidr"]
-        rules.append(rule)
-    rules.extend([
+        provider_rules.append(rule)
+    direct_pins: list[dict] = []
+    if routing_mode == "safe-list" and routing["direct_domains"]:
+        direct_pins.append({"domain_suffix": list(routing["direct_domains"]), "outbound": "direct"})
+    rules = direct_pins + provider_rules + [
         {"domain": ["localhost"], "outbound": "direct"},
         {"ip_cidr": ["127.0.0.0/8", "::1/128"], "outbound": "direct"},
-    ])
+    ]
 
     mode = current_mode()
     if mode == "tun":
@@ -1205,6 +1252,19 @@ def build_singbox_config() -> tuple[dict, set[str]]:
     else:
         inbounds = [{"type": "mixed", "tag": "local-proxy", "listen": "127.0.0.1", "listen_port": _port}]
         route_final = "direct"
+
+    if routing_mode == "safe-list":
+        # route.final must be a live outbound tag: everything not pinned
+        # direct rides the default provider. Fail the build with a precise
+        # error when that provider has no active profile - never emit a
+        # dangling final.
+        default_provider = routing["default_provider"]
+        if default_provider not in active:
+            raise SystemExit(
+                f"routing mode 'safe-list': default_provider '{default_provider}' has no active profile; "
+                "cannot emit a dangling route.final (drop *.conf into providers/<name>/ first)"
+            )
+        route_final = default_provider
 
     config = {
         "log": {"level": "info"},
@@ -1833,6 +1893,146 @@ def routes_remove(id_: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# routing modes (safe-list / vpn-list)
+# ---------------------------------------------------------------------------
+
+ROUTING_MODES = ("safe-list", "vpn-list")
+
+
+def routing_state() -> dict:
+    """Effective routing-mode view: ``mode`` (default|safe-list|vpn-list),
+    ``direct_domains``, ``vpn_domains``, ``default_provider``.
+
+    An absent ``routing`` section means 'default' mode (per-domain provider
+    routes, ``route.final`` = direct) - the pre-routing-modes behavior.
+    """
+    routing = _routing if isinstance(_routing, dict) else {}
+    return {
+        "mode": routing.get("mode", "default"),
+        "direct_domains": list(routing.get("direct_domains", []) or []),
+        "vpn_domains": list(routing.get("vpn_domains", []) or []),
+        "default_provider": routing.get("default_provider"),
+    }
+
+
+def _routing_error(routing: dict, known_providers: set) -> str | None:
+    """Precise error for a malformed routing section, else None.
+
+    Shared by ``load_config`` and the ``routing`` CLI writer so both paths
+    enforce exactly the same schema - malformed config fails loudly, never a
+    silent guess. ``mode`` "default" is the explicit spelling of the absent
+    (pre-existing) behavior; ``default_provider`` is only meaningful (and only
+    required/validated against known providers) in safe-list mode.
+    """
+    mode = routing.get("mode", "default")
+    if mode not in ("default", "safe-list", "vpn-list"):
+        return f"routing.mode must be 'safe-list', 'vpn-list', or absent (default); got '{mode}'"
+    for key in ("direct_domains", "vpn_domains"):
+        value = routing.get(key)
+        if value is not None and (not isinstance(value, list) or not all(isinstance(v, str) for v in value)):
+            return f"routing.{key} must be a string list"
+    default_provider = routing.get("default_provider")
+    if default_provider is not None and not isinstance(default_provider, str):
+        return "routing.default_provider must be a provider name string"
+    if mode == "safe-list":
+        if not default_provider:
+            return "routing mode 'safe-list' needs 'default_provider' (everything not on the direct list goes through it)"
+        if default_provider not in known_providers:
+            return (f"routing.default_provider '{default_provider}' is not a known provider "
+                    f"(have {', '.join(sorted(known_providers))})")
+    return None
+
+
+def _routing_mutate(routing: dict) -> int:
+    """Persist a routing section into router.json atomically (temp + replace,
+    mode 0600, same convention as every other config write) and refresh the
+    in-memory state. Never touches the engine - the operator runs
+    ensure/reload separately."""
+    try:
+        data = json.loads(CONFIG_FILE.read_text())
+        if not isinstance(data, dict):
+            return fail(f"bad {CONFIG_FILE.name}: top level must be an object")
+        data["routing"] = routing
+        _atomic_write(CONFIG_FILE, json.dumps(data, indent=2) + "\n", 0o600)
+    except (json.JSONDecodeError, OSError, TypeError) as exc:
+        return fail(f"could not save routing in {CONFIG_FILE.name}: {exc}")
+    global _routing
+    _routing = dict(routing)
+    return 0
+
+
+def _routing_print(state: dict, *, note: bool = False) -> None:
+    """Print an effective routing state: JSON on stdout (machine-readable),
+    one human summary line on stderr. ``note`` adds the no-reload reminder
+    (mutating commands only)."""
+    print(json.dumps(state, indent=2, sort_keys=True))
+    if state["mode"] == "safe-list":
+        direct = ", ".join(state["direct_domains"]) or "(none)"
+        print(f"mode safe-list: direct {direct}; everything else via {state['default_provider']}", file=sys.stderr)
+    elif state["mode"] == "vpn-list":
+        vpn = ", ".join(state["vpn_domains"]) or "(none)"
+        print(f"mode vpn-list: tunnel {vpn}; everything else direct", file=sys.stderr)
+    else:
+        print("mode default: per-domain provider routes, route.final = direct", file=sys.stderr)
+    if note:
+        print("config saved; the engine was NOT reloaded - run 'router.py ensure' (or 'router.py reload') to apply", file=sys.stderr)
+
+
+def routing_cli_show() -> int:
+    _routing_print(routing_state())
+    return 0
+
+
+def routing_cli_set(mode: str, default_provider: str | None) -> int:
+    routing = dict(_routing if isinstance(_routing, dict) else {})
+    routing["mode"] = mode
+    if default_provider is not None:
+        routing["default_provider"] = default_provider
+    error = _routing_error(routing, set(_providers))
+    if error is not None:
+        return fail(error)
+    if _routing_mutate(routing) != 0:
+        return 1
+    _routing_print(routing_state(), note=True)
+    return 0
+
+
+def routing_cli_add(mode: str, domain: str) -> int:
+    key = "direct_domains" if mode == "safe-list" else "vpn_domains"
+    routing = dict(_routing if isinstance(_routing, dict) else {})
+    entries = list(routing.get(key, []) or [])
+    if domain in entries:
+        print(f"routing: '{domain}' is already on the {key} list (no change)", file=sys.stderr)
+        _routing_print(routing_state(), note=True)
+        return 0
+    entries.append(domain)
+    routing[key] = entries
+    error = _routing_error(routing, set(_providers))
+    if error is not None:
+        return fail(error)
+    if _routing_mutate(routing) != 0:
+        return 1
+    _routing_print(routing_state(), note=True)
+    return 0
+
+
+def routing_cli_remove(mode: str, domain: str) -> int:
+    key = "direct_domains" if mode == "safe-list" else "vpn_domains"
+    routing = dict(_routing if isinstance(_routing, dict) else {})
+    entries = list(routing.get(key, []) or [])
+    if domain not in entries:
+        print(f"routing: '{domain}' is not on the {key} list (no change)", file=sys.stderr)
+        _routing_print(routing_state(), note=True)
+        return 0
+    entries.remove(domain)
+    routing[key] = entries
+    if _routing_mutate(routing) != 0:
+        return 1
+    _routing_print(routing_state(), note=True)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # VPN (TUN) toggle
 # ---------------------------------------------------------------------------
 
@@ -1999,6 +2199,7 @@ def status_json() -> dict:
         "domains": route.get("domains", []),
         "ip_cidr": route.get("ip_cidr", []),
     } for route in _routes]
+    data["routing"] = routing_state()
     return data
 
 
@@ -2195,6 +2396,18 @@ def main() -> int:
     sub.add_parser("up")
     sub.add_parser("down")
 
+    routing = sub.add_parser("routing", help="routing modes (safe-list / vpn-list): show|set|add|remove")
+    routing_sub = routing.add_subparsers(dest="routing_action")
+    routing_sub.add_parser("show", help="show the effective routing mode and lists (JSON + human)")
+    routing_set = routing_sub.add_parser("set", help="switch routing mode (safe-list / vpn-list / default)")
+    routing_set.add_argument("--mode", required=True, choices=list(ROUTING_MODES) + ["default"])
+    routing_set.add_argument("--default-provider", default=None,
+                             help="provider carrying everything not pinned direct (safe-list)")
+    for action in ("add", "remove"):
+        routing_mut = routing_sub.add_parser(action, help=f"{action} a domain on a routing list")
+        routing_mut.add_argument("--mode", required=True, choices=list(ROUTING_MODES))
+        routing_mut.add_argument("--domain", required=True)
+
     egress = sub.add_parser("egress", help="egress health for provider exits")
     egress.add_argument("action", choices=["probe", "show", "check"])
     egress.add_argument("provider", nargs="?", default=None,
@@ -2272,7 +2485,9 @@ def main() -> int:
         if args.cmd == "status":
             if args.json:
                 print(json.dumps({"up": False, "state": "down (unusable config; see error above)",
-                                  "mode": None, "port": None, "providers": {}, "routes": []},
+                                  "mode": None, "port": None, "providers": {}, "routes": [],
+                                  "routing": {"mode": None, "direct_domains": [], "vpn_domains": [],
+                                              "default_provider": None}},
                                  indent=2, sort_keys=True))
             else:
                 print("down (unusable config; see error above)")
@@ -2313,6 +2528,16 @@ def main() -> int:
         return 0
     if args.cmd == "routes":
         return routes_list()
+    if args.cmd == "routing":
+        if args.routing_action == "show":
+            return routing_cli_show()
+        if args.routing_action == "set":
+            return routing_cli_set(args.mode, args.default_provider)
+        if args.routing_action == "add":
+            return routing_cli_add(args.mode, args.domain)
+        if args.routing_action == "remove":
+            return routing_cli_remove(args.mode, args.domain)
+        parser.error("routing needs an action: show | set | add | remove")
     if args.cmd == "vpn":
         if args.action == "on":
             return _with_lock(vpn_on)

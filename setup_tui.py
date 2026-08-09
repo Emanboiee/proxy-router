@@ -606,6 +606,80 @@ def _router_command(root: Path, *args: str) -> int:
         return 1
 
 
+def _read_routing_state(root: Path) -> dict:
+    """Read-only view of the persisted routing section (no mutation, no
+    subprocess): the TUI renders from this; every change goes through the
+    ``router.py routing`` CLI writer below."""
+    try:
+        data = json.loads((Path(root) / "router.json").read_text())
+        routing = data.get("routing") or {}
+        if not isinstance(routing, dict):
+            routing = {}
+    except (OSError, json.JSONDecodeError):
+        routing = {}
+    return {
+        "mode": routing.get("mode", "default"),
+        "direct_domains": list(routing.get("direct_domains", []) or []),
+        "vpn_domains": list(routing.get("vpn_domains", []) or []),
+        "default_provider": routing.get("default_provider"),
+    }
+
+
+def _routing_lines(root: Path) -> list[str]:
+    state = _read_routing_state(root)
+    direct = ", ".join(state["direct_domains"]) or "(none)"
+    vpn = ", ".join(state["vpn_domains"]) or "(none)"
+    return [
+        f"mode: {state['mode']}",
+        f"direct_domains: {direct}",
+        f"vpn_domains: {vpn}",
+        f"default_provider: {state['default_provider'] or '(none)'}",
+    ]
+
+
+def _cmd_routing(root: Path) -> None:
+    """Line-menu flow for routing modes. Every mutation shells out to the
+    existing ``router.py routing`` CLI - one config writer, never a second
+    mutation path - and the engine is never started or reloaded here."""
+    while True:
+        _router_command(root, "routing", "show")
+        print(_style("  [1] set vpn-list   [2] set safe-list   [3] add direct   [4] remove direct"
+                     "   [5] add vpn   [6] remove vpn   [b] back", _Ansi.BOLD))
+        try:
+            choice = input(_style("routing> ", _Ansi.BOLD)).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if choice in ("b", "back", "q"):
+            return
+        if choice == "1":
+            _router_command(root, "routing", "set", "--mode", "vpn-list")
+        elif choice == "2":
+            provider = input("  default provider (empty keeps the current one): ").strip()
+            args = ["routing", "set", "--mode", "safe-list"]
+            if provider:
+                args += ["--default-provider", provider]
+            _router_command(root, "routing", *args)
+        elif choice == "3":
+            domain = input("  domain to go DIRECT: ").strip()
+            if domain:
+                _router_command(root, "routing", "add", "--mode", "safe-list", "--domain", domain)
+        elif choice == "4":
+            domain = input("  domain to remove from the direct list: ").strip()
+            if domain:
+                _router_command(root, "routing", "remove", "--mode", "safe-list", "--domain", domain)
+        elif choice == "5":
+            domain = input("  domain to TUNNEL: ").strip()
+            if domain:
+                _router_command(root, "routing", "add", "--mode", "vpn-list", "--domain", domain)
+        elif choice == "6":
+            domain = input("  domain to remove from the vpn list: ").strip()
+            if domain:
+                _router_command(root, "routing", "remove", "--mode", "vpn-list", "--domain", domain)
+        else:
+            print(f"  unknown choice '{choice}'")
+
+
 # ---------------------------------------------------------------------------
 # interactive wizard
 # ---------------------------------------------------------------------------
@@ -627,6 +701,7 @@ _MENU = [
     ("7", "Check provider health"),
     ("8", "Start / reload the proxy engine (explicit action)"),
     ("9", "Install / verify OpenCode auto-rotation bridge (Hermes)"),
+    ("r", "Routing modes (show / switch / add-remove domain)"),
     ("q", "Quit"),
 ]
 
@@ -687,6 +762,8 @@ def _line_wizard(root: Path) -> int:
                 print(_style("  engine failed to start (see router output above)", _Ansi.RED))
         elif choice == "9":
             _cmd_bridge_install(root)
+        elif choice == "r":
+            _cmd_routing(root)
         else:
             print(f"  unknown choice '{choice}' (enter a number or 'q')")
 
@@ -706,6 +783,7 @@ TUI_MENU = [
     ("7", "Check provider health"),
     ("8", "Start/reload the proxy engine"),
     ("9", "Install / verify OpenCode auto-rotation bridge (Hermes)"),
+    ("r", "Routing modes (show / switch / add-remove domain)"),
     ("0", "Quit"),
 ]
 TUI_MENU_INDEX = {key: index for index, (key, _) in enumerate(TUI_MENU)}
@@ -726,7 +804,8 @@ def _strip_ansi(text: str) -> str:
 
 @dataclasses.dataclass
 class TuiState:
-    """Pure TUI state; view is one of "menu" | "guide" | "import"."""
+    """Pure TUI state; view is one of "menu" | "guide" | "import" |
+    "routing" | "routing_prompt"."""
 
     view: str = "menu"
     cursor: int = 0
@@ -735,17 +814,25 @@ class TuiState:
     guide_scroll: int = 0
     import_provider: str = "proton"
     import_text: str = ""
+    routing_lines: list = dataclasses.field(default_factory=list)
+    routing_prompt_label: str = ""
+    routing_prompt_text: str = ""
+    routing_prompt_args: tuple = ()
     status: str = ""
     status_ok: bool = True
     action: tuple | None = None  # recorded machine action for the wizard loop
     quit: bool = False
     cols: int = 80
     rows: int = 24
+    root: Path = ROOT
 
 
-def _initial_state() -> TuiState:
+def _initial_state(root: Path | None = None) -> TuiState:
     size = shutil.get_terminal_size((80, 24))
-    return TuiState(cols=max(size.columns, 40), rows=max(size.lines, 18))
+    state = TuiState(cols=max(size.columns, 40), rows=max(size.lines, 18))
+    if root is not None:
+        state.root = Path(root).resolve()
+    return state
 
 
 def _fit(text: str, width: int) -> str:
@@ -846,12 +933,58 @@ def _render_import(state: TuiState) -> list[str]:
     return lines
 
 
+_ROUTING_ACTIONS = [
+    ("1", "switch to vpn-list (only listed domains tunneled)"),
+    ("2", "switch to safe-list (everything else via default_provider)"),
+    ("3", "add domain to the direct list"),
+    ("4", "remove domain from the direct list"),
+    ("5", "add domain to the vpn list"),
+    ("6", "remove domain from the vpn list"),
+]
+
+
+def _render_routing(state: TuiState) -> list[str]:
+    """Routing-modes view. Rendered read-only from router.json; every change
+    is executed by the wizard loop through the ``router.py routing`` CLI."""
+    inner = max(state.cols - 2, 30)
+    lines = ["\u250c" + "\u2500" * inner + "\u2510"]
+    lines.append("\u2502" + _style(_fit(" routing modes ", inner), _Ansi.BOLD, _Ansi.CYAN) + "\u2502")
+    lines.append("\u251c" + "\u2500" * inner + "\u2524")
+    for ln in state.routing_lines:
+        lines.append("\u2502" + _fit(" " + ln, inner) + "\u2502")
+    lines.append("\u251c" + "\u2500" * inner + "\u2524")
+    for key, label in _ROUTING_ACTIONS:
+        lines.append("\u2502" + _style(_fit(f"  {key}  {label}", inner), _Ansi.CYAN) + "\u2502")
+    lines.append("\u251c" + "\u2500" * inner + "\u2524")
+    lines.append("\u2502" + _style(_fit(" 1-6 change \u00b7 writes go through the router CLI \u00b7 ESC back ", inner), _Ansi.DIM) + "\u2502")
+    lines.append("\u2514" + "\u2500" * inner + "\u2518")
+    return lines
+
+
+def _render_routing_prompt(state: TuiState) -> list[str]:
+    """Single-field text input for routing mutations (domain/provider)."""
+    inner = max(state.cols - 2, 30)
+    lines = ["\u250c" + "\u2500" * inner + "\u2510"]
+    lines.append("\u2502" + _style(_fit(" routing input ", inner), _Ansi.BOLD, _Ansi.CYAN) + "\u2502")
+    lines.append("\u251c" + "\u2500" * inner + "\u2524")
+    lines.append("\u2502" + _fit(" " + (state.routing_prompt_label or "input:"), inner) + "\u2502")
+    display = state.routing_prompt_text or "no input yet"
+    lines.append("\u2502" + _fit(" input: " + display, inner) + "\u2502")
+    lines.append("\u2502" + _style(_fit(" Enter submits \u00b7 ESC cancels \u00b7 backspace edits ", inner), _Ansi.DIM) + "\u2502")
+    lines.append("\u2514" + "\u2500" * inner + "\u2518")
+    return lines
+
+
 def render_frame(state: TuiState) -> list[str]:
     """Build the full frame (header, body, footer) as a list of screen lines."""
     if state.view == "guide":
         return _render_guide(state)
     if state.view == "import":
         return _render_import(state)
+    if state.view == "routing":
+        return _render_routing(state)
+    if state.view == "routing_prompt":
+        return _render_routing_prompt(state)
     return _render_menu(state)
 
 
@@ -890,6 +1023,12 @@ def _select_item(state: TuiState, index: int) -> TuiState:
         state.action = ("engine",)
     elif key == "9":
         state.action = ("bridge_install",)
+    elif key == "r":
+        # Read-only rendering; mutations flow through the router CLI via
+        # state.action, exactly like every other TUI action.
+        state.view = "routing"
+        state.routing_lines = _routing_lines(state.root) or ["routing modes"]
+        state.routing_prompt_text = ""
     return state
 
 
@@ -933,6 +1072,55 @@ def apply_key(state: TuiState, key: str) -> TuiState:
                 state.import_text += key
         return state
 
+    if state.view == "routing":
+        if key in (ESC, "q", "Q"):
+            state.view = "menu"
+        elif key == "1":
+            state.action = ("routing", "set", "--mode", "vpn-list")
+        elif key == "2":
+            if _read_routing_state(state.root).get("default_provider"):
+                state.action = ("routing", "set", "--mode", "safe-list")
+            else:
+                state.view = "routing_prompt"
+                state.routing_prompt_label = "default provider for safe-list (e.g. proton):"
+                state.routing_prompt_args = ("routing", "set", "--mode", "safe-list",
+                                             "--default-provider", "{TEXT}")
+        elif key == "3":
+            state.view = "routing_prompt"
+            state.routing_prompt_label = "domain to go DIRECT (safe-list):"
+            state.routing_prompt_args = ("routing", "add", "--mode", "safe-list", "--domain", "{TEXT}")
+        elif key == "4":
+            state.view = "routing_prompt"
+            state.routing_prompt_label = "domain to remove from the DIRECT list (safe-list):"
+            state.routing_prompt_args = ("routing", "remove", "--mode", "safe-list", "--domain", "{TEXT}")
+        elif key == "5":
+            state.view = "routing_prompt"
+            state.routing_prompt_label = "domain to TUNNEL (vpn-list):"
+            state.routing_prompt_args = ("routing", "add", "--mode", "vpn-list", "--domain", "{TEXT}")
+        elif key == "6":
+            state.view = "routing_prompt"
+            state.routing_prompt_label = "domain to remove from the VPN list (vpn-list):"
+            state.routing_prompt_args = ("routing", "remove", "--mode", "vpn-list", "--domain", "{TEXT}")
+        return state
+
+    if state.view == "routing_prompt":
+        if key == ESC:
+            state.view = "routing"
+        elif key in (ENTER, "\n"):
+            text = state.routing_prompt_text.strip()
+            state.view = "routing"
+            if not text:
+                state.status = "routing change cancelled: empty input"
+                state.status_ok = False
+            else:
+                state.action = tuple(text if part == "{TEXT}" else part for part in state.routing_prompt_args)
+        elif key in (BACKSPACE, "\x08"):
+            state.routing_prompt_text = state.routing_prompt_text[:-1]
+        elif key and len(key) == 1 and ord(key) >= 32:
+            if len(state.routing_prompt_text) < max(state.cols * 4, 256):
+                state.routing_prompt_text += key
+        return state
+
     # menu view
     if key in (UP, "k", "K"):
         state.cursor = (state.cursor - 1) % len(TUI_MENU)
@@ -942,7 +1130,7 @@ def apply_key(state: TuiState, key: str) -> TuiState:
         state.quit = True
     elif key in (ENTER, "\n"):
         return _select_item(state, state.cursor)
-    elif key in "0123456789" and key in TUI_MENU_INDEX:
+    elif key in TUI_MENU_INDEX:
         state.cursor = TUI_MENU_INDEX[key]
         return _select_item(state, state.cursor)
     return state
@@ -996,6 +1184,14 @@ def _execute_action(action: tuple, root: Path) -> tuple[str, int]:
                 buf.write("engine failed to start (see output above)")
         elif kind == "bridge_install":
             rc = _cmd_bridge_install(root)
+        elif kind == "routing":
+            # One writer: the `router.py routing` CLI. Never starts the engine -
+            # the output tells the operator to run ensure/reload separately.
+            rc = _router_command(root, "routing", *action[1:])
+            if rc == 0:
+                buf.write("routing config saved (engine NOT reloaded - run 'router.py ensure' to apply)")
+            else:
+                buf.write("routing change failed (see router output above)")
         else:  # pragma: no cover - defensive
             rc = 0
     return _strip_ansi(buf.getvalue()).strip(), rc
@@ -1055,7 +1251,7 @@ def _read_key(timeout: float = 0.05) -> str:
 
 def _tui_wizard(root: Path) -> int:
     """Full-screen alternate-screen wizard (both streams must be TTYs)."""
-    state = _initial_state()
+    state = _initial_state(root)
     fd = sys.stdin.fileno()
     try:
         saved = termios.tcgetattr(fd)

@@ -32,6 +32,10 @@
       "provider": "cloudflare"
     }
   ],
+  "routing": {
+    "mode": "vpn-list",
+    "vpn_domains": []
+  },
   "vpn": {
     "address": [
       "172.19.0.1/30"
