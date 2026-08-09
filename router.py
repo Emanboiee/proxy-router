@@ -22,6 +22,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -146,6 +147,27 @@ def set_mode(mode: str) -> None:
     os.chmod(MODE_FILE, 0o600)
 
 
+def _atomic_write(path: Path, text: str, mode: int = 0o600) -> None:
+    """Write ``text`` to ``path`` atomically (temp file + os.replace) with
+    ``mode`` permissions, so a crash mid-write never leaves a truncated
+    config and the file is never world-readable (F5)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=path.parent,
+            prefix=f".{path.name}.", suffix=".tmp", delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(text)
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def load_config() -> int:
     global _providers, _routes, _port, _vpn
     if not CONFIG_FILE.is_file():
@@ -177,12 +199,20 @@ def load_config() -> int:
             return fail(f"bad {CONFIG_FILE.name}: provider '{name}' directory escapes the router root")
     if not isinstance(routes, list) or not all(isinstance(route, dict) for route in routes) or not isinstance(vpn, dict):
         return fail(f"bad {CONFIG_FILE.name}: providers/routes/vpn have invalid types")
+    known_providers = set(providers)
     for route in routes:
         if not isinstance(route.get("provider"), str):
             return fail(f"bad {CONFIG_FILE.name}: every route needs a provider")
+        # F3: an unknown provider must be rejected at load, never silently
+        # dropped, or matching domains would fall through to direct.
+        if route["provider"] not in known_providers:
+            return fail(
+                f"bad {CONFIG_FILE.name}: route '{route.get('id', '<unnamed>')}' "
+                f"references unknown provider '{route['provider']}'"
+            )
         for key in ("domains", "ip_cidr"):
             if key in route and (not isinstance(route[key], list) or not all(isinstance(v, str) for v in route[key])):
-                return fail(f"bad {CONFIG_FILE.name}: route {key} must be a string list")
+                return fail(f"bad {CONFIG_FILE.name}: route '{route.get('id', '<unnamed>')}' {key} must be a string list")
     _port = port
     _providers = providers
     _routes = routes
@@ -221,8 +251,7 @@ def write_default_config(force: bool = False) -> int:
                 "stack": DEFAULT_TUN_STACK,
             },
         }
-    CONFIG_FILE.write_text(json.dumps(data, indent=2) + "\n")
-    os.chmod(CONFIG_FILE, 0o600)
+    _atomic_write(CONFIG_FILE, json.dumps(data, indent=2) + "\n", 0o600)
     print(f"wrote {CONFIG_FILE}")
     return 0
 
@@ -287,6 +316,47 @@ def set_active(name: str, profile: Path) -> None:
     os.chmod(state, 0o600)
 
 
+def _profile_error(profile: Path) -> str | None:
+    """Return an error message when ``profile`` cannot be parsed, else None.
+
+    The engine's parser raises (SystemExit for bad Endpoints/missing
+    AllowedIPs, KeyError/ValueError for missing/typed sections) on malformed
+    files; converting that into a string lets callers skip one bad profile
+    without losing the whole provider or producing a traceback (F2/F6).
+    """
+    try:
+        parse_wireguard(profile)
+        dns_server_for(profile)
+        return None
+    except (SystemExit, KeyError, ValueError, configparser.Error, OSError) as exc:
+        return str(exc) or type(exc).__name__
+
+
+def _usable_profile(name: str) -> Path | None:
+    """Profile for ``name`` that builds cleanly: the persisted active one when
+    valid, else the first non-cooled valid profile. Malformed profiles are
+    logged and skipped so one bad file never disables the provider (F6)."""
+    profiles = provider_files(name)
+    if not profiles:
+        return None
+    active = resolve_active(name)
+    if active is not None:
+        error = _profile_error(active)
+        if error is None:
+            return active
+        print(f"router: skipping bad active profile {active.name} for '{name}': {error}", file=sys.stderr)
+    for profile in profiles:
+        if active is not None and profile == active:
+            continue  # already logged above
+        error = _profile_error(profile)
+        if error is not None:
+            print(f"router: skipping bad profile {profile.name} for '{name}': {error}", file=sys.stderr)
+            continue
+        if not is_cooled_down(name, profile):
+            return profile
+    return None
+
+
 # ---------------------------------------------------------------------------
 # sing-box config generation
 # ---------------------------------------------------------------------------
@@ -320,16 +390,33 @@ def resolve_host(host: str) -> str:
     except OSError:
         pass
     prefer_ipv6 = bool(_vpn.get("prefer_ipv6_peers", True))
-    try:
-        infos = socket.getaddrinfo(host, None, socket.AF_UNSPEC)
-    except socket.gaierror:
-        return host  # let sing-box's resolver deal with it
-    for info in infos:
-        if prefer_ipv6 and info[0] == socket.AF_INET6:
-            return info[4][0]
-        if not prefer_ipv6 and info[0] == socket.AF_INET:
-            return info[4][0]
-    return infos[0][4][0]
+    resolved: list[str] = []
+
+    def _resolve() -> None:
+        # Runs on a daemon worker so a slow/broken resolver can never stall
+        # config build indefinitely (F7).
+        try:
+            infos = socket.getaddrinfo(host, None, socket.AF_UNSPEC)
+        except (socket.gaierror, OSError):
+            return
+        for info in infos:
+            if prefer_ipv6 and info[0] == socket.AF_INET6:
+                resolved.append(info[4][0])
+                return
+            if not prefer_ipv6 and info[0] == socket.AF_INET:
+                resolved.append(info[4][0])
+                return
+        if infos:
+            resolved.append(infos[0][4][0])
+
+    worker = threading.Thread(target=_resolve, name=f"dns-{host}", daemon=True)
+    worker.start()
+    worker.join(timeout=5.0)
+    if resolved:
+        return resolved[0]
+    # Bounded DNS failed (timeout/unresolvable): pass the hostname through and
+    # let sing-box's own resolver deal with it (previous gaierror behavior).
+    return host
 
 
 def _bad_endpoint(endpoint: str) -> None:
@@ -419,17 +506,23 @@ def build_singbox_config() -> tuple[dict, set[str]]:
     active: dict[str, dict] = {}
     dns_map: dict[str, str] = {}
     for name in _providers:
-        profile = resolve_active(name)
+        profile = _usable_profile(name)
         if profile is None:
             continue
-        endpoint = parse_wireguard(profile)
+        try:
+            endpoint = parse_wireguard(profile)
+            dns_map[name] = dns_server_for(profile)
+        except (SystemExit, KeyError, ValueError, configparser.Error, OSError) as exc:
+            # Defensive: _usable_profile already validated, but a file changed
+            # between the check and the build must never kill the config.
+            print(f"router: skipping bad profile {profile.name} for '{name}': {exc}", file=sys.stderr)
+            continue
         endpoint["tag"] = name
-        # sing-box 1.12+: domain destinations routed through this endpoint are
+        # sing-box 1.12+: provider endpoint routed through this endpoint is
         # resolved with an explicit per-endpoint resolver instead of the
         # deprecated implicit DNS rule path. DialerOptions is embedded flat.
         endpoint["domain_resolver"] = f"dns-{name}"
         active[name] = endpoint
-        dns_map[name] = dns_server_for(profile)
 
     # DNS resolution must NOT ride the tunnel: a WireGuard blip would then
     # take down resolution for the very request we're trying to route, which
@@ -738,7 +831,10 @@ def engine_ensure() -> int:
         if engine_alive() and engine_mode_consistent():
             return 0
         return engine_start()
-    if listener_up():
+    # Proxy mode: only a listener owned by OUR engine is "up". A foreign
+    # process answering the port while our pid is dead/mismatched is NOT
+    # healthy (F1): start the engine instead of declaring victory.
+    if listener_up() and engine_alive():
         return 0
     return engine_start()
 
@@ -815,15 +911,29 @@ def rotate(name: str) -> int:
     profiles = provider_files(name)
     if not profiles:
         return fail(f"provider '{name}' has no profiles")
-    seconds = int(_providers.get(name, {}).get("cooldown_seconds", 60))
+    # Keep only parseable profiles so one bad *.conf cannot wedge rotation
+    # (F6); log every skipped filename (F2).
+    valid: list[Path] = []
+    for profile in profiles:
+        error = _profile_error(profile)
+        if error is not None:
+            print(f"router: skipping bad profile {profile.name} of '{name}': {error}", file=sys.stderr)
+            continue
+        valid.append(profile)
+    if not valid:
+        return fail(f"provider '{name}' has no valid profiles (all *.conf are malformed)")
+    try:
+        seconds = int(_providers.get(name, {}).get("cooldown_seconds", 60))
+    except (TypeError, ValueError):
+        return fail(f"provider '{name}': cooldown_seconds must be an integer")
     current = resolve_active(name)
     if current is not None and not is_cooled_down(name, current):
         mark_cooldown(name, current, seconds)
-    if current in profiles:
-        start = profiles.index(current) + 1
-        candidates = profiles[start:] + profiles[:start]
+    if current in valid:
+        start = valid.index(current) + 1
+        candidates = valid[start:] + valid[:start]
     else:
-        candidates = profiles
+        candidates = valid
     for profile in candidates:
         if not is_cooled_down(name, profile):
             set_active(name, profile)
@@ -877,8 +987,10 @@ def routes_list() -> int:
 def _routes_add_entry(target: str, key: str, id_: str | None, provider: str) -> tuple[str, str] | None:
     """Add or update a route in the in-memory table.
 
-    Returns (key, id) on success, or None when the target is empty or the
-    provider is unknown.
+    Merges into the existing entry's list (appending unique values) instead of
+    overwriting, so ``routes add`` never drops previously configured targets
+    (F4). Returns (key, id) on success, or None when the target is empty or
+    the provider is unknown.
     """
     if not target or provider not in _providers:
         return None
@@ -887,18 +999,29 @@ def _routes_add_entry(target: str, key: str, id_: str | None, provider: str) -> 
     if existing is None:
         existing = {"id": id_, "provider": provider}
         _routes.append(existing)
-    existing[key] = [target]
+    entries = existing.get(key)
+    if not isinstance(entries, list):
+        entries = []
+    if target not in entries:
+        entries.append(target)
+    existing[key] = entries
     existing["provider"] = provider
     return key, id_
 
 
 def routes_add(args) -> int:
-    target = args.domain or args.ip or ""
-    key = "domains" if args.domain else "ip_cidr"
-    if _routes_add_entry(target, key, args.id, args.provider) is None:
-        if not target:
-            return fail("need --domain or --ip")
+    # Honor BOTH --domain and --ip when provided (F4).
+    targets: list[tuple[str, str]] = []
+    if args.domain:
+        targets.append(("domains", args.domain))
+    if args.ip:
+        targets.append(("ip_cidr", args.ip))
+    if not targets:
+        return fail("need --domain or --ip")
+    if args.provider not in _providers:
         return fail(f"unknown provider '{args.provider}' (have {', '.join(_providers)})")
+    for key, target in targets:
+        _routes_add_entry(target, key, args.id, args.provider)
     if save_config() != 0:
         return 1
     if engine_reload() != 0:
@@ -1016,8 +1139,12 @@ def _status_report() -> tuple[int, str]:
         if engine_alive():
             return 1, "down (running engine does not match tun mode; run 'vpn on')"
         return 1, "down (mode set to tun; run 'vpn on')"
-    if listener_up():
+    if listener_up() and engine_alive():
         return 0, "up (proxy 127.0.0.1:{})".format(_port)
+    if listener_up():
+        # F1: something answers the port but it is not our engine (stale pid
+        # file or a recycled/foreign process); never report that as up.
+        return 1, "down (foreign listener on 127.0.0.1:{}; run 'start')".format(_port)
     return 1, "down (proxy mode; run 'vpn on' for tun, 'start' for proxy)"
 
 

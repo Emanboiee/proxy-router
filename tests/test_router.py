@@ -552,7 +552,8 @@ class StatusReportTests(unittest.TestCase):
         self.assertIn("up (tun)", line)
 
     def test_proxy_mode_up(self):
-        with mock.patch.object(router, "listener_up", return_value=True):
+        with mock.patch.object(router, "listener_up", return_value=True), \
+             mock.patch.object(router, "engine_alive", return_value=True):
             rc, line = router._status_report()
         self.assertEqual(rc, 0)
         self.assertIn("up", line)
@@ -581,6 +582,7 @@ class EngineEnsureConsistencyTests(unittest.TestCase):
 
     def test_proxy_listener_up_returns_without_start(self):
         with mock.patch.object(router, "listener_up", return_value=True), \
+             mock.patch.object(router, "engine_alive", return_value=True), \
              mock.patch.object(router, "engine_start", side_effect=AssertionError("must not start")):
             self.assertEqual(router.engine_ensure(), 0)
 

@@ -32,6 +32,10 @@ DEFAULT_PING_HOSTS = ("1.1.1.1", "8.8.8.8")
 DEFAULT_MAX_BYTES = 1_000_000
 DEFAULT_TIMEOUT = 10
 MAX_LOG_LINES = 100
+# Rotate the samples file once it grows past either bound (F11): the worker
+# appends a line every interval, so without a cap samples.jsonl grows forever.
+MAX_SAMPLE_LINES = 10_000
+MAX_SAMPLE_BYTES = 5_000_000
 DEFAULT_HEADERS = {
     "User-Agent": "proxy-router-monitor/1.0",
     "Accept": "*/*",
@@ -192,8 +196,12 @@ def measure_ping(host: str, *, command_runner=subprocess.run,
     system = system or platform.system()
     if system == "Windows":
         command = ["ping", "-n", "3", "-w", "2000", host]
-    else:
+    elif system == "Darwin":
+        # macOS: -W is in milliseconds.
         command = ["ping", "-c", "3", "-W", "2000", host]
+    else:
+        # Linux: -W is in SECONDS; 2000 would be an ~33-minute dead wait (F9).
+        command = ["ping", "-c", "3", "-W", "2", host]
     try:
         result = command_runner(command, capture_output=True, text=True, timeout=timeout)
     except FileNotFoundError:
@@ -392,9 +400,28 @@ def stop(root: Path | None = None) -> dict:
     return {"stopped": True, "pid": pid}
 
 
+def _rotate_samples_if_needed(path: Path) -> None:
+    """Archive a too-large/too-long samples file to ``samples.jsonl.1``."""
+    try:
+        size = path.stat().st_size
+        with path.open() as handle:
+            lines = sum(1 for _ in handle)
+    except OSError:
+        return
+    if size < MAX_SAMPLE_BYTES and lines < MAX_SAMPLE_LINES:
+        return
+    archive = path.with_suffix(path.suffix + ".1")
+    archive.unlink(missing_ok=True)
+    try:
+        path.rename(archive)
+    except OSError:
+        pass
+
+
 def append_sample(root: Path, sample: dict) -> None:
     path = samples_file(root)
     path.parent.mkdir(parents=True, exist_ok=True)
+    _rotate_samples_if_needed(path)
     with path.open("a") as handle:
         handle.write(json.dumps(sample, separators=(",", ":")) + "\n")
     os.chmod(path, 0o600)
