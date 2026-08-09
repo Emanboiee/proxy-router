@@ -12,6 +12,13 @@
   },
   "routes": [
     {
+      "id": "opencode-zen",
+      "domains": [
+        "opencode.ai"
+      ],
+      "provider": "proton"
+    },
+    {
       "id": "roblox",
       "domains": [
         "roblox.com",

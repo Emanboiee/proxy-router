@@ -175,11 +175,11 @@ def write_default_config(force: bool = False) -> int:
                 "cloudflare": {"directory": "providers/cloudflare", "cooldown_seconds": 60},
             },
             "routes": [
-                # No default route for opencode.ai: OpenCode Zen's API is
-                # Cloudflare-WAF-blocked (HTTP 403 error 1010) whenever egress
-                # leaves through a WireGuard tunnel (Proton or WARP). It needs
-                # direct egress + local DNS, so it falls through to the final
-                # 'direct' outbound instead.
+                {
+                    "id": "opencode-zen",
+                    "domains": ["opencode.ai"],
+                    "provider": "proton",
+                },
                 {
                     "id": "roblox",
                     "domains": ["roblox.com", "rbxcdn.com", "robloxlabs.com", "rblx.com"],
@@ -991,6 +991,12 @@ def main() -> int:
     vpn = sub.add_parser("vpn", help="toggle TUN mode (vpn on|off|status)")
     vpn.add_argument("action", choices=["on", "off", "status"])
 
+    setup = sub.add_parser("setup", help="interactive Proton/WARP setup wizard")
+    setup.add_argument("setup_args", nargs=argparse.REMAINDER)
+
+    monitor = sub.add_parser("monitor", help="opt-in network monitoring")
+    monitor.add_argument("monitor_args", nargs=argparse.REMAINDER)
+
     r_add = sub.add_parser("add")
     r_add.add_argument("--id")
     r_add.add_argument("--domain")
@@ -1006,7 +1012,17 @@ def main() -> int:
     r_count = sub.add_parser("provider-count")
     r_count.add_argument("provider")
 
-    args = parser.parse_args()
+    args, passthrough = parser.parse_known_args()
+    if args.cmd == "setup":
+        import setup_tui
+
+        return setup_tui.main(["setup", *passthrough, *args.setup_args], root=ROOT)
+    if args.cmd == "monitor":
+        import monitor
+
+        return monitor.main(["monitor", *args.monitor_args, *passthrough], root=ROOT)
+    if passthrough:
+        parser.error("unrecognized arguments: " + " ".join(passthrough))
     if args.cmd == "init":
         return write_default_config(force=getattr(args, "force", False))
     if args.cmd is None:

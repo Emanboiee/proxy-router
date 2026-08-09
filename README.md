@@ -8,15 +8,15 @@ Spiritual successor to `tools/opencode-zen-vpn` (retired).
 Runs a local mixed HTTP/SOCKS proxy at `127.0.0.1:2080` and routes only
 matching domains/IPs through a WireGuard tunnel — everything else goes direct.
 Routes can point at different tunnel providers (e.g. `roblox.com ->
-cloudflare`), and each provider keeps a pool of profiles that rotate on demand
-(rate limits, server death) while the listener stays up (config is hot-reloaded
-via SIGHUP, no restart). Domains with no route (including `opencode.ai`) match
-the final `direct` outbound: OpenCode Zen's API is Cloudflare-WAF-blocked
-(HTTP 403 error 1010) when egress leaves through a WireGuard tunnel, so it
-must keep direct egress + local DNS.
+cloudflare` and `opencode.ai -> proton`), and each provider keeps a pool of
+profiles that rotate on demand (rate limits, server death) while the listener
+stays up (config is hot-reloaded via SIGHUP, no restart). The default template
+keeps the route table conservative; `proxy-router setup --preset` applies the
+validated Proton/WARP presets explicitly.
 
-On macOS the system proxy can be switched on/off (`up`/`down`) so the rest of
-the system also uses the selective proxy.
+On the current deployment, OpenCode Zen uses the Proton pool and Roblox uses
+Cloudflare WARP. Direct egress remains the fallback when all tunnel exits are
+unhealthy.
 
 Core CLI runs on macOS, Linux, and Windows. The macOS-only bits (`up`/`down`
 and the launchd keep-alive) are guarded and print a clear message elsewhere.
@@ -48,19 +48,31 @@ cd proxy-router
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-Then set up your first provider (see [Provider setup](#provider-setup)) and
-start:
+Then initialize the config and use the setup TUI/guide path:
 
 ```sh
-proxy-router init            # writes router.json from router.example.json
-proxy-router ensure          # start engine if the listener is down (idempotent)
+proxy-router init
+proxy-router setup --guide all
+proxy-router setup --import-proton ~/Downloads/protonvpn-*.conf
+proxy-router setup --import-warp ~/Downloads/wgcf-profile.conf  # optional
+proxy-router setup --preset
+proxy-router setup --check
+proxy-router ensure
 ```
+
+`proxy-router setup` with no flags opens the custom terminal wizard. It never
+enables TUN mode or starts monitoring unless you explicitly choose those
+operations.
 
 ## Layout
 
 ```
 router.py                    engine + CLI (single file, stdlib only)
+setup_tui.py                 custom terminal setup wizard + safe imports
+monitor.py                   opt-in latency/ping/speed monitor worker
 router.example.json          config template (port, providers, cooldowns, route table)
+guides/proton-vpn-free.md    Proton VPN Free WireGuard guide
+guides/cloudflare-warp.md    Cloudflare WARP/wgcf guide
 install.sh / install.ps1     installers
 bin/sing-box(.exe)           bundled engine binary (release archives only)
 examples/keepalive.sh        re-arms the engine if the listener dies
@@ -87,6 +99,15 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py remove <id>
 ./router.py rotate <provider>    # switch to next cooled-down profile, hot reload
 ./router.py provider-count proton # rotation candidates (retry budget)
+./router.py setup                  # custom setup TUI
+./router.py setup --guide all      # print Proton + WARP guides
+./router.py setup --preset         # enable OpenCode->Proton and Roblox->WARP presets
+./router.py setup --check          # validate imported profiles without networking
+./router.py monitor status          # read monitor state; never probes
+./router.py monitor check           # explicit one-shot ping/latency/speed sample
+./router.py monitor on              # opt in to a detached sample worker (60s default)
+./router.py monitor off             # stop the worker and remove active state
+./router.py monitor logs            # show recent JSONL samples
 ./router.py init                 # write a fresh router.json (exists => refused; add --force)
 ./router.py up                   # enable macOS system proxy (also ensures engine)
 ./router.py down                 # disable macOS system proxy only (engine keeps running)
@@ -141,10 +162,24 @@ Each profile is a sing-box-compatible WireGuard config dropped into
 `providers/<provider>/` as `<name>.conf`. The provider name (e.g. `proton`)
 becomes the sing-box endpoint tag.
 
-Proton VPN: export a WireGuard config for each server from the app/account
-page and drop the files in. Cloudflare WARP: generate a config with `wgcf`
-(`wgcf account` then `wgcf generate`) and save it as
-`providers/cloudflare/warp.conf`, then add `"cloudflare": {}` to `router.json`.
+The easiest path is the setup wizard:
+
+```sh
+proxy-router setup                  # interactive terminal menu
+proxy-router setup --guide proton   # print the bundled Proton guide
+proxy-router setup --guide warp     # print the bundled WARP guide
+proxy-router setup --import-proton ~/Downloads/*.conf
+proxy-router setup --import-warp ~/Downloads/wgcf-profile.conf
+proxy-router setup --preset          # idempotently adds both safe route presets
+proxy-router setup --check
+```
+
+The full provider instructions live in
+[`guides/proton-vpn-free.md`](guides/proton-vpn-free.md) and
+[`guides/cloudflare-warp.md`](guides/cloudflare-warp.md). The importer validates
+WireGuard structure, sanitizes filenames, and writes profiles as `0600`; it
+never prints private keys. Proton's flaky private resolver `10.2.0.1` is
+replaced by public DNS through the tunnel.
 
 ### Config reference (`router.json`)
 
@@ -156,17 +191,18 @@ page and drop the files in. Cloudflare WARP: generate a config with `wgcf`
     "cloudflare": { "cooldown_seconds": 60 }
   },
   "routes": [
+    { "id": "opencode-zen", "domains": ["opencode.ai"], "provider": "proton" },
     { "id": "roblox", "domains": ["roblox.com", "rbxcdn.com", "robloxlabs.com", "rblx.com"], "provider": "cloudflare" }
   ]
 }
 ```
 
-`opencode.ai` deliberately has **no** route: OpenCode Zen's API is
-Cloudflare-WAF-blocked with HTTP 403 error 1010 whenever its traffic leaves
-via a WireGuard tunnel (Proton or WARP). It resolves fine over direct egress
-with local DNS, so it intentionally matches the default `direct` final. If you
-previously shipped an `opencode -> proton` route, remove it the same way
-(`proxy-router remove opencode`) so chat completions keep working.
+`proxy-router setup --preset` adds the two routes above idempotently. Route
+choice is configurable: the current validated deployment uses the Proton pool
+for OpenCode Zen and Cloudflare WARP for Roblox, while unmatched traffic stays
+direct. If every tunnel exit is unhealthy, direct OpenCode egress remains the
+fallback; the router does not claim that a tunnel is healthy merely because a
+profile parses.
 
 - Route domains and IP CIDRs select which traffic enters a tunnel; everything
   else matches `direct` (unmatched) traffic.
@@ -181,10 +217,32 @@ Notes on claims vs reality:
 
 - The provider `"dns"` key in `router.json` is **not read** — DNS comes from
   each profile's `[Interface] DNS` line.
-- Profile files are **not** chmod'd 600 (only state files and the generated
-  `sing-box.json` are); the install dir is chmod 700 instead.
+- The setup importer chmods imported profile files `600`; manually placed
+  profiles must be secured by the operator. State files and generated
+  `sing-box.json` are also protected.
 - `router.py init` refuses to overwrite an existing `router.json` unless you
   pass `--force`; the installer never overwrites it either.
+
+## Optional network monitoring
+
+Monitoring is completely off by default. Normal proxy traffic does not start a
+worker, timer, ping, HTTP request, or speed test. Use it only when you want a
+snapshot or a background time series:
+
+```sh
+proxy-router monitor status     # state only; no network activity
+proxy-router monitor check      # one explicit bounded sample
+proxy-router monitor on         # detached worker, 60-second samples
+proxy-router monitor logs       # bounded tail of JSONL samples
+proxy-router monitor off        # stop worker and remove enabled state
+```
+
+Each sample records HTTP latency, ICMP ping where the platform provides it, and
+bounded download/upload throughput. The worker state and samples live under
+`state/monitor/` and are mode `0600`; `monitor on` is the only command that
+starts recurring work. An optional `monitor` object in `router.json` can set
+`interval_seconds`, `ping_hosts`, URLs, `max_bytes`, and timeouts. Speed checks
+are intentionally bounded and use a conservative 1 MB default.
 
 ## Self-healing
 
