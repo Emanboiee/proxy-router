@@ -652,6 +652,12 @@ def probe_url_for(name: str) -> str | None:
     route would go out direct and measure the wrong path). None when the
     provider has no route domain to probe through.
 
+    An explicit ``probe_url`` on the provider entry wins over the route
+    pick: some routed domains (e.g. roblox.com's bot-protection landing
+    page) hang or redirect even on a healthy tunnel, which would
+    false-mark the exit dead. Operators pin a light, reliable target
+    (e.g. https://www.roblox.com/robots.txt) when that happens.
+
     In safe-list routing mode, domains whitelisted as ``direct_domains`` are
     sent DIRECT by the route table; probing such a host would measure the
     direct path, not the tunnel, and false-alive a dead exit — so those are
@@ -661,6 +667,11 @@ def probe_url_for(name: str) -> str | None:
     tunneled path to probe; None is returned (egress check then skips the
     provider instead of trusting a direct-path result).
     """
+    entry = _providers.get(name)
+    if isinstance(entry, dict):
+        pinned = entry.get("probe_url")
+        if isinstance(pinned, str) and pinned.startswith("https://"):
+            return pinned
     direct = frozenset((routing_state().get("direct_domains") or [])) \
         if routing_state().get("mode") == "safe-list" else frozenset()
     for route in _routes:
@@ -2464,8 +2475,14 @@ def main() -> int:
     if args.cmd == "init":
         return write_default_config(force=getattr(args, "force", False))
     if args.cmd is None:
-        parser.print_help()
-        return 2
+        # Bare `proxy-router` opens the interactive TUI (settings, presets,
+        # routing modes, health). The wizard never starts or reloads the
+        # engine on its own — the only lifecycle action is menu item 8,
+        # operator-initiated. Help stays available via `router.py --help`
+        # (argparse handles that before we get here).
+        import setup_tui
+
+        return setup_tui.main([], root=ROOT)
 
     if args.cmd == "up":
         if sys.platform != "darwin":

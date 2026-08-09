@@ -1872,6 +1872,30 @@ class RoutingModeTests(unittest.TestCase):
         router._routing = {}
         self.assertEqual(router.probe_url_for("proton"), "https://example.com")
 
+    def test_probe_url_for_uses_provider_pinned_probe_url_first(self):
+        # roblox.com's bot-protection landing hangs even on a healthy tunnel;
+        # a pinned per-provider probe_url (a light target) must win over the
+        # first-routed-domain pick so egress checks don't false-mark the exit.
+        router._providers["cloudflare"] = {
+            "directory": "providers/cloudflare",
+            "cooldown_seconds": 60,
+            "probe_url": "https://www.roblox.com/robots.txt",
+        }
+        self.assertEqual(router.probe_url_for("cloudflare"),
+                         "https://www.roblox.com/robots.txt")
+        # provider without a pin still uses the route pick
+        self.assertEqual(router.probe_url_for("proton"), "https://example.com")
+
+    def test_probe_url_for_ignores_invalid_pinned_probe_url(self):
+        # invalid pin falls back to the first routed domain, not to garbage
+        router._providers["cloudflare"] = {
+            "directory": "providers/cloudflare",
+            "cooldown_seconds": 60,
+            "probe_url": "not-a-url",
+        }
+        router._routes = router._routes + [{"id": "roblox", "domains": ["roblox.com"], "provider": "cloudflare"}]
+        self.assertEqual(router.probe_url_for("cloudflare"), "https://roblox.com")
+
     def test_safe_list_tun_keeps_hijack_first(self):
         router.set_mode("tun")
         router._routing = {"mode": "safe-list", "direct_domains": ["youtube.com"], "default_provider": "proton"}

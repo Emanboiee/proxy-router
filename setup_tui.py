@@ -36,6 +36,8 @@ import tempfile
 import textwrap
 from pathlib import Path
 
+_PRESET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+
 try:
     import termios
     import tty
@@ -71,6 +73,50 @@ _PRESET_ROUTES = {
         "id": "roblox",
         "domains": ["roblox.com", "rbxcdn.com", "robloxlabs.com", "rblx.com"],
         "provider": "cloudflare",
+    },
+    "school": {
+        "id": "school",
+        "domains": [
+            "discord.com",
+            "discord.gg",
+            "discordapp.com",
+            "twitch.tv",
+            "facebook.com",
+            "fbcdn.net",
+            "instagram.com",
+            "cdninstagram.com",
+            "youtube.com",
+            "googlevideo.com",
+            "ytimg.com",
+            "x.com",
+            "twitter.com",
+            "cdn.sstatic.net",
+        ],
+        "provider": "cloudflare",
+    },
+}
+
+# Built-in preset definitions: name -> {"routes": [..], "routing": {...}}.
+# A preset is a NAMED bundle of routes (domains -> provider) plus an optional
+# routing-mode section, applied by name with `setup --preset <name>`. Users
+# add their own with `setup --preset-add NAME --provider P --domain ...`.
+_BUILTIN_PRESETS: dict = {
+    "opencode": {
+        "routes": [_PRESET_ROUTES["opencode-zen"]],
+        "routing": {"mode": "default"},
+    },
+    "roblox": {
+        "routes": [_PRESET_ROUTES["roblox"]],
+        "routing": {"mode": "default"},
+    },
+    "default": {  # the classic combo: opencode via proton + roblox via warp
+        "routes": [_PRESET_ROUTES["opencode-zen"], _PRESET_ROUTES["roblox"]],
+        "routing": {"mode": "default"},
+    },
+    "school-warp": {
+        "routes": [_PRESET_ROUTES["school"]],
+        "routing": {"mode": "vpn-list",
+                    "vpn_domains": list(_PRESET_ROUTES["school"]["domains"])},
     },
 }
 
@@ -317,6 +363,122 @@ def apply_presets(config_path, opencode=True, warp_roblox=True) -> dict:
     return {"added": added}
 
 
+def custom_preset_path(root: Path, name: str) -> Path:
+    """Path of the custom preset file for ``name`` under ``root/presets/``.
+
+    Preset names are validated like provider names (letters/digits/._-), so a
+    name can never escape the presets directory.
+    """
+    if not _PRESET_NAME.fullmatch(name):
+        raise ValueError(
+            f"invalid preset name '{name}' (use letters, digits, '.', '_', '-'; max 64)"
+        )
+    return root / "presets" / f"{name}.json"
+
+
+def preset_names(root: Path) -> list[str]:
+    """All available preset names: built-ins first, then custom files."""
+    names = sorted(_BUILTIN_PRESETS)
+    try:
+        custom_dir = root / "presets"
+        if custom_dir.is_dir():
+            names += sorted(p.stem for p in custom_dir.glob("*.json"))
+    except OSError:
+        pass
+    result: list[str] = []
+    for name in names:
+        if name not in result:
+            result.append(name)
+    return result
+
+
+def load_preset(root: Path, name: str) -> dict:
+    """Load a preset definition (built-in or custom) as
+    ``{"routes": [...], "routing": {...}, "providers": {...}}``."""
+    if name in _BUILTIN_PRESETS:
+        return dict(_BUILTIN_PRESETS[name])
+    path = custom_preset_path(root, name)
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"preset '{name}' is not loadable: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"preset '{name}' must be a JSON object")
+    return data
+
+
+def apply_preset_by_name(root: Path, name: str) -> dict:
+    """Apply the preset ``name`` to ``root/router.json`` (idempotent, lossless).
+
+    Adds the preset's routes/providers and merges its ``routing`` section
+    (mode switch when the preset defines one; a ``default`` routing is left
+    untouched). Never starts the engine.
+    Returns ``{"added": [...], "mode": ..., "preset": name}``.
+    """
+    config_path = root / "router.json"
+    if config_path.is_file():
+        data = json.loads(config_path.read_text())
+    else:
+        data = _default_config()
+    preset = load_preset(root, name)
+    providers = data.setdefault("providers", {})
+    routes = data.setdefault("routes", [])
+    for provider in preset.get("providers", {}):
+        providers.setdefault(provider, dict(preset["providers"][provider]))
+    added: list[str] = []
+    for route in preset.get("routes", []):
+        if route.get("provider") and route["provider"] not in providers:
+            providers.setdefault(route["provider"], {
+                "directory": f"providers/{route['provider']}", "cooldown_seconds": 60})
+        if not any(r.get("id") == route.get("id") for r in routes):
+            routes.append(dict(route))
+            added.append(str(route.get("id")))
+    routing = preset.get("routing") or {}
+    mode = routing.get("mode", "default")
+    if mode != "default":
+        data["routing"] = data.get("routing") or {}
+        data["routing"].update({k: v for k, v in routing.items() if v is not None})
+        # never clobber an explicitly-set default_provider with None
+        if routing.get("default_provider"):
+            data["routing"]["default_provider"] = routing["default_provider"]
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(data, indent=2) + "\n")
+    os.chmod(config_path, 0o600)
+    return {"added": added, "mode": mode, "preset": name}
+
+
+def add_custom_preset(root: Path, name: str, provider: str, domains: list[str],
+                      mode: str = "vpn-list", default_provider: str | None = None) -> Path:
+    """Create a custom named preset file under ``root/presets/``.
+
+    Custom presets are the "make it yours" path: pick a name, a provider
+    (proton, cloudflare, or any configured exit), and the domains that ride
+    it. The remaining routing mode defaults to vpn-list (only these domains
+    tunneled) — the configurable inverse of safe-list.
+    """
+    domain_list = [d for d in domains if d]
+    if not domain_list:
+        raise ValueError("preset needs at least one domain")
+    routing: dict = {"mode": mode}
+    if mode == "vpn-list":
+        routing["vpn_domains"] = domain_list
+    elif mode == "safe-list":
+        routing["direct_domains"] = domain_list
+        if default_provider:
+            routing["default_provider"] = default_provider
+    elif mode == "default":
+        routing = {"mode": "default"}
+    preset = {
+        "routes": [{"id": name, "domains": domain_list, "provider": provider}],
+        "routing": routing,
+    }
+    path = custom_preset_path(root, name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(preset, indent=2) + "\n")
+    os.chmod(path, 0o600)
+    return path
+
+
 # ---------------------------------------------------------------------------
 # non-interactive commands
 # ---------------------------------------------------------------------------
@@ -428,6 +590,34 @@ def _cmd_preset(root: Path) -> int:
     else:
         print(_style(_tint_provider("setup: route presets already applied (nothing to add)"), _Ansi.GREEN))
     print(f"setup: wrote {config_path}")
+    return 0
+
+
+def _cmd_preset_prompt(root: Path) -> int:
+    """Line-menu flow: pick a preset by name (built-in or custom) and apply it."""
+    names = preset_names(root)
+    if not names:
+        print(_style("  no presets available", _Ansi.RED), file=sys.stderr)
+        return 1
+    print(_style("  available presets: " + ", ".join(names), _Ansi.BOLD))
+    name = input("  preset name (empty cancels): ").strip()
+    if not name:
+        return 1
+    if name not in names:
+        print(_style(f"  unknown preset '{name}' — use one of: {', '.join(names)}", _Ansi.RED), file=sys.stderr)
+        return 1
+    try:
+        result = apply_preset_by_name(root, name)
+    except (ValueError, json.JSONDecodeError, OSError) as exc:
+        print(_style(f"  preset apply failed: {exc}", _Ansi.RED), file=sys.stderr)
+        return 1
+    label = f"preset '{result['preset']}' applied — routing={result['mode']}"
+    if result["added"]:
+        label += f", added route(s): {', '.join(result['added'])}"
+    else:
+        label += " (already present, nothing added)"
+    print(_style(_tint_provider(label), _Ansi.GREEN))
+    print("  run menu item 8 (`ensure`) to apply; engine untouched for now.")
     return 0
 
 
@@ -701,7 +891,8 @@ _MENU = [
     ("7", "Check provider health"),
     ("8", "Start / reload the proxy engine (explicit action)"),
     ("9", "Install / verify OpenCode auto-rotation bridge (Hermes)"),
-    ("r", "Routing modes (show / switch / add-remove domain)"),
+    ("r", "Routing modes (safe-list / vpn-list / default)"),
+    ("s", "Presets: apply by name / browser (built-in + custom)"),
     ("q", "Quit"),
 ]
 
@@ -764,6 +955,8 @@ def _line_wizard(root: Path) -> int:
             _cmd_bridge_install(root)
         elif choice == "r":
             _cmd_routing(root)
+        elif choice == "s":
+            _cmd_preset_prompt(root)
         else:
             print(f"  unknown choice '{choice}' (enter a number or 'q')")
 
@@ -784,6 +977,7 @@ TUI_MENU = [
     ("8", "Start/reload the proxy engine"),
     ("9", "Install / verify OpenCode auto-rotation bridge (Hermes)"),
     ("r", "Routing modes (show / switch / add-remove domain)"),
+    ("s", "Presets: apply by name / browser (built-in + custom)"),
     ("0", "Quit"),
 ]
 TUI_MENU_INDEX = {key: index for index, (key, _) in enumerate(TUI_MENU)}
@@ -940,7 +1134,9 @@ _ROUTING_ACTIONS = [
     ("4", "remove domain from the direct list"),
     ("5", "add domain to the vpn list"),
     ("6", "remove domain from the vpn list"),
+    ("7", "apply a preset by name (built-in or custom)"),
 ]
+_PRESET_PROMPT_LABEL = "preset name to apply (built-in or custom):"
 
 
 def _render_routing(state: TuiState) -> list[str]:
@@ -956,7 +1152,7 @@ def _render_routing(state: TuiState) -> list[str]:
     for key, label in _ROUTING_ACTIONS:
         lines.append("\u2502" + _style(_fit(f"  {key}  {label}", inner), _Ansi.CYAN) + "\u2502")
     lines.append("\u251c" + "\u2500" * inner + "\u2524")
-    lines.append("\u2502" + _style(_fit(" 1-6 change \u00b7 writes go through the router CLI \u00b7 ESC back ", inner), _Ansi.DIM) + "\u2502")
+    lines.append("\u2502" + _style(_fit(" 1-7 change \u00b7 writes go through the router CLI \u00b7 ESC back ", inner), _Ansi.DIM) + "\u2502")
     lines.append("\u2514" + "\u2500" * inner + "\u2518")
     return lines
 
@@ -1028,6 +1224,16 @@ def _select_item(state: TuiState, index: int) -> TuiState:
         # state.action, exactly like every other TUI action.
         state.view = "routing"
         state.routing_lines = _routing_lines(state.root) or ["routing modes"]
+        state.routing_prompt_text = ""
+    elif key == "s":
+        # Preset browser: renders read-only, mutation flows through
+        # state.action like routing changes.
+        state.view = "routing"
+        try:
+            names = preset_names(state.root)
+            state.routing_lines = ["presets: " + (", ".join(names) if names else "(none)")]
+        except OSError:
+            state.routing_lines = ["presets: (unreadable)"]
         state.routing_prompt_text = ""
     return state
 
@@ -1101,6 +1307,10 @@ def apply_key(state: TuiState, key: str) -> TuiState:
             state.view = "routing_prompt"
             state.routing_prompt_label = "domain to remove from the VPN list (vpn-list):"
             state.routing_prompt_args = ("routing", "remove", "--mode", "vpn-list", "--domain", "{TEXT}")
+        elif key == "7":
+            state.view = "routing_prompt"
+            state.routing_prompt_label = _PRESET_PROMPT_LABEL
+            state.routing_prompt_args = ("preset_by_name", "{TEXT}")
         return state
 
     if state.view == "routing_prompt":
@@ -1174,6 +1384,15 @@ def _execute_action(action: tuple, root: Path) -> tuple[str, int]:
             rc = _cmd_import(root, action[1], [action[2]])
         elif kind == "preset":
             rc = _cmd_preset(root)
+        elif kind == "preset_by_name":
+            try:
+                result = apply_preset_by_name(root, action[1])
+                buf.write(f"preset '{result['preset']}' applied — routing={result['mode']}"
+                          + (f"; added {', '.join(result['added'])}" if result["added"] else "; nothing to add"))
+                rc = 0
+            except (ValueError, json.JSONDecodeError, OSError) as exc:
+                buf.write(f"preset apply failed: {exc}")
+                rc = 1
         elif kind == "check":
             rc = _cmd_check(root)
         elif kind == "engine":
@@ -1330,8 +1549,22 @@ def main(argv=None, root=None) -> int:
                         help="import WireGuard .conf file(s)/directory into providers/proton")
     parser.add_argument("--import-warp", nargs="+", metavar="PATH",
                         help="import WireGuard .conf file(s)/directory into providers/cloudflare")
-    parser.add_argument("--preset", action="store_true",
-                        help="apply safe route presets to router.json (idempotent)")
+    parser.add_argument("--preset", metavar="NAME", nargs="?",
+                        const="default",
+                        help="apply a preset by name (built-in or custom; bare --preset applies 'default')")
+    parser.add_argument("--preset-list", action="store_true",
+                        help="list available presets (built-in and custom)")
+    parser.add_argument("--preset-add", metavar="NAME",
+                        help="create a custom preset file under presets/")
+    parser.add_argument("--provider", metavar="PROVIDER",
+                        help="provider for --preset-add (e.g. proton, cloudflare)")
+    parser.add_argument("--domain", action="append", default=[], metavar="DOMAIN",
+                        help="domain for --preset-add (repeatable)")
+    parser.add_argument("--preset-route-mode", choices=["vpn-list", "safe-list", "default"],
+                        default="vpn-list",
+                        help="routing mode for --preset-add (default vpn-list)")
+    parser.add_argument("--preset-default-provider", metavar="PROVIDER",
+                        help="default_provider for --preset-add safe-list mode")
     parser.add_argument("--bridge-install", action="store_true",
                         help="install the Hermes OpenCode auto-rotation bridge")
     parser.add_argument("--bridge-force-install", action="store_true",
@@ -1350,7 +1583,35 @@ def main(argv=None, root=None) -> int:
     if args.import_warp:
         rc = max(rc, _cmd_import(ROOT, "cloudflare", args.import_warp))
     if args.preset:
-        rc = max(rc, _cmd_preset(ROOT))
+        try:
+            result = apply_preset_by_name(ROOT, args.preset)
+            label = f"setup: preset '{result['preset']}' applied — routing={result['mode']}"
+            if result["added"]:
+                label += f", added route(s): {', '.join(result['added'])}"
+            else:
+                label += " (already present, nothing added)"
+            print(_style(_tint_provider(label), _Ansi.GREEN))
+            print("setup: run `proxy-router ensure` (or reload) to apply; the engine is untouched.")
+        except (ValueError, json.JSONDecodeError, OSError) as exc:
+            print(_style(f"setup: preset apply failed: {exc}", _Ansi.RED), file=sys.stderr)
+            rc = max(rc, 1)
+    if args.preset_list:
+        print("setup: available presets:")
+        for name in preset_names(ROOT):
+            source = "built-in" if name in _BUILTIN_PRESETS else "custom"
+            print(f"  {name:16s} ({source})")
+    if args.preset_add:
+        try:
+            if not args.provider:
+                raise ValueError("--preset-add needs --provider (e.g. proton, cloudflare)")
+            path = add_custom_preset(ROOT, args.preset_add, args.provider, args.domain,
+                                     mode=args.preset_route_mode,
+                                     default_provider=args.preset_default_provider)
+            print(_style(f"setup: custom preset '{args.preset_add}' written to {path}", _Ansi.GREEN))
+            print("setup: apply it with `setup --preset <name>`, or from the TUI preset menu.")
+        except ValueError as exc:
+            print(_style(f"setup: {exc}", _Ansi.RED), file=sys.stderr)
+            rc = max(rc, 1)
     if args.bridge_install:
         rc = max(rc, _cmd_bridge_install(ROOT))
     if args.bridge_force_install:

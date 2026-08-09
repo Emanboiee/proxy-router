@@ -178,6 +178,72 @@ class ApplyPresetsTests(unittest.TestCase):
         self.assertEqual(data["providers"]["proton"]["cooldown_seconds"], 60)
 
 
+class CustomPresetTests(unittest.TestCase):
+    """Named presets: listing, apply-by-name, and custom preset creation."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(setup_tui, self.root)
+        self.config = self.root / "router.json"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_builtin_names_listed(self):
+        names = setup_tui.preset_names(self.root)
+        self.assertIn("school-warp", names)
+        self.assertIn("default", names)
+
+    def test_apply_school_warp_sets_vpn_list(self):
+        result = setup_tui.apply_preset_by_name(self.root, "school-warp")
+        self.assertEqual(result["mode"], "vpn-list")
+        data = json.loads(self.config.read_text())
+        self.assertEqual(data["routing"]["mode"], "vpn-list")
+        self.assertIn("discord.com", data["routing"]["vpn_domains"])
+        school = next(r for r in data["routes"] if r["id"] == "school")
+        self.assertEqual(school["provider"], "cloudflare")
+        self.assertIn("cloudflare", data["providers"])
+
+    def test_apply_preset_idempotent(self):
+        setup_tui.apply_preset_by_name(self.root, "school-warp")
+        result = setup_tui.apply_preset_by_name(self.root, "school-warp")
+        self.assertEqual(result["added"], [])
+        data = json.loads(self.config.read_text())
+        self.assertEqual(len([r for r in data["routes"] if r["id"] == "school"]), 1)
+
+    def test_custom_preset_roundtrip(self):
+        path = setup_tui.add_custom_preset(
+            self.root, "mygames", "cloudflare", ["game.com", "play.net"])
+        self.assertTrue(path.is_file())
+        self.assertEqual(path.name, "mygames.json")
+        names = setup_tui.preset_names(self.root)
+        self.assertIn("mygames", names)
+        result = setup_tui.apply_preset_by_name(self.root, "mygames")
+        self.assertEqual(result["mode"], "vpn-list")
+        data = json.loads(self.config.read_text())
+        self.assertIn("game.com", data["routing"]["vpn_domains"])
+        route = next(r for r in data["routes"] if r["id"] == "mygames")
+        self.assertEqual(route["provider"], "cloudflare")
+
+    def test_custom_preset_safe_list_default_provider(self):
+        path = setup_tui.add_custom_preset(
+            self.root, "work", "proton", ["gmail.com", "drive.google.com"],
+            mode="safe-list", default_provider="proton")
+        preset = json.loads(path.read_text())
+        self.assertEqual(preset["routing"]["mode"], "safe-list")
+        self.assertEqual(preset["routing"]["default_provider"], "proton")
+        self.assertIn("gmail.com", preset["routing"]["direct_domains"])
+
+    def test_invalid_preset_name_rejected(self):
+        with self.assertRaises(ValueError):
+            setup_tui.add_custom_preset(self.root, "../evil", "proton", ["x.com"])
+
+    def test_unknown_preset_raises(self):
+        with self.assertRaises(ValueError):
+            setup_tui.apply_preset_by_name(self.root, "nope-not-a-preset")
+
+
 class CheckTests(unittest.TestCase):
     """check reports provider profile availability without network."""
 
@@ -448,8 +514,11 @@ class RoutingTuiTests(unittest.TestCase):
         (root / "router.json").write_text(json.dumps(data))
 
     def test_menu_lists_routing_modes(self):
-        self.assertEqual(setup_tui._MENU[-2][0], "r")
         self.assertIn(("r", "Routing modes (show / switch / add-remove domain)"), setup_tui.TUI_MENU)
+        self.assertIn(("s", "Presets: apply by name / browser (built-in + custom)"), setup_tui.TUI_MENU)
+
+    def test_routing_actions_include_preset_by_name(self):
+        self.assertEqual(setup_tui._ROUTING_ACTIONS[-1][0], "7")
 
     def test_routing_view_opens_and_reflects_config(self):
         with tempfile.TemporaryDirectory() as tmp:
