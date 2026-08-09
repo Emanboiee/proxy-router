@@ -85,11 +85,35 @@ class _Ansi:
     GREEN = "\x1b[32m"
     YELLOW = "\x1b[33m"
     CYAN = "\x1b[36m"
+    MAGENTA = "\x1b[35m"
     REVERSE = "\x1b[7m"
+    # 256-color: true orange/purple (brand-ish, readable on light+dark).
+    PURPLE = "\x1b[38;5;141m"
+    ORANGE = "\x1b[38;5;208m"
 
 
 def _style(text: str, *codes: str) -> str:
     return "".join(codes) + text + _Ansi.RESET if ANSI else text
+
+
+_PROVIDER_RE = re.compile(r"\b(proton|cloudflare|warp)\b", re.IGNORECASE)
+
+
+def _tint_provider(text: str) -> str:
+    """Color provider names: Proton/WARP = purple, Cloudflare = orange.
+
+    Applies AFTER width fitting so ANSI bytes never affect layout math.
+    No-op when ANSI is disabled (NO_COLOR / non-TTY).
+    """
+    if not ANSI:
+        return text
+
+    def _repl(match: re.Match) -> str:
+        word = match.group(0)
+        color = _Ansi.PURPLE if word.lower() in ("proton", "warp") else _Ansi.ORANGE
+        return color + word + _Ansi.RESET
+
+    return _PROVIDER_RE.sub(_repl, text)
 
 
 # ---------------------------------------------------------------------------
@@ -358,7 +382,7 @@ def _cmd_guide(provider: str) -> int:
     if not text:
         print(f"setup: no guide available for '{provider}'", file=sys.stderr)
         return 1
-    print(_style(f"--- {provider} setup guide ---", _Ansi.BOLD, _Ansi.CYAN))
+    print(_style(f"--- {_tint_provider(provider)} setup guide ---", _Ansi.BOLD, _Ansi.CYAN))
     print(text)
     return 0
 
@@ -400,9 +424,9 @@ def _cmd_preset(root: Path) -> int:
         print(_style(f"setup: preset failed: {exc}", _Ansi.RED), file=sys.stderr)
         return 1
     if result["added"]:
-        print(_style("setup: added route preset(s): " + ", ".join(result["added"]), _Ansi.GREEN))
+        print(_style(_tint_provider("setup: added route preset(s): " + ", ".join(result["added"])), _Ansi.GREEN))
     else:
-        print("setup: route presets already applied (nothing to add)")
+        print(_style(_tint_provider("setup: route presets already applied (nothing to add)"), _Ansi.GREEN))
     print(f"setup: wrote {config_path}")
     return 0
 
@@ -610,14 +634,14 @@ _MENU = [
 def _print_menu() -> None:
     print(_style(_BANNER, _Ansi.CYAN))
     for key, label in _MENU:
-        print(f"  {_style(key, _Ansi.BOLD)}  {label}")
+        print(f"  {_style(key, _Ansi.BOLD)}  {_tint_provider(label)}")
     print()
 
 
 def _prompt_import(root: Path, provider: str) -> None:
     label = "Proton VPN" if provider == "proton" else "Cloudflare WARP"
     try:
-        answer = input(f"  path to .conf file or directory ({label}): ").strip()
+        answer = input(f"  path to .conf file or directory ({_tint_provider(label)}): ").strip()
     except (EOFError, KeyboardInterrupt):
         print()
         return
@@ -756,11 +780,13 @@ def _render_menu(state: TuiState) -> list[str]:
         right = f" {key} "
         prefix = f"  {key}  "
         fitted = _fit(prefix + label, inner - len(right))
+        label_plain = fitted[len(prefix):]
+        label_tint = _tint_provider(label_plain)
         if index == state.cursor:
-            row = "\u2502" + fitted + right + "\u2502"
+            row = "\u2502" + prefix + label_tint + right + "\u2502"
             lines.append(_style(row, _Ansi.REVERSE))
         else:
-            lines.append("\u2502" + _style(prefix, _Ansi.CYAN) + fitted[len(prefix):] + right + "\u2502")
+            lines.append("\u2502" + _style(prefix, _Ansi.CYAN) + label_tint + right + "\u2502")
     lines.append("\u251c" + "\u2500" * inner + "\u2524")
     status_lines = [ln for ln in state.status.splitlines() if ln.strip()] or ["Ready \u2014 pick an item."]
     for ln in status_lines[-2:]:
@@ -786,7 +812,7 @@ def _render_guide(state: TuiState) -> list[str]:
     }
     title = titles.get(state.guide_provider, "Guide")
     lines = ["\u250c" + "\u2500" * inner + "\u2510"]
-    lines.append("\u2502" + _style(_fit(f" {title} ", inner), _Ansi.BOLD, _Ansi.CYAN) + "\u2502")
+    lines.append("\u2502" + _style(_fit(f" {_tint_provider(title)} ", inner), _Ansi.BOLD, _Ansi.CYAN) + "\u2502")
     lines.append("\u251c" + "\u2500" * inner + "\u2524")
     visible = max(state.rows - 5, 1)
     scroll = min(state.guide_scroll, max(0, len(state.guide_lines) - visible))
@@ -809,7 +835,7 @@ def _render_import(state: TuiState) -> list[str]:
         else "Import Cloudflare WARP profiles"
     )
     lines = ["\u250c" + "\u2500" * inner + "\u2510"]
-    lines.append("\u2502" + _style(_fit(f" {title} ", inner), _Ansi.BOLD, _Ansi.CYAN) + "\u2502")
+    lines.append("\u2502" + _style(_fit(f" {_tint_provider(title)} ", inner), _Ansi.BOLD, _Ansi.CYAN) + "\u2502")
     lines.append("\u251c" + "\u2500" * inner + "\u2524")
     path_display = state.import_text or "no path yet"
     lines.append("\u2502" + _fit(" path: " + path_display, inner) + "\u2502")
