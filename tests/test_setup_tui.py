@@ -1,6 +1,7 @@
 """Tests for setup_tui.py (stdlib only, no network, no private keys printed)."""
 import io
 import json
+import os
 import stat
 import sys
 import tempfile
@@ -210,6 +211,101 @@ class CheckTests(unittest.TestCase):
         result = setup_tui.check(self.root)
         self.assertEqual(result["ok"], False)
         self.assertIn("proton", result["issues"][0].lower())
+
+
+class BridgeTests(unittest.TestCase):
+    """Hermes OpenCode auto-rotation bridge: installs/checks go to env paths only."""
+
+    @staticmethod
+    def _env(vpn_root: Path, tmp: Path) -> dict:
+        return {
+            "OPENCODE_ZEN_VPN_ROOT": str(vpn_root),
+            "HERMES_CONFIG": str(tmp / "no-such-hermes.yaml"),
+        }
+
+    def test_bridge_check_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            vpn_root = Path(tmp) / "vpn"
+            vpn_root.mkdir()
+            out = io.StringIO()
+            with mock.patch.dict(os.environ, self._env(vpn_root, Path(tmp))), \
+                 mock.patch("sys.stdout", out):
+                rc = setup_tui._cmd_bridge_check()
+            self.assertEqual(rc, 1)
+            text = out.getvalue()
+            self.assertIn("bridge: manager missing", text)
+            for line in text.splitlines():
+                self.assertTrue(line.startswith("bridge:"), line)
+
+    def test_bridge_install_copies_and_validates(self):
+        expected = (
+            Path(setup_tui.__file__).resolve().parent / "examples" / "proxy-manager.sh"
+        ).read_bytes()
+        with tempfile.TemporaryDirectory() as tmp:
+            vpn_root = Path(tmp) / "vpn"
+            with mock.patch.dict(os.environ, self._env(vpn_root, Path(tmp))), \
+                 mock.patch("sys.stdout", io.StringIO()), \
+                 mock.patch("sys.stderr", io.StringIO()):
+                rc = setup_tui._cmd_bridge_install(Path(tmp))
+            self.assertEqual(rc, 0)
+            target = vpn_root / "proxy-manager.sh"
+            self.assertTrue(target.is_file())
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755)
+            self.assertEqual(target.read_bytes(), expected)
+            self.assertEqual(stat.S_IMODE(vpn_root.stat().st_mode), 0o700)
+
+    def test_bridge_install_idempotent(self):
+        expected = (
+            Path(setup_tui.__file__).resolve().parent / "examples" / "proxy-manager.sh"
+        ).read_bytes()
+        with tempfile.TemporaryDirectory() as tmp:
+            vpn_root = Path(tmp) / "vpn"
+            with mock.patch.dict(os.environ, self._env(vpn_root, Path(tmp))), \
+                 mock.patch("sys.stdout", io.StringIO()), \
+                 mock.patch("sys.stderr", io.StringIO()):
+                first = setup_tui._cmd_bridge_install(Path(tmp))
+            self.assertEqual(first, 0)
+            target = vpn_root / "proxy-manager.sh"
+            mtime = target.stat().st_mtime_ns
+            with mock.patch.dict(os.environ, self._env(vpn_root, Path(tmp))), \
+                 mock.patch("sys.stdout", io.StringIO()), \
+                 mock.patch("sys.stderr", io.StringIO()):
+                second = setup_tui._cmd_bridge_install(Path(tmp))
+            self.assertEqual(second, 0)
+            self.assertEqual(target.stat().st_mtime_ns, mtime)
+            self.assertEqual(target.read_bytes(), expected)
+
+    def test_bridge_force_overwrites(self):
+        expected = (
+            Path(setup_tui.__file__).resolve().parent / "examples" / "proxy-manager.sh"
+        ).read_bytes()
+        with tempfile.TemporaryDirectory() as tmp:
+            vpn_root = Path(tmp) / "vpn"
+            vpn_root.mkdir()
+            target = vpn_root / "proxy-manager.sh"
+            target.write_text("#!/bin/sh\necho stale\n")
+            with mock.patch.dict(os.environ, self._env(vpn_root, Path(tmp))), \
+                 mock.patch("sys.stdout", io.StringIO()), \
+                 mock.patch("sys.stderr", io.StringIO()):
+                rc = setup_tui._cmd_bridge_install(Path(tmp), force=True)
+            self.assertEqual(rc, 0)
+            self.assertEqual(target.read_bytes(), expected)
+
+    def test_bridge_flag_main(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            vpn_root = Path(tmp) / "vpn"
+            vpn_root.mkdir()
+            out = io.StringIO()
+            with mock.patch.dict(os.environ, self._env(vpn_root, Path(tmp))), \
+                 mock.patch("sys.stdout", out):
+                rc = setup_tui.main(["setup", "--bridge-check"])
+            self.assertEqual(rc, 1)
+            self.assertIn("bridge:", out.getvalue())
+
+    def test_tui_item_9_records_bridge_action(self):
+        state = setup_tui.apply_key(setup_tui.TuiState(), "9")
+        self.assertEqual(state.action, ("bridge_install",))
+        self.assertFalse(state.quit)
 
 
 class FullScreenTuiTests(unittest.TestCase):

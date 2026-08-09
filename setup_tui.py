@@ -7,6 +7,8 @@ Stdlib only. Owns the non-engine half of ``proxy-router setup``:
 - ``import_profiles`` - validates/dedupes/copies WireGuard ``.conf`` files
 - ``apply_presets``   - idempotent safe route presets (opencode.ai, Roblox)
 - ``check``           - reports provider profile availability (no network)
+- ``bridge``          - installs/verifies the Hermes OpenCode auto-rotation
+  bridge (``proxy-manager.sh``) at the path the Hermes plugin expects
 - ``main`` / ``wizard`` - non-interactive CLI flags and a full-screen TUI
   (alternate screen, arrow-key navigation; plain line menu when not a TTY)
 
@@ -44,6 +46,10 @@ except ImportError:  # pragma: no cover - non-POSIX platforms
 _HAVE_TERMIOS = termios is not None and tty is not None
 
 ROOT = Path(os.environ.get("PROXY_ROUTER_ROOT") or Path(__file__).resolve().parent).resolve()
+
+# Default Hermes config path for the bridge check (resolved via env at call
+# time so tests can override; defaults to this module-level value).
+_HERMES_CONFIG_DEFAULT = "~/.hermes/config.yaml"
 
 # Guides live next to this module in the checkout/installed prefix. They are
 # resolved from the module location (not ROOT) because the test harness
@@ -401,6 +407,167 @@ def _cmd_preset(root: Path) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Hermes OpenCode auto-rotation bridge
+# ---------------------------------------------------------------------------
+
+def bridge_root() -> Path:
+    """Machine-level VPN root that the Hermes rotation plugin expects.
+
+    Mirrors the plugin's lookup exactly: ``OPENCODE_ZEN_VPN_ROOT`` env
+    override, else the plugin's compiled-in default (hardcoded here only).
+    ``expanduser`` so ``~`` prefixes work in the env value.
+    """
+    return Path(
+        os.environ.get("OPENCODE_ZEN_VPN_ROOT", "/Users/kyson/airi/tools/opencode-zen-vpn")
+    ).expanduser()
+
+
+def _hermes_config_path() -> Path:
+    """Hermes config path, resolved from env at call time (default module global)."""
+    return Path(os.environ.get("HERMES_CONFIG", _HERMES_CONFIG_DEFAULT)).expanduser()
+
+
+def _hermes_plugin_enabled() -> bool:
+    """Best-effort: is ``opencode-server-rotation`` listed under a plugins: block?
+
+    Read-only and never fatal: an unreadable/missing config reports not
+    enabled. A simple scan of parsed lines keeps this dependency-free.
+    """
+    try:
+        lines = _hermes_config_path().read_text().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return False
+    section = ""
+    for line in lines:
+        if line and not line[0].isspace():
+            section = line.split(":", 1)[0].strip()
+        if section == "plugins" and "opencode-server-rotation" in line:
+            return True
+    return False
+
+
+def _cmd_bridge_check(root: Path | None = None) -> int:
+    """Verify the Hermes rotation bridge; no side effects, one line per check.
+
+    ``root`` is accepted for CLI symmetry but placement always comes from
+    ``OPENCODE_ZEN_VPN_ROOT`` (this is a machine-level Hermes integration,
+    not a repo file). The Hermes plugin-enabled line is informational only
+    and does not affect the exit code.
+    """
+    manager = bridge_root() / "proxy-manager.sh"
+    ok = True
+
+    if manager.is_file():
+        print(f"bridge: manager present ({manager})")
+    else:
+        print(f"bridge: manager missing ({manager})")
+        ok = False
+
+    if os.access(manager, os.X_OK):
+        print("bridge: executable")
+    else:
+        print("bridge: not executable")
+        ok = False
+
+    if manager.is_file():
+        try:
+            result = subprocess.run(["bash", "-n", str(manager)], capture_output=True, text=True)
+        except OSError as exc:
+            print(f"bridge: syntax check skipped (bash unavailable: {exc})")
+        else:
+            if result.returncode == 0:
+                print("bridge: syntax ok")
+            else:
+                print(f"bridge: syntax error: {result.stderr.strip() or result.stdout.strip()}")
+                ok = False
+    else:
+        print("bridge: syntax check skipped (manager missing)")
+
+    vpn_root = bridge_root()
+    if os.environ.get("OPENCODE_ZEN_VPN_ROOT"):
+        print(f"bridge: vpn root {vpn_root} (env OPENCODE_ZEN_VPN_ROOT)")
+    else:
+        print(f"bridge: vpn root {vpn_root} (default)")
+
+    if _hermes_plugin_enabled():
+        print("bridge: hermes plugin enabled (opencode-server-rotation)")
+    else:
+        print("bridge: hermes plugin NOT enabled (add plugins: - opencode-server-rotation)")
+    return 0 if ok else 1
+
+
+def _cmd_bridge_install(root: Path, force: bool = False) -> int:
+    """Install the Hermes OpenCode auto-rotation bridge and validate it.
+
+    Copies ``examples/proxy-manager.sh`` to ``OPENCODE_ZEN_VPN_ROOT/
+    proxy-manager.sh`` (a machine-level Hermes integration, not a repo
+    config file), chmod 0755, then runs ``bash -n`` and removes the file
+    on failure. Idempotent when content is already identical; refuses to
+    overwrite a differing existing file unless ``force`` is set.
+    """
+    source = Path(__file__).resolve().parent / "examples" / "proxy-manager.sh"
+    target_dir = bridge_root()
+    target = target_dir / "proxy-manager.sh"
+
+    try:
+        payload = source.read_bytes()
+    except OSError as exc:
+        print(f"bridge: cannot read source {source}: {exc}", file=sys.stderr)
+        return 1
+
+    if target.is_file():
+        try:
+            if target.read_bytes() == payload:
+                print(f"bridge: already up to date ({target})")
+                return 0
+        except OSError as exc:
+            if not force:
+                print(f"bridge: existing {target} not readable ({exc})", file=sys.stderr)
+                return 1
+        if not force:
+            print(
+                f"bridge: refusing to overwrite existing {target} "
+                "(use --bridge-force-install)",
+                file=sys.stderr,
+            )
+            return 1
+    elif target.exists():
+        if not force:
+            print(f"bridge: refusing to replace non-file path {target}", file=sys.stderr)
+            return 1
+
+    created_dir = not target_dir.is_dir()
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        if created_dir:
+            os.chmod(target_dir, 0o700)
+        shutil.copy2(source, target)
+        os.chmod(target, 0o755)
+    except OSError as exc:
+        print(f"bridge: install failed: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        result = subprocess.run(["bash", "-n", str(target)], capture_output=True, text=True)
+    except OSError as exc:
+        print(f"bridge: bash unavailable after install ({exc})", file=sys.stderr)
+        return 1
+    if result.returncode != 0:
+        try:
+            target.unlink(missing_ok=True)
+        except OSError:
+            pass
+        print(
+            f"bridge: syntax check failed, removed {target}: "
+            f"{result.stderr.strip() or result.stdout.strip()}",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"bridge: installed -> {target}")
+    return 0
+
+
 def _router_command(root: Path, *args: str) -> int:
     """Run the existing router CLI against ``root`` (never enabled implicitly)."""
     script = Path(__file__).resolve().parent / "router.py"
@@ -432,6 +599,7 @@ _MENU = [
     ("6", "Apply route presets (opencode.ai -> proton, roblox -> cloudflare)"),
     ("7", "Check provider health"),
     ("8", "Start / reload the proxy engine (explicit action)"),
+    ("9", "Install / verify OpenCode auto-rotation bridge (Hermes)"),
     ("q", "Quit"),
 ]
 
@@ -490,6 +658,8 @@ def _line_wizard(root: Path) -> int:
                 print(_style("  engine up", _Ansi.GREEN))
             else:
                 print(_style("  engine failed to start (see router output above)", _Ansi.RED))
+        elif choice == "9":
+            _cmd_bridge_install(root)
         else:
             print(f"  unknown choice '{choice}' (enter a number or 'q')")
 
@@ -498,7 +668,7 @@ def _line_wizard(root: Path) -> int:
 # full-screen TUI: state, pure key handling and frame rendering
 # ---------------------------------------------------------------------------
 
-# TUI menu keeps the same 8 actions plus Quit (digit 0; q/Q/ESC also quit).
+# TUI menu keeps the same actions plus Quit (digit 0; q/Q/ESC also quit).
 TUI_MENU = [
     ("1", "Show Proton guide"),
     ("2", "Show Cloudflare guide"),
@@ -508,6 +678,7 @@ TUI_MENU = [
     ("6", "Apply route presets (opencode.ai -> proton, roblox -> cloudflare)"),
     ("7", "Check provider health"),
     ("8", "Start/reload the proxy engine"),
+    ("9", "Install / verify OpenCode auto-rotation bridge (Hermes)"),
     ("0", "Quit"),
 ]
 TUI_MENU_INDEX = {key: index for index, (key, _) in enumerate(TUI_MENU)}
@@ -676,6 +847,8 @@ def _select_item(state: TuiState, index: int) -> TuiState:
         state.action = ("check",)
     elif key == "8":
         state.action = ("engine",)
+    elif key == "9":
+        state.action = ("bridge_install",)
     return state
 
 
@@ -780,6 +953,8 @@ def _execute_action(action: tuple, root: Path) -> tuple[str, int]:
                 buf.write("engine up")
             else:
                 buf.write("engine failed to start (see output above)")
+        elif kind == "bridge_install":
+            rc = _cmd_bridge_install(root)
         else:  # pragma: no cover - defensive
             rc = 0
     return _strip_ansi(buf.getvalue()).strip(), rc
@@ -920,6 +1095,12 @@ def main(argv=None, root=None) -> int:
                         help="import WireGuard .conf file(s)/directory into providers/cloudflare")
     parser.add_argument("--preset", action="store_true",
                         help="apply safe route presets to router.json (idempotent)")
+    parser.add_argument("--bridge-install", action="store_true",
+                        help="install the Hermes OpenCode auto-rotation bridge")
+    parser.add_argument("--bridge-force-install", action="store_true",
+                        help="install the bridge, overwriting an existing file")
+    parser.add_argument("--bridge-check", action="store_true",
+                        help="verify the installed OpenCode auto-rotation bridge")
     args = parser.parse_args(argv)
 
     rc = 0
@@ -933,7 +1114,14 @@ def main(argv=None, root=None) -> int:
         rc = max(rc, _cmd_import(ROOT, "cloudflare", args.import_warp))
     if args.preset:
         rc = max(rc, _cmd_preset(ROOT))
-    if not (args.guide or args.check or args.import_proton or args.import_warp or args.preset):
+    if args.bridge_install:
+        rc = max(rc, _cmd_bridge_install(ROOT))
+    if args.bridge_force_install:
+        rc = max(rc, _cmd_bridge_install(ROOT, force=True))
+    if args.bridge_check:
+        rc = max(rc, _cmd_bridge_check(ROOT))
+    if not (args.guide or args.check or args.import_proton or args.import_warp or args.preset
+            or args.bridge_install or args.bridge_force_install or args.bridge_check):
         rc = wizard(ROOT)
     return rc
 

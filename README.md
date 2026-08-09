@@ -57,12 +57,16 @@ proxy-router setup --import-proton ~/Downloads/protonvpn-*.conf
 proxy-router setup --import-warp ~/Downloads/wgcf-profile.conf  # optional
 proxy-router setup --preset
 proxy-router setup --check
+proxy-router setup --bridge-install  # install the Hermes OpenCode rotation bridge
+proxy-router setup --bridge-force-install  # overwrite an existing bridge file
+proxy-router setup --bridge-check    # verify the installed bridge
 proxy-router ensure
 ```
 
 `proxy-router setup` with no flags opens the custom terminal wizard. It never
 enables TUN mode or starts monitoring unless you explicitly choose those
-operations.
+operations. Menu item 9 installs/verifies the Hermes OpenCode auto-rotation
+bridge (placed at `$OPENCODE_ZEN_VPN_ROOT/proxy-manager.sh`).
 
 ## Layout
 
@@ -103,6 +107,8 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py setup --guide all      # print Proton + WARP guides
 ./router.py setup --preset         # enable OpenCode->Proton and Roblox->WARP presets
 ./router.py setup --check          # validate imported profiles without networking
+./router.py setup --bridge-install # install/verify the Hermes OpenCode rotation bridge
+./router.py setup --bridge-check   # verify the installed bridge without writing
 ./router.py monitor status          # read monitor state; never probes
 ./router.py monitor check           # explicit one-shot ping/latency/speed sample
 ./router.py monitor on              # opt in to a detached sample worker (60s default)
@@ -165,13 +171,16 @@ becomes the sing-box endpoint tag.
 The easiest path is the setup wizard:
 
 ```sh
-proxy-router setup                  # interactive terminal menu
+proxy-router setup                  # interactive terminal menu (item 9: Hermes rotation bridge)
 proxy-router setup --guide proton   # print the bundled Proton guide
 proxy-router setup --guide warp     # print the bundled WARP guide
 proxy-router setup --import-proton ~/Downloads/*.conf
 proxy-router setup --import-warp ~/Downloads/wgcf-profile.conf
 proxy-router setup --preset          # idempotently adds both safe route presets
 proxy-router setup --check
+proxy-router setup --bridge-install  # install/verify the Hermes OpenCode rotation bridge
+proxy-router setup --bridge-force-install  # overwrite an existing bridge file
+proxy-router setup --bridge-check    # verify the bridge without writing
 ```
 
 The full provider instructions live in
