@@ -366,11 +366,11 @@ def _cmd_guide(provider: str) -> int:
 def _cmd_check(root: Path) -> int:
     result = check(root)
     if result["ok"]:
-        print("setup: ok - every provider has at least one valid profile")
+        print(_style("setup: ok - every provider has at least one valid profile", _Ansi.GREEN))
         return 0
     for issue in result["issues"]:
-        print(f"setup: {issue}", file=sys.stderr)
-    print("setup: check failed", file=sys.stderr)
+        print(_style(f"setup: {issue}", _Ansi.RED), file=sys.stderr)
+    print(_style("setup: check failed", _Ansi.RED), file=sys.stderr)
     return 1
 
 
@@ -384,9 +384,9 @@ def _cmd_import(root: Path, provider: str, paths) -> int:
             _Ansi.GREEN,
         ))
         for name in merged["files"]:
-            print(f"  + {name}")
+            print(_style(f"  + {name}", _Ansi.DIM))
     for entry in merged["rejected_files"]:
-        print(f"  - {entry['name']}: {entry['reason']}")
+        print(_style(f"  - {entry['name']}: {entry['reason']}", _Ansi.YELLOW))
     if merged["rejected"]:
         print(_style(f"setup: rejected {merged['rejected']} file(s)", _Ansi.YELLOW))
     return 0 if merged["imported"] else 1
@@ -397,7 +397,7 @@ def _cmd_preset(root: Path) -> int:
     try:
         result = apply_presets(config_path)
     except (json.JSONDecodeError, OSError) as exc:
-        print(f"setup: preset failed: {exc}", file=sys.stderr)
+        print(_style(f"setup: preset failed: {exc}", _Ansi.RED), file=sys.stderr)
         return 1
     if result["added"]:
         print(_style("setup: added route preset(s): " + ", ".join(result["added"]), _Ansi.GREEN))
@@ -459,30 +459,30 @@ def _cmd_bridge_check(root: Path | None = None) -> int:
     ok = True
 
     if manager.is_file():
-        print(f"bridge: manager present ({manager})")
+        print(_style(f"bridge: manager present ({manager})", _Ansi.GREEN))
     else:
-        print(f"bridge: manager missing ({manager})")
+        print(_style(f"bridge: manager missing ({manager})", _Ansi.RED))
         ok = False
 
     if os.access(manager, os.X_OK):
-        print("bridge: executable")
+        print(_style("bridge: executable", _Ansi.GREEN))
     else:
-        print("bridge: not executable")
+        print(_style("bridge: not executable", _Ansi.RED))
         ok = False
 
     if manager.is_file():
         try:
             result = subprocess.run(["bash", "-n", str(manager)], capture_output=True, text=True)
         except OSError as exc:
-            print(f"bridge: syntax check skipped (bash unavailable: {exc})")
+            print(_style(f"bridge: syntax check skipped (bash unavailable: {exc})", _Ansi.YELLOW))
         else:
             if result.returncode == 0:
-                print("bridge: syntax ok")
+                print(_style("bridge: syntax ok", _Ansi.GREEN))
             else:
-                print(f"bridge: syntax error: {result.stderr.strip() or result.stdout.strip()}")
+                print(_style(f"bridge: syntax error: {result.stderr.strip() or result.stdout.strip()}", _Ansi.RED))
                 ok = False
     else:
-        print("bridge: syntax check skipped (manager missing)")
+        print(_style("bridge: syntax check skipped (manager missing)", _Ansi.YELLOW))
 
     vpn_root = bridge_root()
     if os.environ.get("OPENCODE_ZEN_VPN_ROOT"):
@@ -491,9 +491,9 @@ def _cmd_bridge_check(root: Path | None = None) -> int:
         print(f"bridge: vpn root {vpn_root} (default)")
 
     if _hermes_plugin_enabled():
-        print("bridge: hermes plugin enabled (opencode-server-rotation)")
+        print(_style("bridge: hermes plugin enabled (opencode-server-rotation)", _Ansi.GREEN))
     else:
-        print("bridge: hermes plugin NOT enabled (add plugins: - opencode-server-rotation)")
+        print(_style("bridge: hermes plugin NOT enabled (add plugins: - opencode-server-rotation)", _Ansi.YELLOW))
     return 0 if ok else 1
 
 
@@ -519,22 +519,25 @@ def _cmd_bridge_install(root: Path, force: bool = False) -> int:
     if target.is_file():
         try:
             if target.read_bytes() == payload:
-                print(f"bridge: already up to date ({target})")
+                print(_style(f"bridge: already up to date ({target})", _Ansi.GREEN))
                 return 0
         except OSError as exc:
             if not force:
-                print(f"bridge: existing {target} not readable ({exc})", file=sys.stderr)
+                print(_style(f"bridge: existing {target} not readable ({exc})", _Ansi.RED), file=sys.stderr)
                 return 1
         if not force:
             print(
-                f"bridge: refusing to overwrite existing {target} "
-                "(use --bridge-force-install)",
+                _style(
+                    f"bridge: refusing to overwrite existing {target} "
+                    "(use --bridge-force-install)",
+                    _Ansi.YELLOW,
+                ),
                 file=sys.stderr,
             )
             return 1
     elif target.exists():
         if not force:
-            print(f"bridge: refusing to replace non-file path {target}", file=sys.stderr)
+            print(_style(f"bridge: refusing to replace non-file path {target}", _Ansi.YELLOW), file=sys.stderr)
             return 1
 
     created_dir = not target_dir.is_dir()
@@ -564,7 +567,7 @@ def _cmd_bridge_install(root: Path, force: bool = False) -> int:
             file=sys.stderr,
         )
         return 1
-    print(f"bridge: installed -> {target}")
+    print(_style(f"bridge: installed -> {target}", _Ansi.GREEN))
     return 0
 
 
@@ -751,16 +754,25 @@ def _render_menu(state: TuiState) -> list[str]:
     lines.append("\u251c" + "\u2500" * inner + "\u2524")
     for index, (key, label) in enumerate(TUI_MENU):
         right = f" {key} "
-        left = _fit(f"  {key}  {label}", inner - len(right))
-        row = "\u2502" + left + right + "\u2502"
+        prefix = f"  {key}  "
+        fitted = _fit(prefix + label, inner - len(right))
         if index == state.cursor:
-            row = _style(row, _Ansi.REVERSE)
-        lines.append(row)
+            row = "\u2502" + fitted + right + "\u2502"
+            lines.append(_style(row, _Ansi.REVERSE))
+        else:
+            lines.append("\u2502" + _style(prefix, _Ansi.CYAN) + fitted[len(prefix):] + right + "\u2502")
     lines.append("\u251c" + "\u2500" * inner + "\u2524")
     status_lines = [ln for ln in state.status.splitlines() if ln.strip()] or ["Ready \u2014 pick an item."]
     for ln in status_lines[-2:]:
-        lines.append("\u2502" + _fit(" " + _strip_ansi(ln), inner) + "\u2502")
-    lines.append("\u2502" + _fit(" \u2191\u2193 navigate \u00b7 Enter select \u00b7 q/ESC quit ", inner) + "\u2502")
+        plain = _strip_ansi(ln)
+        if plain.strip() == "Ready \u2014 pick an item.":
+            styled = _style(_fit(" " + plain, inner), _Ansi.DIM)
+        elif state.status_ok:
+            styled = _style(_fit(" " + plain, inner), _Ansi.GREEN)
+        else:
+            styled = _style(_fit(" " + plain, inner), _Ansi.RED)
+        lines.append("\u2502" + styled + "\u2502")
+    lines.append("\u2502" + _style(_fit(" \u2191\u2193 navigate \u00b7 Enter select \u00b7 q/ESC quit ", inner), _Ansi.DIM) + "\u2502")
     lines.append("\u2514" + "\u2500" * inner + "\u2518")
     return lines
 
@@ -784,7 +796,7 @@ def _render_guide(state: TuiState) -> list[str]:
     lines.append("\u251c" + "\u2500" * inner + "\u2524")
     total = len(state.guide_lines)
     shown = min(scroll + 1, total) if total else 0
-    lines.append("\u2502" + _fit(f" line {shown}/{total} \u00b7 \u2191\u2193 scroll \u00b7 q back ", inner) + "\u2502")
+    lines.append("\u2502" + _style(_fit(f" line {shown}/{total} \u00b7 \u2191\u2193 scroll \u00b7 q back ", inner), _Ansi.DIM) + "\u2502")
     lines.append("\u2514" + "\u2500" * inner + "\u2518")
     return lines
 
@@ -799,8 +811,9 @@ def _render_import(state: TuiState) -> list[str]:
     lines = ["\u250c" + "\u2500" * inner + "\u2510"]
     lines.append("\u2502" + _style(_fit(f" {title} ", inner), _Ansi.BOLD, _Ansi.CYAN) + "\u2502")
     lines.append("\u251c" + "\u2500" * inner + "\u2524")
-    lines.append("\u2502" + _fit(" path: " + state.import_text, inner) + "\u2502")
-    lines.append("\u2502" + _fit(" Enter submits \u00b7 ESC cancels \u00b7 backspace edits ", inner) + "\u2502")
+    path_display = state.import_text or "no path yet"
+    lines.append("\u2502" + _fit(" path: " + path_display, inner) + "\u2502")
+    lines.append("\u2502" + _style(_fit(" Enter submits \u00b7 ESC cancels \u00b7 backspace edits ", inner), _Ansi.DIM) + "\u2502")
     lines.append("\u2514" + "\u2500" * inner + "\u2518")
     return lines
 
