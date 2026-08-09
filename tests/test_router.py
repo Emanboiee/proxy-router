@@ -1289,6 +1289,52 @@ class EgressLiveCheckTests(unittest.TestCase):
         self.assertFalse(record["ok"])
         self.assertNotIn("dns_ok", record)  # only persisted when determined
 
+    def test_transport_death_applies_cooldown(self):
+        # TLS/transport failure (no HTTP status) must cool the exit so
+        # resolve_active/rotation stop re-picking it for the cooldown window.
+        with mock.patch.object(router, "probe_egress", return_value=self._probe(
+                error="URLError: <urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING]>")), \
+             mock.patch.object(router, "egress_dns_probe", return_value=None):
+            status, _ = router.check_egress_live("proton", self.profile)
+        self.assertEqual(status, "dead")
+        self.assertTrue(router.is_cooled_down("proton", self.profile))
+
+    def test_degraded_http_status_does_not_cooldown(self):
+        # A 403/1010 reputation block marks blocked (stronger than cooldown);
+        # a plain 5xx means the tunnel path works and must NOT be cooled.
+        with mock.patch.object(router, "probe_egress", return_value=self._probe(
+                status=503, error="HTTP 503")):
+            status, _ = router.check_egress_live("proton", self.profile)
+        self.assertEqual(status, "degraded")
+        self.assertFalse(router.is_cooled_down("proton", self.profile))
+
+    def test_alive_probe_does_not_cooldown(self):
+        with mock.patch.object(router, "probe_egress", return_value=self._probe(
+                ok=True, status=200)):
+            status, _ = router.check_egress_live("proton", self.profile)
+        self.assertEqual(status, "alive")
+        self.assertFalse(router.is_cooled_down("proton", self.profile))
+
+    def test_probe_profile_transport_failure_cools_exit(self):
+        # Same rule through the probe_profile path (used by egress probe and
+        # rotate's post-switch verification).
+        with mock.patch.object(router, "probe_egress", return_value=self._probe(
+                error="URLError: <urlopen error [SSL: TLSV1_ALERT_INTERNAL_ERROR]>")), \
+             mock.patch.object(router, "record_egress", wraps=router.record_egress):
+            ok, record = router.probe_profile("proton", self.profile)
+        self.assertFalse(ok)
+        self.assertTrue(router.is_cooled_down("proton", self.profile))
+        self.assertNotIn("block_reason", record or {})
+
+    def test_probe_profile_http_failure_does_not_cooldown(self):
+        # HTTP-status failure (reputation/5xx) is NOT a dead tunnel: only the
+        # blocked marker applies for 1010/403, and plain 5xx cools nothing.
+        with mock.patch.object(router, "probe_egress", return_value=self._probe(
+                status=500, error="HTTP 500")):
+            ok, _ = router.probe_profile("proton", self.profile)
+        self.assertFalse(ok)
+        self.assertFalse(router.is_cooled_down("proton", self.profile))
+
     def test_no_routed_domain_counts_as_alive(self):
         router._routes = []
         with mock.patch.object(router, "probe_egress", side_effect=AssertionError("must not probe")):

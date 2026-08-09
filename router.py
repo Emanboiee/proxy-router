@@ -565,6 +565,13 @@ def probe_profile(name: str, profile: Path, *, port: int | None = None) -> tuple
                            status=result["status"], error=result["error"])
     if result["block_reason"]:
         mark_blocked(name, profile, result["block_reason"])
+    elif not result["ok"] and result["status"] is None and not is_cooled_down(name, profile):
+        # Transport-level failure (TLS/connection/read) with no HTTP status:
+        # the exit is failed for real traffic. Cool it so rotation and
+        # resolve_active avoid it instead of re-picking the same dead exit.
+        seconds = int(egress_settings()["upstream_cooldown_seconds"]) or 300
+        mark_cooldown(name, profile, seconds)
+        print(f"router: marked {profile.stem} failed (transport/TLS; cooldown {seconds}s)", file=sys.stderr)
     return result["ok"], record
 
 
@@ -661,6 +668,13 @@ def check_egress_live(name: str, profile: Path, *, port: int | None = None) -> t
                            status=probe["status"], error=probe["error"], dns_ok=dns_ok)
     if probe["block_reason"]:
         mark_blocked(name, profile, probe["block_reason"])
+    elif status == "dead" and not is_cooled_down(name, profile):
+        # TLS/transport-level death (no HTTP status): the exit is failed for
+        # real traffic. Cool it so resolve_active/rotation stop re-picking the
+        # same dead exit within the upstream cooldown window (default 300s).
+        seconds = int(egress_settings()["upstream_cooldown_seconds"]) or 300
+        mark_cooldown(name, profile, seconds)
+        print(f"router: marked {profile.stem} dead (cooldown {seconds}s)", file=sys.stderr)
     return status, record
 
 
