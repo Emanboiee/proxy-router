@@ -100,7 +100,7 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py vpn restart          # stop + re-enter TUN in one step (single elevation prompt)
 ./router.py vpn status           # show current mode and liveness
 ./router.py elevate install      # one-time macOS admin prompt; afterwards engine commands run
-                                 # without prompts (vpn on/off/restart, reload, ensure, rotate)
+                                 # without prompts (vpn on/off/restart, reload, ensure, rotate, start, stop, add, remove)
 ./router.py elevate uninstall    # remove the passwordless-sudo grant
 ./router.py elevate status       # is the grant active for this interpreter/script?
 ./router.py add --domain example.com --provider proton [--id my-route]
@@ -265,8 +265,9 @@ Platform notes:
   standard macOS admin-password dialog (`osascript` with administrator
   privileges). Run `proxy-router elevate install` once (single admin prompt)
   to grant passwordless sudo for exactly the engine commands (see below);
-  afterwards `vpn on`/`vpn off`/`vpn restart`/`reload`/`ensure`/`rotate` run
-  silently, even from background keepalive/launchd ticks. Without the grant,
+  afterwards `vpn on`/`vpn off`/`vpn restart`/`reload`/`ensure`/`rotate`/
+  `start`/`stop`/`add`/`remove` run silently, even from background
+  keepalive/launchd ticks. Without the grant,
   interactive runs ask for permission every time — no manual `sudo` needed —
   and background ticks never prompt (they have no TTY) and keep the clear
   "run with sudo" error instead. Use `vpn restart` to cycle the TUN with a
@@ -301,12 +302,15 @@ admin-password dialog on every run, grant passwordless sudo once:
 ```
 
 The sudoers file only authorizes the exact engine command shapes for this
-interpreter + script path (NOPASSWD for `vpn *`, `reload`, `ensure`,
-`rotate *`, `rotate * --reason *`). `*` in sudoers matches exactly one argv
-token and sudo execs the command directly (no shell), so there is no argv
-injection surface. With the grant in place, the interactive dialog path is
-skipped and background keepalive/launchd ticks can also elevate silently —
-`vpn on`/`vpn off`/`vpn restart` never prompt again.
+interpreter + script path (NOPASSWD for `vpn *`, `start`, `stop`, `ensure`,
+`reload`, `add *`, `remove *`, `rotate *`, `rotate * --reason *`). This is
+exactly the set of commands the elevation logic may raise to root in TUN
+mode, so a granted install runs them all silently. `*` in sudoers matches
+exactly one argv token and sudo execs the command directly (no shell), so
+there is no argv injection surface. With the grant in place, the
+interactive dialog path is skipped and background keepalive/launchd ticks
+can also elevate silently — `vpn on`/`vpn off`/`vpn restart` never prompt
+again.
 
 ## Provider setup
 
