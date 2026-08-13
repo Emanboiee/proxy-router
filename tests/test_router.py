@@ -265,11 +265,16 @@ class VpnModeTests(unittest.TestCase):
         router.set_mode("tun")
         config, _ = router.build_singbox_config()
         inbounds = config["inbounds"]
-        self.assertEqual(len(inbounds), 1)
+        # tun mode keeps the mixed listener alongside tun; full behaviour in
+        # test_tun_mode_keeps_mixed_proxy_listener
+        self.assertEqual(len(inbounds), 2)
         self.assertEqual(inbounds[0]["type"], "tun")
         self.assertEqual(inbounds[0]["address"], ["172.19.0.1/30"])
         self.assertEqual(inbounds[0]["stack"], "system")
         self.assertTrue(inbounds[0]["auto_route"])
+        self.assertEqual(inbounds[1]["type"], "mixed")
+        self.assertEqual(inbounds[1]["listen"], "127.0.0.1")
+        self.assertEqual(inbounds[1]["listen_port"], 2080)
         self.assertEqual(config["route"]["final"], "direct")
 
     def test_proxy_mode_builds_mixed_inbound(self):

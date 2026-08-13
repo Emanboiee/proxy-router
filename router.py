@@ -12,12 +12,15 @@ profile, so it is written mode 0600 alongside the input profiles.
 from __future__ import annotations
 
 import argparse
+import base64
 import configparser
 import datetime
+import getpass
 import json
 import os
 import random
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -1351,7 +1354,7 @@ def build_singbox_config() -> tuple[dict, set[str]]:
 
     mode = current_mode()
     if mode == "tun":
-        inbounds = [{
+        tun: dict = {
             "type": "tun",
             "tag": "tun-in",
             "address": _vpn.get("address", DEFAULT_TUN_ADDRESS),
@@ -1359,7 +1362,16 @@ def build_singbox_config() -> tuple[dict, set[str]]:
             "stack": _vpn.get("stack", DEFAULT_TUN_STACK),
             "auto_route": True,
             "strict_route": False,
-        }]
+        }
+        # Keep the mixed proxy listener ALONGSIDE the TUN: apps pinned to
+        # 127.0.0.1:PORT (hermes gateway, with-proxy, keepalive egress
+        # probes) must keep working while TUN captures everything else at
+        # the IP layer. Both inbound types share the same route rules, so
+        # no packet is processed twice.
+        inbounds = [
+            tun,
+            {"type": "mixed", "tag": "local-proxy", "listen": "127.0.0.1", "listen_port": _port},
+        ]
         route_final = "direct"
         # In tun mode the OS resolver's queries enter the tunnel; hijack them
         # into sing-box's DNS module so dns.rules still pin routed domains to
@@ -1561,7 +1573,11 @@ def engine_mode_consistent() -> bool:
     inbounds = config.get("inbounds", [])
     if current_mode() == "tun":
         return any(i.get("type") == "tun" for i in inbounds)
-    return any(i.get("type") in ("mixed", "socks", "http") for i in inbounds)
+    # Engine builds always include the mixed proxy listener (kept in TUN
+    # mode too), so proxy mode is only consistent when there is NO tun.
+    return not any(i.get("type") == "tun" for i in inbounds) and any(
+        i.get("type") in ("mixed", "socks", "http") for i in inbounds
+    )
 
 
 def log_offset() -> int:
@@ -2253,6 +2269,17 @@ def vpn_off() -> int:
     return engine_start()
 
 
+def vpn_restart() -> int:
+    """Stop the current engine and bring TUN back up in a single operation.
+
+    One elevated invocation means one macOS admin-password prompt for the
+    whole cycle, instead of two with `vpn off && vpn on`."""
+    rc = engine_stop()
+    if rc != 0:
+        return rc
+    return vpn_on()
+
+
 def _status_report() -> tuple[int, str]:
     """Single liveness check shared by `status` and `vpn status` (M13): both
     commands must report the same up/down state and exit code so automation
@@ -2627,6 +2654,177 @@ def with_proxy(cmd: list[str], *, timeout_ms: int = 300,
 # CLI
 # ---------------------------------------------------------------------------
 
+def _needs_elevation(args) -> bool:
+    """Whether this invocation must re-run as root before doing anything.
+
+    TUN mode needs root (utun creation, route table) and the engine then
+    runs as root, so `vpn on` and tun-mode engine commands cannot run as a
+    regular user. Only interactive macOS sessions elevate: launchd/keepalive
+    ticks have no TTY and must never pop a password dialog on every interval
+    (they keep the existing clear-error behavior instead). Once `elevate
+    install` granted passwordless sudo, elevation is silent, so the TTY gate
+    lifts and background ticks may also elevate.
+    """
+    if sys.platform != "darwin" or os.geteuid() == 0:
+        return False
+    if os.environ.get("PROXY_ROUTER_ELEVATED"):
+        return False
+    if not sys.stdin.isatty() and not _sudoers_installed():
+        return False
+    mode = current_mode()
+    if args.cmd == "vpn":
+        return args.action in ("on", "restart") or (args.action == "off" and mode == "tun")
+    return (args.cmd in ("start", "stop", "ensure", "reload", "rotate", "add", "remove")
+            and mode == "tun")
+
+
+def _elevate_macos() -> int:
+    """Re-run the current command with administrator privileges (macOS).
+
+    Instead of requiring the user to type `sudo python3 router.py vpn on`,
+    re-exec the exact same CLI through the standard macOS "… wants to make
+    changes" password dialog (osascript `do shell script … with administrator
+    privileges`), which asks for permission on every run.
+
+    SUDO_UID/SUDO_GID are injected so a rooted child run can identify the
+    invoking user; PROXY_ROUTER_ELEVATED prevents recursion; PATH is passed
+    through so the bundled sing-box still resolves.
+    """
+    env = (
+        f"SUDO_UID={os.getuid()} SUDO_GID={os.getgid()} "
+        f"PROXY_ROUTER_ELEVATED=1 "
+        f"PATH={shlex.quote(os.environ.get('PATH', ''))}"
+    )
+    cmd = shlex.join([sys.executable, os.path.abspath(__file__), *sys.argv[1:]])
+    shell_cmd = f"{env} {cmd}"
+    # AppleScript string literals accept only `\"` and `\\` escapes; escape
+    # the shell command's quotes/backslashes but keep the literal delimiters
+    # unescaped (a `\` at expression position is a syntax error).
+    content = shell_cmd.replace("\\", "\\\\").replace('"', '\\"')
+    script = f'do shell script "{content}" with administrator privileges'
+    proc = subprocess.run(["osascript", "-e", script], text=True)
+    if proc.returncode != 0:
+        print("router: elevation canceled or failed; run with sudo manually if needed",
+              file=sys.stderr)
+    return proc.returncode
+
+
+SUDOERS_FILE = Path("/etc/sudoers.d/91-proxy-router")
+
+# One NOPASSWD entry per engine-command shape the elevation path may run.
+# sudoers matches the FULL argv; `*` matches exactly one argument, so
+# multi-arg shapes get their own line. sudo execs the command directly
+# (no shell interpolation), so `*` can never smuggle arguments into the
+# interpreter or script.
+SUDOERS_COMMANDS = (
+    ("vpn", "*"),
+    ("reload",),
+    ("ensure",),
+    ("rotate", "*"),
+    ("rotate", "*", "--reason", "*"),
+)
+
+
+def _sudoers_rules(user: str, python: str, router_path: str) -> str:
+    """Render the sudoers NOPASSWD rules for the given interpreter + script."""
+    lines = ["# Managed by `proxy-router elevate install`; remove with `elevate uninstall`."]
+    for shape in SUDOERS_COMMANDS:
+        cmd = " ".join([python, router_path, *shape])
+        lines.append(f"{user} ALL=(root) NOPASSWD: {cmd}")
+    return "\n".join(lines) + "\n"
+
+
+def _sudoers_installed() -> bool:
+    """True when `sudo -n` may run this script's engine commands without a prompt.
+
+    Executes (not lists) the read-only `vpn status` command with `-n`.
+    `sudo -n -l` is a false positive when a sudoers rule exists but still
+    requires a password: listing succeeds but executing fails, e.g. a
+    plain `kyson ALL=(ALL) ALL` entry. Every sudoers rule shares the
+    interpreter + script prefix, so one execution proves the whole set."""
+    if os.geteuid() == 0 or not shutil.which("sudo"):
+        return os.geteuid() == 0
+    cmd = [sys.executable, os.path.abspath(__file__), "vpn", "status"]
+    probe = subprocess.run(["sudo", "-n", *cmd], capture_output=True, text=True)
+    if probe.returncode == 0:
+        return True
+    # `vpn status` exits 1 while the engine is down (rc 0 only when the
+    # engine is up and matches the persisted mode), so a nonzero exit is
+    # NOT proof the grant is missing. Only a sudo-level denial on stderr
+    # means the NOPASSWD rule is absent; `sudo -n` reports that denial
+    # there ("a password is required", "not in the sudoers file",
+    # requiretty) instead of running the command.
+    stderr = (probe.stderr or "").lower()
+    return not any(token in stderr for token in (
+        "a password is required",
+        "not in the sudoers",
+        "must have a tty",
+    ))
+
+
+def _elevate() -> int:
+    """Re-run the current command as root: silently when `elevate install`
+    granted passwordless sudo, else through the macOS admin dialog."""
+    if _sudoers_installed():
+        cmd = [sys.executable, os.path.abspath(__file__), *sys.argv[1:]]
+        return subprocess.run(["sudo", "-n", *cmd]).returncode
+    return _elevate_macos()
+
+
+def cmd_elevate(action: str) -> int:
+    """`elevate install|uninstall|status`: manage the one-time sudoers grant."""
+    if action == "status":
+        if _sudoers_installed():
+            print("elevate: passwordless sudo for engine commands is active")
+            return 0
+        print("elevate: not installed; run `router.py elevate install` for one-time setup",
+              file=sys.stderr)
+        return 1
+    if action == "uninstall":
+        if os.geteuid() != 0:
+            return _elevate()  # re-runs as root; silent when rules exist
+        # Rooted re-run: remove the file we manage.
+        if SUDOERS_FILE.exists():
+            SUDOERS_FILE.unlink()
+            print(f"elevate: removed {SUDOERS_FILE}")
+        return 0
+
+    rules = _sudoers_rules(getpass.getuser(), sys.executable, os.path.abspath(__file__))
+    if os.geteuid() != 0:
+        # One prompt (or none, if sudo already works): write, validate with
+        # visudo, then atomically install. Re-run as root and continue.
+        if not _sudoers_installed():
+            return _elevate()
+        cmd = [sys.executable, os.path.abspath(__file__), "elevate", "install"]
+        return subprocess.run(["sudo", "-n", *cmd]).returncode
+
+    if SUDOERS_FILE.exists():
+        existing = SUDOERS_FILE.read_text()
+        managed = existing.splitlines()[0].startswith("# Managed by `proxy-router")
+        if not managed:
+            print(f"elevate: {SUDOERS_FILE} exists with foreign content; move it aside first",
+                  file=sys.stderr)
+            return 1
+        if existing == rules:
+            print(f"elevate: already installed ({SUDOERS_FILE})")
+            return 0
+        print("elevate: interpreter or script path changed; rewriting rules", file=sys.stderr)
+
+    tmp = SUDOERS_FILE.with_name(SUDOERS_FILE.name + ".tmp")
+    payload = base64.b64encode(rules.encode()).decode()
+    tmp.write_bytes(b"")
+    tmp.write_text(rules)
+    os.chmod(tmp, 0o440)
+    if subprocess.run(["/usr/sbin/visudo", "-c", "-f", str(tmp)]).returncode != 0:
+        tmp.unlink(missing_ok=True)
+        print("elevate: generated sudoers rules failed visudo validation; nothing installed",
+              file=sys.stderr)
+        return 1
+    tmp.rename(SUDOERS_FILE)
+    print(f"elevate: installed {SUDOERS_FILE}; engine commands now run without a password prompt")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="router", description="selective WireGuard proxy router")
     sub = parser.add_subparsers(dest="cmd")
@@ -2665,8 +2863,8 @@ def main() -> int:
     init = sub.add_parser("init")
     init.add_argument("--force", action="store_true", help="overwrite an existing router.json")
 
-    vpn = sub.add_parser("vpn", help="toggle TUN mode (vpn on|off|status)")
-    vpn.add_argument("action", choices=["on", "off", "status"])
+    vpn = sub.add_parser("vpn", help="toggle TUN mode (vpn on|off|restart|status)")
+    vpn.add_argument("action", choices=["on", "off", "restart", "status"])
 
     setup = sub.add_parser("setup", help="interactive Proton/WARP setup wizard")
     setup.add_argument("setup_args", nargs=argparse.REMAINDER)
@@ -2712,7 +2910,14 @@ def main() -> int:
     r_count = sub.add_parser("provider-count")
     r_count.add_argument("provider")
 
+    elevate = sub.add_parser("elevate", help="one-time passwordless-sudo grant (install|uninstall|status)")
+    elevate.add_argument("action", choices=["install", "uninstall", "status"])
+
     args, passthrough = parser.parse_known_args()
+    if args.cmd == "elevate":
+        return cmd_elevate(args.action)
+    if _needs_elevation(args):
+        return _elevate()
     if args.cmd == "setup":
         import setup_tui
 
@@ -2840,6 +3045,9 @@ def main() -> int:
         if args.action == "on":
             route_watcher_stop()
             return _with_lock(vpn_on)
+        if args.action == "restart":
+            route_watcher_stop()
+            return _with_lock(vpn_restart)
         if args.action == "off":
             route_watcher_stop()
             rc = _with_lock(vpn_off)
