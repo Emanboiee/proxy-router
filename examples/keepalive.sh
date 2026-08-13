@@ -22,6 +22,14 @@
 # seconds, so a broken pool cannot storm. A boot self-test runs once on the
 # first successful ensure (one early rotation, same storm guard).
 #
+# Scheduled rotation: when router.json has a "rotation" block, the loop also
+# calls `router.py rotate --if-due` on every healthy tick - the CLI reads the
+# configured interval/jitter and only rotates once the interval has elapsed
+# (exit 3 = not due, nothing logged), so the active exit churns on a cadence
+# and upstream rate limits see a fresh egress IP. The verify-then-switch
+# rollback path and per-provider cooldowns apply exactly as for a manual
+# rotate; `state/<provider>.rotation` tracks the last switch time.
+#
 # Knobs (env vars, defaults):
 #   PROXY_KEEPALIVE_INTERVAL       base wait between ensures           (15)
 #   PROXY_KEEPALIVE_MAX_BACKOFF    cap for exponential backoff         (300)
@@ -116,6 +124,11 @@ while true; do
             rotate_dead "$(printf '%s\n' "$out" | sed -n 's/^dead: //p')"
           fi
         fi
+      fi
+      # Scheduled rotation: `rotate --if-due` self-gates on the configured
+      # interval (exit 0 = rotated, 3 = not due); never logs when quiet.
+      if "$ROOT/router.py" rotate --if-due >/dev/null 2>&1; then
+        echo "router: scheduled rotation: rotated provider(s)" >&2
       fi
     fi
   else

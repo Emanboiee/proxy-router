@@ -16,6 +16,7 @@ import configparser
 import datetime
 import json
 import os
+import random
 import re
 import shutil
 import signal
@@ -52,6 +53,13 @@ DEFAULT_EGRESS_SETTINGS = {
     "slow_latency_ms": 1200.0,
     "ok_window": 86400,
 }
+# Optional scheduled rotation (router.json top-level ``rotation``): churn the
+# active provider's exit every ``interval_seconds`` (0/absent = off) with
+# ``jitter_seconds`` spread (default 300) instead of only rotating reactively
+# on failures, so upstream rate limits see a fresh egress IP on a cadence.
+DEFAULT_ROTATION_SETTINGS = {"interval_seconds": 0, "jitter_seconds": 300}
+
+_rotation: dict = {}
 # Per-reason upstream-error policy (router.json top-level ``error_policy``,
 # then per-provider ``providers.<name>.error_policy``, then these built-in
 # defaults; closest scope wins). action: cooldown (rotate skips the lane until
@@ -266,6 +274,7 @@ def load_config() -> int:
     except ValueError as exc:
         return fail(f"bad {CONFIG_FILE.name}: {exc}")
     _load_egress_settings(data)
+    _load_rotation_settings(data)
     _port = port
     _providers = providers
     _routes = routes
@@ -317,6 +326,9 @@ def write_default_config(force: bool = False) -> int:
                 "slow_latency_ms": 1200,
                 "ok_window": 86400,
             },
+            # Scheduled rotation: churn the active exits every 2h (with
+            # ±150s jitter) so upstream rate limits see a fresh egress IP.
+            "rotation": {"interval_seconds": 7200, "jitter_seconds": 300},
             "error_policy": {
                 "default": {"action": "cooldown", "seconds": 300},
                 "429": {"action": "exhaust", "seconds": 900},
@@ -527,6 +539,21 @@ def _load_egress_settings(data: dict) -> None:
     if not sane:
         settings["probe_url"] = DEFAULT_EGRESS_SETTINGS["probe_url"]
     _egress_settings = settings
+
+
+def _load_rotation_settings(data: dict) -> None:
+    """Merge router.json's optional top-level ``rotation`` dict; raises
+    ValueError on invalid values so load_config rejects the config."""
+    global _rotation
+    supplied = data.get("rotation") if isinstance(data, dict) else None
+    interval = DEFAULT_ROTATION_SETTINGS["interval_seconds"]
+    jitter = DEFAULT_ROTATION_SETTINGS["jitter_seconds"]
+    if isinstance(supplied, dict):
+        interval = int(supplied.get("interval_seconds", interval))
+        jitter = int(supplied.get("jitter_seconds", jitter))
+    if interval < 0 or jitter < 0:
+        raise ValueError("rotation interval_seconds/jitter_seconds must be >= 0")
+    _rotation = {"interval_seconds": interval, "jitter_seconds": jitter}
 
 
 def egress_record_path(name: str, profile: Path) -> Path:
@@ -893,6 +920,89 @@ def record_rotation(name: str, profile: Path) -> None:
     """Persist the last switch (profile + epoch) for status --json."""
     record = {"profile": profile.stem, "at": int(time.time())}
     _atomic_write(ROOT / "state" / f"{name}.rotation", json.dumps(record, indent=2, sort_keys=True) + "\n", 0o600)
+
+
+def scheduled_interval() -> int:
+    """Configured scheduled-rotation interval in seconds (0 = off)."""
+    try:
+        return int(_rotation.get("interval_seconds", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def last_rotation_at(name: str) -> int | None:
+    """Epoch of the last recorded rotation for ``name``
+    (state/<name>.rotation "at"), or None when there is no record."""
+    record = ROOT / "state" / f"{name}.rotation"
+    if not record.is_file():
+        return None
+    try:
+        return int(json.loads(record.read_text())["at"])
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return None
+
+
+def next_rotation_at(name: str) -> int | None:
+    """Epoch of the next scheduled rotation for ``name``, or None when
+    rotation is disabled or no rotation has ever been recorded."""
+    interval = scheduled_interval()
+    if interval <= 0:
+        return None
+    at = last_rotation_at(name)
+    if at is None:
+        return None
+    jitter = int(_rotation.get("jitter_seconds", DEFAULT_ROTATION_SETTINGS["jitter_seconds"]) or 0)
+    # Deterministic per-rotation jitter: seeded by the last rotation time, so
+    # repeated checks agree instead of re-rolling every tick and potentially
+    # deferring forever at the boundary.
+    offset = random.Random(at).randint(-(jitter // 2), jitter // 2) if jitter > 0 else 0
+    return at + interval + offset
+
+
+def rotate_due(provider: str | None = None) -> int:
+    """Scheduled rotation pass: rotate every provider whose interval elapsed.
+
+    Read-only when nothing is due (exit 3). Rotates via the normal ``rotate``
+    path (verify-then-switch, rollback, cooldowns); the current exit is NOT
+    marked as an upstream failure — a scheduled switch is a preference, not a
+    failure signal. Providers without a rotation record are seeded with now
+    (first rotation waits a full interval). Returns 0 when a provider was
+    rotated or seeded, 3 otherwise.
+    """
+    interval = scheduled_interval()
+    if interval <= 0:
+        return 3
+    if provider is not None:
+        names = [provider]
+    else:
+        suffix = ".active"
+        names = sorted(
+            p.name[: -len(suffix)]
+            for p in (ROOT / "state").glob(f"*{suffix}")
+            if p.name.endswith(suffix) and p.name[: -len(suffix)] in _providers
+        )
+    if not names:
+        return 3
+    now = int(time.time())
+    handled = False
+    for name in names:
+        at = last_rotation_at(name)
+        if at is None:
+            active = persisted_active(name)
+            if active is not None:
+                record_rotation(name, active)
+            else:
+                _atomic_write(
+                    ROOT / "state" / f"{name}.rotation",
+                    json.dumps({"profile": None, "at": now}, sort_keys=True) + "\n",
+                )
+            handled = True
+            continue
+        next_at = next_rotation_at(name)
+        if next_at is None or now < next_at:
+            continue
+        handled = rotate(name) == 0 or handled
+    return 0 if handled else 3
 
 
 def _clear_cooldown(name: str, profile: Path) -> None:
@@ -1523,6 +1633,31 @@ def wait_listener(timeout: float = 8.0) -> bool:
 # ---------------------------------------------------------------------------
 # engine lifecycle
 # ---------------------------------------------------------------------------
+
+def route_watcher_start() -> None:
+    """Start the independent routed-connection watcher best-effort."""
+    if current_mode() == "tun":
+        route_watcher_stop()
+        return
+    try:
+        import route_watcher
+
+        result = route_watcher.start(ROOT)
+        if result.get("error"):
+            print(f"router: route watcher unavailable: {result['error']}", file=sys.stderr)
+    except Exception as exc:  # watcher failure must not take down the proxy
+        print(f"router: route watcher unavailable: {type(exc).__name__}", file=sys.stderr)
+
+
+def route_watcher_stop() -> None:
+    """Stop only our watcher; never signal arbitrary processes."""
+    try:
+        import route_watcher
+
+        route_watcher.stop(ROOT)
+    except Exception as exc:
+        print(f"router: route watcher stop warning: {type(exc).__name__}", file=sys.stderr)
+
 
 def rotate_log_if_needed() -> None:
     """Archive an oversized sing-box.log to sing-box.log.1 (mirrors monitor.py's
@@ -2211,6 +2346,21 @@ def status_json() -> dict:
         "ip_cidr": route.get("ip_cidr", []),
     } for route in _routes]
     data["routing"] = routing_state()
+    try:
+        import route_watcher
+
+        data["watcher"] = route_watcher.status(ROOT)
+    except Exception:
+        data["watcher"] = {"running": False, "enabled": False, "scope": "proxy-observable only"}
+    rotation = {
+        "interval_seconds": scheduled_interval(),
+        "jitter_seconds": int(_rotation.get("jitter_seconds", DEFAULT_ROTATION_SETTINGS["jitter_seconds"]) or 0),
+    }
+    if rotation["interval_seconds"] > 0:
+        next_times = [n for n in (next_rotation_at(name) for name in _providers) if n is not None]
+        if next_times:
+            rotation["next_at"] = min(next_times)
+    data["rotation"] = rotation
     return data
 
 
@@ -2390,6 +2540,90 @@ def system_proxy_off() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Fail-open proxy runner
+# ---------------------------------------------------------------------------
+
+PROXY_ENV_VARS = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")
+
+
+def _config_port() -> int:
+    """Read the mixed-proxy port from router.json without full validation so
+    with-proxy stays usable even with a broken/missing config."""
+    try:
+        if CONFIG_FILE.is_file():
+            port = int(json.loads(CONFIG_FILE.read_text()).get("port", DEFAULT_PORT))
+            if 1 <= port <= 65535:
+                return port
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return DEFAULT_PORT
+
+
+def _listener_healthy(port: int, timeout: float) -> bool:
+    """True when a TCP listener answers on 127.0.0.1:port. Read-only probe:
+    never starts the engine, never touches state."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def with_proxy(cmd: list[str], *, timeout_ms: int = 300,
+               force_proxy: bool = False, force_direct: bool = False,
+               check: bool = False) -> int:
+    """Fail-open command runner: exec ``cmd`` through the local proxy when the
+    listener is up, otherwise strip the proxy env and run direct.
+
+    Use when:
+    - Wrapping apps pointed at 127.0.0.1:<port> (hermes, curl, ...) so they
+      keep working when the engine is stopped / manual-off.
+    - Health checks: ``--check`` prints the proxy URL and exits 0 when the
+      listener answers, exits 1 when it does not.
+
+    Expects:
+    - ``cmd``: argv to exec via os.execvpe (child replaces this process; exit
+      code flows through).
+    - ``--force-proxy`` refuses to run (exit 4) when the listener is down;
+      ``--force-direct`` skips the probe and always strips the proxy env.
+    - ``--check`` ignores ``cmd``.
+
+    Returns:
+    - Child exit code (exec path), 4 for a refused --force-proxy run, 1 for
+      --check when the listener is down, 1 for a missing command.
+    """
+    timeout = max(0.001, timeout_ms / 1000.0)
+    if check:
+        port = _config_port()
+        if _listener_healthy(port, timeout):
+            print(f"http://127.0.0.1:{port}")
+            return 0
+        return 1
+    if not cmd:
+        return fail("with-proxy: no command given (usage: router.py with-proxy [flags] -- <cmd...>)")
+    if force_proxy and force_direct:
+        return fail("with-proxy: --force-proxy and --force-direct are mutually exclusive")
+    port = _config_port()
+    healthy = _listener_healthy(port, timeout)
+    if force_proxy and not healthy:
+        print(f"router: proxy listener 127.0.0.1:{port} is down; refusing --force-proxy run", file=sys.stderr)
+        return 4
+    env = dict(os.environ)
+    if (healthy and not force_direct) or force_proxy:
+        url = f"http://127.0.0.1:{port}"
+        for var in PROXY_ENV_VARS:
+            env[var] = url
+    else:
+        for var in PROXY_ENV_VARS:
+            env.pop(var, None)
+    try:
+        os.execvpe(cmd[0], cmd, env)
+    except OSError as exc:
+        return fail(f"with-proxy: cannot execute {cmd[0]}: {exc}")
+    return 127  # unreachable: execvpe only returns on error
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -2440,6 +2674,9 @@ def main() -> int:
     monitor = sub.add_parser("monitor", help="opt-in network monitoring")
     monitor.add_argument("monitor_args", nargs=argparse.REMAINDER)
 
+    watcher = sub.add_parser("watcher", help="standalone routed-connection watcher")
+    watcher.add_argument("watcher_args", nargs=argparse.REMAINDER)
+
     r_add = sub.add_parser("add")
     r_add.add_argument("--id")
     r_add.add_argument("--domain")
@@ -2450,13 +2687,27 @@ def main() -> int:
     r_rm.add_argument("id")
 
     r_rot = sub.add_parser("rotate")
-    r_rot.add_argument("provider")
+    r_rot.add_argument("provider", nargs="?", help="provider name (optional with --if-due)")
+    r_rot.add_argument("--if-due", action="store_true",
+                       help="scheduled rotation: only rotate when the configured interval elapsed (exit 3 when not due)")
     r_rot.add_argument("--reason", default=None,
                        help="mark the current profile with an upstream error/cooldown before rotating (e.g. 503, 429, timeout, 1010)")
     r_rot.add_argument("--force", action="store_true",
                        help="ignore cooldowns and blocked-exit markers and switch anyway")
     r_rot.add_argument("--no-probe", action="store_true",
                        help="skip the post-switch egress probe")
+
+    w_proxy = sub.add_parser("with-proxy", help="run a command through the proxy when up, else direct (fail-open)")
+    w_proxy.add_argument("--timeout-ms", type=int, default=300, help="listener probe timeout (default 300)")
+    w_proxy_group = w_proxy.add_mutually_exclusive_group()
+    w_proxy_group.add_argument("--force-proxy", action="store_true",
+                               help="fail (exit 4) instead of running direct when the listener is down")
+    w_proxy_group.add_argument("--force-direct", action="store_true",
+                               help="skip the probe and always run direct")
+    w_proxy.add_argument("--check", action="store_true",
+                         help="print the proxy URL and exit 0 if the listener answers, else exit 1")
+    w_proxy.add_argument("cmd_tail", nargs=argparse.REMAINDER,
+                         help="-- <cmd...> (argv after a leading --)")
 
     r_count = sub.add_parser("provider-count")
     r_count.add_argument("provider")
@@ -2470,8 +2721,20 @@ def main() -> int:
         import monitor
 
         return monitor.main(["monitor", *args.monitor_args, *passthrough], root=ROOT)
+    if args.cmd == "watcher":
+        import route_watcher
+
+        return route_watcher.main(["watcher", *args.watcher_args, *passthrough], root=ROOT)
     if passthrough:
         parser.error("unrecognized arguments: " + " ".join(passthrough))
+    if args.cmd == "with-proxy":
+        # Fail-open must work even with a broken/missing router.json, so it
+        # bypasses the load_config gate below (it only reads the port).
+        tail = args.cmd_tail
+        if tail and tail[0] == "--":
+            tail = tail[1:]
+        return with_proxy(tail, timeout_ms=args.timeout_ms, force_proxy=args.force_proxy,
+                          force_direct=args.force_direct, check=args.check)
     if args.cmd == "init":
         return write_default_config(force=getattr(args, "force", False))
     if args.cmd is None:
@@ -2489,6 +2752,7 @@ def main() -> int:
             return fail("up requires macOS (v1 scope)")
         rc = load_config()
         if rc == 0 and engine_start() == 0:
+            route_watcher_start()
             return system_proxy_on()
         return rc
     if args.cmd == "down" and sys.platform != "darwin":
@@ -2515,10 +2779,20 @@ def main() -> int:
         return rc
 
     if args.cmd == "ensure":
-        return _with_lock(engine_ensure)
+        rc = _with_lock(engine_ensure)
+        if rc == 0:
+            route_watcher_start()
+        else:
+            route_watcher_stop()
+        return rc
     if args.cmd == "start":
-        return _with_lock(engine_start)
+        route_watcher_stop()
+        rc = _with_lock(engine_start)
+        if rc == 0:
+            route_watcher_start()
+        return rc
     if args.cmd == "stop":
+        route_watcher_stop()
         return _with_lock(engine_stop)
     if args.cmd == "status":
         if resolve_sing_box() is None:
@@ -2530,8 +2804,15 @@ def main() -> int:
             print(line)
         return rc
     if args.cmd == "reload":
-        return _with_lock(engine_reload)
+        rc = _with_lock(engine_reload)
+        if rc == 0:
+            route_watcher_start()
+        return rc
     if args.cmd == "rotate":
+        if args.if_due:
+            return _with_lock(lambda: rotate_due(args.provider))
+        if not args.provider:
+            parser.error("rotate needs a provider (or use --if-due for scheduled rotation)")
         return _with_lock(lambda: rotate(args.provider, reason=args.reason, force=args.force,
                                          probe=not args.no_probe))
     if args.cmd == "egress":
@@ -2557,9 +2838,14 @@ def main() -> int:
         parser.error("routing needs an action: show | set | add | remove")
     if args.cmd == "vpn":
         if args.action == "on":
+            route_watcher_stop()
             return _with_lock(vpn_on)
         if args.action == "off":
-            return _with_lock(vpn_off)
+            route_watcher_stop()
+            rc = _with_lock(vpn_off)
+            if rc == 0:
+                route_watcher_start()
+            return rc
         return vpn_status()
     if args.cmd == "add":
         return _with_lock(lambda: routes_add(args))

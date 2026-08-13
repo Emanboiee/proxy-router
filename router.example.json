@@ -61,5 +61,9 @@
     "connection": { "action": "cooldown", "seconds": 300 },
     "1010": { "action": "block", "seconds": 3600 },
     "403": { "action": "block", "seconds": 3600 }
+  },
+  "rotation": {
+    "interval_seconds": 7200,
+    "jitter_seconds": 300
   }
 }
