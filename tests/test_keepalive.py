@@ -12,6 +12,7 @@ tests can assert on:
 - reset-on-success, and the boot self-test.
 """
 import os
+import signal
 import subprocess
 import tempfile
 import time
@@ -73,7 +74,7 @@ class KeepaliveHarness:
     def __init__(self, *, interval="1", fail_ensures="", egress="alive",
                  probe_every="4", dead_strikes="2", storm_window="600",
                  max_rotations="2"):
-        self._tmp = tempfile.TemporaryDirectory()
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.root = Path(self._tmp.name)
         (self.root / "bin").mkdir()
         sleep_bin = self.root / "bin" / "sleep"
@@ -107,7 +108,7 @@ class KeepaliveHarness:
         self.env = env
         self.proc = subprocess.Popen([str(target)], env=env,
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                     text=True)
+                                     text=True, start_new_session=True)
 
     def lines(self) -> list[str]:
         if not self.log.is_file():
@@ -130,10 +131,22 @@ class KeepaliveHarness:
         if getattr(self, "_closed", False):
             return
         self._closed = True
-        self.proc.terminate()
+        # Kill the whole process group, not just the bash parent: the fake
+        # router.py / sleep children inherit the pipes and tmp dir, and can
+        # still be writing when the parent exits — a plain SIGTERM to the
+        # parent then leaves children recreating files mid-rmtree (Errno 66
+        # "Directory not empty" flake).
+        try:
+            os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+        except ProcessLookupError:
+            pass
         try:
             self.out, self.err = self.proc.communicate(timeout=5)
         except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             self.proc.kill()
             self.out, self.err = self.proc.communicate()
         self._tmp.cleanup()
