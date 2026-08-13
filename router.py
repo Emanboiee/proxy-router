@@ -34,6 +34,11 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+try:
+    import pwd as _pwd
+except ImportError:  # pragma: no cover - Windows has no pwd
+    _pwd = None
+
 ROOT = Path(os.environ.get("PROXY_ROUTER_ROOT") or Path(__file__).resolve().parent).resolve()
 CONFIG_FILE = ROOT / "router.json"
 SING_BOX_CONFIG = ROOT / "sing-box.json"
@@ -2718,8 +2723,12 @@ SUDOERS_FILE = Path("/etc/sudoers.d/91-proxy-router")
 # interpreter or script.
 SUDOERS_COMMANDS = (
     ("vpn", "*"),
-    ("reload",),
+    ("start",),
+    ("stop",),
     ("ensure",),
+    ("reload",),
+    ("add", "*"),
+    ("remove", "*"),
     ("rotate", "*"),
     ("rotate", "*", "--reason", "*"),
 )
@@ -2732,6 +2741,24 @@ def _sudoers_rules(user: str, python: str, router_path: str) -> str:
         cmd = " ".join([python, router_path, *shape])
         lines.append(f"{user} ALL=(root) NOPASSWD: {cmd}")
     return "\n".join(lines) + "\n"
+
+
+def _elevation_user() -> str:
+    """The username the sudoers rules must grant.
+
+    The elevated child runs as root, where ``getpass.getuser()`` reads
+    LOGNAME/USER from the root environment and returns ``"root"`` —
+    granting rules to root instead of the invoking user. ``SUDO_UID`` is
+    injected by both elevation paths (``_elevate_macos``'s osascript env
+    and ``sudo -n`` itself), so resolve the username from it when present.
+    """
+    sudo_uid = os.environ.get("SUDO_UID")
+    if sudo_uid and _pwd is not None:
+        try:
+            return _pwd.getpwuid(int(sudo_uid)).pw_name
+        except (KeyError, ValueError):
+            pass
+    return getpass.getuser()
 
 
 def _sudoers_installed() -> bool:
@@ -2789,7 +2816,7 @@ def cmd_elevate(action: str) -> int:
             print(f"elevate: removed {SUDOERS_FILE}")
         return 0
 
-    rules = _sudoers_rules(getpass.getuser(), sys.executable, os.path.abspath(__file__))
+    rules = _sudoers_rules(_elevation_user(), sys.executable, os.path.abspath(__file__))
     if os.geteuid() != 0:
         # One prompt (or none, if sudo already works): write, validate with
         # visudo, then atomically install. Re-run as root and continue.

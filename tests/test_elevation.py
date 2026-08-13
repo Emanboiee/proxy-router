@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import getpass
 import importlib.util
 import json
 import sys
@@ -186,12 +187,65 @@ def test_sudoers_rules_render_all_command_shapes():
     lines = rules.strip().splitlines()
     assert lines[0].startswith("# Managed by `proxy-router elevate install`")
     cmds = [l.split("NOPASSWD: ", 1)[1] for l in lines[1:]]
-    assert "/usr/bin/python3 /opt/pr/router.py vpn *" in cmds
-    assert "/usr/bin/python3 /opt/pr/router.py reload" in cmds
-    assert "/usr/bin/python3 /opt/pr/router.py ensure" in cmds
-    assert "/usr/bin/python3 /opt/pr/router.py rotate *" in cmds
-    assert "/usr/bin/python3 /opt/pr/router.py rotate * --reason *" in cmds
+    # Every command `_needs_elevation` may elevate in tun mode must be
+    # executable passwordless after `elevate install` (start/stop/add/
+    # remove were missing and fell back to prompting).
+    for shape in ("vpn *", "start", "stop", "ensure", "reload",
+                  "add *", "remove *", "rotate *", "rotate * --reason *"):
+        assert f"/usr/bin/python3 /opt/pr/router.py {shape}" in cmds, shape
     assert all(" ALL=(root) NOPASSWD: " in l for l in lines[1:])
+
+
+def test_elevation_user_resolves_sudo_uid_over_root_env(tmp_path, monkeypatch):
+    """The elevated child runs as root, where getpass.getuser() reads the
+    root environment (LOGNAME=root) and would grant rules to 'root'
+    instead of the invoking user; SUDO_UID carries the real uid."""
+    router = load_router(tmp_path)
+    fake_pwd = type("Pwd", (), {"getpwuid": staticmethod(lambda uid: type("E", (), {"pw_name": "kyson"})())})()
+    monkeypatch.setattr(router, "_pwd", fake_pwd)
+    monkeypatch.setenv("SUDO_UID", "501")
+    assert router._elevation_user() == "kyson"
+
+
+def test_elevation_user_falls_back_to_login_user(tmp_path, monkeypatch):
+    router = load_router(tmp_path)
+    monkeypatch.delenv("SUDO_UID", raising=False)
+    assert router._elevation_user() == getpass.getuser()
+
+
+def test_elevation_user_ignores_invalid_sudo_uid(tmp_path, monkeypatch):
+    """A non-numeric SUDO_UID (spoofed env) must not crash or resolve to a
+    fabricated user; fall back to the login user."""
+    router = load_router(tmp_path)
+    fake_pwd = type("Pwd", (), {"getpwuid": staticmethod(lambda uid: (_ for _ in ()).throw(KeyError(uid)))})()
+    monkeypatch.setattr(router, "_pwd", fake_pwd)
+    monkeypatch.setenv("SUDO_UID", "not-a-number")
+    assert router._elevation_user() == getpass.getuser()
+
+
+def test_cmd_elevate_install_as_root_grants_invoking_user(tmp_path, monkeypatch):
+    """ROOT CAUSE: `cmd_elevate('install')` computed rules with
+    getpass.getuser(); when re-run in the root child (osascript/sudo -n)
+    that returns 'root', so the installed sudoers file granted NOPASSWD to
+    root — the requesting user got nothing and every engine command kept
+    prompting. The rules must target the SUDO_UID user."""
+    router = load_router(tmp_path)
+    router.SUDOERS_FILE = tmp_path / "91-proxy-router"
+    fake_pwd = type("Pwd", (), {"getpwuid": staticmethod(lambda uid: type("E", (), {"pw_name": "kyson"})())})()
+    monkeypatch.setattr(router, "_pwd", fake_pwd)
+    monkeypatch.setenv("SUDO_UID", "501")
+    monkeypatch.setattr(router.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(router.os, "chmod", lambda *a, **k: None)
+
+    class _VisudoOk:
+        returncode = 0
+
+    monkeypatch.setattr(router.subprocess, "run", lambda *a, **k: _VisudoOk())
+
+    assert router.cmd_elevate("install") == 0
+    installed = router.SUDOERS_FILE.read_text()
+    assert "kyson ALL=(root) NOPASSWD: " in installed
+    assert "\nroot ALL=(root) NOPASSWD: " not in installed
 
 
 def test_sudoers_installed_probes_by_executing_not_listing(tmp_path, monkeypatch):
