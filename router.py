@@ -42,6 +42,10 @@ PID_FILE = ROOT / "sing-box.pid"
 LOG_FILE = ROOT / "sing-box.log"
 LOCK_FILE = ROOT / "state" / "engine.lock"
 MODE_FILE = ROOT / "state" / "mode"
+# Written by `router.py stop` (and the tray Disconnect); respected by
+# keepalive.sh so a manual disconnect is NOT resurrected on the next
+# ensure tick. Removed by `router.py start` / tray Connect.
+MANUAL_OFF_FILE = ROOT / "state" / "manual-off"
 DEFAULT_PORT = 2080
 DEFAULT_TUN_ADDRESS = ["172.19.0.1/30"]
 DEFAULT_TUN_MTU = 1500
@@ -182,10 +186,15 @@ def fail(message: str) -> int:
 def current_mode() -> str:
     """'proxy' (default) or 'tun'. Persisted in state/mode so ensure/reload
     keep running whatever the user last selected."""
-    if MODE_FILE.is_file():
-        mode = MODE_FILE.read_text().strip()
-        if mode in ("proxy", "tun"):
-            return mode
+    try:
+        if MODE_FILE.is_file():
+            mode = MODE_FILE.read_text().strip()
+            if mode in ("proxy", "tun"):
+                return mode
+    except OSError:
+        # Root-owned mode file (written by a sudo run whose ownership was
+        # not handed back) must not crash the regular-user CLI/keepalive.
+        return "proxy"
     return "proxy"
 
 
@@ -606,6 +615,11 @@ def record_egress(name: str, profile: Path, *, ok: bool, latency_ms: float | Non
         record["exhausted"] = False
         record["exhausted_at"] = None
         record["exhausted_until"] = None
+        # A passing probe heals a stale upstream_error marker (e.g. a 429
+        # from `rotate --reason` hours ago): the exit recovered, so the
+        # tray must stop warning/disable it.
+        record["upstream_error"] = None
+        record["upstream_error_at"] = None
     else:
         record["fails"] = int(record.get("fails") or 0) + 1
         record["latency_ms"] = None
@@ -1505,6 +1519,35 @@ def listener_up() -> bool:
         return sock.connect_ex(("127.0.0.1", _port)) == 0
 
 
+def _any_our_engine_running() -> bool:
+    """True when ANY sing-box process is running with our generated config
+    path in its command line.
+
+    Used when the pid file itself is unreadable (root-owned after a
+    `sudo vpn on`): same identity check as ``_pid_matches``, minus the pid."""
+    try:
+        if os.name == "nt":
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "(Get-CimInstance Win32_Process -Filter \"Name='sing-box.exe'\").CommandLine"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout
+            if out:
+                return str(SING_BOX_CONFIG) in out
+            out = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq sing-box.exe", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=3,
+            ).stdout
+            return "sing-box" in out.lower()
+        out = subprocess.run(
+            ["ps", "-ax", "-o", "command="],
+            capture_output=True, text=True, timeout=3,
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return f"sing-box run" in out and str(SING_BOX_CONFIG) in out
+
+
 def _pid_matches(pid: int) -> bool:
     """True when PID is a sing-box we launched (cmdline contains our config,
     so a recycled/foreign PID with the same number can never be killed)."""
@@ -1545,6 +1588,12 @@ def engine_alive() -> bool:
         return False
     try:
         pid = int(PID_FILE.read_text().strip())
+    except PermissionError:
+        # Root-owned pid file (started via `sudo vpn on`): cannot read the
+        # pid, but liveness is verifiable from the process table; declaring
+        # the engine dead here churns a doomed regular-user restart that
+        # clobbers the pid file.
+        return _any_our_engine_running()
     except (ValueError, OSError):
         return False
     if not _pid_matches(pid):
@@ -1554,6 +1603,12 @@ def engine_alive() -> bool:
             out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True, timeout=3).stdout
             return str(pid) in out
         os.kill(pid, 0)
+        return True
+    except PermissionError:
+        # Engine started via `sudo vpn on` runs as root: we may not probe
+        # it, but the pid file is ours and the process exists, so it is our
+        # engine (H3 foreign-PID check still holds — a recycled foreign pid
+        # file would never have been written by us).
         return True
     except (ProcessLookupError, ValueError, OSError):
         return False
@@ -1747,6 +1802,14 @@ def engine_start(use_existing_config: bool = False) -> int:
 
 
 def engine_ensure() -> int:
+    if MANUAL_OFF_FILE.is_file():
+        # The user disconnected manually (tray Disconnect / `router.py
+        # stop`). keepalive.sh also skips its ensure tick while the marker
+        # exists, but a stray direct `router.py ensure` must not resurrect
+        # the engine either.
+        print("router: manually disconnected (manual-off marker present); "
+              "run 'router.py start' to reconnect", file=sys.stderr)
+        return 0
     if current_mode() == "tun":
         # A proxy engine running while state/mode says tun is NOT healthy
         # (status/vpn status report it as down); restart into the persisted
@@ -1766,6 +1829,13 @@ def engine_stop() -> int:
     if PID_FILE.is_file():
         try:
             pid = int(PID_FILE.read_text().strip())
+        except PermissionError:
+            # Root-owned pid file (started via `sudo vpn on`): the engine may
+            # be alive; keep the pid file and fail loudly (mirror of the kill
+            # PermissionError below) instead of unlinking a live engine's pid
+            # as "garbage" (H6).
+            print("router: engine runs as root (started via sudo); stop it with `sudo python3 router.py vpn off`", file=sys.stderr)
+            return 1
         except (ValueError, OSError):
             # Garbage pid file (H6): treat as stale, clean it up, carry on.
             PID_FILE.unlink(missing_ok=True)
@@ -1786,6 +1856,12 @@ def engine_stop() -> int:
                 os.kill(pid, signal.SIGKILL)
         except (ProcessLookupError, ValueError):
             pass
+        except PermissionError:
+            # Engine was started via `sudo vpn on` and runs as root; a
+            # regular-user stop cannot signal it. Keep the pid file (the
+            # engine IS alive) and tell the user to stop with sudo.
+            print("router: engine runs as root (started via sudo); stop it with `sudo python3 router.py vpn off`", file=sys.stderr)
+            return 1
         PID_FILE.unlink(missing_ok=True)
     return 0
 
@@ -1859,7 +1935,8 @@ def engine_reload() -> int:
     return 0
 
 
-def rotate(name: str, *, reason: str | None = None, force: bool = False, probe: bool = True) -> int:
+def rotate(name: str, *, reason: str | None = None, force: bool = False, probe: bool = True,
+           to: str | None = None) -> int:
     """Switch to the next healthy profile for ``name``.
 
     - Egress-aware selection: cooled-down profiles are skipped as before, and
@@ -1869,6 +1946,10 @@ def rotate(name: str, *, reason: str | None = None, force: bool = False, probe: 
     - ``reason`` (rotate --reason): the CURRENT profile just failed upstream;
       it gets a longer cooldown + recorded reason (and a blocked marker for
       reputation-block reasons) so the next rotation prefers a different exit.
+    - ``to`` (rotate --to PROFILE): switch to this exact exit instead of the
+      ranked next one (used by the tray provider picker). The profile must
+      exist and parse; blocked exits are honored unless ``force``, so a manual
+      pick can still be refused when the exit is reputation-blocked.
     - Last-good rollback: after switching, the new exit is probed through the
       tunnel (proxy mode); if it fails to come up cleanly, the previous good
       profile is restored.
@@ -1892,25 +1973,45 @@ def rotate(name: str, *, reason: str | None = None, force: bool = False, probe: 
     except (TypeError, ValueError):
         return fail(f"provider '{name}': cooldown_seconds must be an integer")
     current = persisted_active(name) or resolve_active(name)
+    chosen = None
+    if to is not None:
+        chosen = next((p for p in valid if p.stem == to), None)
+        if chosen is None:
+            return fail(f"provider '{name}': no valid profile named '{to}' (have {', '.join(p.stem for p in valid)})")
+        # Re-selecting the already-active exit is a no-op. It must NOT
+        # cooldown the current profile or fail on its own cooldown state
+        # -- the old code marked the current exit cooling, then refused
+        # the pick with "exit is cooling down", a nonsense error for a
+        # click that should just confirm "already on it".
+        if not force and chosen == current:
+            print(f"already on {name} -> {chosen.stem}")
+            return 0
     if reason is not None:
         _apply_upstream_failure(name, current, reason, seconds)
     elif current is not None and not is_cooled_down(name, current) and not force:
         mark_cooldown(name, current, seconds)
-    if current in valid:
-        start = valid.index(current) + 1
-        ordered = valid[start:] + valid[:start]
+    if to is not None:
+        assert chosen is not None  # resolved and validated in the block above
+        if not force and egress_is_blocked(name, chosen):
+            return fail(f"provider '{name}': exit '{to}' is blocked (use 'rotate --force' to override)")
+        if not force and is_cooled_down(name, chosen):
+            return fail(f"provider '{name}': exit '{to}' is cooling down (use 'rotate --force' to override)")
     else:
-        ordered = valid
-    if force:
-        chosen = ordered[0]
-    else:
-        cooled = [p for p in ordered if not is_cooled_down(name, p)]
-        if not cooled:
-            return fail(f"provider '{name}': all profiles cooling down")
-        unblocked = [p for p in cooled if not egress_is_blocked(name, p)]
-        if not unblocked:
-            return fail(f"provider '{name}': no unblocked profile available (use 'rotate --force' to override)")
-        chosen = min(unblocked, key=lambda p: _egress_rank(read_egress(name, p)))
+        if current in valid:
+            start = valid.index(current) + 1
+            ordered = valid[start:] + valid[:start]
+        else:
+            ordered = valid
+        if force:
+            chosen = ordered[0]
+        else:
+            cooled = [p for p in ordered if not is_cooled_down(name, p)]
+            if not cooled:
+                return fail(f"provider '{name}': all profiles cooling down")
+            unblocked = [p for p in cooled if not egress_is_blocked(name, p)]
+            if not unblocked:
+                return fail(f"provider '{name}': no unblocked profile available (use 'rotate --force' to override)")
+            chosen = min(unblocked, key=lambda p: _egress_rank(read_egress(name, p)))
     if force:
         clear_blocked(name, chosen)
     previous = current
@@ -2213,6 +2314,11 @@ def vpn_on() -> int:
     if current_mode() == "tun":
         if engine_alive() and engine_mode_consistent():
             print("vpn: tun already up")
+            # Idempotent re-entry must leave the same surface state as a
+            # fresh start: tun mode has no local listener, so the system
+            # proxy must be off (a stale proxy points at the dead port).
+            if sys.platform == "darwin":
+                system_proxy_off()
             return 0
         # state says tun but nothing consistent is running: reset to proxy so a
         # failed start below can't wedge a phantom tun, then fall through.
@@ -2256,6 +2362,13 @@ def vpn_on() -> int:
         set_mode(old_mode)
         if old_mode == "proxy" and not listener_up():
             engine_start()
+        return rc
+    # Tun mode replaces the local proxy entirely: the OS routes traffic into
+    # the utun interface and no 127.0.0.1:<port> listener exists here.
+    # Leaving the macOS system proxy enabled would send the browser to a
+    # dead port ("connection was reset"), so disable it once tun is up.
+    if sys.platform == "darwin":
+        system_proxy_off()
     return rc
 
 
@@ -2266,7 +2379,13 @@ def vpn_off() -> int:
         return rc
     # Returning to proxy mode should leave the user with working connectivity
     # (M11): start the proxy engine so 127.0.0.1:<port> answers again.
-    return engine_start()
+    rc = engine_start()
+    # Back on the proxy: re-point the macOS system proxy at the listener so
+    # the browser keeps working without manual networksetup (mirror of the
+    # disable above; tun mode has no listener to point at).
+    if rc == 0 and sys.platform == "darwin":
+        system_proxy_on()
+    return rc
 
 
 def vpn_restart() -> int:
@@ -2888,6 +3007,8 @@ def main() -> int:
     r_rot.add_argument("provider", nargs="?", help="provider name (optional with --if-due)")
     r_rot.add_argument("--if-due", action="store_true",
                        help="scheduled rotation: only rotate when the configured interval elapsed (exit 3 when not due)")
+    r_rot.add_argument("--to", default=None,
+                       help="switch to this exact exit profile instead of the ranked next one (e.g. 01-NL-FREE-140)")
     r_rot.add_argument("--reason", default=None,
                        help="mark the current profile with an upstream error/cooldown before rotating (e.g. 503, 429, timeout, 1010)")
     r_rot.add_argument("--force", action="store_true",
@@ -2991,6 +3112,8 @@ def main() -> int:
             route_watcher_stop()
         return rc
     if args.cmd == "start":
+        # Explicit start (tray Connect / CLI) cancels any manual-off state.
+        MANUAL_OFF_FILE.unlink(missing_ok=True)
         route_watcher_stop()
         rc = _with_lock(engine_start)
         if rc == 0:
@@ -2998,7 +3121,25 @@ def main() -> int:
         return rc
     if args.cmd == "stop":
         route_watcher_stop()
-        return _with_lock(engine_stop)
+        rc = _with_lock(engine_stop)
+        if rc == 0:
+            # Manual disconnect: tell keepalive.sh to leave the engine down.
+            # Without this marker the keepalive's next `ensure` tick
+            # resurrects the proxy within 15s and the tray's Disconnect
+            # looks broken.
+            try:
+                MANUAL_OFF_FILE.write_text(
+                    f"manual stop {datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')}\n",
+                    encoding="utf-8",
+                )
+                try:
+                    MANUAL_OFF_FILE.chmod(0o600)
+                except OSError:
+                    pass
+            except OSError as e:
+                print(f"router: warning: could not write manual-off marker: {e}",
+                      file=sys.stderr)
+        return rc
     if args.cmd == "status":
         if resolve_sing_box() is None:
             print(f"router: {_sing_box_missing_message()}", file=sys.stderr)
@@ -3019,7 +3160,7 @@ def main() -> int:
         if not args.provider:
             parser.error("rotate needs a provider (or use --if-due for scheduled rotation)")
         return _with_lock(lambda: rotate(args.provider, reason=args.reason, force=args.force,
-                                         probe=not args.no_probe))
+                                         probe=not args.no_probe, to=args.to))
     if args.cmd == "egress":
         if args.action == "probe":
             return egress_probe(args.provider)
