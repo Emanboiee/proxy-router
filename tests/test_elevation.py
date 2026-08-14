@@ -222,6 +222,7 @@ class ElevateFallbackTests(unittest.TestCase):
 
     def test_sudo_denial_falls_back_to_admin_dialog(self):
         with mock.patch.object(router, "_sudoers_installed", return_value=True), \
+             mock.patch.object(router.sys.stdin, "isatty", return_value=True), \
              mock.patch.object(router, "_elevate_macos", return_value=42) as dialog, \
              mock.patch.object(router.subprocess, "run",
                                return_value=self._probe(1, "a password is required")):
@@ -231,6 +232,7 @@ class ElevateFallbackTests(unittest.TestCase):
 
     def test_sudoers_denial_token_falls_back_to_admin_dialog(self):
         with mock.patch.object(router, "_sudoers_installed", return_value=True), \
+             mock.patch.object(router.sys.stdin, "isatty", return_value=True), \
              mock.patch.object(router, "_elevate_macos", return_value=42) as dialog, \
              mock.patch.object(router.subprocess, "run",
                                return_value=self._probe(1, "kyson is not in the sudoers file")):
@@ -253,6 +255,26 @@ class ElevateFallbackTests(unittest.TestCase):
              mock.patch.object(router.subprocess, "run", return_value=self._probe(0)):
             rc = router._elevate()
         self.assertEqual(rc, 0)
+        dialog.assert_not_called()
+
+    def test_non_tty_denial_never_opens_admin_dialog(self):
+        # A stale grant whose probed shape is denied must NOT pop the
+        # admin dialog from a keepalive/launchd tick (no TTY).
+        with mock.patch.object(router, "_sudoers_installed", return_value=True), \
+             mock.patch.object(router.sys.stdin, "isatty", return_value=False), \
+             mock.patch.object(router, "_elevate_macos", return_value=42) as dialog, \
+             mock.patch.object(router.subprocess, "run",
+                               return_value=self._probe(1, "a password is required")):
+            rc = router._elevate()
+        self.assertEqual(rc, 1)
+        dialog.assert_not_called()
+
+    def test_non_tty_without_grant_never_opens_admin_dialog(self):
+        with mock.patch.object(router, "_sudoers_installed", return_value=False), \
+             mock.patch.object(router.sys.stdin, "isatty", return_value=False), \
+             mock.patch.object(router, "_elevate_macos", return_value=42) as dialog:
+            rc = router._elevate()
+        self.assertEqual(rc, 1)
         dialog.assert_not_called()
 
 

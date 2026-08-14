@@ -3287,6 +3287,12 @@ def _elevate() -> int:
         stderr = (probe.stderr or "").lower()
         if not any(token in stderr for token in _SUDO_DENIAL_TOKENS):
             return probe.returncode
+    if not sys.stdin.isatty():
+        # keepalive/launchd tick: never pop an admin dialog. The TTY gate in
+        # _needs_elevation normally stops ticks from reaching this; a stale
+        # grant whose probed shape was denied would otherwise fall through
+        # to the dialog on every interval (issue #13 review finding).
+        return 1
     return _elevate_macos()
 
 
