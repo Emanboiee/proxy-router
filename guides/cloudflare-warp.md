@@ -119,3 +119,18 @@ chmod 600 providers/cloudflare/*.conf
   and `[Peer]` section. Run `proxy-router setup --check` for details.
 - **`setup --check` fails:** Verify files are in `providers/cloudflare/` with
   `0600` permissions and contain valid WireGuard configuration.
+- **Handshake never completes / "operation timed out" on every probe while
+  Proton works:** Some networks (schools, dorms, corporate filters) drop the
+  WARP endpoint's default UDP port `2408`. The tunnel handshake then never
+  completes even with a freshly registered key, while a Proton provider on a
+  different port keeps working. Fix: repoint the profile's `Endpoint` to a
+  WARP alternate port and reload:
+  ```sh
+  sed -i '' 's/^Endpoint = engage.cloudflareclient.com:2408$/Endpoint = engage.cloudflareclient.com:4500/' providers/cloudflare/warp.conf
+  proxy-router reload   # sudo: /opt/anaconda3/bin/python3 .../router.py reload
+  ```
+  Cloudflare's WARP endpoint listens on several UDP ports — `2408`, `500`,
+  `1701`, `4500`. `4500` (NAT-T) is the least likely to be filtered and is a
+  good first choice. Verify with `proxy-router egress check` — the provider
+  should flip from `dead` to `alive`; `curl -x http://127.0.0.1:2080
+  https://www.roblox.com/robots.txt` should return 200.

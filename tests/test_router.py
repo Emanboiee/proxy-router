@@ -1372,7 +1372,7 @@ class EgressLiveCheckTests(unittest.TestCase):
 
 class EgressCheckCommandTests(unittest.TestCase):
     """egress check CLI semantics: exit codes, dead: line, json shape, and
-    stop-at-first-dead."""
+    all-provider checking (records refresh even after a dead-first exit)."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -1440,8 +1440,37 @@ class EgressCheckCommandTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         joined = "".join(str(c) for c in write.call_args_list)
         self.assertIn("dead: proton", joined)
-        # stop at first dead: cloudflare must not be checked
-        self.assertEqual(self.live.call_count, 1)
+        # both providers are checked so records refresh; only the first dead
+        # provider is named so keepalive rotates exactly one exit
+        self.assertEqual(self.live.call_count, 2)
+        self.assertNotIn("dead: cloudflare", joined)
+
+    def test_records_refresh_after_first_dead(self):
+        # regression: a dead-first provider must not freeze the follow-on
+        # provider's record at its last failure (status UIs showed stale
+        # "timed out" labels while the tunnel actually worked)
+        router.set_active("proton", self.root / "providers" / "proton" / "a.conf")
+        router.set_active("cloudflare", self.root / "providers" / "cloudflare" / "b.conf")
+        self.live_patch.stop()  # exercise the real check_egress_live/record path
+        probes = [
+            {"ok": False, "latency_ms": None, "status": None,
+             "error": "URLError: timeout", "block_reason": None},
+            {"ok": True, "latency_ms": 42.0, "status": 200,
+             "error": None, "block_reason": None},
+        ]
+        with mock.patch.object(router, "probe_egress", side_effect=probes) as probe, \
+             mock.patch.object(router, "egress_dns_probe", return_value=False), \
+             mock.patch("sys.stdout.write") as write:
+            rc = router.egress_check()
+        self.assertEqual(rc, 1)
+        self.assertEqual(probe.call_count, 2)
+        joined = "".join(str(c) for c in write.call_args_list)
+        self.assertIn("dead: proton", joined)
+        self.assertNotIn("dead: cloudflare", joined)
+        record = router.read_egress("cloudflare", self.root / "providers" / "cloudflare" / "b.conf")
+        self.assertTrue(record["ok"])
+        self.assertEqual(record["fails"], 0)
+        self.assertEqual(record["latency_ms"], 42.0)
 
     def test_degraded_exit_zero_not_dead(self):
         router.set_active("proton", self.root / "providers" / "proton" / "a.conf")
@@ -1454,7 +1483,8 @@ class EgressCheckCommandTests(unittest.TestCase):
     def test_json_shape(self):
         router.set_active("proton", self.root / "providers" / "proton" / "a.conf")
         router.set_active("cloudflare", self.root / "providers" / "cloudflare" / "b.conf")
-        self._live(("dead", {"ok": False, "dns_ok": False}))
+        self._live(("dead", {"ok": False, "dns_ok": False}),
+                   ("alive", {"ok": True, "dns_ok": True}))
         with mock.patch("sys.stdout.write") as write:
             rc = router.egress_check(as_json=True)
         self.assertEqual(rc, 1)
@@ -1462,6 +1492,7 @@ class EgressCheckCommandTests(unittest.TestCase):
         data = json.loads(text)
         self.assertEqual(data["dead"], ["proton"])
         self.assertEqual(data["results"]["proton"]["status"], "dead")
+        self.assertEqual(data["results"]["cloudflare"]["status"], "alive")
 
     def test_provider_filter(self):
         router.set_active("proton", self.root / "providers" / "proton" / "a.conf")
