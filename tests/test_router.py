@@ -68,10 +68,25 @@ class WireGuardParseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             conf = Path(tmp) / "profile.conf"
             _write_conf(conf, psk=False, mtu=False, keepalive=False)
-            endpoint = router.parse_wireguard(conf)
+            old_vpn, router._vpn = router._vpn, {}
+            try:
+                endpoint = router.parse_wireguard(conf)
+            finally:
+                router._vpn = old_vpn
             self.assertNotIn("pre_shared_key", endpoint["peers"][0])
             self.assertNotIn("persistent_keepalive_interval", endpoint["peers"][0])
-            self.assertNotIn("mtu", endpoint)
+            self.assertEqual(endpoint["mtu"], router.DEFAULT_ENDPOINT_MTU)
+
+    def test_parse_wireguard_mtu_fallback_uses_vpn_mtu(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conf = Path(tmp) / "profile.conf"
+            _write_conf(conf, mtu=False)
+            old_vpn, router._vpn = router._vpn, {"mtu": 1420}
+            try:
+                endpoint = router.parse_wireguard(conf)
+            finally:
+                router._vpn = old_vpn
+            self.assertEqual(endpoint["mtu"], 1420)
 
     def test_dns_server_for_avoids_private_proton_resolver(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1537,6 +1552,141 @@ class EgressCheckCommandTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         _, kwargs = probe.call_args
         self.assertEqual(probe.call_args[0][1].stem, "a")
+
+
+class EgressSweepTests(unittest.TestCase):
+    """egress sweep: full-pool probing in wrap order, best-alive end state,
+    dead-pool exit code, and configurable probe targets."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(router, self.root)
+        (self.root / "providers" / "proton").mkdir(parents=True)
+        for name in ("a", "b", "c"):
+            _write_conf(self.root / "providers" / "proton" / f"{name}.conf")
+        router._providers = {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}}
+        router._routes = [{"id": "example-com", "domains": ["example.com"], "provider": "proton"}]
+        router._port = 2080
+        router._vpn = {}
+        self.listener = mock.patch.object(router, "listener_up", return_value=True)
+        self.listener.start()
+        self.rotate_patch = mock.patch.object(router, "rotate", return_value=0)
+        self.rotate = self.rotate_patch.start()
+        self.probe_patch = mock.patch.object(router, "probe_profile",
+                                             return_value=(True, {"ok": True, "latency_ms": 10.0,
+                                                                 "status": 200}))
+        self.probe = self.probe_patch.start()
+        self.reload_patch = mock.patch.object(router, "engine_reload", return_value=0)
+        self.engine_reload = self.reload_patch.start()
+        self.sleep_patch = mock.patch.object(router.time, "sleep")
+        self.sleep_patch.start()
+
+    def tearDown(self):
+        self.sleep_patch.stop()
+        self.reload_patch.stop()
+        self.probe_patch.stop()
+        self.rotate_patch.stop()
+        self.listener.stop()
+        self._tmp.cleanup()
+
+    def _profile(self, stem):
+        return self.root / "providers" / "proton" / f"{stem}.conf"
+
+    def _probe(self, *results):
+        self.probe_patch.stop()
+        self.probe_patch = mock.patch.object(router, "probe_profile", side_effect=list(results))
+        self.probe = self.probe_patch.start()
+
+    def test_requires_proxy_mode(self):
+        router.set_mode("tun")
+        with mock.patch("sys.stdout.write"):
+            rc = router.egress_sweep()
+        self.assertEqual(rc, 1)
+
+    def test_probes_every_profile_once_in_wrap_order(self):
+        router.set_active("proton", self._profile("a"))
+        rc = router.egress_sweep("proton")
+        self.assertEqual(rc, 0)
+        stems = [call.args[1].stem for call in self.probe.call_args_list]
+        self.assertEqual(stems, ["a", "b", "c"])
+        # one force/no-probe hop before every non-first profile
+        self.assertEqual([c.args[0] for c in self.rotate.call_args_list], ["proton", "proton"])
+        for call in self.rotate.call_args_list:
+            self.assertTrue(call.kwargs["force"])
+            self.assertFalse(call.kwargs["probe"])
+
+    def test_ends_on_best_alive_profile(self):
+        router.set_active("proton", self._profile("a"))
+        self._probe(
+            (True, {"ok": True, "latency_ms": 100.0, "status": 200}),
+            (True, {"ok": True, "latency_ms": 50.0, "status": 200}),
+            (True, {"ok": True, "latency_ms": 200.0, "status": 200}),
+        )
+        with mock.patch("sys.stdout.write") as write:
+            rc = router.egress_sweep("proton")
+        self.assertEqual(rc, 0)
+        self.assertEqual(router.persisted_active("proton").stem, "b")
+        self.engine_reload.assert_called_once()
+        joined = "".join(c.args[0] for c in write.call_args_list)
+        self.assertIn("switched proton -> b (sweep)", joined)
+
+    def test_keeps_current_when_already_best(self):
+        # all profiles alive at the same latency: first tested (the current
+        # one) wins, so the sweep must NOT reload the engine.
+        router.set_active("proton", self._profile("a"))
+        rc = router.egress_sweep("proton")
+        self.assertEqual(rc, 0)
+        self.assertEqual(router.persisted_active("proton").stem, "a")
+        self.engine_reload.assert_not_called()
+
+    def test_all_profiles_dead_exit_one_no_switch(self):
+        router.set_active("proton", self._profile("a"))
+        self._probe(
+            (False, {"ok": False, "latency_ms": None, "status": None}),
+            (False, {"ok": False, "latency_ms": None, "status": None}),
+            (False, {"ok": False, "latency_ms": None, "status": None}),
+        )
+        with mock.patch("sys.stdout.write") as write:
+            rc = router.egress_sweep("proton")
+        self.assertEqual(rc, 1)
+        self.engine_reload.assert_not_called()
+        self.assertEqual(router.persisted_active("proton").stem, "a")  # left on current
+        joined = "".join(c.args[0] for c in write.call_args_list)
+        self.assertIn("0/3 alive", joined)
+
+    def test_unknown_provider_is_error_but_not_dead(self):
+        rc = router.egress_sweep("ghost")
+        self.assertEqual(rc, 0)
+        self.probe.assert_not_called()
+        self.rotate.assert_not_called()
+
+    def test_uses_provider_pinned_probe_url(self):
+        # the pinned probe_url from router.json wins over the route-domain
+        # pick, so the sweep rides the tunnel to the configured target
+        config = {
+            "port": 2080,
+            "providers": {
+                "proton": {"directory": "providers/proton",
+                           "probe_url": "https://pinned.example/probe"},
+            },
+            "routes": [{"id": "example-com", "domains": ["example.com"], "provider": "proton"}],
+        }
+        (self.root / "router.json").write_text(json.dumps(config))
+        self.assertEqual(router.load_config(), 0)
+        router.set_active("proton", self._profile("a"))
+        self.probe_patch.stop()  # exercise the real probe_profile/probe_url_for path
+        urls = []
+
+        def fake_probe_egress(*, port=None, url=None, timeout=None, opener=None, clock=None):
+            urls.append(url)
+            return {"ok": True, "latency_ms": 5.0, "status": 200, "error": None, "block_reason": None}
+
+        with mock.patch.object(router, "probe_egress", side_effect=fake_probe_egress), \
+             mock.patch("sys.stdout.write"):
+            rc = router.egress_sweep("proton")
+        self.assertEqual(rc, 0)
+        self.assertEqual(urls, ["https://pinned.example/probe"] * 3)
 
 
 class LastGoodConfigTests(unittest.TestCase):

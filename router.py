@@ -41,6 +41,8 @@ MODE_FILE = ROOT / "state" / "mode"
 DEFAULT_PORT = 2080
 DEFAULT_TUN_ADDRESS = ["172.19.0.1/30"]
 DEFAULT_TUN_MTU = 1500
+# sing-box's 1500 default black-holes TCP on restrictive paths (see proton profiles)
+DEFAULT_ENDPOINT_MTU = 1280
 DEFAULT_TUN_STACK = "system"
 DEFAULT_PROBE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
 DEFAULT_EGRESS_SETTINGS = {
@@ -1129,6 +1131,8 @@ def parse_wireguard(profile: Path) -> dict:
         endpoint["peers"][0]["persistent_keepalive_interval"] = int(peer["PersistentKeepalive"].strip())
     if interface.get("MTU", "").strip():
         endpoint["mtu"] = int(interface["MTU"].strip())
+    else:
+        endpoint["mtu"] = int(_vpn.get("mtu") or DEFAULT_ENDPOINT_MTU)
     return endpoint
 
 
@@ -2310,6 +2314,105 @@ def egress_check(name: str | None = None, as_json: bool = False) -> int:
     return 1 if dead else 0
 
 
+def egress_sweep(name: str | None = None, as_json: bool = False) -> int:
+    """Full-pool sweep: probe EVERY profile of every provider (or just
+    ``name``) through the running tunnel, persisting per-profile health,
+    cooldown, and blocked markers, then end on the best alive profile.
+
+    Unlike `egress check` (which probes only the ACTIVE exit), a sweep walks
+    the whole pool in wrap order - each profile is tested exactly once, the
+    engine hopping from exit to exit with a short settle wait after each hop
+    (the first request after a WireGuard switch can flake and would
+    false-mark a healthy exit failed/cooldown) - so health records for the
+    entire pool stay fresh and the tunnel ends on the fastest alive exit
+    instead of sitting on a stale-but-alive lane. ``rotate`` is called with
+    force=True + probe=False for hops: it advances in wrap order without
+    cooling the current profile and without rollback; it does reload the
+    engine so every probe rides the tunnel through the profile being tested.
+
+    Blocked/cooldown markers written by the probes persist exactly as they do
+    for `egress probe`; the final switch (``set_active`` + ``engine_reload``)
+    happens only when a strictly better (lower-latency; unmeasured alive
+    profiles rank after measured ones, ties go to the first tested) alive
+    profile exists, so a healthy sweep never reloads the engine. When nothing
+    is alive the tunnel is left on the current profile - nothing is restored,
+    nothing is switched.
+
+    Output: ``--json`` emits ``{"dead": [...], "results": {...}}``; human
+    mode prints one summary line per provider. Exit 1 when any provider was
+    swept and had zero alive profiles (an unknown provider is an error entry
+    but not a dead pool).
+    """
+    if current_mode() != "proxy":
+        return fail("egress sweep requires proxy mode (tun has no 127.0.0.1 listener)")
+    if not listener_up():
+        return fail(f"engine not listening on 127.0.0.1:{_port}; start it first")
+    providers = [name] if name is not None else list(_providers)
+    results: dict[str, dict] = {}
+    dead: list[str] = []
+    for provider in providers:
+        if provider not in _providers:
+            results[provider] = {"error": "unknown provider"}
+            continue
+        # Keep only parseable profiles so one bad *.conf cannot wedge the
+        # sweep (F6); log every skipped filename (F2), same as rotate.
+        valid: list[Path] = []
+        for profile in provider_files(provider):
+            error = _profile_error(profile)
+            if error is not None:
+                print(f"router: skipping bad profile {profile.name} of '{provider}': {error}", file=sys.stderr)
+                continue
+            valid.append(profile)
+        if not valid:
+            results[provider] = {"error": "no valid profiles"}
+            continue
+        current = persisted_active(provider) or resolve_active(provider)
+        if current in valid:
+            start = valid.index(current)
+            ordered = valid[start:] + valid[:start]
+        else:
+            ordered = valid
+        entry: dict[str, dict] = {}
+        for i, profile in enumerate(ordered):
+            if i > 0:
+                rotate(provider, force=True, probe=False)  # hop forward in wrap order
+                time.sleep(1.5)  # WireGuard handshake settle (avoids false transport cooling)
+            ok, record = probe_profile(provider, profile)
+            entry[profile.stem] = {
+                "ok": ok,
+                "latency_ms": record.get("latency_ms") if record else None,
+                "status": record.get("status") if record else None,
+            }
+        alive = [stem for stem, r in entry.items() if r["ok"]]
+        if alive:
+            best = min(alive, key=lambda stem: (
+                entry[stem]["latency_ms"] is None,
+                entry[stem]["latency_ms"] or 0.0,
+            ))
+            if current is None or best != current.stem:
+                set_active(provider, next(p for p in ordered if p.stem == best))
+                engine_reload()
+                print(f"switched {provider} -> {best} (sweep)")
+        else:
+            dead.append(provider)
+        results[provider] = entry
+    if as_json:
+        print(json.dumps({"dead": dead, "results": results}, indent=2, sort_keys=True))
+    else:
+        for provider, entry in results.items():
+            if "error" in entry:
+                print(f"{provider}: {entry['error']}")
+                continue
+            alive = [stem for stem, r in entry.items() if r["ok"]]
+            best = min(alive, key=lambda stem: (
+                entry[stem]["latency_ms"] is None,
+                entry[stem]["latency_ms"] or 0.0,
+            )) if alive else None
+            suffix = f" (best: {best})" if best is not None else ""
+            print(f"{provider}: sweep done, {len(alive)}/{len(entry)} alive{suffix}")
+    return 1 if dead else 0
+
+
 def egress_show(name: str | None = None) -> int:
     """Print persisted egress records (state/egress/**) as JSON."""
     providers = [name] if name is not None else list(_providers)
@@ -2425,13 +2528,13 @@ def main() -> int:
         routing_mut.add_argument("--domain", required=True)
 
     egress = sub.add_parser("egress", help="egress health for provider exits")
-    egress.add_argument("action", choices=["probe", "show", "check"])
+    egress.add_argument("action", choices=["probe", "show", "check", "sweep"])
     egress.add_argument("provider", nargs="?", default=None,
-                        help="provider name (positional, for probe/show)")
+                        help="provider name (positional, for probe/show/sweep)")
     egress.add_argument("--provider", dest="provider_opt", default=None,
                         help="provider name to check (egress check)")
     egress.add_argument("--json", action="store_true",
-                        help="egress check: machine-readable JSON output")
+                        help="egress check/sweep: machine-readable JSON output")
 
     init = sub.add_parser("init")
     init.add_argument("--force", action="store_true", help="overwrite an existing router.json")
@@ -2544,6 +2647,8 @@ def main() -> int:
             return egress_probe(args.provider)
         if args.action == "check":
             return egress_check(args.provider_opt or args.provider, as_json=args.json)
+        if args.action == "sweep":
+            return _with_lock(lambda: egress_sweep(args.provider, as_json=args.json))
         return egress_show(args.provider)
     if args.cmd == "provider-count":
         print(provider_count(args.provider))

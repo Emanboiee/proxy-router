@@ -109,6 +109,7 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py egress probe [provider]  # probe current exit(s) through the tunnel, persist health
 ./router.py egress show [provider]   # print persisted egress records (JSON)
 ./router.py egress check [--provider <name>] [--json]  # read-only live check: exit 1 ONLY when an active exit is DEAD
+./router.py egress sweep [provider] [--json]  # full-pool sweep: probe EVERY profile, end on the best alive exit
 ./router.py status --json         # machine-readable status for scripts/Hermes
 ./router.py setup                  # custom setup TUI
 ./router.py setup --guide all      # print Proton + WARP guides
@@ -161,6 +162,17 @@ Rotation is then egress-aware instead of blind round-robin:
 - After switching, the new exit is probed; if it does not come up cleanly the
   router restores the previous good profile (one bounded rollback step).
 - `egress probe` refreshes health on demand without rotating.
+- `egress sweep` [provider] probes EVERY profile of the pool through the
+  running tunnel (not just the active exit), persisting per-profile health,
+  cooldown, and blocked markers, then ends on the best alive profile - lowest
+  latency first, unmeasured alive profiles ranking after measured ones. It
+  hops through the pool in wrap order (one `rotate` per step, engine reloaded
+  each hop) with a short settle wait after each switch, so the first-request
+  flake of a fresh WireGuard handshake never false-marks an exit failed. When
+  nothing is alive the tunnel stays on the current profile and exit code 1
+  signals a provider with zero alive exits (`--json` names them under
+  `dead`). A sweep reloads the engine only when a strictly better exit was
+  found, so a healthy sweep is cheap.
 - `egress check` is the read-only liveness view used by the keepalive self-heal
   loop: it probes the ACTIVE exit(s) through the running tunnel and classifies
   each one `alive` (HTTP response rode the tunnel), `degraded` (an HTTP status
@@ -395,6 +407,13 @@ rotation; a healthy tunnel logs `router: boot self-test ok`. Keepalive
 rotations are capped at `PROXY_KEEPALIVE_MAX_ROTATIONS` (default 2) per
 `PROXY_KEEPALIVE_STORM_WINDOW` seconds (default 600), so a genuinely broken
 pool can never rotation-storm.
+
+The dead-tunnel checks only ever probe the ACTIVE exit, so a pool could sit
+on a stale-but-alive lane forever. Every `PROXY_KEEPALIVE_SWEEP_EVERY`
+seconds (default 1800 = 30 min) the keepalive therefore runs a full-pool
+`egress sweep` (see "Egress health & rotation smarts"): every profile of
+every provider is probed through the tunnel and the pool ends on the best
+alive exit, with health/cooldown/block markers persisted along the way.
 
 ## Hermes integration
 
