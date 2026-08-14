@@ -317,13 +317,17 @@ admin-password dialog on every run, grant passwordless sudo once:
 ```
 
 The sudoers file only authorizes the exact engine command shapes for this
-interpreter + script path (NOPASSWD for `vpn *`, `reload`, `ensure`,
-`rotate *`, `rotate * --reason *`). `*` in sudoers matches exactly one argv
-token and sudo execs the command directly (no shell), so there is no argv
-injection surface; state files are handed back to the invoking user via the
-`SUDO_UID`/`SUDO_GID` sudo sets automatically. With the grant in place, the
-interactive dialog path is skipped and background keepalive/launchd ticks can
-also elevate silently — `vpn on`/`vpn off`/`vpn restart` never prompt again.
+interpreter + script path (NOPASSWD for `start`, `stop`, `vpn *`, `reload`,
+`ensure`, `rotate *`, `rotate * --reason *`). `*` in sudoers matches exactly
+one argv token and sudo execs the command directly (no shell), so there is no
+argv injection surface; state files are handed back to the invoking user via
+the `SUDO_UID`/`SUDO_GID` sudo sets automatically. With the grant in place,
+the interactive dialog path is skipped and background keepalive/launchd ticks
+can also elevate silently — `vpn on`/`vpn off`/`vpn restart` never prompt
+again. The tray's Connect/Disconnect and the CLI's proxy-mode `start`/`stop`
+also elevate automatically while the engine runs as root, so an engine
+started via `sudo vpn on` stays manageable after `vpn off` returns to proxy
+mode.
 
 ## Provider setup
 

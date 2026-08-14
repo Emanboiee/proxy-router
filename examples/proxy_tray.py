@@ -303,11 +303,54 @@ class RouterClient:
     def ensure(self) -> tuple[int, str]:
         return self._run("ensure")
 
+    def _engine_runs_as_root(self) -> bool:
+        """True when the live engine process is owned by root.
+
+        An engine started via `sudo vpn on` keeps running as root after the
+        TUN is turned off; its pid file is root-owned mode 0600, so a
+        regular user cannot read it (that unreadable state is exactly what
+        makes plain `start`/`stop` fail with "Cannot stop because it is run
+        with sudo"). Mirrors router.py's probe: unreadable root-owned pid
+        file counts as root; a readable one is confirmed against `ps`.
+        """
+        if sys.platform != "darwin":
+            return False
+        pid_file = os.path.join(self.root, "sing-box.pid")
+        try:
+            st = os.stat(pid_file)
+        except OSError:
+            return False
+        if st.st_uid != 0:
+            return False
+        try:
+            with open(pid_file, encoding="utf-8") as fh:
+                pid = int(fh.read().strip())
+        except PermissionError:
+            return True
+        except (OSError, ValueError):
+            return False
+        try:
+            probe = subprocess.run(
+                ["ps", "-o", "user=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=3,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return probe.stdout.strip() == "root"
+
     def start(self) -> tuple[int, str]:
         # Explicit start: clears any manual-off marker (tray Connect).
+        # A root-owned engine must be managed elevated, exactly like the
+        # TUN toggle — a user-level start would clobber its pid file.
+        if self._engine_runs_as_root():
+            return self._run_elevated("start")
         return self._run("start")
 
     def stop(self) -> tuple[int, str]:
+        # The root-owned engine (started via `sudo vpn on`) cannot be
+        # signalled by a regular user: re-run the stop as root.
+        if self._engine_runs_as_root():
+            return self._run_elevated("stop")
         return self._run("stop")
 
     def rotate(self) -> tuple[int, str]:

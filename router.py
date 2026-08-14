@@ -2107,7 +2107,7 @@ def engine_stop() -> int:
             # be alive; keep the pid file and fail loudly (mirror of the kill
             # PermissionError below) instead of unlinking a live engine's pid
             # as "garbage" (H6).
-            print("router: engine runs as root (started via sudo); stop it with `sudo python3 router.py vpn off`", file=sys.stderr)
+            print("router: engine runs as root (started via sudo); run `router.py elevate install` once to stop it from the tray, or stop it now with `sudo python3 router.py stop`", file=sys.stderr)
             return 1
         except (ValueError, OSError):
             # Garbage pid file (H6): treat as stale, clean it up, carry on.
@@ -2133,7 +2133,7 @@ def engine_stop() -> int:
             # Engine was started via `sudo vpn on` and runs as root; a
             # regular-user stop cannot signal it. Keep the pid file (the
             # engine IS alive) and tell the user to stop with sudo.
-            print("router: engine runs as root (started via sudo); stop it with `sudo python3 router.py vpn off`", file=sys.stderr)
+            print("router: engine runs as root (started via sudo); run `router.py elevate install` once to stop it from the tray, or stop it now with `sudo python3 router.py stop`", file=sys.stderr)
             return 1
         PID_FILE.unlink(missing_ok=True)
     return 0
@@ -3103,16 +3103,57 @@ def with_proxy(cmd: list[str], *, timeout_ms: int = 300,
 # CLI
 # ---------------------------------------------------------------------------
 
+def _engine_runs_as_root() -> bool:
+    """True when the live engine process is owned by root.
+
+    An engine started via `sudo vpn on` keeps running as root after `vpn
+    off` returns to proxy mode. Its pid file is root-owned mode 0600, so a
+    regular user cannot read it; a root-owned pid file is therefore
+    treated as "the engine is root's" (any live process behind it was
+    spawned by root — re-reading it after a stale root file simply makes
+    the elevated run clean it up). A readable root-owned pid file is
+    confirmed against `ps` so a recycled pid never over-elevates. This
+    probe is read-only and safe from any invocation.
+    """
+    if os.name == "nt" or os.geteuid() == 0:
+        return False
+    try:
+        st = os.stat(PID_FILE)
+    except OSError:
+        return False
+    if st.st_uid != 0:
+        return False
+    try:
+        pid = int(PID_FILE.read_text().strip())
+    except PermissionError:
+        # Root-owned 0600 file, unreadable as a regular user: root's engine.
+        return True
+    except (ValueError, OSError):
+        return False
+    try:
+        probe = subprocess.run(
+            ["ps", "-o", "user=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=3,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return probe.stdout.strip() == "root"
+
+
 def _needs_elevation(args) -> bool:
     """Whether this invocation must re-run as root before doing anything.
 
     TUN mode needs root (utun creation, route table) and the engine then
     runs as root, so `vpn on` and tun-mode engine commands cannot run as a
-    regular user. Only interactive macOS sessions elevate: launchd/keepalive
-    ticks have no TTY and must never pop a password dialog on every interval
-    (they keep the existing clear-error behavior instead). Once `elevate
-    install` granted passwordless sudo, elevation is silent, so the TTY gate
-    lifts and background ticks may also elevate.
+    regular user. Proxy-mode engine commands must also elevate while the
+    engine ITSELF runs as root (started via `sudo vpn on`): a user-level
+    `stop` cannot signal it, and `start` would clobber the root-owned pid
+    file (issue #12 — the tray Stop failed with "Cannot stop because it is
+    run with sudo"). Only interactive macOS sessions elevate:
+    launchd/keepalive ticks have no TTY and must never pop a password
+    dialog on every interval (they keep the existing clear-error behavior
+    instead). Once `elevate install` granted passwordless sudo, elevation
+    is silent, so the TTY gate lifts and background ticks may also elevate.
     """
     if sys.platform != "darwin" or os.geteuid() == 0:
         return False
@@ -3124,7 +3165,7 @@ def _needs_elevation(args) -> bool:
     if args.cmd == "vpn":
         return args.action in ("on", "restart") or (args.action == "off" and mode == "tun")
     return (args.cmd in ("start", "stop", "ensure", "reload", "rotate", "add", "remove")
-            and mode == "tun")
+            and (mode == "tun" or _engine_runs_as_root()))
 
 
 def _elevate_macos() -> int:
@@ -3167,6 +3208,8 @@ SUDOERS_FILE = Path("/etc/sudoers.d/91-proxy-router")
 # interpreter or script.
 SUDOERS_COMMANDS = (
     ("vpn", "*"),
+    ("start",),
+    ("stop",),
     ("reload",),
     ("ensure",),
     ("rotate", "*"),
