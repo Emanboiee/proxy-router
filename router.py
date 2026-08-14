@@ -127,7 +127,8 @@ def _sing_box_missing_message() -> str:
     #11: the tray reported an unexplained "Connect: Failed").
     """
     bundled = ROOT / "bin" / ("sing-box.exe" if os.name == "nt" else "sing-box")
-    tried = [f"env SING_BOX={os.environ.get('SING_BOX') or '(unset)'}",
+    env_value = os.environ.get("SING_BOX")
+    tried = [f"env SING_BOX (set, missing)" if env_value else "env SING_BOX=(unset)",
              f"{bundled} (missing)"]
     if sys.platform == "darwin" and os.name != "nt":
         tried.extend(("/opt/homebrew/bin/sing-box (missing)",

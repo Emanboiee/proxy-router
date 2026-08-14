@@ -76,6 +76,10 @@ _FRIENDLY_ERRORS = (
     ("no valid profiles", "no usable profiles found — re-add your .conf under Setup"),
 )
 
+# Longest tail line _humanize keeps: the sing-box missing-binary message
+# (darwin) is ~424 chars, so 500 keeps it fully visible (issue #11).
+_MAX_DETAIL = 500
+
 
 def _sudoers_ok(python: str, router: str) -> bool:
     """True when `sudo -n` may run router.py without a password prompt.
@@ -146,8 +150,9 @@ def _humanize(out: str) -> str:
         return "saved — Connect to apply"
     # The sing-box missing-binary message lists every candidate path; a
     # 160-char cap cut it mid-sentence into an unexplained "Connect: Failed"
-    # (issue #11). 320 chars keeps the full actionable detail visible.
-    detail = out.splitlines()[-1][:320]
+    # (issue #11). 500 chars keeps even the darwin message (measured ~424)
+    # fully visible.
+    detail = out.splitlines()[-1][:_MAX_DETAIL]
     for needle, repl in _FRIENDLY_ERRORS:
         if needle in detail:
             return repl

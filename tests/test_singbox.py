@@ -1,4 +1,5 @@
 """Unit tests for the sing-box discovery / missing-binary messaging."""
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -31,6 +32,17 @@ class MissingMessageTests(unittest.TestCase):
             msg = router._sing_box_missing_message()
             self.assertIn("sing-box.exe", msg)
             self.assertNotIn("homebrew", msg.lower())
+
+    def test_unset_env_shows_unset_marker(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            msg = router._sing_box_missing_message()
+        self.assertIn("env SING_BOX=(unset)", msg)
+
+    def test_set_env_shows_missing_marker_without_echoing_value(self):
+        with mock.patch.dict(os.environ, {"SING_BOX": "/secret/path/sing-box"}):
+            msg = router._sing_box_missing_message()
+        self.assertIn("env SING_BOX (set, missing)", msg)
+        self.assertNotIn("/secret/path/sing-box", msg)
 
 
 if __name__ == "__main__":
