@@ -368,8 +368,8 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(rc, 1)
             self.assertIn("bridge:", out.getvalue())
 
-    def test_tui_item_9_records_bridge_action(self):
-        state = setup_tui.apply_key(setup_tui.TuiState(), "9")
+    def test_tui_item_8_records_bridge_action(self):
+        state = setup_tui.apply_key(setup_tui.TuiState(), "8")
         self.assertEqual(state.action, ("bridge_install",))
         self.assertFalse(state.quit)
 
@@ -388,11 +388,24 @@ class FullScreenTuiTests(unittest.TestCase):
         self.assertIn("Start proxy-router", joined)
         self.assertIn("Stop proxy-router", joined)
         self.assertIn("Add a VPN provider", joined)
-        self.assertIn("TUN mode toggle", joined)
-        self.assertIn("rotation & autoroute", joined)
+        self.assertIn("Settings: TUN mode, rotation & autoroute", joined)
         self.assertIn("Check provider health", joined)
         self.assertIn("Quit", joined)
         self.assertIn("\u2191\u2193 navigate", joined)
+
+    def test_menu_scrolls_on_small_terminals(self):
+        state = setup_tui.TuiState(rows=12)  # room for 3 items only
+        frame = setup_tui.render_frame(state)
+        self.assertLessEqual(len(frame), state.rows)
+        joined = "\n".join(frame)
+        self.assertIn("Start proxy-router", joined)  # top of the list
+        self.assertNotIn("Quit", joined)             # tail clipped
+        state = setup_tui.TuiState(rows=12, cursor=len(setup_tui.TUI_MENU) - 1)
+        frame = setup_tui.render_frame(state)
+        joined = "\n".join(frame)
+        self.assertNotIn("Start proxy-router", joined)  # window scrolled down
+        self.assertIn("Quit", joined)
+        self.assertIn("item", joined)  # scroll position hint present
 
     def test_apply_key_moves_cursor_and_returns_new_state(self):
         state = setup_tui.TuiState()
@@ -518,10 +531,14 @@ class ControlCenterTuiTests(unittest.TestCase):
     """Control-center menu: engine start/stop, VPN toggle, provider wizard and
     rotation settings record actions; the wizard loop executes them."""
 
-    def test_menu_lists_engine_and_vpn_items(self):
+    def test_menu_lists_engine_items_and_single_settings_entry(self):
         keys = {key for key, _ in setup_tui.TUI_MENU}
-        for key in ("1", "2", "3", "4", "5"):
+        for key in ("1", "2", "3", "4"):
             self.assertIn(key, keys)
+        settings_entries = [label for _, label in setup_tui.TUI_MENU if label.startswith("Settings:")]
+        self.assertEqual(len(settings_entries), 1)  # TUN + rotation consolidated
+        self.assertIn("TUN mode", settings_entries[0])
+        self.assertIn("rotation", settings_entries[0])
 
     def test_engine_start_records_action(self):
         state = setup_tui.apply_key(setup_tui.TuiState(), "1")
@@ -532,9 +549,16 @@ class ControlCenterTuiTests(unittest.TestCase):
         state = setup_tui.apply_key(setup_tui.TuiState(), "2")
         self.assertEqual(state.action, ("engine_stop",))
 
-    def test_vpn_toggle_records_action(self):
+    def test_settings_view_opens_and_tun_toggle_records_action(self):
         state = setup_tui.apply_key(setup_tui.TuiState(), "4")
-        self.assertEqual(state.action, ("vpn_toggle",))
+        self.assertEqual(state.view, "settings")
+        joined = "\n".join(setup_tui.render_frame(state))
+        self.assertIn("vpn mode", joined)
+        self.assertIn("rotation", joined)
+        toggled = setup_tui.apply_key(state, "1")
+        self.assertEqual(toggled.action, ("vpn_toggle",))
+        esc = setup_tui.apply_key(state, "\x1b")
+        self.assertEqual(esc.view, "menu")
 
     def test_provider_wizard_opens_and_esc_returns(self):
         state = setup_tui.apply_key(setup_tui.TuiState(), "3")
@@ -551,19 +575,21 @@ class ControlCenterTuiTests(unittest.TestCase):
         self.assertEqual(state.view, "import")
         self.assertEqual(state.import_provider, "cloudflare")
 
-    def test_rotation_view_opens_and_esc_returns(self):
-        state = setup_tui.apply_key(setup_tui.TuiState(), "5")
+    def test_rotation_view_opens_from_settings_and_esc_returns(self):
+        state = setup_tui.apply_key(setup_tui.TuiState(), "4")  # settings
+        state = setup_tui.apply_key(state, "2")  # rotation & autoroute
         self.assertEqual(state.view, "rotation")
         joined = "\n".join(setup_tui.render_frame(state))
         self.assertIn("interval_seconds", joined)
         esc = setup_tui.apply_key(state, "\x1b")
-        self.assertEqual(esc.view, "menu")
+        self.assertEqual(esc.view, "settings")
 
     def test_rotation_interval_prompt_returns_to_rotation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "router.json").write_text(json.dumps({"port": 2080}))
-            state = setup_tui.apply_key(setup_tui.TuiState(root=root), "5")
+            state = setup_tui.apply_key(setup_tui.TuiState(root=root), "4")
+            state = setup_tui.apply_key(state, "2")
             state = setup_tui.apply_key(state, "1")
             self.assertEqual(state.view, "routing_prompt")
             self.assertEqual(state.prompt_return_view, "rotation")
@@ -572,7 +598,8 @@ class ControlCenterTuiTests(unittest.TestCase):
             state = setup_tui.apply_key(state, "\r")
             self.assertEqual(state.action, ("rotation_set", "interval_seconds", "3600"))
             self.assertEqual(state.view, "rotation")
-            prompt = setup_tui.apply_key(setup_tui.TuiState(root=root), "5")
+            prompt = setup_tui.apply_key(setup_tui.TuiState(root=root), "4")
+            prompt = setup_tui.apply_key(prompt, "2")
             prompt = setup_tui.apply_key(prompt, "2")
             prompt = setup_tui.apply_key(prompt, "\x1b")
             self.assertEqual(prompt.view, "rotation")
@@ -582,7 +609,8 @@ class ControlCenterTuiTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "router.json").write_text(json.dumps({"rotation": {"policy": "latency"}}))
-            state = setup_tui.apply_key(setup_tui.TuiState(root=root), "5")
+            state = setup_tui.apply_key(setup_tui.TuiState(root=root), "4")
+            state = setup_tui.apply_key(state, "2")
             state = setup_tui.apply_key(state, "3")
             self.assertEqual(state.action, ("rotation_set", "policy", "least-recent"))
 

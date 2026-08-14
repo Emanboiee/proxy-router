@@ -65,7 +65,7 @@ proxy-router ensure
 
 `proxy-router setup` with no flags opens the custom terminal wizard. It never
 enables TUN mode or starts monitoring unless you explicitly choose those
-operations. Menu item 9 installs/verifies the Hermes OpenCode auto-rotation
+operations. Menu item 8 installs/verifies the Hermes OpenCode auto-rotation
 bridge (placed at `$OPENCODE_ZEN_VPN_ROOT/proxy-manager.sh`).
 
 ## Layout
@@ -334,7 +334,7 @@ becomes the sing-box endpoint tag.
 The easiest path is the setup wizard:
 
 ```sh
-proxy-router setup                  # interactive terminal menu (item 9: Hermes rotation bridge)
+proxy-router setup                  # interactive terminal menu (item 8: Hermes rotation bridge)
 proxy-router setup --guide proton   # print the bundled Proton guide
 proxy-router setup --guide warp     # print the bundled WARP guide
 proxy-router setup --import-proton ~/Downloads/*.conf

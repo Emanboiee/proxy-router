@@ -1010,12 +1010,11 @@ _MENU = [
     ("1", "Start proxy-router (engine + tray autostart)"),
     ("2", "Stop proxy-router"),
     ("3", "Add a VPN provider (step-by-step wizard)"),
-    ("4", "Settings: TUN mode toggle"),
-    ("5", "Settings: rotation & autoroute"),
-    ("6", "Presets: browse / apply / create (built-in + custom)"),
-    ("7", "Check provider health"),
-    ("8", "Routing modes (show / switch / add-remove domain)"),
-    ("9", "Install / verify the OpenCode bridge (Hermes rotation gateway)"),
+    ("4", "Settings: TUN mode, rotation & autoroute"),
+    ("5", "Presets: browse / apply / create (built-in + custom)"),
+    ("6", "Check provider health"),
+    ("7", "Routing modes (show / switch / add-remove domain)"),
+    ("8", "Install / verify the OpenCode bridge (Hermes rotation gateway)"),
     ("r", "Routing modes (show / switch / add-remove domain)"),
     ("s", "Presets: apply by name / create custom (built-in + custom)"),
     ("q", "Quit"),
@@ -1101,6 +1100,32 @@ def _line_rotation(root: Path) -> None:
             print(f"  unknown choice '{choice}'")
 
 
+def _line_settings(root: Path) -> None:
+    """Line-mode settings: TUN mode toggle and rotation sub-flows."""
+    while True:
+        print(_style(f"  vpn mode: {_read_vpn_mode(root)}", _Ansi.DIM))
+        print(_style("  [1] TUN mode toggle   [2] rotation & autoroute   [b] back", _Ansi.BOLD))
+        try:
+            choice = input(_style("settings> ", _Ansi.BOLD)).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if choice in ("b", "back", "q"):
+            return
+        if choice == "1":
+            target = "off" if _read_vpn_mode(root) == "tun" else "on"
+            print(_style(f"  toggling TUN mode (vpn {target})...", _Ansi.YELLOW))
+            rc = _router_command(root, "vpn", target)
+            if rc == 0:
+                print(_style(f"  TUN mode {target}", _Ansi.GREEN))
+            else:
+                print(_style("  vpn toggle failed (see router output above)", _Ansi.RED))
+        elif choice == "2":
+            _line_rotation(root)
+        else:
+            print(f"  unknown choice '{choice}'")
+
+
 def _line_wizard(root: Path) -> int:
     """Line-based fallback: used whenever either stream is not a real TTY."""
     while True:
@@ -1133,22 +1158,14 @@ def _line_wizard(root: Path) -> int:
         elif choice == "3":
             _line_provider_wizard(root)
         elif choice == "4":
-            target = "off" if _read_vpn_mode(root) == "tun" else "on"
-            print(_style(f"  toggling TUN mode (vpn {target})...", _Ansi.YELLOW))
-            rc = _router_command(root, "vpn", target)
-            if rc == 0:
-                print(_style(f"  TUN mode {target}", _Ansi.GREEN))
-            else:
-                print(_style("  vpn toggle failed (see router output above)", _Ansi.RED))
-        elif choice == "5":
-            _line_rotation(root)
-        elif choice in ("6", "s"):
+            _line_settings(root)
+        elif choice in ("5", "s"):
             _cmd_preset_prompt(root)
-        elif choice == "7":
+        elif choice == "6":
             _cmd_check(root)
-        elif choice in ("8", "r"):
+        elif choice in ("7", "r"):
             _cmd_routing(root)
-        elif choice == "9":
+        elif choice == "8":
             _cmd_bridge_install(root)
         else:
             print(f"  unknown choice '{choice}' (enter a number or 'q')")
@@ -1163,12 +1180,11 @@ TUI_MENU = [
     ("1", "Start proxy-router (engine + tray autostart)"),
     ("2", "Stop proxy-router"),
     ("3", "Add a VPN provider (step-by-step wizard)"),
-    ("4", "Settings: TUN mode toggle"),
-    ("5", "Settings: rotation & autoroute"),
-    ("6", "Presets: browse / apply / create (built-in + custom)"),
-    ("7", "Check provider health"),
-    ("8", "Routing modes (show / switch / add-remove domain)"),
-    ("9", "Install / verify the OpenCode bridge (Hermes rotation gateway)"),
+    ("4", "Settings: TUN mode, rotation & autoroute"),
+    ("5", "Presets: browse / apply / create (built-in + custom)"),
+    ("6", "Check provider health"),
+    ("7", "Routing modes (show / switch / add-remove domain)"),
+    ("8", "Install / verify the OpenCode bridge (Hermes rotation gateway)"),
     ("r", "Routing modes (show / switch / add-remove domain)"),
     ("s", "Presets: apply by name / create custom (built-in + custom)"),
     ("0", "Quit"),
@@ -1191,8 +1207,8 @@ def _strip_ansi(text: str) -> str:
 
 @dataclasses.dataclass
 class TuiState:
-    """Pure TUI state; view is one of "menu" | "guide" | "import" |
-    "routing" | "routing_prompt" | "provider" | "rotation". """
+    """Pure TUI state; view is one of "menu" | "settings" | "guide" |
+    "import" | "routing" | "routing_prompt" | "provider" | "rotation". """
 
     view: str = "menu"
     cursor: int = 0
@@ -1256,13 +1272,21 @@ def _render_menu(state: TuiState) -> list[str]:
     lines.append("\u2502" + header + "\u2502")
     lines.append("\u2502" + _fit(" Guides \u00b7 imports \u00b7 presets \u00b7 health checks ", inner) + "\u2502")
     lines.append("\u251c" + "\u2500" * inner + "\u2524")
-    for index, (key, label) in enumerate(TUI_MENU):
+    # Scroll window keeps the cursor row visible; fixed overhead is 9 rows.
+    total = len(TUI_MENU)
+    visible = max(state.rows - 9, 1)
+    scroll = min(max(state.cursor - visible + 1, 0), max(total - visible, 0))
+    for index in range(visible):
+        item_index = scroll + index
+        if item_index >= total:
+            break
+        key, label = TUI_MENU[item_index]
         right = f" {key} "
         prefix = f"  {key}  "
         fitted = _fit(prefix + label, inner - len(right))
         label_plain = fitted[len(prefix):]
         label_tint = _tint_provider(label_plain)
-        if index == state.cursor:
+        if item_index == state.cursor:
             row = "\u2502" + prefix + label_tint + right + "\u2502"
             lines.append(_style(row, _Ansi.REVERSE))
         else:
@@ -1278,7 +1302,12 @@ def _render_menu(state: TuiState) -> list[str]:
         else:
             styled = _style(_fit(" " + plain, inner), _Ansi.RED)
         lines.append("\u2502" + styled + "\u2502")
-    lines.append("\u2502" + _style(_fit(" \u2191\u2193 navigate \u00b7 Enter select \u00b7 q/ESC quit ", inner), _Ansi.DIM) + "\u2502")
+    if total > visible:
+        hint = " \u2191\u2193 navigate \u00b7 Enter select \u00b7 q/ESC quit \u00b7 item {}-{}/{} ".format(
+            scroll + 1, min(scroll + visible, total), total)
+    else:
+        hint = " \u2191\u2193 navigate \u00b7 Enter select \u00b7 q/ESC quit "
+    lines.append("\u2502" + _style(_fit(hint, inner), _Ansi.DIM) + "\u2502")
     lines.append("\u2514" + "\u2500" * inner + "\u2518")
     return lines
 
@@ -1346,6 +1375,10 @@ _ROTATION_ACTIONS = [
     ("1", "interval_seconds (0 = off)"),
     ("2", "jitter_seconds (default 300)"),
     ("3", "policy: latency <-> least-recent (autoroute)"),
+]
+_SETTINGS_ACTIONS = [
+    ("1", "TUN mode toggle (proxy <-> full tunnel)"),
+    ("2", "rotation & autoroute settings"),
 ]
 _PROVIDER_WIZARD_STEPS = [
     ("1", "Proton VPN (step-by-step guide)"),
@@ -1437,6 +1470,26 @@ def _render_rotation(state: TuiState) -> list[str]:
     return lines
 
 
+def _render_settings(state: TuiState) -> list[str]:
+    """Settings view: one entry point for TUN mode and rotation settings."""
+    inner = max(state.cols - 2, 30)
+    lines = ["\u250c" + "\u2500" * inner + "\u2510"]
+    lines.append("\u2502" + _style(_fit(" settings ", inner), _Ansi.BOLD, _Ansi.CYAN) + "\u2502")
+    lines.append("\u251c" + "\u2500" * inner + "\u2524")
+    vpn = _read_vpn_mode(state.root)
+    lines.append("\u2502" + _fit(f" vpn mode: {vpn} (proxy mode or full TUN capture)", inner) + "\u2502")
+    rot = _read_rotation_state(state.root)
+    lines.append("\u2502" + _fit(f" rotation: interval {rot['interval_seconds']}s \u00b7 "
+                                 f"jitter {rot['jitter_seconds']}s \u00b7 policy {rot['policy']}", inner) + "\u2502")
+    lines.append("\u251c" + "\u2500" * inner + "\u2524")
+    for key, label in _SETTINGS_ACTIONS:
+        lines.append("\u2502" + _style(_fit(f"  {key}  {label}", inner), _Ansi.CYAN) + "\u2502")
+    lines.append("\u251c" + "\u2500" * inner + "\u2524")
+    lines.append("\u2502" + _style(_fit(" 1-2 change \u00b7 ESC back ", inner), _Ansi.DIM) + "\u2502")
+    lines.append("\u2514" + "\u2500" * inner + "\u2518")
+    return lines
+
+
 def render_frame(state: TuiState) -> list[str]:
     """Build the full frame (header, body, footer) as a list of screen lines."""
     if state.view == "guide":
@@ -1451,6 +1504,8 @@ def render_frame(state: TuiState) -> list[str]:
         return _render_provider(state)
     if state.view == "rotation":
         return _render_rotation(state)
+    if state.view == "settings":
+        return _render_settings(state)
     return _render_menu(state)
 
 
@@ -1478,10 +1533,8 @@ def _select_item(state: TuiState, index: int) -> TuiState:
     elif key == "3":
         state.view = "provider"
     elif key == "4":
-        state.action = ("vpn_toggle",)
-    elif key == "5":
-        state.view = "rotation"
-    elif key in ("6", "s"):
+        state.view = "settings"
+    elif key in ("5", "s"):
         # Preset browser: renders read-only, mutation flows through
         # state.action like routing changes.
         state.view = "routing"
@@ -1492,16 +1545,16 @@ def _select_item(state: TuiState, index: int) -> TuiState:
         except OSError:
             state.routing_lines = ["presets: (unreadable)"]
         state.routing_prompt_text = ""
-    elif key == "7":
+    elif key == "6":
         state.action = ("check",)
-    elif key in ("8", "r"):
+    elif key in ("7", "r"):
         # Read-only rendering; mutations flow through the router CLI via
         # state.action, exactly like every other TUI action.
         state.view = "routing"
         state.preset_browser = False
         state.routing_lines = _routing_lines(state.root) or ["routing modes"]
         state.routing_prompt_text = ""
-    elif key == "9":
+    elif key == "8":
         state.action = ("bridge_install",)
     return state
 
@@ -1544,9 +1597,18 @@ def apply_key(state: TuiState, key: str) -> TuiState:
             state.provider_wizard_import = True
         return state
 
-    if state.view == "rotation":
+    if state.view == "settings":
         if key in (ESC, "q", "Q"):
             state.view = "menu"
+        elif key == "1":
+            state.action = ("vpn_toggle",)
+        elif key == "2":
+            state.view = "rotation"
+        return state
+
+    if state.view == "rotation":
+        if key in (ESC, "q", "Q"):
+            state.view = "settings"
         elif key in ("1", "2"):
             setting = "interval_seconds" if key == "1" else "jitter_seconds"
             state.view = "routing_prompt"
