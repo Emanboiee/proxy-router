@@ -385,10 +385,11 @@ class FullScreenTuiTests(unittest.TestCase):
         self.assertIn("\u2514", joined)
         self.assertIn("\u2502", joined)
         self.assertIn("proxy-router setup", joined)
-        self.assertIn("Show Proton guide", joined)
-        self.assertIn("Show Cloudflare guide", joined)
-        self.assertIn("Show both guides", joined)
-        self.assertIn("Apply route presets", joined)
+        self.assertIn("Start proxy-router", joined)
+        self.assertIn("Stop proxy-router", joined)
+        self.assertIn("Add a VPN provider", joined)
+        self.assertIn("TUN mode toggle", joined)
+        self.assertIn("rotation & autoroute", joined)
         self.assertIn("Check provider health", joined)
         self.assertIn("Quit", joined)
         self.assertIn("\u2191\u2193 navigate", joined)
@@ -409,25 +410,31 @@ class FullScreenTuiTests(unittest.TestCase):
         self.assertEqual(wrapped.cursor, len(setup_tui.TUI_MENU) - 1)
 
     def test_enter_on_guide_builds_pager_with_guide_text(self):
-        state = setup_tui.apply_key(setup_tui.TuiState(), "\r")
+        state = setup_tui.apply_key(setup_tui.TuiState(), "3")  # provider wizard
+        state = setup_tui.apply_key(state, "1")  # proton guide
         self.assertEqual(state.view, "guide")
         self.assertEqual(state.guide_provider, "proton")
         self.assertTrue(state.guide_lines)
+        self.assertTrue(state.provider_wizard_import)
         frame = setup_tui.render_frame(state)
         joined = "\n".join(frame)
         self.assertIn("Show Proton VPN guide", joined)
+        self.assertIn("i import", joined)
         self.assertIn("q back", joined)
         self.assertIn("WireGuard", joined)  # guide body is visible inside the pager
 
     def test_guide_scroll_and_back_to_menu(self):
-        state = setup_tui.apply_key(setup_tui.TuiState(), "3")
+        state = setup_tui.apply_key(setup_tui.TuiState(), "3")  # provider wizard
+        state = setup_tui.apply_key(state, "2")  # warp guide
         self.assertEqual(state.view, "guide")
-        self.assertEqual(state.guide_provider, "all")
+        self.assertEqual(state.guide_provider, "warp")
         scrolled = setup_tui.apply_key(state, "\x1b[B")
         self.assertEqual(scrolled.guide_scroll, 1)
         scrolled = setup_tui.apply_key(scrolled, "\x1b[A")
         self.assertEqual(scrolled.guide_scroll, 0)
         back = setup_tui.apply_key(scrolled, "q")
+        self.assertEqual(back.view, "provider")  # wizard continuation
+        back = setup_tui.apply_key(back, "q")
         self.assertEqual(back.view, "menu")
 
     def test_q_esc_ctrl_c_and_zero_quit(self):
@@ -436,7 +443,9 @@ class FullScreenTuiTests(unittest.TestCase):
             self.assertTrue(state.quit, repr(key))
 
     def test_import_editing_and_enter_records_action(self):
-        state = setup_tui.apply_key(setup_tui.TuiState(), "4")
+        state = setup_tui.apply_key(setup_tui.TuiState(), "3")  # provider wizard
+        state = setup_tui.apply_key(state, "1")  # proton guide
+        state = setup_tui.apply_key(state, "i")  # jump to import
         self.assertEqual(state.view, "import")
         self.assertEqual(state.import_provider, "proton")
         for ch in "/tmp/conf.d":
@@ -449,10 +458,13 @@ class FullScreenTuiTests(unittest.TestCase):
         self.assertEqual(state.action, ("import", "proton", "/tmp/conf."))
 
     def test_import_escape_cancels(self):
-        state = setup_tui.apply_key(setup_tui.TuiState(), "5")
+        state = setup_tui.apply_key(setup_tui.TuiState(), "3")  # provider wizard
+        state = setup_tui.apply_key(state, "2")  # warp guide
+        state = setup_tui.apply_key(state, "i")  # jump to import
+        self.assertEqual(state.import_provider, "cloudflare")
         state = setup_tui.apply_key(state, "/some/path")
         state = setup_tui.apply_key(state, "\x1b")
-        self.assertEqual(state.view, "menu")
+        self.assertEqual(state.view, "provider")  # wizard continuation
         self.assertIsNone(state.action)
 
     def test_non_tty_falls_back_to_plain_line_menu(self):
@@ -478,7 +490,7 @@ class FullScreenTuiTests(unittest.TestCase):
         root = Path(tempfile.mkdtemp())
         fake_in = FakeTTY()
         fake_out = FakeTTY()
-        events = iter(["\r", "\x1b[B", "q", "q"])  # enter guide, scroll, back, quit
+        events = iter(["3", "1", "\x1b[B", "q", "q", "q"])  # provider wizard, proton guide, scroll, back, back, quit
         with mock.patch("sys.stdin", fake_in), \
              mock.patch("sys.stdout", fake_out), \
              mock.patch("setup_tui._read_key", side_effect=lambda: next(events)), \
@@ -489,7 +501,7 @@ class FullScreenTuiTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         text = fake_out.getvalue()
         self.assertTrue(text.startswith("\x1b[?1049h"))  # entered alternate screen
-        self.assertIn("Show Proton guide", text)          # frame rendered
+        self.assertIn("Start proxy-router", text)         # frame rendered
         self.assertIn("Show Proton VPN guide", text)      # guide pager rendered
         self.assertIn("\u250c", text)
         self.assertTrue(text.rstrip().endswith("\x1b[?25h\x1b[?1049l"))  # restored
@@ -500,6 +512,100 @@ class FullScreenTuiTests(unittest.TestCase):
             frame = setup_tui.render_frame(state)
         self.assertEqual(len(setup_tui._strip_ansi(frame[1])), state.cols)
         self.assertIn("Proton", setup_tui._strip_ansi(frame[1]))
+
+
+class ControlCenterTuiTests(unittest.TestCase):
+    """Control-center menu: engine start/stop, VPN toggle, provider wizard and
+    rotation settings record actions; the wizard loop executes them."""
+
+    def test_menu_lists_engine_and_vpn_items(self):
+        keys = {key for key, _ in setup_tui.TUI_MENU}
+        for key in ("1", "2", "3", "4", "5"):
+            self.assertIn(key, keys)
+
+    def test_engine_start_records_action(self):
+        state = setup_tui.apply_key(setup_tui.TuiState(), "1")
+        self.assertEqual(state.action, ("engine_start",))
+        self.assertEqual(state.view, "menu")
+
+    def test_engine_stop_records_action(self):
+        state = setup_tui.apply_key(setup_tui.TuiState(), "2")
+        self.assertEqual(state.action, ("engine_stop",))
+
+    def test_vpn_toggle_records_action(self):
+        state = setup_tui.apply_key(setup_tui.TuiState(), "4")
+        self.assertEqual(state.action, ("vpn_toggle",))
+
+    def test_provider_wizard_opens_and_esc_returns(self):
+        state = setup_tui.apply_key(setup_tui.TuiState(), "3")
+        self.assertEqual(state.view, "provider")
+        esc = setup_tui.apply_key(state, "\x1b")
+        self.assertEqual(esc.view, "menu")
+
+    def test_provider_wizard_guide_then_import(self):
+        state = setup_tui.apply_key(setup_tui.TuiState(), "3")
+        state = setup_tui.apply_key(state, "2")  # warp guide
+        self.assertEqual(state.view, "guide")
+        self.assertEqual(state.guide_provider, "warp")
+        state = setup_tui.apply_key(state, "i")
+        self.assertEqual(state.view, "import")
+        self.assertEqual(state.import_provider, "cloudflare")
+
+    def test_rotation_view_opens_and_esc_returns(self):
+        state = setup_tui.apply_key(setup_tui.TuiState(), "5")
+        self.assertEqual(state.view, "rotation")
+        joined = "\n".join(setup_tui.render_frame(state))
+        self.assertIn("interval_seconds", joined)
+        esc = setup_tui.apply_key(state, "\x1b")
+        self.assertEqual(esc.view, "menu")
+
+    def test_rotation_interval_prompt_returns_to_rotation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "router.json").write_text(json.dumps({"port": 2080}))
+            state = setup_tui.apply_key(setup_tui.TuiState(root=root), "5")
+            state = setup_tui.apply_key(state, "1")
+            self.assertEqual(state.view, "routing_prompt")
+            self.assertEqual(state.prompt_return_view, "rotation")
+            for ch in "3600":
+                state = setup_tui.apply_key(state, ch)
+            state = setup_tui.apply_key(state, "\r")
+            self.assertEqual(state.action, ("rotation_set", "interval_seconds", "3600"))
+            self.assertEqual(state.view, "rotation")
+            prompt = setup_tui.apply_key(setup_tui.TuiState(root=root), "5")
+            prompt = setup_tui.apply_key(prompt, "2")
+            prompt = setup_tui.apply_key(prompt, "\x1b")
+            self.assertEqual(prompt.view, "rotation")
+            self.assertIsNone(prompt.action)
+
+    def test_rotation_policy_toggle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "router.json").write_text(json.dumps({"rotation": {"policy": "latency"}}))
+            state = setup_tui.apply_key(setup_tui.TuiState(root=root), "5")
+            state = setup_tui.apply_key(state, "3")
+            self.assertEqual(state.action, ("rotation_set", "policy", "least-recent"))
+
+    def test_rotation_set_executes_and_writes_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "router.json").write_text(json.dumps({"port": 2080}))
+            text, rc = setup_tui._execute_action(
+                ("rotation_set", "interval_seconds", "3600"), root)
+            self.assertEqual(rc, 0, text)
+            data = json.loads((root / "router.json").read_text())
+            self.assertEqual(data["rotation"]["interval_seconds"], 3600)
+            text, rc = setup_tui._execute_action(("rotation_set", "policy", "bogus"), root)
+            self.assertEqual(rc, 1, text)
+
+    def test_read_vpn_mode_defaults_to_proxy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual(setup_tui._read_vpn_mode(root), "proxy")
+            mode = root / "state" / "mode"
+            mode.parent.mkdir(parents=True)
+            mode.write_text("tun")
+            self.assertEqual(setup_tui._read_vpn_mode(root), "tun")
 
 
 class RoutingTuiTests(unittest.TestCase):
@@ -515,7 +621,7 @@ class RoutingTuiTests(unittest.TestCase):
 
     def test_menu_lists_routing_modes(self):
         self.assertIn(("r", "Routing modes (show / switch / add-remove domain)"), setup_tui.TUI_MENU)
-        self.assertIn(("s", "Presets: apply by name / browser (built-in + custom)"), setup_tui.TUI_MENU)
+        self.assertIn(("s", "Presets: apply by name / create custom (built-in + custom)"), setup_tui.TUI_MENU)
 
     def test_routing_actions_include_preset_by_name(self):
         self.assertEqual(setup_tui._ROUTING_ACTIONS[-1][0], "7")
