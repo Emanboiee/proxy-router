@@ -34,6 +34,7 @@ EVENTS_NAME = "events.jsonl"
 DEFAULT_INTERVAL = 2.0
 TARGET_IDLE_SECONDS = 60.0
 PROBE_EVERY_SECONDS = 10.0
+CLIENT_SNAPSHOT_EVERY_SECONDS = 5.0
 FAILURE_WINDOW_SECONDS = 60.0
 MIN_TRANSPORT_FAILURES = 2
 ROTATE_COOLDOWN_SECONDS = 120.0
@@ -178,16 +179,7 @@ def append_event(root: Path, event: dict) -> None:
         os.chmod(path, 0o600)
     except OSError:
         pass
-    # Keep line growth bounded even when individual records are tiny.
-    try:
-        with path.open(encoding="utf-8") as handle:
-            line_count = sum(1 for _ in handle)
-        if line_count > EVENT_MAX_LINES:
-            with path.open(encoding="utf-8") as handle:
-                lines = collections.deque(handle, maxlen=EVENT_MAX_LINES)
-            path.write_text("".join(lines), encoding="utf-8")
-    except OSError:
-        pass
+
 
 
 class RotationGuard:
@@ -286,6 +278,8 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
     domains = critical_domains(root)
     last_target: dict[str, float] = {}
     last_probe: dict[str, float] = {}
+    clients: list[dict] = []
+    clients_at = 0.0
     guard = RotationGuard()
     try:
         while enabled_file(root).is_file():
@@ -298,10 +292,13 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
                 host = event.get("host", "")
                 if event["kind"] == "target":
                     is_critical = any(domain_matches(host, d) for d in domains)
+                    if now - clients_at >= CLIENT_SNAPSHOT_EVERY_SECONDS:
+                        clients = client_snapshot(root)
+                        clients_at = now
                     event.update({
                         "critical": is_critical,
                         "observed_at": time.time(),
-                        "clients": client_snapshot(root),
+                        "clients": clients,
                     })
                     append_event(root, event)
                     if is_critical:
@@ -330,7 +327,23 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
     return 0
 
 
-def _pid_running(pid: int) -> bool:
+def _pid_matches(root: Path, pid: int) -> bool:
+    """Reject recycled/foreign PIDs before status or stop signals them."""
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True, text=True, timeout=3,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    command = result.stdout.strip()
+    return "--worker" in command and str(Path(root).resolve()) in command and Path(__file__).resolve().name in command
+
+
+def _pid_running(pid: int, root: Path | None = None) -> bool:
+    root = Path(root) if root is not None else ROOT
+    if not _pid_matches(root, pid):
+        return False
     try:
         os.kill(pid, 0)
     except (OSError, ProcessLookupError):
@@ -344,7 +357,7 @@ def status(root: Path | None = None) -> dict:
         pid = int(pid_file(root).read_text().strip())
     except (OSError, ValueError):
         pid = None
-    return {"enabled": enabled_file(root).is_file(), "running": bool(pid and _pid_running(pid)), "pid": pid,
+    return {"enabled": enabled_file(root).is_file(), "running": bool(pid and _pid_running(pid, root)), "pid": pid,
             "events": events_file(root).is_file(), "scope": "proxy-observable only", "targets": list(critical_domains(root))}
 
 
@@ -373,7 +386,7 @@ def stop(root: Path | None = None) -> dict:
         pid = int(pid_file(root).read_text().strip())
     except (OSError, ValueError):
         pid = None
-    if pid and _pid_running(pid):
+    if pid and _pid_running(pid, root):
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError:
