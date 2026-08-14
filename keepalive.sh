@@ -30,13 +30,6 @@
 # rollback path and per-provider cooldowns apply exactly as for a manual
 # rotate; `state/<provider>.rotation` tracks the last switch time.
 #
-# Full-pool egress sweep: nothing above probes the non-active exits, so a pool
-# could sit on a stale-but-alive lane forever. Every
-# PROXY_KEEPALIVE_SWEEP_EVERY seconds (default 1800 = 30 min) the loop runs
-# `router.py egress sweep`, which probes EVERY profile of every provider
-# through the tunnel, persists health/cooldown/block markers, and ends on the
-# best alive exit (no reload when the current exit already is best).
-#
 # Knobs (env vars, defaults):
 #   PROXY_KEEPALIVE_INTERVAL       base wait between ensures           (15)
 #   PROXY_KEEPALIVE_MAX_BACKOFF    cap for exponential backoff         (300)
@@ -44,7 +37,6 @@
 #   PROXY_KEEPALIVE_DEAD_STRIKES   consecutive dead checks before rotate (2)
 #   PROXY_KEEPALIVE_STORM_WINDOW   rotation-guard window in seconds    (600)
 #   PROXY_KEEPALIVE_MAX_ROTATIONS  max keepalive rotations per window  (2)
-#   PROXY_KEEPALIVE_SWEEP_EVERY    full-pool egress sweep every N seconds (1800)
 set -uo pipefail
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -59,7 +51,6 @@ PROBE_EVERY="${PROXY_KEEPALIVE_PROBE_EVERY:-4}"
 DEAD_STRIKES="${PROXY_KEEPALIVE_DEAD_STRIKES:-2}"
 STORM_WINDOW="${PROXY_KEEPALIVE_STORM_WINDOW:-600}"
 MAX_ROTATIONS="${PROXY_KEEPALIVE_MAX_ROTATIONS:-2}"
-SWEEP_EVERY="${PROXY_KEEPALIVE_SWEEP_EVERY:-1800}"
 
 backoff="$INTERVAL"
 boot=1
@@ -67,7 +58,6 @@ checks=0
 strikes=0
 rotations=0
 window_start=0
-last_sweep=0
 
 # Allow at most MAX_ROTATIONS keepalive rotations per STORM_WINDOW seconds.
 rotation_allowed() {
@@ -108,6 +98,14 @@ rotate_dead() {
 }
 
 while true; do
+  # Manual disconnect (tray Disconnect / `router.py stop`) writes
+  # state/manual-off; while it exists the user wants the engine DOWN, so
+  # skip ensure entirely instead of resurrecting it 15s later. `router.py
+  # start` (tray Connect) removes the marker.
+  if [ -f "$ROOT/state/manual-off" ]; then
+    sleep "$INTERVAL"
+    continue
+  fi
   if "$ROOT/router.py" ensure >/dev/null 2>&1; then
     backoff="$INTERVAL"
     if [ "$boot" -eq 1 ]; then
@@ -140,19 +138,6 @@ while true; do
       if "$ROOT/router.py" rotate --if-due >/dev/null 2>&1; then
         echo "router: scheduled rotation: rotated provider(s)" >&2
       fi
-    fi
-    # Time-based full-pool sweep: on the first successful ensure, and every
-    # SWEEP_EVERY seconds after, probe EVERY profile of every provider and
-    # end on the best alive exit (the sweep only reloads when a better exit
-    # is found; exit 1 means some provider has no alive profile at all).
-    sweep_now=$(date +%s)
-    if [ "$last_sweep" -eq 0 ] || [ $((sweep_now - last_sweep)) -ge "$SWEEP_EVERY" ]; then
-      if "$ROOT/router.py" egress sweep --json >/dev/null 2>&1; then
-        echo "router: full-pool egress sweep done"
-      else
-        echo "router: sweep: some provider has no alive exits" >&2
-      fi
-      last_sweep="$sweep_now"
     fi
   else
     backoff=$((backoff * 2))
