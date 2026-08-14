@@ -97,7 +97,12 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py routes               # list route table
 ./router.py vpn on               # full TUN mode: route everything via the engines' rules
 ./router.py vpn off              # stop the TUN, back to proxy mode
+./router.py vpn restart          # stop + re-enter TUN in one step (single elevation prompt)
 ./router.py vpn status           # show current mode and liveness
+./router.py elevate install      # one-time macOS admin prompt; afterwards engine commands run
+                                 # without prompts (vpn on/off/restart, reload, ensure, rotate)
+./router.py elevate uninstall    # remove the passwordless-sudo grant
+./router.py elevate status       # is the grant active for this interpreter/script?
 ./router.py add --domain example.com --provider proton [--id my-route]
 ./router.py add --ip 1.2.3.0/24 --provider proton [--id my-route]
 ./router.py remove <id>
@@ -254,13 +259,34 @@ Platform notes:
   (`sudo proxy-router vpn on`).
 - **Windows**: needs an elevated shell and `wintun.dll` next to
   `sing-box.exe` (drop it from the official Wintun release).
-- **macOS**: needs root to create the `utun` interface
-  (`sudo proxy-router vpn on`). This is NOT a System Settings VPN provider
-  entry — that would require a signed NetworkExtension app. It is a TUN
-  interface managed from the terminal.
+- **macOS**: needs root to create the `utun` interface. Running
+  `proxy-router vpn on` (or any engine command while TUN mode is active) as a
+  regular user in an interactive terminal re-executes itself through the
+  standard macOS admin-password dialog (`osascript` with administrator
+  privileges). Run `proxy-router elevate install` once (single admin prompt)
+  to grant passwordless sudo for exactly the engine commands (see below);
+  afterwards `vpn on`/`vpn off`/`vpn restart`/`reload`/`ensure`/`rotate` run
+  silently, even from background keepalive/launchd ticks. Without the grant,
+  interactive runs ask for permission every time — no manual `sudo` needed —
+  and background ticks never prompt (they have no TTY) and keep the clear
+  "run with sudo" error instead. State files are handed back to the invoking
+  user automatically. Use `vpn restart` to cycle the TUN with a single prompt
+  (`vpn off && vpn on` asks twice). This is NOT a System Settings VPN
+  provider entry — that would require a signed NetworkExtension app. It is a
+  TUN interface managed from the terminal.
 
 TUN options live under `"vpn"` in `router.json`:
 `address` (CIDR list), `mtu`, `stack` (`system`, default | `gvisor`).
+
+`mtu` must fit the path to the WireGuard endpoint: if the physical network
+itself is tunneled (e.g. a school/proxy filter with a reduced inner MTU),
+the WireGuard packets fragment or get dropped, which reads as "TUN is
+slow". Measure the endpoint path with `ping -D -s <size> <endpoint>` and
+set `mtu` to `path_mtu - 80` (WireGuard overhead); 1280 is a safe
+default. `selective`/`selective_provider` is an optional IP-CIDR capture
+list from `rulesets/<name>.json` — only use it when you want TUN to
+capture exactly one site; with it set, all other domains fall out to
+direct and are NOT tunneled.
 
 Two more knobs in `"vpn"` control address-family policy:
 
@@ -273,6 +299,31 @@ Two more knobs in `"vpn"` control address-family policy:
   drop the WARP IPv4 endpoint so the IPv6 one must be used). This is a
   separate scope from `dns_strategy`: endpoints are the tunnel servers,
   destinations are the sites you route.
+- `dns_transport` — transport for the generated `dns-<provider>` servers that
+  resolve tunneled domains. Default `udp`. Set to `https` (DoH over TCP
+  443 to 1.1.1.1) on networks that drop UDP 53 to external resolvers while
+  allowing outbound TCP 443; the same IP literal is used as the server
+  address with `server_port: 443`.
+
+## One-time elevation (macOS)
+
+`vpn` engine commands need root to create the `utun` interface. Instead of an
+admin-password dialog on every run, grant passwordless sudo once:
+
+```sh
+./router.py elevate install    # one admin prompt; installs /etc/sudoers.d/91-proxy-router
+./router.py elevate status     # exit 0 when the grant matches this interpreter/script
+./router.py elevate uninstall  # remove the grant
+```
+
+The sudoers file only authorizes the exact engine command shapes for this
+interpreter + script path (NOPASSWD for `vpn *`, `reload`, `ensure`,
+`rotate *`, `rotate * --reason *`). `*` in sudoers matches exactly one argv
+token and sudo execs the command directly (no shell), so there is no argv
+injection surface; state files are handed back to the invoking user via the
+`SUDO_UID`/`SUDO_GID` sudo sets automatically. With the grant in place, the
+interactive dialog path is skipped and background keepalive/launchd ticks can
+also elevate silently — `vpn on`/`vpn off`/`vpn restart` never prompt again.
 
 ## Provider setup
 
