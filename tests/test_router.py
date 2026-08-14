@@ -27,6 +27,7 @@ def _relocate(module, root: Path) -> None:
     module.LOG_FILE = module.ROOT / "sing-box.log"
     module.LOCK_FILE = module.ROOT / "state" / "engine.lock"
     module.MODE_FILE = module.ROOT / "state" / "mode"
+    module.MANUAL_OFF_FILE = module.ROOT / "state" / "manual-off"
 
 
 def _write_conf(path: Path, *, psk: bool = True, mtu: bool = True, keepalive: bool = True) -> None:
@@ -68,10 +69,25 @@ class WireGuardParseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             conf = Path(tmp) / "profile.conf"
             _write_conf(conf, psk=False, mtu=False, keepalive=False)
-            endpoint = router.parse_wireguard(conf)
+            old_vpn, router._vpn = router._vpn, {}
+            try:
+                endpoint = router.parse_wireguard(conf)
+            finally:
+                router._vpn = old_vpn
             self.assertNotIn("pre_shared_key", endpoint["peers"][0])
             self.assertNotIn("persistent_keepalive_interval", endpoint["peers"][0])
-            self.assertNotIn("mtu", endpoint)
+            self.assertEqual(endpoint["mtu"], router.DEFAULT_ENDPOINT_MTU)
+
+    def test_parse_wireguard_mtu_fallback_uses_vpn_mtu(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conf = Path(tmp) / "profile.conf"
+            _write_conf(conf, mtu=False)
+            old_vpn, router._vpn = router._vpn, {"mtu": 1420}
+            try:
+                endpoint = router.parse_wireguard(conf)
+            finally:
+                router._vpn = old_vpn
+            self.assertEqual(endpoint["mtu"], 1420)
 
     def test_dns_server_for_avoids_private_proton_resolver(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -105,7 +121,8 @@ class ConfigBuildTests(unittest.TestCase):
 
     def test_build_config_maps_routes_and_skips_empty_provider(self):
         config, active = router.build_singbox_config()
-        self.assertEqual(active, {"proton"})
+        self.assertEqual(set(active), {"proton"})
+        self.assertEqual(active["proton"].name, "a.conf")
         self.assertEqual([e["tag"] for e in config["endpoints"]], ["proton"])
         dns_tags = [s["tag"] for s in config["dns"]["servers"]]
         self.assertIn("dns-proton", dns_tags)
@@ -203,6 +220,9 @@ class RotationTests(unittest.TestCase):
         for name in ("a", "b"):
             _write_conf(self.root / "providers" / "proton" / f"{name}.conf")
         router._providers = {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}}
+        # Pin rotation to the default policy: RotationPolicyTests runs before
+        # this class (alphabetical order) and leaves "least-recent" behind.
+        router._rotation = dict(router.DEFAULT_ROTATION_SETTINGS)
         # rotate() probes egress through the tunnel; tests never touch the network.
         self._probe = mock.patch.object(router, "probe_profile", return_value=(True, {"ok": True}))
         self._probe.start()
@@ -265,11 +285,17 @@ class VpnModeTests(unittest.TestCase):
         router.set_mode("tun")
         config, _ = router.build_singbox_config()
         inbounds = config["inbounds"]
-        self.assertEqual(len(inbounds), 1)
+        # Mixed proxy listener stays alongside the TUN so apps pinned to
+        # 127.0.0.1:PORT keep working while TUN captures everything else.
+        self.assertEqual(len(inbounds), 2)
         self.assertEqual(inbounds[0]["type"], "tun")
         self.assertEqual(inbounds[0]["address"], ["172.19.0.1/30"])
         self.assertEqual(inbounds[0]["stack"], "system")
         self.assertTrue(inbounds[0]["auto_route"])
+        self.assertEqual(inbounds[1], {
+            "type": "mixed", "tag": "local-proxy",
+            "listen": "127.0.0.1", "listen_port": 2080,
+        })
         self.assertEqual(config["route"]["final"], "direct")
 
     def test_proxy_mode_builds_mixed_inbound(self):
@@ -1539,6 +1565,141 @@ class EgressCheckCommandTests(unittest.TestCase):
         self.assertEqual(probe.call_args[0][1].stem, "a")
 
 
+class EgressSweepTests(unittest.TestCase):
+    """egress sweep: full-pool probing in wrap order, best-alive end state,
+    dead-pool exit code, and configurable probe targets."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(router, self.root)
+        (self.root / "providers" / "proton").mkdir(parents=True)
+        for name in ("a", "b", "c"):
+            _write_conf(self.root / "providers" / "proton" / f"{name}.conf")
+        router._providers = {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}}
+        router._routes = [{"id": "example-com", "domains": ["example.com"], "provider": "proton"}]
+        router._port = 2080
+        router._vpn = {}
+        self.listener = mock.patch.object(router, "listener_up", return_value=True)
+        self.listener.start()
+        self.rotate_patch = mock.patch.object(router, "rotate", return_value=0)
+        self.rotate = self.rotate_patch.start()
+        self.probe_patch = mock.patch.object(router, "probe_profile",
+                                             return_value=(True, {"ok": True, "latency_ms": 10.0,
+                                                                 "status": 200}))
+        self.probe = self.probe_patch.start()
+        self.reload_patch = mock.patch.object(router, "engine_reload", return_value=0)
+        self.engine_reload = self.reload_patch.start()
+        self.sleep_patch = mock.patch.object(router.time, "sleep")
+        self.sleep_patch.start()
+
+    def tearDown(self):
+        self.sleep_patch.stop()
+        self.reload_patch.stop()
+        self.probe_patch.stop()
+        self.rotate_patch.stop()
+        self.listener.stop()
+        self._tmp.cleanup()
+
+    def _profile(self, stem):
+        return self.root / "providers" / "proton" / f"{stem}.conf"
+
+    def _probe(self, *results):
+        self.probe_patch.stop()
+        self.probe_patch = mock.patch.object(router, "probe_profile", side_effect=list(results))
+        self.probe = self.probe_patch.start()
+
+    def test_requires_proxy_mode(self):
+        router.set_mode("tun")
+        with mock.patch("sys.stdout.write"):
+            rc = router.egress_sweep()
+        self.assertEqual(rc, 1)
+
+    def test_probes_every_profile_once_in_wrap_order(self):
+        router.set_active("proton", self._profile("a"))
+        rc = router.egress_sweep("proton")
+        self.assertEqual(rc, 0)
+        stems = [call.args[1].stem for call in self.probe.call_args_list]
+        self.assertEqual(stems, ["a", "b", "c"])
+        # one force/no-probe hop before every non-first profile
+        self.assertEqual([c.args[0] for c in self.rotate.call_args_list], ["proton", "proton"])
+        for call in self.rotate.call_args_list:
+            self.assertTrue(call.kwargs["force"])
+            self.assertFalse(call.kwargs["probe"])
+
+    def test_ends_on_best_alive_profile(self):
+        router.set_active("proton", self._profile("a"))
+        self._probe(
+            (True, {"ok": True, "latency_ms": 100.0, "status": 200}),
+            (True, {"ok": True, "latency_ms": 50.0, "status": 200}),
+            (True, {"ok": True, "latency_ms": 200.0, "status": 200}),
+        )
+        with mock.patch("sys.stdout.write") as write:
+            rc = router.egress_sweep("proton")
+        self.assertEqual(rc, 0)
+        self.assertEqual(router.persisted_active("proton").stem, "b")
+        self.engine_reload.assert_called_once()
+        joined = "".join(c.args[0] for c in write.call_args_list)
+        self.assertIn("switched proton -> b (sweep)", joined)
+
+    def test_keeps_current_when_already_best(self):
+        # all profiles alive at the same latency: first tested (the current
+        # one) wins, so the sweep must NOT reload the engine.
+        router.set_active("proton", self._profile("a"))
+        rc = router.egress_sweep("proton")
+        self.assertEqual(rc, 0)
+        self.assertEqual(router.persisted_active("proton").stem, "a")
+        self.engine_reload.assert_not_called()
+
+    def test_all_profiles_dead_exit_one_no_switch(self):
+        router.set_active("proton", self._profile("a"))
+        self._probe(
+            (False, {"ok": False, "latency_ms": None, "status": None}),
+            (False, {"ok": False, "latency_ms": None, "status": None}),
+            (False, {"ok": False, "latency_ms": None, "status": None}),
+        )
+        with mock.patch("sys.stdout.write") as write:
+            rc = router.egress_sweep("proton")
+        self.assertEqual(rc, 1)
+        self.engine_reload.assert_not_called()
+        self.assertEqual(router.persisted_active("proton").stem, "a")  # left on current
+        joined = "".join(c.args[0] for c in write.call_args_list)
+        self.assertIn("0/3 alive", joined)
+
+    def test_unknown_provider_is_error_but_not_dead(self):
+        rc = router.egress_sweep("ghost")
+        self.assertEqual(rc, 0)
+        self.probe.assert_not_called()
+        self.rotate.assert_not_called()
+
+    def test_uses_provider_pinned_probe_url(self):
+        # the pinned probe_url from router.json wins over the route-domain
+        # pick, so the sweep rides the tunnel to the configured target
+        config = {
+            "port": 2080,
+            "providers": {
+                "proton": {"directory": "providers/proton",
+                           "probe_url": "https://pinned.example/probe"},
+            },
+            "routes": [{"id": "example-com", "domains": ["example.com"], "provider": "proton"}],
+        }
+        (self.root / "router.json").write_text(json.dumps(config))
+        self.assertEqual(router.load_config(), 0)
+        router.set_active("proton", self._profile("a"))
+        self.probe_patch.stop()  # exercise the real probe_profile/probe_url_for path
+        urls = []
+
+        def fake_probe_egress(*, port=None, url=None, timeout=None, opener=None, clock=None):
+            urls.append(url)
+            return {"ok": True, "latency_ms": 5.0, "status": 200, "error": None, "block_reason": None}
+
+        with mock.patch.object(router, "probe_egress", side_effect=fake_probe_egress), \
+             mock.patch("sys.stdout.write"):
+            rc = router.egress_sweep("proton")
+        self.assertEqual(rc, 0)
+        self.assertEqual(urls, ["https://pinned.example/probe"] * 3)
+
+
 class LastGoodConfigTests(unittest.TestCase):
     """Feature 2: sing-box.json.last-good snapshot + one-step restore when a
     reload's new config fails validation or the engine fails to come up."""
@@ -1840,7 +2001,8 @@ class RoutingModeTests(unittest.TestCase):
 
     def test_default_mode_byte_compatible(self):
         config, active = router.build_singbox_config()
-        self.assertEqual(active, {"proton"})
+        self.assertEqual(set(active), {"proton"})
+        self.assertEqual(active["proton"].name, "a.conf")
         self.assertEqual(config["route"]["final"], "direct")
         self.assertEqual(config["route"]["rules"], [
             {"outbound": "proton", "domain_suffix": ["example.com"]},
@@ -1965,7 +2127,7 @@ class RoutingModeTests(unittest.TestCase):
         self.assertEqual(router.load_config(), 1)
 
     def test_vpn_list_final_direct_and_pins_intact(self):
-        router._routing = {"mode": "vpn-list", "vpn_domains": ["blocked.example"]}
+        router._routing = {"mode": "vpn-list", "vpn_domains": ["example.com"]}
         config, _ = router.build_singbox_config()
         self.assertEqual(config["route"]["final"], "direct")
         # tunnel pins intact and no direct-pin/dns rules were added
@@ -2155,6 +2317,114 @@ class ScheduledRotationTests(unittest.TestCase):
             data = router.status_json()
         self.assertEqual(data["rotation"]["interval_seconds"], 3600)
         self.assertIn("next_at", data["rotation"])
+
+
+class RotationPolicyTests(unittest.TestCase):
+    """Autoroute: rotation policy 'latency' (default) vs 'least-recent'."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(router, self.root)
+        (self.root / "providers" / "proton").mkdir(parents=True)
+        (self.root / "state").mkdir(parents=True)
+        for name in ("a", "b", "c"):
+            _write_conf(self.root / "providers" / "proton" / f"{name}.conf")
+        router._providers = {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}}
+        router._rotation = {"interval_seconds": 0, "jitter_seconds": 300, "policy": "latency"}
+        router._routes = []
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _profile(self, stem):
+        return self.root / "providers" / "proton" / f"{stem}.conf"
+
+    def _set_policy(self, policy):
+        router._load_rotation_settings({"rotation": {"policy": policy}})
+
+    def _seed_ok(self, stem, last_ok_at, latency_ms=None):
+        record = {"last_ok_at": last_ok_at, "checked_at": last_ok_at, "fails": 0}
+        if latency_ms is not None:
+            record["latency_ms"] = latency_ms
+        router.write_egress("proton", self._profile(stem), record)
+
+    def _active_stem(self):
+        return (self.root / "state" / "proton.active").read_text()
+
+    def test_default_policy_is_latency(self):
+        self.assertEqual(router.rotation_policy(), "latency")
+
+    def test_least_recent_policy_loaded(self):
+        self._set_policy("least-recent")
+        self.assertEqual(router.rotation_policy(), "least-recent")
+
+    def test_invalid_policy_rejected(self):
+        with self.assertRaises(ValueError):
+            self._set_policy("round-robin")
+
+    def _cool(self, stem):
+        path = self.root / "state" / "cooldowns" / "proton" / f"{stem}.until"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(int(time.time()) + 3600))
+
+    def _rotate_ranked(self):
+        with mock.patch.object(router, "engine_reload", return_value=0), \
+                mock.patch.object(router, "probe_profile", return_value=(True, {"ok": True})):
+            return router.rotate("proton")
+
+    def test_lru_key_oldest_ok_wins(self):
+        self._set_policy("least-recent")
+        router.set_active("proton", self._profile("a"))
+        self._cool("a")
+        self._seed_ok("b", int(time.time()) - 1 * 3600)
+        self._seed_ok("c", int(time.time()) - 2 * 3600)
+        self.assertEqual(self._rotate_ranked(), 0)
+        self.assertEqual(self._active_stem(), "c")
+
+    def test_least_recent_never_used_wins(self):
+        self._set_policy("least-recent")
+        router.set_active("proton", self._profile("a"))
+        self._cool("a")
+        self._seed_ok("b", int(time.time()) - 3600)
+        self.assertEqual(self._rotate_ranked(), 0)
+        self.assertEqual(self._active_stem(), "c")
+
+    def test_least_recent_skips_recently_failed(self):
+        self._set_policy("least-recent")
+        router.set_active("proton", self._profile("a"))
+        self._cool("a")
+        self._seed_ok("b", int(time.time()) - 3600)
+        router.write_egress("proton", self._profile("c"), {
+            "last_ok_at": None, "checked_at": int(time.time() - 100),
+            "fails": 2, "latency_ms": None})
+        self.assertEqual(self._rotate_ranked(), 0)
+        self.assertEqual(self._active_stem(), "b")
+
+    def test_least_recent_excludes_blocked(self):
+        self._set_policy("least-recent")
+        router.set_active("proton", self._profile("a"))
+        self._cool("a")
+        self._seed_ok("b", int(time.time()) - 3600)
+        router.write_egress("proton", self._profile("c"), {
+            "last_ok_at": int(time.time() - 1), "checked_at": int(time.time() - 1),
+            "fails": 0, "blocked_until": int(time.time()) + 3600})
+        self.assertEqual(self._rotate_ranked(), 0)
+        self.assertEqual(self._active_stem(), "b")
+
+    def test_latency_policy_prefers_fastest_over_oldest(self):
+        router.set_active("proton", self._profile("a"))
+        self._cool("a")
+        self._seed_ok("a", int(time.time()) - 28800, latency_ms=200)
+        self._seed_ok("b", int(time.time()) - 3600, latency_ms=40)
+        self.assertEqual(self._rotate_ranked(), 0)
+        self.assertEqual(self._active_stem(), "b")
+
+    def test_status_json_exposes_policy(self):
+        data = router.status_json()
+        self.assertEqual(data["rotation"]["policy"], "latency")
+        self._set_policy("least-recent")
+        self.assertEqual(router.status_json()["rotation"]["policy"], "least-recent")
 
 
 class WithProxyTests(unittest.TestCase):

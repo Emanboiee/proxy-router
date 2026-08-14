@@ -65,7 +65,7 @@ proxy-router ensure
 
 `proxy-router setup` with no flags opens the custom terminal wizard. It never
 enables TUN mode or starts monitoring unless you explicitly choose those
-operations. Menu item 9 installs/verifies the Hermes OpenCode auto-rotation
+operations. Menu item 8 installs/verifies the Hermes OpenCode auto-rotation
 bridge (placed at `$OPENCODE_ZEN_VPN_ROOT/proxy-manager.sh`).
 
 ## Layout
@@ -97,7 +97,12 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py routes               # list route table
 ./router.py vpn on               # full TUN mode: route everything via the engines' rules
 ./router.py vpn off              # stop the TUN, back to proxy mode
+./router.py vpn restart          # stop + re-enter TUN in one step (single elevation prompt)
 ./router.py vpn status           # show current mode and liveness
+./router.py elevate install      # one-time macOS admin prompt; afterwards engine commands run
+                                 # without prompts (vpn on/off/restart, reload, ensure, rotate)
+./router.py elevate uninstall    # remove the passwordless-sudo grant
+./router.py elevate status       # is the grant active for this interpreter/script?
 ./router.py add --domain example.com --provider proton [--id my-route]
 ./router.py add --ip 1.2.3.0/24 --provider proton [--id my-route]
 ./router.py remove <id>
@@ -113,6 +118,7 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py egress probe [provider]  # probe current exit(s) through the tunnel, persist health
 ./router.py egress show [provider]   # print persisted egress records (JSON)
 ./router.py egress check [--provider <name>] [--json]  # read-only live check: exit 1 ONLY when an active exit is DEAD
+./router.py egress sweep [provider] [--json]  # full-pool sweep: probe EVERY profile, end on the best alive exit
 ./router.py status --json         # machine-readable status for scripts/Hermes
 ./router.py setup                  # custom setup TUI
 ./router.py setup --guide all      # print Proton + WARP guides
@@ -165,6 +171,17 @@ Rotation is then egress-aware instead of blind round-robin:
 - After switching, the new exit is probed; if it does not come up cleanly the
   router restores the previous good profile (one bounded rollback step).
 - `egress probe` refreshes health on demand without rotating.
+- `egress sweep` [provider] probes EVERY profile of the pool through the
+  running tunnel (not just the active exit), persisting per-profile health,
+  cooldown, and blocked markers, then ends on the best alive profile - lowest
+  latency first, unmeasured alive profiles ranking after measured ones. It
+  hops through the pool in wrap order (one `rotate` per step, engine reloaded
+  each hop) with a short settle wait after each switch, so the first-request
+  flake of a fresh WireGuard handshake never false-marks an exit failed. When
+  nothing is alive the tunnel stays on the current profile and exit code 1
+  signals a provider with zero alive exits (`--json` names them under
+  `dead`). A sweep reloads the engine only when a strictly better exit was
+  found, so a healthy sweep is cheap.
 - `egress check` is the read-only liveness view used by the keepalive self-heal
   loop: it probes the ACTIVE exit(s) through the running tunnel and classifies
   each one `alive` (HTTP response rode the tunnel), `degraded` (an HTTP status
@@ -254,13 +271,34 @@ Platform notes:
   (`sudo proxy-router vpn on`).
 - **Windows**: needs an elevated shell and `wintun.dll` next to
   `sing-box.exe` (drop it from the official Wintun release).
-- **macOS**: needs root to create the `utun` interface
-  (`sudo proxy-router vpn on`). This is NOT a System Settings VPN provider
-  entry — that would require a signed NetworkExtension app. It is a TUN
-  interface managed from the terminal.
+- **macOS**: needs root to create the `utun` interface. Running
+  `proxy-router vpn on` (or any engine command while TUN mode is active) as a
+  regular user in an interactive terminal re-executes itself through the
+  standard macOS admin-password dialog (`osascript` with administrator
+  privileges). Run `proxy-router elevate install` once (single admin prompt)
+  to grant passwordless sudo for exactly the engine commands (see below);
+  afterwards `vpn on`/`vpn off`/`vpn restart`/`reload`/`ensure`/`rotate` run
+  silently, even from background keepalive/launchd ticks. Without the grant,
+  interactive runs ask for permission every time — no manual `sudo` needed —
+  and background ticks never prompt (they have no TTY) and keep the clear
+  "run with sudo" error instead. State files are handed back to the invoking
+  user automatically. Use `vpn restart` to cycle the TUN with a single prompt
+  (`vpn off && vpn on` asks twice). This is NOT a System Settings VPN
+  provider entry — that would require a signed NetworkExtension app. It is a
+  TUN interface managed from the terminal.
 
 TUN options live under `"vpn"` in `router.json`:
 `address` (CIDR list), `mtu`, `stack` (`system`, default | `gvisor`).
+
+`mtu` must fit the path to the WireGuard endpoint: if the physical network
+itself is tunneled (e.g. a school/proxy filter with a reduced inner MTU),
+the WireGuard packets fragment or get dropped, which reads as "TUN is
+slow". Measure the endpoint path with `ping -D -s <size> <endpoint>` and
+set `mtu` to `path_mtu - 80` (WireGuard overhead); 1280 is a safe
+default. `selective`/`selective_provider` is an optional IP-CIDR capture
+list from `rulesets/<name>.json` — only use it when you want TUN to
+capture exactly one site; with it set, all other domains fall out to
+direct and are NOT tunneled.
 
 Two more knobs in `"vpn"` control address-family policy:
 
@@ -273,6 +311,35 @@ Two more knobs in `"vpn"` control address-family policy:
   drop the WARP IPv4 endpoint so the IPv6 one must be used). This is a
   separate scope from `dns_strategy`: endpoints are the tunnel servers,
   destinations are the sites you route.
+- `dns_transport` — transport for the generated `dns-<provider>` servers that
+  resolve tunneled domains. Default `udp`. Set to `https` (DoH over TCP
+  443 to 1.1.1.1) on networks that drop UDP 53 to external resolvers while
+  allowing outbound TCP 443; the same IP literal is used as the server
+  address with `server_port: 443`.
+
+## One-time elevation (macOS)
+
+`vpn` engine commands need root to create the `utun` interface. Instead of an
+admin-password dialog on every run, grant passwordless sudo once:
+
+```sh
+./router.py elevate install    # one admin prompt; installs /etc/sudoers.d/91-proxy-router
+./router.py elevate status     # exit 0 when the grant matches this interpreter/script
+./router.py elevate uninstall  # remove the grant
+```
+
+The sudoers file only authorizes the exact engine command shapes for this
+interpreter + script path (NOPASSWD for `start`, `stop`, `vpn *`, `reload`,
+`ensure`, `rotate *`, `rotate * --reason *`). `*` in sudoers matches exactly
+one argv token and sudo execs the command directly (no shell), so there is no
+argv injection surface; state files are handed back to the invoking user via
+the `SUDO_UID`/`SUDO_GID` sudo sets automatically. With the grant in place,
+the interactive dialog path is skipped and background keepalive/launchd ticks
+can also elevate silently — `vpn on`/`vpn off`/`vpn restart` never prompt
+again. The tray's Connect/Disconnect and the CLI's proxy-mode `start`/`stop`
+also elevate automatically while the engine runs as root, so an engine
+started via `sudo vpn on` stays manageable after `vpn off` returns to proxy
+mode.
 
 ## Provider setup
 
@@ -283,7 +350,7 @@ becomes the sing-box endpoint tag.
 The easiest path is the setup wizard:
 
 ```sh
-proxy-router setup                  # interactive terminal menu (item 9: Hermes rotation bridge)
+proxy-router setup                  # interactive terminal menu (item 8: Hermes rotation bridge)
 proxy-router setup --guide proton   # print the bundled Proton guide
 proxy-router setup --guide warp     # print the bundled WARP guide
 proxy-router setup --import-proton ~/Downloads/*.conf
@@ -452,6 +519,13 @@ Flags: `--timeout-ms` (probe timeout, default 300). The child replaces the
 wrapper via exec, so exit codes and signals pass through untouched. `--check`
 is what scripts should use for one-shot health checks (exit 0/1, prints the
 URL only when up).
+
+The dead-tunnel checks only ever probe the ACTIVE exit, so a pool could sit
+on a stale-but-alive lane forever. Every `PROXY_KEEPALIVE_SWEEP_EVERY`
+seconds (default 1800 = 30 min) the keepalive therefore runs a full-pool
+`egress sweep` (see "Egress health & rotation smarts"): every profile of
+every provider is probed through the tunnel and the pool ends on the best
+alive exit, with health/cooldown/block markers persisted along the way.
 
 ## Hermes integration
 

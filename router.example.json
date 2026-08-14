@@ -9,7 +9,10 @@
       "directory": "providers/cloudflare",
       "cooldown_seconds": 60,
       "error_policy": {
-        "429": { "action": "cooldown", "seconds": 300 }
+        "429": {
+          "action": "cooldown",
+          "seconds": 300
+        }
       }
     }
   },
@@ -41,7 +44,9 @@
       "172.19.0.1/30"
     ],
     "mtu": 1500,
-    "stack": "system"
+    "stack": "system",
+    "dns_transport": "udp",
+    "selective": "roblox"
   },
   "egress": {
     "probe_url": "https://www.cloudflare.com/cdn-cgi/trace",
@@ -53,17 +58,42 @@
     "ok_window": 86400
   },
   "error_policy": {
-    "default": { "action": "cooldown", "seconds": 300 },
-    "429": { "action": "exhaust", "seconds": 900 },
-    "503": { "action": "cooldown", "seconds": 120 },
-    "timeout": { "action": "cooldown", "seconds": 60 },
-    "tls": { "action": "cooldown", "seconds": 300 },
-    "connection": { "action": "cooldown", "seconds": 300 },
-    "1010": { "action": "block", "seconds": 3600 },
-    "403": { "action": "block", "seconds": 3600 }
+    "default": {
+      "action": "cooldown",
+      "seconds": 300
+    },
+    "429": {
+      "action": "exhaust",
+      "seconds": 900
+    },
+    "503": {
+      "action": "cooldown",
+      "seconds": 120
+    },
+    "timeout": {
+      "action": "cooldown",
+      "seconds": 60
+    },
+    "tls": {
+      "action": "cooldown",
+      "seconds": 300
+    },
+    "connection": {
+      "action": "cooldown",
+      "seconds": 300
+    },
+    "1010": {
+      "action": "block",
+      "seconds": 3600
+    },
+    "403": {
+      "action": "block",
+      "seconds": 3600
+    }
   },
   "rotation": {
     "interval_seconds": 7200,
-    "jitter_seconds": 300
+    "jitter_seconds": 300,
+    "policy": "latency"
   }
 }
