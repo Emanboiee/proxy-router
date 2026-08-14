@@ -2255,9 +2255,13 @@ def egress_check(name: str | None = None, as_json: bool = False) -> int:
 
     Never rotates, never touches the engine; the only write is the normal
     egress health record. Bounded probes make it safe to run every 30-60s.
-    Stops at the first dead provider. In human mode a trailing ``dead:
-    <provider>`` line (and exit code 1) is the machine contract keepalive
-    parses; ``--json`` emits the same data as one JSON document.
+    Every provider is checked even after a dead one is found, so egress
+    records stay fresh for status UIs (a dead-first provider must not freeze
+    other providers' records at their last failure). In human mode a trailing
+    ``dead: <provider>`` line (and exit code 1) is the machine contract
+    keepalive parses; only the first dead provider is named so keepalive
+    rotates exactly one provider. ``--json`` emits the same data as one JSON
+    document.
     """
     mode = current_mode()
     if mode != "proxy":
@@ -2285,8 +2289,9 @@ def egress_check(name: str | None = None, as_json: bool = False) -> int:
         elif status == "degraded" and record is not None and record.get("status") is not None:
             entry["detail"] = f"HTTP {record['status']}"
         results[provider] = entry
-        if dead:
-            break  # stop at the first dead provider so keepalive rotates it
+    # No break after a dead provider: every provider's record must be
+    # refreshed each cycle so status UIs never show stale failures from a
+    # provider that merely follows a dead-first one in check order.
     if as_json:
         print(json.dumps({"dead": dead, "results": results}, indent=2, sort_keys=True))
     else:
