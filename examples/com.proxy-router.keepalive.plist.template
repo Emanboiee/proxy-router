@@ -22,6 +22,8 @@
     <string>en_US.UTF-8</string>
     <key>PATH</key>
     <string>@PATH@</string>
+    <key>SING_BOX</key>
+    <string>/opt/homebrew/bin/sing-box</string>
   </dict>
 
   <key>LimitLoadToSessionType</key>

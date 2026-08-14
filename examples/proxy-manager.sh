@@ -1,23 +1,11 @@
 #!/usr/bin/env bash
-# Bridge for the Hermes `opencode_server_rotation` plugin.
-#
-# The plugin invokes `proxy-manager.sh rotate` from the legacy
-# tools/opencode-zen-vpn directory (cwd = that directory, 45s timeout). The
-# directory was retired and succeeded by proxy-router; install this bridge at
-# the plugin's exact expected path and it forwards rotation to the router:
-#
-#   mkdir -p ~/airi/tools/opencode-zen-vpn   # wherever YOUR prefix lives
-#   cp examples/proxy-manager.sh ~/airi/tools/opencode-zen-vpn/proxy-manager.sh
-#   chmod +x ~/airi/tools/opencode-zen-vpn/proxy-manager.sh
-#
-# No plugin edits and no Hermes config changes are required.
+# Bridge for the Hermes opencode-server-rotation plugin.
+# The plugin calls this machine-level bridge; it forwards provider failures to
+# the existing proxy-router CLI. The router remains the only engine mutator.
 set -euo pipefail
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
-# Locate the router: explicit override, standalone copy next to this script,
-# sibling layout (<prefix>/opencode-zen-vpn + <prefix>/proxy-router), the
-# default install prefix, then PATH.
 router_py() {
   if [ -n "${PROXY_ROUTER_BIN:-}" ] && [ -x "${PROXY_ROUTER_BIN:-}" ]; then
     printf '%s\n' "$PROXY_ROUTER_BIN"
@@ -26,6 +14,7 @@ router_py() {
   local candidate
   for candidate in \
     "$SCRIPT_DIR/router.py" \
+    "$(dirname "$SCRIPT_DIR")/router.py" \
     "$(dirname "$SCRIPT_DIR")/proxy-router/router.py" \
     "$HOME/.local/share/proxy-router/router.py" \
   ; do
@@ -45,10 +34,22 @@ case "${1:-}" in
   rotate)
     ROUTER=$(router_py)
     PROVIDER="${OPENCODE_PROVIDER:-proton}"
-    "$ROUTER" rotate "$PROVIDER"
+    REASON="${2:-}"
+    case "$REASON" in
+      ""|408|425|429|500|502|503|504|1010|403|timeout|tls|connection|rate_limit|upstream_rate_limit|server_error) ;;
+      *)
+        printf 'proxy-manager: unsupported rotation reason %s\n' "$REASON" >&2
+        exit 2
+        ;;
+    esac
+    if [ -n "$REASON" ]; then
+      "$ROUTER" rotate "$PROVIDER" --reason "$REASON"
+    else
+      "$ROUTER" rotate "$PROVIDER"
+    fi
     ;;
   help|-h|--help|"")
-    printf 'usage: %s rotate [OPENCODE_PROVIDER=proton]\n' "$0" >&2
+    printf 'usage: %s rotate [REASON] [OPENCODE_PROVIDER=proton]\n' "$0" >&2
     exit 0
     ;;
   *)
