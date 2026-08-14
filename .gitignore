@@ -19,3 +19,11 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+# Runtime artifacts / stray copies
+sing-box.json.debug
+sing-box.json.last-good
+sing-box.log.1
+wgcf-account.toml.*
+wgcf-profile.conf
+.omo/
+examples/_tmp_pyinfo.py
