@@ -63,11 +63,15 @@ _BUILTIN_PRESETS = (
     ("school-warp", "school-warp — school sites via Cloudflare"),
 )
 
+# Must match router.py's MIN_SING_BOX_VERSION = (1, 12, 0); the tray runs
+# standalone (no router import), so the version label is mirrored here.
+_MIN_SING_BOX_LABEL = "1.12+"
+
 # Raw CLI error fragments -> what a non-technical user should actually do.
 _FRIENDLY_ERRORS = (
     ("no sing-box binary", "VPN engine not found — run Setup, then Connect"),
     ("sing-box not found",
-     "VPN engine not found — install sing-box 1.12+ (github.com/SagerNet/sing-box/releases) or set SING_BOX, then Connect"),
+     f"VPN engine not found — install sing-box {_MIN_SING_BOX_LABEL} (github.com/SagerNet/sing-box/releases) or set SING_BOX, then Connect"),
     ("needs 'default_provider'", "pick a default provider first: Routing mode → home (safe list)"),
     ("no active profile", "no VPN profile yet — add one under Setup"),
     ("missing router.json", "no configuration yet — start under Setup"),
