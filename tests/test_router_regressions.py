@@ -959,7 +959,7 @@ def test_elevate_macos_runs_osascript_with_admin_privileges(tmp_path, monkeypatc
 
 
 def test_elevate_macos_escapes_applescript_specials(tmp_path, monkeypatch):
-    """Quotes/backslashes in args must survive the AppleScript string literal
+    r"""Quotes/backslashes in args must survive the AppleScript string literal
     (e.g. an --id with quotes): content `\"`/`\\` escapes, literal delimiters
     stay unescaped (a `\` at expression position is a -2741 syntax error)."""
     router = load_router(tmp_path)
