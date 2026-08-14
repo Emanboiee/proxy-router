@@ -12,6 +12,7 @@ tests can assert on:
 - reset-on-success, and the boot self-test.
 """
 import os
+import signal
 import subprocess
 import tempfile
 import time
@@ -107,7 +108,8 @@ class KeepaliveHarness:
         self.env = env
         self.proc = subprocess.Popen([str(target)], env=env,
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                     text=True)
+                                     text=True,
+                                     start_new_session=(os.name == "posix"))
 
     def lines(self) -> list[str]:
         if not self.log.is_file():
@@ -130,11 +132,23 @@ class KeepaliveHarness:
         if getattr(self, "_closed", False):
             return
         self._closed = True
-        self.proc.terminate()
+        if os.name == "posix":
+            try:
+                os.killpg(self.proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        else:
+            self.proc.terminate()
         try:
             self.out, self.err = self.proc.communicate(timeout=5)
         except subprocess.TimeoutExpired:
-            self.proc.kill()
+            if os.name == "posix":
+                try:
+                    os.killpg(self.proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            else:
+                self.proc.kill()
             self.out, self.err = self.proc.communicate()
         self._tmp.cleanup()
 
