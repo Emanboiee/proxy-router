@@ -117,6 +117,20 @@ class HumanizeTests(unittest.TestCase):
     def test_empty_output_is_empty(self):
         self.assertEqual(tray._humanize(""), "")
 
+    def test_long_unmapped_detail_cap_is_above_160(self):
+        # The CLI's missing-binary message lists every candidate; the old
+        # 160-char cap cut it into an unexplained "Connect: Failed" (#11).
+        out = "router: could not start sing-box: " + "candidate-path " * 30
+        detail = tray._humanize(out)
+        self.assertGreater(len(detail), 160)  # old cap would cut at 160
+        self.assertEqual(len(detail), 320)  # new cap keeps the full detail
+
+    def test_sing_box_not_found_maps_to_friendly_next_step(self):
+        detail = tray._humanize(
+            "router: sing-box not found (tried: env SING_BOX=(unset), ...)")
+        self.assertIn("install sing-box 1.12+", detail)
+        self.assertIn("github.com/SagerNet/sing-box/releases", detail)
+
 
 if __name__ == "__main__":
     unittest.main()

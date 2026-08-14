@@ -119,9 +119,24 @@ def resolve_sing_box() -> str | None:
 
 
 def _sing_box_missing_message() -> str:
-    """One-line message naming every location the resolver checks."""
+    """Actionable one-line message naming every location the resolver checked.
+
+    Tray Connect shows the CLI's last line, so the real candidates (env,
+    bundled path, Homebrew locations, PATH) plus the minimum version and
+    download URL turn a bare "Sing-box not found" into a next step (issue
+    #11: the tray reported an unexplained "Connect: Failed").
+    """
     bundled = ROOT / "bin" / ("sing-box.exe" if os.name == "nt" else "sing-box")
-    return f"sing-box not found; set SING_BOX, bundle it at {bundled}, or install it on PATH"
+    tried = [f"env SING_BOX={os.environ.get('SING_BOX') or '(unset)'}",
+             f"{bundled} (missing)"]
+    if sys.platform == "darwin" and os.name != "nt":
+        tried.extend(("/opt/homebrew/bin/sing-box (missing)",
+                      "/usr/local/bin/sing-box (missing)"))
+    tried.append("PATH (no 'sing-box')")
+    version = ".".join(map(str, MIN_SING_BOX_VERSION))
+    return (f"sing-box not found (tried: {', '.join(tried)}); "
+            f"install {version}+ from https://github.com/SagerNet/sing-box/releases "
+            f"at {bundled}, or set SING_BOX=/path/to/sing-box")
 
 
 # The generated sing-box.json uses features that do not exist before sing-box

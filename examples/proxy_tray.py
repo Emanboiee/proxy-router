@@ -66,6 +66,8 @@ _BUILTIN_PRESETS = (
 # Raw CLI error fragments -> what a non-technical user should actually do.
 _FRIENDLY_ERRORS = (
     ("no sing-box binary", "VPN engine not found — run Setup, then Connect"),
+    ("sing-box not found",
+     "VPN engine not found — install sing-box 1.12+ (github.com/SagerNet/sing-box/releases) or set SING_BOX, then Connect"),
     ("needs 'default_provider'", "pick a default provider first: Routing mode → home (safe list)"),
     ("no active profile", "no VPN profile yet — add one under Setup"),
     ("missing router.json", "no configuration yet — start under Setup"),
@@ -142,7 +144,10 @@ def _humanize(out: str) -> str:
         return ""
     if "engine is untouched" in out or "engine was NOT reloaded" in out:
         return "saved — Connect to apply"
-    detail = out.splitlines()[-1][:160]
+    # The sing-box missing-binary message lists every candidate path; a
+    # 160-char cap cut it mid-sentence into an unexplained "Connect: Failed"
+    # (issue #11). 320 chars keeps the full actionable detail visible.
+    detail = out.splitlines()[-1][:320]
     for needle, repl in _FRIENDLY_ERRORS:
         if needle in detail:
             return repl
