@@ -172,7 +172,8 @@ class KeepaliveEgressCheckTests(unittest.TestCase):
             rotates = [l for l in lines if l.startswith("rotate")]
             self.assertEqual(rotates, [])
             # cadence: periodic checks every PROBE_EVERY(2) ensures after boot
-            check_lines = [i for i, l in enumerate(lines) if l == "egress check"]
+            ticks = [l for l in lines if l != "egress sweep --json"]
+            check_lines = [i for i, l in enumerate(ticks) if l == "egress check"]
             self.assertGreaterEqual(len(check_lines), 4, f"too few checks: {lines}")
             gaps = [b - a for a, b in zip(check_lines, check_lines[1:])]
             # every PROBE_EVERY ensures triggers a check; log distance is
