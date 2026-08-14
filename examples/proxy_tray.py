@@ -74,6 +74,17 @@ _FRIENDLY_ERRORS = (
     ("no valid profiles", "no usable profiles found — re-add your .conf under Setup"),
 )
 
+# stderr markers that prove `sudo -n` DENIED (vs the command itself
+# failing). A sudoers grant is a snapshot of the command shapes at install
+# time, so a command added later (e.g. `start`/`stop` for issue #12) can
+# hit a denial even when the probe passes; callers fall back to the admin
+# dialog on these markers instead of surfacing a raw sudo error.
+_SUDO_DENIAL_TOKENS = (
+    "a password is required",
+    "not in the sudoers",
+    "must have a tty",
+)
+
 
 def _sudoers_ok(python: str, router: str) -> bool:
     """True when `sudo -n` may run router.py without a password prompt.
@@ -96,11 +107,7 @@ def _sudoers_ok(python: str, router: str) -> bool:
     # ("a password is required", "not in the sudoers file", requiretty)
     # means the NOPASSWD rule is absent. Mirrors router.py's probe.
     stderr = (probe.stderr or "").lower()
-    return not any(token in stderr for token in (
-        "a password is required",
-        "not in the sudoers",
-        "must have a tty",
-    ))
+    return not any(token in stderr for token in _SUDO_DENIAL_TOKENS)
 
 
 def _friendly_egress_error(err: object) -> str:
@@ -313,8 +320,10 @@ class RouterClient:
         with sudo"). Mirrors router.py's probe: unreadable root-owned pid
         file counts as root; a readable one is confirmed against `ps`.
         """
-        if sys.platform != "darwin":
+        if sys.platform != "darwin" or os.geteuid() == 0:
+            # Non-macOS or already-root tray: no elevation needed either way.
             return False
+        # Must match router.py's PID_FILE (ROOT / "sing-box.pid").
         pid_file = os.path.join(self.root, "sing-box.pid")
         try:
             st = os.stat(pid_file)
@@ -411,7 +420,12 @@ class RouterClient:
                     capture_output=True, text=True, timeout=ELEVATED_COMMAND_TIMEOUT,
                 )
                 out = (p.stdout or "") + ("\n" + p.stderr if p.stderr else "")
-                return p.returncode, out.strip()
+                if p.returncode == 0 or not any(
+                        token in (p.stderr or "").lower() for token in _SUDO_DENIAL_TOKENS):
+                    return p.returncode, out.strip()
+                # sudo-level denial: the grant predates this command shape;
+                # fall through to the per-run admin dialog instead of
+                # surfacing a raw sudo error.
             except subprocess.TimeoutExpired:
                 return -1, "timeout: sudo did not answer in time"
             except FileNotFoundError:

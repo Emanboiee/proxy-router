@@ -2107,7 +2107,7 @@ def engine_stop() -> int:
             # be alive; keep the pid file and fail loudly (mirror of the kill
             # PermissionError below) instead of unlinking a live engine's pid
             # as "garbage" (H6).
-            print("router: engine runs as root (started via sudo); run `router.py elevate install` once to stop it from the tray, or stop it now with `sudo python3 router.py stop`", file=sys.stderr)
+            print(_ROOT_ENGINE_HINT, file=sys.stderr)
             return 1
         except (ValueError, OSError):
             # Garbage pid file (H6): treat as stale, clean it up, carry on.
@@ -2133,7 +2133,7 @@ def engine_stop() -> int:
             # Engine was started via `sudo vpn on` and runs as root; a
             # regular-user stop cannot signal it. Keep the pid file (the
             # engine IS alive) and tell the user to stop with sudo.
-            print("router: engine runs as root (started via sudo); run `router.py elevate install` once to stop it from the tray, or stop it now with `sudo python3 router.py stop`", file=sys.stderr)
+            print(_ROOT_ENGINE_HINT, file=sys.stderr)
             return 1
         PID_FILE.unlink(missing_ok=True)
     return 0
@@ -2191,7 +2191,8 @@ def engine_reload(active_overrides: dict[str, Path] | None = None) -> int:
     try:
         os.kill(pid, signal.SIGHUP)  # SIGHUP: sing-box hot-reloads the config in place
     except PermissionError:
-        return fail("engine runs as root (started via sudo); reload it with `sudo python3 router.py reload`")
+        return fail("engine runs as root (started via sudo); run `router.py elevate install` once, "
+                    "or reload it now with `sudo python3 router.py reload`")
     except ProcessLookupError:
         if engine_start(recover=False) != 0:
             print("router: engine failed to start with new config; restoring last-good", file=sys.stderr)
@@ -3216,6 +3217,24 @@ SUDOERS_COMMANDS = (
     ("rotate", "*", "--reason", "*"),
 )
 
+# stderr markers that prove `sudo -n` DENIED (vs the command itself
+# failing). A sudoers grant is a snapshot of the command shapes at install
+# time, so a command added later (e.g. `start`/`stop` for issue #12) can
+# hit a denial even when the probe passes; callers fall back to the admin
+# dialog on these markers instead of surfacing a raw sudo error.
+_SUDO_DENIAL_TOKENS = (
+    "a password is required",
+    "not in the sudoers",
+    "must have a tty",
+)
+
+# Root-owned engine (started via `sudo vpn on`): a regular user cannot
+# signal it, so name the one-time grant and the manual sudo escape hatch
+# (issue #12). Shared by engine_stop's two PermissionError paths.
+_ROOT_ENGINE_HINT = ("router: engine runs as root (started via sudo); run "
+                     "`router.py elevate install` once to stop it from the tray, "
+                     "or stop it now with `sudo python3 router.py stop`")
+
 
 def _sudoers_rules(user: str, python: str, router_path: str) -> str:
     """Render the sudoers NOPASSWD rules for the given interpreter + script."""
@@ -3247,19 +3266,27 @@ def _sudoers_installed() -> bool:
     # there ("a password is required", "not in the sudoers file",
     # requiretty) instead of running the command.
     stderr = (probe.stderr or "").lower()
-    return not any(token in stderr for token in (
-        "a password is required",
-        "not in the sudoers",
-        "must have a tty",
-    ))
+    return not any(token in stderr for token in _SUDO_DENIAL_TOKENS)
 
 
 def _elevate() -> int:
     """Re-run the current command as root: silently when `elevate install`
-    granted passwordless sudo, else through the macOS admin dialog."""
+    granted passwordless sudo, else through the macOS admin dialog.
+
+    A sudoers grant is a snapshot of the command shapes at install time; a
+    command added to the elevation surface afterwards (e.g. `start`/`stop`
+    for issue #12) can be denied even though the probe passes. A sudo-level
+    denial on stderr falls back to the admin dialog; a nonzero exit that is
+    NOT a denial is the elevated command itself failing and is returned
+    unchanged (no dialog for a real engine error)."""
     if _sudoers_installed():
         cmd = [sys.executable, os.path.abspath(__file__), *sys.argv[1:]]
-        return subprocess.run(["sudo", "-n", *cmd]).returncode
+        probe = subprocess.run(["sudo", "-n", *cmd], capture_output=True, text=True)
+        if probe.returncode == 0:
+            return 0
+        stderr = (probe.stderr or "").lower()
+        if not any(token in stderr for token in _SUDO_DENIAL_TOKENS):
+            return probe.returncode
     return _elevate_macos()
 
 
@@ -3285,10 +3312,10 @@ def cmd_elevate(action: str) -> int:
     if os.geteuid() != 0:
         # One prompt (or none, if sudo already works): write, validate with
         # visudo, then atomically install. Re-run as root and continue.
-        if not _sudoers_installed():
-            return _elevate()
-        cmd = [sys.executable, os.path.abspath(__file__), "elevate", "install"]
-        return subprocess.run(["sudo", "-n", *cmd]).returncode
+        # `_elevate` (not a raw `sudo -n`) so a grant that lacks the
+        # `elevate install` shape (it never includes itself) falls back to
+        # the admin dialog instead of a raw sudo denial.
+        return _elevate()
 
     if SUDOERS_FILE.exists():
         existing = SUDOERS_FILE.read_text()

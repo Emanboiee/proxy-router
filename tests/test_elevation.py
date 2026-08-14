@@ -204,5 +204,57 @@ class EngineStopMessageTests(unittest.TestCase):
         self.assertTrue(router.PID_FILE.is_file())
 
 
+class ElevateFallbackTests(unittest.TestCase):
+    """`_elevate` must fall back to the admin dialog when `sudo -n`
+    DENIES (stale grant missing a command shape added later, e.g.
+    `start`/`stop`), but return a real elevated-command failure unchanged
+    (no dialog for an engine error)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        _relocate(router, root)
+        self.addCleanup(self.tmp.cleanup)
+        router.sys.argv = ["router.py", "stop"]
+
+    def _probe(self, returncode: int, stderr: str = ""):
+        return type("P", (), {"returncode": returncode, "stderr": stderr})()
+
+    def test_sudo_denial_falls_back_to_admin_dialog(self):
+        with mock.patch.object(router, "_sudoers_installed", return_value=True), \
+             mock.patch.object(router, "_elevate_macos", return_value=42) as dialog, \
+             mock.patch.object(router.subprocess, "run",
+                               return_value=self._probe(1, "a password is required")):
+            rc = router._elevate()
+        self.assertEqual(rc, 42)
+        dialog.assert_called_once()
+
+    def test_sudoers_denial_token_falls_back_to_admin_dialog(self):
+        with mock.patch.object(router, "_sudoers_installed", return_value=True), \
+             mock.patch.object(router, "_elevate_macos", return_value=42) as dialog, \
+             mock.patch.object(router.subprocess, "run",
+                               return_value=self._probe(1, "kyson is not in the sudoers file")):
+            rc = router._elevate()
+        self.assertEqual(rc, 42)
+        dialog.assert_called_once()
+
+    def test_elevated_command_failure_returns_rc_without_dialog(self):
+        with mock.patch.object(router, "_sudoers_installed", return_value=True), \
+             mock.patch.object(router, "_elevate_macos", return_value=42) as dialog, \
+             mock.patch.object(router.subprocess, "run",
+                               return_value=self._probe(3, "router: engine failed to start")):
+            rc = router._elevate()
+        self.assertEqual(rc, 3)
+        dialog.assert_not_called()
+
+    def test_success_returns_zero_without_dialog(self):
+        with mock.patch.object(router, "_sudoers_installed", return_value=True), \
+             mock.patch.object(router, "_elevate_macos", return_value=42) as dialog, \
+             mock.patch.object(router.subprocess, "run", return_value=self._probe(0)):
+            rc = router._elevate()
+        self.assertEqual(rc, 0)
+        dialog.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

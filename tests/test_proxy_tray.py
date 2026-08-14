@@ -118,5 +118,60 @@ class HumanizeTests(unittest.TestCase):
         self.assertEqual(tray._humanize(""), "")
 
 
+class RunElevatedFallbackTests(unittest.TestCase):
+    """`_run_elevated` falls back to the admin dialog when `sudo -n`
+    denies (stale grant missing a command shape added later), but returns
+    a real elevated-command failure unchanged (no dialog for an engine
+    error)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.client = tray.RouterClient(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+
+    def _probe(self, returncode, stdout="", stderr=""):
+        return type("P", (), {"returncode": returncode, "stdout": stdout, "stderr": stderr})()
+
+    def test_sudo_denial_falls_back_to_osascript(self):
+        with mock.patch.object(tray, "_sudoers_ok", return_value=True), \
+             mock.patch.object(tray.subprocess, "run") as run:
+            run.side_effect = [
+                self._probe(1, stderr="a password is required"),
+                self._probe(0, stdout="stopped"),
+            ]
+            rc, out = self.client._run_elevated("stop")
+        self.assertEqual((rc, out), (0, "stopped"))
+        self.assertEqual(run.call_args.args[0][0], "osascript")
+
+    def test_sudoers_denial_token_falls_back_to_osascript(self):
+        with mock.patch.object(tray, "_sudoers_ok", return_value=True), \
+             mock.patch.object(tray.subprocess, "run") as run:
+            run.side_effect = [
+                self._probe(1, stderr="kyson is not in the sudoers file"),
+                self._probe(0, stdout="stopped"),
+            ]
+            rc, out = self.client._run_elevated("stop")
+        self.assertEqual((rc, out), (0, "stopped"))
+        self.assertEqual(run.call_args.args[0][0], "osascript")
+
+    def test_elevated_command_failure_returns_rc_without_osascript(self):
+        with mock.patch.object(tray, "_sudoers_ok", return_value=True), \
+             mock.patch.object(tray.subprocess, "run") as run:
+            run.return_value = self._probe(3, stderr="router: engine failed to start")
+            rc, out = self.client._run_elevated("stop")
+        self.assertEqual(rc, 3)
+        self.assertEqual(run.call_args.args[0][0], "sudo")
+        self.assertEqual(run.call_count, 1)
+
+    def test_success_returns_without_osascript(self):
+        with mock.patch.object(tray, "_sudoers_ok", return_value=True), \
+             mock.patch.object(tray.subprocess, "run") as run:
+            run.return_value = self._probe(0, stdout="stopped")
+            rc, out = self.client._run_elevated("stop")
+        self.assertEqual((rc, out), (0, "stopped"))
+        self.assertEqual(run.call_args.args[0][0], "sudo")
+        self.assertEqual(run.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
