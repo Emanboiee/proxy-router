@@ -488,6 +488,10 @@ config changes are needed.
   process; a stale pid file with a dead listener needs a `start`.
 - macOS system proxy toggles use the active network service (the default
   route's hardware port), so Wi-Fi won't be missed when on Ethernet.
+- WARP tunnel dead on every probe while Proton works — your network may be
+  dropping UDP `2408`; switch the profile's `Endpoint` to `4500` and reload
+  (see [guides/cloudflare-warp.md](guides/cloudflare-warp.md) →
+  Troubleshooting).
 
 ## Development
 
