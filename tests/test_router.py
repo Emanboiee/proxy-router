@@ -27,6 +27,7 @@ def _relocate(module, root: Path) -> None:
     module.LOG_FILE = module.ROOT / "sing-box.log"
     module.LOCK_FILE = module.ROOT / "state" / "engine.lock"
     module.MODE_FILE = module.ROOT / "state" / "mode"
+    module.MANUAL_OFF_FILE = module.ROOT / "state" / "manual-off"
 
 
 def _write_conf(path: Path, *, psk: bool = True, mtu: bool = True, keepalive: bool = True) -> None:
@@ -105,7 +106,8 @@ class ConfigBuildTests(unittest.TestCase):
 
     def test_build_config_maps_routes_and_skips_empty_provider(self):
         config, active = router.build_singbox_config()
-        self.assertEqual(active, {"proton"})
+        self.assertEqual(set(active), {"proton"})
+        self.assertEqual(active["proton"].name, "a.conf")
         self.assertEqual([e["tag"] for e in config["endpoints"]], ["proton"])
         dns_tags = [s["tag"] for s in config["dns"]["servers"]]
         self.assertIn("dns-proton", dns_tags)
@@ -203,6 +205,9 @@ class RotationTests(unittest.TestCase):
         for name in ("a", "b"):
             _write_conf(self.root / "providers" / "proton" / f"{name}.conf")
         router._providers = {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}}
+        # Pin rotation to the default policy: RotationPolicyTests runs before
+        # this class (alphabetical order) and leaves "least-recent" behind.
+        router._rotation = dict(router.DEFAULT_ROTATION_SETTINGS)
         # rotate() probes egress through the tunnel; tests never touch the network.
         self._probe = mock.patch.object(router, "probe_profile", return_value=(True, {"ok": True}))
         self._probe.start()
@@ -265,11 +270,17 @@ class VpnModeTests(unittest.TestCase):
         router.set_mode("tun")
         config, _ = router.build_singbox_config()
         inbounds = config["inbounds"]
-        self.assertEqual(len(inbounds), 1)
+        # Mixed proxy listener stays alongside the TUN so apps pinned to
+        # 127.0.0.1:PORT keep working while TUN captures everything else.
+        self.assertEqual(len(inbounds), 2)
         self.assertEqual(inbounds[0]["type"], "tun")
         self.assertEqual(inbounds[0]["address"], ["172.19.0.1/30"])
         self.assertEqual(inbounds[0]["stack"], "system")
         self.assertTrue(inbounds[0]["auto_route"])
+        self.assertEqual(inbounds[1], {
+            "type": "mixed", "tag": "local-proxy",
+            "listen": "127.0.0.1", "listen_port": 2080,
+        })
         self.assertEqual(config["route"]["final"], "direct")
 
     def test_proxy_mode_builds_mixed_inbound(self):
@@ -1809,7 +1820,8 @@ class RoutingModeTests(unittest.TestCase):
 
     def test_default_mode_byte_compatible(self):
         config, active = router.build_singbox_config()
-        self.assertEqual(active, {"proton"})
+        self.assertEqual(set(active), {"proton"})
+        self.assertEqual(active["proton"].name, "a.conf")
         self.assertEqual(config["route"]["final"], "direct")
         self.assertEqual(config["route"]["rules"], [
             {"outbound": "proton", "domain_suffix": ["example.com"]},
@@ -1934,7 +1946,7 @@ class RoutingModeTests(unittest.TestCase):
         self.assertEqual(router.load_config(), 1)
 
     def test_vpn_list_final_direct_and_pins_intact(self):
-        router._routing = {"mode": "vpn-list", "vpn_domains": ["blocked.example"]}
+        router._routing = {"mode": "vpn-list", "vpn_domains": ["example.com"]}
         config, _ = router.build_singbox_config()
         self.assertEqual(config["route"]["final"], "direct")
         # tunnel pins intact and no direct-pin/dns rules were added
@@ -2124,6 +2136,114 @@ class ScheduledRotationTests(unittest.TestCase):
             data = router.status_json()
         self.assertEqual(data["rotation"]["interval_seconds"], 3600)
         self.assertIn("next_at", data["rotation"])
+
+
+class RotationPolicyTests(unittest.TestCase):
+    """Autoroute: rotation policy 'latency' (default) vs 'least-recent'."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(router, self.root)
+        (self.root / "providers" / "proton").mkdir(parents=True)
+        (self.root / "state").mkdir(parents=True)
+        for name in ("a", "b", "c"):
+            _write_conf(self.root / "providers" / "proton" / f"{name}.conf")
+        router._providers = {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}}
+        router._rotation = {"interval_seconds": 0, "jitter_seconds": 300, "policy": "latency"}
+        router._routes = []
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _profile(self, stem):
+        return self.root / "providers" / "proton" / f"{stem}.conf"
+
+    def _set_policy(self, policy):
+        router._load_rotation_settings({"rotation": {"policy": policy}})
+
+    def _seed_ok(self, stem, last_ok_at, latency_ms=None):
+        record = {"last_ok_at": last_ok_at, "checked_at": last_ok_at, "fails": 0}
+        if latency_ms is not None:
+            record["latency_ms"] = latency_ms
+        router.write_egress("proton", self._profile(stem), record)
+
+    def _active_stem(self):
+        return (self.root / "state" / "proton.active").read_text()
+
+    def test_default_policy_is_latency(self):
+        self.assertEqual(router.rotation_policy(), "latency")
+
+    def test_least_recent_policy_loaded(self):
+        self._set_policy("least-recent")
+        self.assertEqual(router.rotation_policy(), "least-recent")
+
+    def test_invalid_policy_rejected(self):
+        with self.assertRaises(ValueError):
+            self._set_policy("round-robin")
+
+    def _cool(self, stem):
+        path = self.root / "state" / "cooldowns" / "proton" / f"{stem}.until"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(int(time.time()) + 3600))
+
+    def _rotate_ranked(self):
+        with mock.patch.object(router, "engine_reload", return_value=0), \
+                mock.patch.object(router, "probe_profile", return_value=(True, {"ok": True})):
+            return router.rotate("proton")
+
+    def test_lru_key_oldest_ok_wins(self):
+        self._set_policy("least-recent")
+        router.set_active("proton", self._profile("a"))
+        self._cool("a")
+        self._seed_ok("b", int(time.time()) - 1 * 3600)
+        self._seed_ok("c", int(time.time()) - 2 * 3600)
+        self.assertEqual(self._rotate_ranked(), 0)
+        self.assertEqual(self._active_stem(), "c")
+
+    def test_least_recent_never_used_wins(self):
+        self._set_policy("least-recent")
+        router.set_active("proton", self._profile("a"))
+        self._cool("a")
+        self._seed_ok("b", int(time.time()) - 3600)
+        self.assertEqual(self._rotate_ranked(), 0)
+        self.assertEqual(self._active_stem(), "c")
+
+    def test_least_recent_skips_recently_failed(self):
+        self._set_policy("least-recent")
+        router.set_active("proton", self._profile("a"))
+        self._cool("a")
+        self._seed_ok("b", int(time.time()) - 3600)
+        router.write_egress("proton", self._profile("c"), {
+            "last_ok_at": None, "checked_at": int(time.time() - 100),
+            "fails": 2, "latency_ms": None})
+        self.assertEqual(self._rotate_ranked(), 0)
+        self.assertEqual(self._active_stem(), "b")
+
+    def test_least_recent_excludes_blocked(self):
+        self._set_policy("least-recent")
+        router.set_active("proton", self._profile("a"))
+        self._cool("a")
+        self._seed_ok("b", int(time.time()) - 3600)
+        router.write_egress("proton", self._profile("c"), {
+            "last_ok_at": int(time.time() - 1), "checked_at": int(time.time() - 1),
+            "fails": 0, "blocked_until": int(time.time()) + 3600})
+        self.assertEqual(self._rotate_ranked(), 0)
+        self.assertEqual(self._active_stem(), "b")
+
+    def test_latency_policy_prefers_fastest_over_oldest(self):
+        router.set_active("proton", self._profile("a"))
+        self._cool("a")
+        self._seed_ok("a", int(time.time()) - 28800, latency_ms=200)
+        self._seed_ok("b", int(time.time()) - 3600, latency_ms=40)
+        self.assertEqual(self._rotate_ranked(), 0)
+        self.assertEqual(self._active_stem(), "b")
+
+    def test_status_json_exposes_policy(self):
+        data = router.status_json()
+        self.assertEqual(data["rotation"]["policy"], "latency")
+        self._set_policy("least-recent")
+        self.assertEqual(router.status_json()["rotation"]["policy"], "least-recent")
 
 
 class WithProxyTests(unittest.TestCase):
