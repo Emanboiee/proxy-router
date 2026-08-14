@@ -105,7 +105,11 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py rotate <provider> --reason 503|429|timeout|1010  # mark CURRENT exit failed upstream, prefer a different one
 ./router.py rotate <provider> --force   # switch anyway, ignoring cooldowns and blocked exits
 ./router.py rotate <provider> --no-probe # skip the post-switch egress probe
+./router.py rotate --if-due      # scheduled rotation: only when the interval elapsed (exit 3 = not due)
 ./router.py provider-count proton # rotation candidates (retry budget)
+./router.py with-proxy [--timeout-ms 300] [--force-proxy|--force-direct] -- <cmd...>
+                                 # fail-open runner: exec <cmd> through the proxy when up, else direct
+./router.py with-proxy --check   # health check: prints proxy URL + exit 0 when up, exit 1 when down
 ./router.py egress probe [provider]  # probe current exit(s) through the tunnel, persist health
 ./router.py egress show [provider]   # print persisted egress records (JSON)
 ./router.py egress check [--provider <name>] [--json]  # read-only live check: exit 1 ONLY when an active exit is DEAD
@@ -310,7 +314,8 @@ replaced by public DNS through the tunnel.
   "routes": [
     { "id": "opencode-zen", "domains": ["opencode.ai"], "provider": "proton" },
     { "id": "roblox", "domains": ["roblox.com", "rbxcdn.com", "robloxlabs.com", "rblx.com"], "provider": "cloudflare" }
-  ]
+  ],
+  "rotation": { "interval_seconds": 7200, "jitter_seconds": 300 }
 }
 ```
 
@@ -396,6 +401,58 @@ rotations are capped at `PROXY_KEEPALIVE_MAX_ROTATIONS` (default 2) per
 `PROXY_KEEPALIVE_STORM_WINDOW` seconds (default 600), so a genuinely broken
 pool can never rotation-storm.
 
+## Scheduled rotation
+
+By default the router only rotates reactively (dead tunnel, upstream
+429/503/...). With a `rotation` block in `router.json` the keepalive loop also
+rotates proactively on a fixed cadence, so the active exit's egress IP churns
+before upstream rate limits accumulate:
+
+```json
+"rotation": { "interval_seconds": 7200, "jitter_seconds": 300 }
+```
+
+- `interval_seconds` — rotate every N seconds (0 or absent = off; default
+  config enables 7200 = 2h).
+- `jitter_seconds` — spread the next rotation by ±jitter/2 around the exact
+  interval (default 300), so the switch doesn't tick in lockstep with other
+  clients on the same provider.
+- Every healthy keepalive tick runs `router.py rotate --if-due`; it reads
+  `state/<provider>.rotation` and only acts once the interval has elapsed
+  (exit 0 = rotated, 3 = not due). It is skipped automatically while the
+  engine is down or `manual-off` is set.
+- A provider with no rotation record yet is seeded as "rotated now", so a
+  fresh install waits a full interval before the first switch.
+- Scheduled switches reuse the normal `rotate` path: verify-then-switch with
+  rollback, per-provider cooldowns, and storm-guarded by nothing extra — the
+  cadence itself is the guard. The current exit is NOT marked as an upstream
+  failure (a scheduled switch is a preference, not a failure signal).
+- `router.py status --json` reports `rotation.interval_seconds`,
+  `rotation.jitter_seconds`, and `rotation.next_at` (earliest upcoming switch).
+
+Manual rotation still works as before; scheduled rotation never forces past a
+blocked/cooldown profile.
+
+## Fail-open proxy runner
+
+Apps pointed at `127.0.0.1:<port>` (hermes, curl, a cron job, ...) break when
+the engine is down. `with-proxy` wraps any command with a health check: when
+the listener answers it runs the command with `http_proxy`/`https_proxy` (and
+uppercase variants) set, otherwise it strips those vars and runs DIRECT — the
+engine is never started, so `manual-off` stays honored:
+
+```sh
+./router.py with-proxy -- hermes model@opencode "..."   # proxy when up, direct otherwise
+./router.py with-proxy --check                          # prints http://127.0.0.1:2080, exit 0 when up
+./router.py with-proxy --force-proxy -- cmd...          # refuse (exit 4) instead of running direct
+./router.py with-proxy --force-direct -- cmd...         # always direct, skip the probe
+```
+
+Flags: `--timeout-ms` (probe timeout, default 300). The child replaces the
+wrapper via exec, so exit codes and signals pass through untouched. `--check`
+is what scripts should use for one-shot health checks (exit 0/1, prints the
+URL only when up).
+
 ## Hermes integration
 
 Point `hermes` at the proxy (`http://127.0.0.1:2080` via
@@ -404,6 +461,13 @@ on rate-limit/transient-http/transport failures it rotates the provider pool
 once per profile and retries the exact same command after 15s
 (`OPENCODE_RETRY_DELAY_SECONDS` to override, `OPENCODE_MAX_ATTEMPTS` to cap,
 `OPENCODE_PROVIDER` to change the pool).
+
+The wrapper is fail-open: it pre-flights with `router.py with-proxy --check`
+and only sets the proxy env while the listener is up. When the router is
+stopped or disabled, hermes runs DIRECT (no rotation, no engine resurrection)
+so it keeps working without the tunnel — useful when the Proton egress is
+rate-limited and you just want opencode to work. Rotation on failure resumes
+automatically once the proxy is back up.
 
 The Hermes `opencode_server_rotation` plugin expects a rotation manager at
 `tools/opencode-zen-vpn/proxy-manager.sh` (its `rotate` subcommand). That

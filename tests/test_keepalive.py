@@ -165,15 +165,22 @@ class KeepaliveEgressCheckTests(unittest.TestCase):
     def test_boot_self_test_healthy_logs_and_never_rotates(self):
         h = KeepaliveHarness(probe_every="2")
         try:
-            lines = h.wait_lines(12)
+            lines = h.wait_lines(20)
             h.close()
             self.assertIn("router: boot self-test ok", h.out,
                           f"healthy boot line missing:\nstdout={h.out!r}\nstderr={h.err!r}")
-            rotates = [l for l in lines if l.startswith("rotate")]
+            # The scheduled-rotation check (`rotate --if-due`) runs every
+            # healthy tick and self-gates on its interval; the boot self-test
+            # must never trigger an EMERGENCY provider rotation.
+            rotates = [l for l in lines if l.startswith("rotate proton")]
             self.assertEqual(rotates, [])
-            # cadence: periodic checks every PROBE_EVERY(2) ensures after boot
-            check_lines = [i for i, l in enumerate(lines) if l == "egress check"]
-            self.assertGreaterEqual(len(check_lines), 4, f"too few checks: {lines}")
+            # cadence: periodic checks every PROBE_EVERY(2) ensures after boot.
+            # `rotate --if-due` entries are tick noise, so measure gaps on the
+            # filtered list.
+            checks = [l for l in lines if l == "egress check"]
+            self.assertGreaterEqual(len(checks), 4, f"too few checks: {lines}")
+            ticks = [l for l in lines if l != "rotate --if-due"]
+            check_lines = [i for i, l in enumerate(ticks) if l == "egress check"]
             gaps = [b - a for a, b in zip(check_lines, check_lines[1:])]
             # every PROBE_EVERY ensures triggers a check; log distance is
             # PROBE_EVERY + 1 because the ensure line sits between checks

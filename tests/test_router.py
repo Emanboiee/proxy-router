@@ -2051,5 +2051,171 @@ class RoutingCliTests(unittest.TestCase):
             self.assertEqual(data["routing"]["mode"], "default")
 
 
+class ScheduledRotationTests(unittest.TestCase):
+    """rotate_due / next_rotation_at / _load_rotation_settings (scheduled rotation)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(router, self.root)
+        (self.root / "providers" / "proton").mkdir(parents=True)
+        (self.root / "state").mkdir(parents=True)
+        for name in ("a", "b"):
+            _write_conf(self.root / "providers" / "proton" / f"{name}.conf")
+        router._providers = {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}}
+        router._rotation = {"interval_seconds": 3600, "jitter_seconds": 300}
+        router._routes = []
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _rotation_record(self) -> int:
+        path = self.root / "state" / "proton.rotation"
+        self.assertTrue(path.is_file(), "rotation record was not written")
+        return int(json.loads(path.read_text())["at"])
+
+    def test_load_rotation_settings_rejects_negative(self):
+        with self.assertRaises(ValueError):
+            router._load_rotation_settings({"rotation": {"interval_seconds": -1, "jitter_seconds": 0}})
+
+    def test_load_rotation_settings_defaults_when_absent(self):
+        router._load_rotation_settings({})
+        self.assertEqual(router.scheduled_interval(), 0)
+        self.assertEqual(router._rotation["jitter_seconds"], 300)
+
+    def test_rotate_due_disabled_returns_3(self):
+        router._rotation = {"interval_seconds": 0, "jitter_seconds": 300}
+        self.assertEqual(router.rotate_due("proton"), 3)
+
+    def test_rotate_due_seeds_missing_record(self):
+        # No rotation record yet: the first pass seeds "rotated now" (returns 0)
+        # so a fresh install waits a full interval before the first switch.
+        router.set_active("proton", self.root / "providers" / "proton" / "b.conf")
+        self.assertEqual(router.rotate_due("proton"), 0)
+        record = json.loads((self.root / "state" / "proton.rotation").read_text())
+        self.assertEqual(record["profile"], "b")
+
+    def test_rotate_due_not_due_returns_3(self):
+        (self.root / "state" / "proton.rotation").write_text(
+            json.dumps({"profile": "a", "at": int(time.time())}), encoding="utf-8")
+        with mock.patch.object(router, "rotate", side_effect=AssertionError("must not rotate when not due")):
+            self.assertEqual(router.rotate_due("proton"), 3)
+
+    def test_rotate_due_rotates_when_interval_elapsed(self):
+        router.set_active("proton", self.root / "providers" / "proton" / "a.conf")
+        backdated = int(time.time()) - 7200  # two full intervals ago
+        (self.root / "state" / "proton.rotation").write_text(
+            json.dumps({"profile": "a", "at": backdated}), encoding="utf-8")
+        with mock.patch.object(router, "engine_reload", return_value=0), \
+                mock.patch.object(router, "probe_profile", return_value=(True, {"ok": True})):
+            self.assertEqual(router.rotate_due("proton"), 0)
+        self.assertGreater(self._rotation_record(), backdated)
+
+    def test_next_rotation_at_is_deterministic(self):
+        at = int(time.time()) - 3600
+        (self.root / "state" / "proton.rotation").write_text(
+            json.dumps({"profile": "a", "at": at}), encoding="utf-8")
+        self.assertEqual(router.next_rotation_at("proton"), router.next_rotation_at("proton"))
+
+    def test_status_json_reports_rotation(self):
+        (self.root / "state" / "proton.rotation").write_text(
+            json.dumps({"profile": "b", "at": int(time.time()) - 7200}), encoding="utf-8")
+        with mock.patch.object(router, "_status_report", return_value=(0, "ok")):
+            data = router.status_json()
+        self.assertEqual(data["rotation"]["interval_seconds"], 3600)
+        self.assertIn("next_at", data["rotation"])
+
+
+class WithProxyTests(unittest.TestCase):
+    """with-proxy fail-open runner (listener probe + env set/strip)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(router, self.root)
+        self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._srv.bind(("127.0.0.1", 0))
+        self._srv.listen(1)
+        self.port = self._srv.getsockname()[1]
+        (self.root / "router.json").write_text(
+            json.dumps({"port": self.port}), encoding="utf-8")
+
+    def tearDown(self):
+        self._srv.close()
+        self._tmp.cleanup()
+
+    def _exec_through(self, healthy: bool) -> dict:
+        """Run with_proxy against a (possibly down) listener and capture the
+        env the child would receive, using a fake execvpe that stops here."""
+        caught = {}
+
+        def fake_execvpe(file, argv, env):
+            caught.update({"file": file, "argv": argv, "env": env})
+            raise SystemExit(0)
+
+        if not healthy:
+            self._srv.close()
+        with mock.patch.object(router.os, "execvpe", side_effect=fake_execvpe):
+            with self.assertRaises(SystemExit):
+                router.with_proxy(["/bin/echo", "hi"], timeout_ms=200)
+        return caught
+
+    def test_check_up_prints_url_and_exit_0(self):
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(router.with_proxy([], check=True, timeout_ms=200), 0)
+        self.assertEqual(out.getvalue().strip(), f"http://127.0.0.1:{self.port}")
+
+    def test_check_down_exit_1(self):
+        self._srv.close()
+        self.assertEqual(router.with_proxy([], check=True, timeout_ms=200), 1)
+
+    def test_force_proxy_refused_when_down(self):
+        self._srv.close()
+        self.assertEqual(router.with_proxy(["/bin/echo"], force_proxy=True, timeout_ms=200), 4)
+
+    def test_force_proxy_and_direct_rejected(self):
+        self.assertEqual(router.with_proxy(["/bin/echo"], force_proxy=True, force_direct=True, timeout_ms=200), 1)
+
+    def test_missing_command_rejected(self):
+        self.assertEqual(router.with_proxy([], timeout_ms=200), 1)
+
+    def test_proxy_env_set_when_healthy(self):
+        caught = self._exec_through(healthy=True)
+        self.assertEqual(caught["env"].get("http_proxy"), f"http://127.0.0.1:{self.port}")
+        self.assertEqual(caught["env"].get("HTTPS_PROXY"), f"http://127.0.0.1:{self.port}")
+
+    def test_proxy_env_stripped_when_down(self):
+        os.environ["http_proxy"] = "http://stale.example:8080"
+        try:
+            caught = self._exec_through(healthy=False)
+            self.assertNotIn("http_proxy", caught["env"])
+            self.assertNotIn("HTTPS_PROXY", caught["env"])
+        finally:
+            os.environ.pop("http_proxy", None)
+
+    def test_force_direct_skips_probe_even_when_healthy(self):
+        caught = self._exec_through_variant(force_direct=True)
+        self.assertNotIn("http_proxy", caught["env"])
+
+    def _exec_through_variant(self, force_direct: bool = False) -> dict:
+        caught = {}
+
+        def fake_execvpe(file, argv, env):
+            caught.update({"env": env})
+            raise SystemExit(0)
+
+        with mock.patch.object(router.os, "execvpe", side_effect=fake_execvpe):
+            with self.assertRaises(SystemExit):
+                router.with_proxy(["/bin/echo"], force_direct=force_direct, timeout_ms=200)
+        return caught
+
+    def test_config_port_falls_back_to_default(self):
+        (self.root / "router.json").unlink()
+        self.assertEqual(router._config_port(), router.DEFAULT_PORT)
+
+
 if __name__ == "__main__":
     unittest.main()
