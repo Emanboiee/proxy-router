@@ -104,5 +104,16 @@
     "interval_seconds": 7200,
     "jitter_seconds": 300,
     "policy": "latency"
+  },
+  "keepalive": {
+    "preset": "balanced",
+    "enabled": true,
+    "interval": 15,
+    "max_backoff": 300,
+    "probe_every": 4,
+    "dead_strikes": 2,
+    "storm_window": 600,
+    "max_rotations": 2,
+    "sweep_every": 1800
   }
 }

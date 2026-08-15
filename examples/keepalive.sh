@@ -45,6 +45,7 @@
 #   PROXY_KEEPALIVE_STORM_WINDOW   rotation-guard window in seconds    (600)
 #   PROXY_KEEPALIVE_MAX_ROTATIONS  max keepalive rotations per window  (2)
 #   PROXY_KEEPALIVE_SWEEP_EVERY    full-pool egress sweep every N seconds (1800)
+#   PROXY_KEEPALIVE_ENABLED        temporary on/off override               (config)
 set -uo pipefail
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -53,13 +54,45 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 if [ ! -f "$ROOT/router.py" ] && [ -f "$(dirname "$ROOT")/router.py" ]; then
   ROOT="$(dirname "$ROOT")"
 fi
-INTERVAL="${PROXY_KEEPALIVE_INTERVAL:-15}"
-MAX_BACKOFF="${PROXY_KEEPALIVE_MAX_BACKOFF:-300}"
-PROBE_EVERY="${PROXY_KEEPALIVE_PROBE_EVERY:-4}"
-DEAD_STRIKES="${PROXY_KEEPALIVE_DEAD_STRIKES:-2}"
-STORM_WINDOW="${PROXY_KEEPALIVE_STORM_WINDOW:-600}"
-MAX_ROTATIONS="${PROXY_KEEPALIVE_MAX_ROTATIONS:-2}"
-SWEEP_EVERY="${PROXY_KEEPALIVE_SWEEP_EVERY:-1800}"
+
+# Read one validated value from router.json. Environment variables below win,
+# so launchd/system operators can make temporary changes without rewriting
+# config. Missing or malformed config falls back to the safe defaults.
+config_setting() {
+  python3 - "$ROOT/router.json" "$1" "$2" <<'PY' 2>/dev/null || printf '%s\n' "$2"
+import json
+import sys
+
+path, key, default = sys.argv[1:]
+try:
+    data = json.loads(open(path, encoding="utf-8").read())
+    value = (data.get("keepalive") or {}).get(key, default)
+    if key == "enabled":
+        print("1" if value not in (False, 0, "0", "false", "off") else "0")
+    else:
+        value = int(value)
+        if value < 1:
+            raise ValueError
+        print(value)
+except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    raise SystemExit(1)
+PY
+}
+
+ENABLED="${PROXY_KEEPALIVE_ENABLED:-$(config_setting enabled 1)}"
+case "$ENABLED" in
+  0|false|False|off|OFF)
+    echo "router: autocheck disabled"
+    exit 0
+    ;;
+esac
+INTERVAL="${PROXY_KEEPALIVE_INTERVAL:-$(config_setting interval 15)}"
+MAX_BACKOFF="${PROXY_KEEPALIVE_MAX_BACKOFF:-$(config_setting max_backoff 300)}"
+PROBE_EVERY="${PROXY_KEEPALIVE_PROBE_EVERY:-$(config_setting probe_every 4)}"
+DEAD_STRIKES="${PROXY_KEEPALIVE_DEAD_STRIKES:-$(config_setting dead_strikes 2)}"
+STORM_WINDOW="${PROXY_KEEPALIVE_STORM_WINDOW:-$(config_setting storm_window 600)}"
+MAX_ROTATIONS="${PROXY_KEEPALIVE_MAX_ROTATIONS:-$(config_setting max_rotations 2)}"
+SWEEP_EVERY="${PROXY_KEEPALIVE_SWEEP_EVERY:-$(config_setting sweep_every 1800)}"
 
 backoff="$INTERVAL"
 boot=1

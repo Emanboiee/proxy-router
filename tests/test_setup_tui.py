@@ -768,6 +768,32 @@ class RoutingTuiTests(unittest.TestCase):
             self.assertIn("NOT reloaded", text)
 
 
+class AutocheckConfigTests(unittest.TestCase):
+    def test_light_preset_and_override_preserve_routes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "router.json"
+            config.write_text(json.dumps({"routes": [{"id": "keep"}]}))
+            settings = setup_tui.configure_autocheck(
+                config, "light", sweep_every=3600, probe_every=20
+            )
+            self.assertTrue(settings["enabled"])
+            self.assertEqual(settings["preset"], "light")
+            self.assertEqual(settings["sweep_every"], 3600)
+            self.assertEqual(settings["probe_every"], 20)
+            self.assertEqual(json.loads(config.read_text())["routes"], [{"id": "keep"}])
+
+    def test_off_disables_autocheck(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "router.json"
+            setup_tui.configure_autocheck(config, "off")
+            self.assertFalse(json.loads(config.read_text())["keepalive"]["enabled"])
+
+    def test_rejects_zero_interval(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError):
+                setup_tui.configure_autocheck(Path(tmp) / "router.json", interval=0)
+
+
 if __name__ == "__main__":
     unittest.main()
 

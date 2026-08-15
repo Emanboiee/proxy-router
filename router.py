@@ -448,6 +448,17 @@ def write_default_config(force: bool = False) -> int:
             # Scheduled rotation: churn the active exits every 2h (with
             # ±150s jitter) so upstream rate limits see a fresh egress IP.
             "rotation": {"interval_seconds": 7200, "jitter_seconds": 300, "policy": "latency"},
+            "keepalive": {
+                "preset": "balanced",
+                "enabled": True,
+                "interval": 15,
+                "max_backoff": 300,
+                "probe_every": 4,
+                "dead_strikes": 2,
+                "storm_window": 600,
+                "max_rotations": 2,
+                "sweep_every": 1800,
+            },
             "error_policy": {
                 "default": {"action": "cooldown", "seconds": 300},
                 "429": {"action": "exhaust", "seconds": 900},
@@ -3782,6 +3793,41 @@ def _needs_elevation(args) -> bool:
             and (mode == "tun" or _engine_runs_as_root()))
 
 
+def profile_copy(provider: str, sources: list[str]) -> int:
+    """Copy validated local WireGuard profiles into a configured provider.
+
+    This is the short, scriptable path for sharing profiles: it accepts files
+    or directories, sanitizes names, avoids overwrites, and preserves private
+    profile permissions without ever printing profile contents.
+    """
+    if not isinstance(provider, str) or not _PROVIDER_NAME.fullmatch(provider):
+        return fail(f"profile copy: invalid provider '{provider}'")
+    if provider not in _providers:
+        return fail(f"profile copy: unknown provider '{provider}'")
+    try:
+        import setup_tui
+        destination = provider_dir(provider)
+        results = []
+        for raw in sources:
+            source = Path(os.path.expanduser(raw))
+            results.append(setup_tui.import_profiles(source, destination))
+    except (OSError, ValueError, TypeError) as exc:
+        return fail(f"profile copy: {exc}")
+    imported = sum(result["imported"] for result in results)
+    rejected = sum(result["rejected"] for result in results)
+    files = [name for result in results for name in result["files"]]
+    rejected_files = [entry for result in results for entry in result["rejected_files"]]
+    if imported:
+        print(f"profile copy: imported {imported} profile(s) into {destination.relative_to(ROOT)}")
+        for name in files:
+            print(f"  + {name}")
+    for entry in rejected_files:
+        print(f"  - {entry['name']}: {entry['reason']}", file=sys.stderr)
+    if rejected:
+        print(f"profile copy: rejected {rejected} file(s)", file=sys.stderr)
+    return 0 if imported else 1
+
+
 def _elevate_macos() -> int:
     """Re-run the current command with administrator privileges (macOS).
 
@@ -4066,6 +4112,15 @@ def main() -> int:
     r_count = sub.add_parser("provider-count")
     r_count.add_argument("provider")
 
+    profile = sub.add_parser("profile", help="manage local WireGuard profiles")
+    profile_sub = profile.add_subparsers(dest="profile_action")
+    profile_copy_parser = profile_sub.add_parser(
+        "copy", help="copy validated .conf file(s)/directory into a provider"
+    )
+    profile_copy_parser.add_argument("sources", nargs="+", metavar="PATH")
+    profile_copy_parser.add_argument("--provider", required=True,
+                                    help="configured destination provider (e.g. proton)")
+
     elevate = sub.add_parser("elevate", help="one-time passwordless-sudo grant (install|uninstall|status)")
     elevate.add_argument("action", choices=["install", "uninstall", "status"])
 
@@ -4246,6 +4301,10 @@ def main() -> int:
     if args.cmd == "provider-count":
         print(provider_count(args.provider))
         return 0
+    if args.cmd == "profile":
+        if args.profile_action == "copy":
+            return profile_copy(args.provider, args.sources)
+        parser.error("profile needs an action: copy")
     if args.cmd == "routes":
         return routes_list()
     if args.cmd == "routing":

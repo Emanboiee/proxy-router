@@ -57,6 +57,8 @@ proxy-router init
 proxy-router setup --guide all
 proxy-router setup --import-proton ~/Downloads/protonvpn-*.conf
 proxy-router setup --import-warp ~/Downloads/wgcf-profile.conf  # optional
+proxy-router profile copy ~/Downloads/friend-proton.conf --provider proton
+proxy-router setup --autocheck light  # low-resource machine
 proxy-router setup --preset
 proxy-router setup --fallback proton --fallback-to cloudflare,mullvad
 proxy-router setup --keepalive-install  # macOS: supervise unattended 24/7 operation
@@ -129,6 +131,7 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py egress show [provider]   # print persisted egress records (JSON)
 ./router.py egress check [--provider <name>] [--json]  # read-only live check: exit 1 ONLY when an active exit is DEAD
 ./router.py egress sweep [provider] [--json]  # full-pool sweep: probe EVERY profile, end on the best alive exit
+./router.py profile copy PATH [PATH ...] --provider proton  # validate + copy shared .conf profiles safely
 ./router.py status --json         # machine-readable status for scripts/Hermes
 ./router.py setup                  # custom setup TUI
 ./router.py setup --guide all      # print Proton + WARP guides
@@ -138,6 +141,8 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py setup --transparent  # apps need no HTTP_PROXY; configured routes use TUN
 ./router.py setup --transparent-off
 ./router.py setup --keepalive-install  # install the macOS 24/7 launchd supervisor
+./router.py setup --autocheck off|light|balanced|aggressive  # resource-aware health-check preset
+./router.py setup --autocheck-sweep-every 7200 --autocheck-probe-every 12  # explicit tuning overrides
 ./router.py setup --check          # validate imported profiles without networking
 ./router.py setup --bridge-install # install/verify the Hermes OpenCode rotation bridge
 ./router.py setup --bridge-check   # verify the installed bridge without writing
@@ -150,6 +155,32 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py up                   # enable macOS system proxy (also ensures engine)
 ./router.py down                 # disable macOS system proxy only (engine keeps running)
 ```
+
+### Auto-check tuning and shared profiles
+
+The launchd keepalive reads the `keepalive` block from `router.json`. Choose a
+resource profile during setup:
+
+```sh
+proxy-router setup --autocheck light       # fewer probes/sweeps
+proxy-router setup --autocheck balanced    # default
+proxy-router setup --autocheck aggressive  # frequent health checks
+proxy-router setup --autocheck off          # leave the supervisor installed but idle
+```
+
+Every numeric knob also has a `--autocheck-*` override, and matching
+`PROXY_KEEPALIVE_*` environment variables take precedence for temporary
+runtime tuning. A shared WireGuard profile can be copied without hand-editing
+config:
+
+```sh
+proxy-router profile copy ~/Downloads/*.conf --provider proton
+```
+
+Files are structurally validated, renamed safely on collisions, written with
+`0600` permissions, and never printed. The router does not download arbitrary
+URLs or trust profile contents just because someone sent them. Tiny security
+win, surprisingly useful.
 
 ### Response-aware error recovery (opt-in)
 
