@@ -2106,7 +2106,7 @@ def main(argv=None, root=None) -> int:
             result = configure_fallback(ROOT / "router.json", primary, candidates or [])
             chain = " -> ".join(result["fallback_providers"]) or "(none)"
             print(_style(f"setup: fallback chain {primary} -> {chain}", _Ansi.GREEN))
-            print("setup: run `proxy-router ensure` (or reload) to apply; the engine is untouched.")
+            print("setup: run `proxy-router reload` to apply (or `ensure` if stopped); the engine was not restarted.")
         except (ValueError, json.JSONDecodeError, OSError) as exc:
             print(_style(f"setup: fallback configuration failed: {exc}", _Ansi.RED), file=sys.stderr)
             rc = max(rc, 1)
@@ -2125,7 +2125,7 @@ def main(argv=None, root=None) -> int:
             else:
                 label += " (already present, nothing added)"
             print(_style(_tint_provider(label), _Ansi.GREEN))
-            print("setup: run `proxy-router ensure` (or reload) to apply; the engine is untouched.")
+            print("setup: run `proxy-router reload` to apply (or `ensure` if stopped); the engine was not restarted.")
         except (ValueError, json.JSONDecodeError, OSError) as exc:
             print(_style(f"setup: preset apply failed: {exc}", _Ansi.RED), file=sys.stderr)
             rc = max(rc, 1)
