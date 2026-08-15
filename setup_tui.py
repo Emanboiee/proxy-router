@@ -350,7 +350,8 @@ def apply_presets(config_path, opencode=True, warp_roblox=True) -> dict:
         proton_config.setdefault("directory", "providers/proton")
         proton_config.setdefault("cooldown_seconds", 60)
         if warp_roblox or "cloudflare" in providers:
-            proton_config["fallback_provider"] = "cloudflare"
+            if "fallback_providers" not in proton_config and "fallback_provider" not in proton_config:
+                proton_config["fallback_providers"] = ["cloudflare"]
         if not any(r.get("id") == "opencode-zen" for r in routes):
             routes.append(dict(_PRESET_ROUTES["opencode-zen"]))
             added.append("opencode-zen")
@@ -365,6 +366,45 @@ def apply_presets(config_path, opencode=True, warp_roblox=True) -> dict:
     config_path.write_text(json.dumps(data, indent=2) + "\n")
     os.chmod(config_path, 0o600)
     return {"added": added}
+
+
+def configure_fallback(config_path, primary: str, candidates: list[str] | str) -> dict:
+    """Set an ordered fallback chain without starting or reloading the engine.
+
+    ``candidates`` may be a list or a comma-separated CLI value. The legacy
+    singular ``fallback_provider`` key is removed when a new chain is saved,
+    making the migration explicit while preserving every unrelated setting.
+    An empty candidate list clears the chain.
+    """
+    config_path = Path(config_path)
+    if config_path.is_file():
+        data = json.loads(config_path.read_text())
+    else:
+        data = _default_config()
+    providers = data.setdefault("providers", {})
+    if primary not in providers:
+        raise ValueError(f"unknown primary provider '{primary}'")
+    if isinstance(candidates, str):
+        candidates = [item.strip() for item in candidates.split(",") if item.strip()]
+    if not isinstance(candidates, list) or any(not isinstance(item, str) for item in candidates):
+        raise ValueError("fallback candidates must be a comma-separated provider list")
+    if len(set(candidates)) != len(candidates):
+        raise ValueError("fallback candidates must not contain duplicates")
+    if primary in candidates:
+        raise ValueError("a provider cannot fall back to itself")
+    unknown = [item for item in candidates if item not in providers]
+    if unknown:
+        raise ValueError(f"unknown fallback provider(s): {', '.join(unknown)}")
+    entry = providers[primary]
+    entry.pop("fallback_provider", None)
+    if candidates:
+        entry["fallback_providers"] = candidates
+    else:
+        entry.pop("fallback_providers", None)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(data, indent=2) + "\n")
+    os.chmod(config_path, 0o600)
+    return {"provider": primary, "fallback_providers": candidates}
 
 
 def custom_preset_path(root: Path, name: str) -> Path:
@@ -437,7 +477,7 @@ def apply_preset_by_name(root: Path, name: str) -> dict:
                 "cooldown_seconds": 60,
             }
             if route["provider"] == "proton" and "cloudflare" in providers:
-                provider_config["fallback_provider"] = "cloudflare"
+                provider_config["fallback_providers"] = ["cloudflare"]
             providers.setdefault(route["provider"], provider_config)
         if not any(r.get("id") == route.get("id") for r in routes):
             routes.append(dict(route))
@@ -834,6 +874,23 @@ def _cmd_bridge_install(root: Path, force: bool = False) -> int:
         return 1
     print(_style(f"bridge: installed -> {target}", _Ansi.GREEN))
     return 0
+
+
+def _cmd_keepalive_install(root: Path, remove: bool = False) -> int:
+    """Install or remove the macOS launchd supervisor for unattended support."""
+    script = root / "examples" / "install-launchd.sh"
+    if not script.is_file():
+        print(f"keepalive: installer missing: {script}", file=sys.stderr)
+        return 1
+    env = dict(os.environ)
+    env["PROXY_ROUTER_DIR"] = str(root)
+    command = ["bash", str(script)] + (["--remove"] if remove else [])
+    try:
+        result = subprocess.run(command, env=env, cwd=root)
+    except OSError as exc:
+        print(f"keepalive: installer failed: {exc}", file=sys.stderr)
+        return 1
+    return result.returncode
 
 
 def _router_command(root: Path, *args: str) -> int:
@@ -1993,6 +2050,16 @@ def main(argv=None, root=None) -> int:
                         help="import WireGuard .conf file(s)/directory into providers/proton")
     parser.add_argument("--import-warp", nargs="+", metavar="PATH",
                         help="import WireGuard .conf file(s)/directory into providers/cloudflare")
+    parser.add_argument("--fallback", metavar="PRIMARY",
+                        help="set a primary provider's ordered fallback chain")
+    parser.add_argument("--fallback-to", metavar="PROVIDER,...",
+                        help="comma-separated fallback providers for --fallback; empty clears it")
+    parser.add_argument("--fallback-clear", metavar="PRIMARY",
+                        help="clear a provider's fallback chain")
+    parser.add_argument("--keepalive-install", action="store_true",
+                        help="install the macOS launchd 24/7 supervisor")
+    parser.add_argument("--keepalive-remove", action="store_true",
+                        help="remove the macOS launchd 24/7 supervisor")
     parser.add_argument("--preset", metavar="NAME", nargs="?",
                         const="default",
                         help="apply a preset by name (built-in or custom; bare --preset applies 'default')")
@@ -2026,6 +2093,29 @@ def main(argv=None, root=None) -> int:
         rc = max(rc, _cmd_import(ROOT, "proton", args.import_proton))
     if args.import_warp:
         rc = max(rc, _cmd_import(ROOT, "cloudflare", args.import_warp))
+    if args.fallback or args.fallback_clear:
+        try:
+            if args.fallback and args.fallback_clear:
+                raise ValueError("choose --fallback or --fallback-clear, not both")
+            if args.fallback_clear and args.fallback_to is not None:
+                raise ValueError("--fallback-clear cannot be combined with --fallback-to")
+            primary = args.fallback or args.fallback_clear
+            candidates = [] if args.fallback_clear else args.fallback_to
+            if args.fallback and args.fallback_to is None:
+                raise ValueError("--fallback needs --fallback-to PROVIDER,... (empty clears it)")
+            result = configure_fallback(ROOT / "router.json", primary, candidates or [])
+            chain = " -> ".join(result["fallback_providers"]) or "(none)"
+            print(_style(f"setup: fallback chain {primary} -> {chain}", _Ansi.GREEN))
+            print("setup: run `proxy-router ensure` (or reload) to apply; the engine is untouched.")
+        except (ValueError, json.JSONDecodeError, OSError) as exc:
+            print(_style(f"setup: fallback configuration failed: {exc}", _Ansi.RED), file=sys.stderr)
+            rc = max(rc, 1)
+    if args.keepalive_install or args.keepalive_remove:
+        if args.keepalive_install and args.keepalive_remove:
+            print("setup: choose --keepalive-install or --keepalive-remove, not both", file=sys.stderr)
+            rc = max(rc, 1)
+        else:
+            rc = max(rc, _cmd_keepalive_install(ROOT, remove=args.keepalive_remove))
     if args.preset:
         try:
             result = apply_preset_by_name(ROOT, args.preset)
@@ -2062,8 +2152,10 @@ def main(argv=None, root=None) -> int:
         rc = max(rc, _cmd_bridge_install(ROOT, force=True))
     if args.bridge_check:
         rc = max(rc, _cmd_bridge_check(ROOT))
-    if not (args.guide or args.check or args.import_proton or args.import_warp or args.preset
-            or args.bridge_install or args.bridge_force_install or args.bridge_check):
+    if not (args.guide or args.check or args.import_proton or args.import_warp or args.fallback
+            or args.fallback_clear or args.keepalive_install or args.keepalive_remove
+            or args.preset or args.bridge_install
+            or args.bridge_force_install or args.bridge_check):
         rc = wizard(ROOT)
     return rc
 

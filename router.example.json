@@ -4,7 +4,7 @@
     "proton": {
       "directory": "providers/proton",
       "cooldown_seconds": 60,
-      "fallback_provider": "cloudflare"
+      "fallback_providers": ["cloudflare"]
     },
     "cloudflare": {
       "directory": "providers/cloudflare",

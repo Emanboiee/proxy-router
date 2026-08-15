@@ -296,28 +296,57 @@ def load_config() -> int:
         directory = entry.get("directory", f"providers/{name}")
         if not isinstance(directory, str):
             return fail(f"bad {CONFIG_FILE.name}: provider '{name}' directory must be a string")
-        fallback = entry.get("fallback_provider")
-        if fallback is not None and (
-            not isinstance(fallback, str) or fallback == name or fallback not in providers
+        legacy_fallback = entry.get("fallback_provider")
+        fallback_list = entry.get("fallback_providers")
+        if fallback_list is not None and legacy_fallback is not None:
+            return fail(
+                f"bad {CONFIG_FILE.name}: provider '{name}' cannot define both fallback_provider and fallback_providers"
+            )
+        if fallback_list is not None and (
+            not isinstance(fallback_list, list)
+            or any(not isinstance(target, str) for target in fallback_list)
         ):
             return fail(
-                f"bad {CONFIG_FILE.name}: provider '{name}' fallback_provider must name another configured provider"
+                f"bad {CONFIG_FILE.name}: provider '{name}' fallback_providers must be a string list"
+            )
+        if isinstance(fallback_list, list) and len(set(fallback_list)) != len(fallback_list):
+            return fail(
+                f"bad {CONFIG_FILE.name}: provider '{name}' fallback_providers must not contain duplicates"
+            )
+        fallbacks = fallback_list if fallback_list is not None else (
+            [legacy_fallback] if legacy_fallback is not None else []
+        )
+        if any(target == name or target not in providers for target in fallbacks):
+            field = "fallback_providers" if fallback_list is not None else "fallback_provider"
+            return fail(
+                f"bad {CONFIG_FILE.name}: provider '{name}' {field} must name another configured provider"
             )
         try:
             (ROOT / directory).resolve().relative_to(ROOT)
         except ValueError:
             return fail(f"bad {CONFIG_FILE.name}: provider '{name}' directory escapes the router root")
+    def fallback_targets(provider: str) -> list[str]:
+        entry = providers[provider]
+        targets = entry.get("fallback_providers")
+        if isinstance(targets, list):
+            return targets
+        target = entry.get("fallback_provider")
+        return [target] if isinstance(target, str) else []
+
+    def check_fallback_path(provider: str, path: tuple[str, ...] = ()) -> str | None:
+        if provider in path:
+            return provider
+        next_path = path + (provider,)
+        for target in fallback_targets(provider):
+            cycle = check_fallback_path(target, next_path)
+            if cycle is not None:
+                return cycle
+        return None
+
     for name in providers:
-        seen: set[str] = set()
-        current = name
-        while True:
-            if current in seen:
-                return fail(f"bad {CONFIG_FILE.name}: fallback_provider cycle includes '{current}'")
-            seen.add(current)
-            target = providers[current].get("fallback_provider")
-            if not isinstance(target, str):
-                break
-            current = target
+        cycle = check_fallback_path(name)
+        if cycle is not None:
+            return fail(f"bad {CONFIG_FILE.name}: fallback chain cycle includes '{cycle}'")
     if not isinstance(routes, list) or not all(isinstance(route, dict) for route in routes) or not isinstance(vpn, dict):
         return fail(f"bad {CONFIG_FILE.name}: providers/routes/vpn have invalid types")
     routing = data.get("routing", {})
@@ -370,7 +399,7 @@ def write_default_config(force: bool = False) -> int:
             "port": DEFAULT_PORT,
             "providers": {
                 "proton": {"directory": "providers/proton", "cooldown_seconds": 60,
-                           "fallback_provider": "cloudflare"},
+                           "fallback_providers": ["cloudflare"]},
                 "cloudflare": {"directory": "providers/cloudflare", "cooldown_seconds": 60,
                                "error_policy": {"429": {"action": "cooldown", "seconds": 300}}},
             },
@@ -757,25 +786,39 @@ def _fallback_state_path(name: str) -> Path:
     return ROOT / "state" / "fallback" / f"{name}.json"
 
 
-def configured_fallback(name: str) -> str | None:
-    """Return the configured fallback provider for ``name``, if valid."""
+def configured_fallbacks(name: str) -> list[str]:
+    """Return the ordered configured fallback providers for ``name``.
+
+    ``fallback_provider`` is retained as a compatibility alias for existing
+    router.json files; new configurations should use ``fallback_providers``.
+    """
     entry = _providers.get(name)
-    target = entry.get("fallback_provider") if isinstance(entry, dict) else None
-    if not isinstance(target, str) or target == name or target not in _providers:
-        return None
-    return target
+    if not isinstance(entry, dict):
+        return []
+    targets = entry.get("fallback_providers")
+    if targets is None:
+        target = entry.get("fallback_provider")
+        targets = [target] if isinstance(target, str) else []
+    return [target for target in targets if target != name and target in _providers]
+
+
+def configured_fallback(name: str) -> str | None:
+    """Return the first configured fallback provider for ``name``."""
+    targets = configured_fallbacks(name)
+    return targets[0] if targets else None
 
 
 def active_fallback(name: str) -> str | None:
     """Return the active runtime fallback, ignoring stale/invalid markers."""
-    target = configured_fallback(name)
-    if target is None:
+    targets = configured_fallbacks(name)
+    if not targets:
         return None
     try:
         data = json.loads(_fallback_state_path(name).read_text())
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return None
-    return target if isinstance(data, dict) and data.get("provider") == target else None
+    active = data.get("provider") if isinstance(data, dict) else None
+    return active if active in targets else None
 
 
 def _effective_route_provider(name: str) -> str:
@@ -784,35 +827,50 @@ def _effective_route_provider(name: str) -> str:
 
 
 def activate_fallback(name: str, *, target: str | None = None, reason: str = "transport") -> int:
-    """Route ``name``'s domains through its configured fallback provider."""
+    """Activate one provider from ``name``'s ordered fallback chain.
+
+    With no explicit target, candidates are attempted in configured order. A
+    candidate with no valid profiles is skipped; a failed hard switch rolls its
+    marker/configuration back before the next candidate is tried.
+    """
     if name not in _providers:
         return fail(f"unknown provider '{name}'")
-    configured = configured_fallback(name)
-    target = target or configured
-    if target is None or target != configured:
-        return fail(f"provider '{name}' has no configured fallback provider")
-    candidates = provider_files(target)
-    if not candidates or not any(_profile_error(profile) is None for profile in candidates):
-        return fail(f"fallback provider '{target}' has no valid profiles")
-    if active_fallback(name) == target:
-        print(f"fallback already active: {name} -> {target}")
+    configured = configured_fallbacks(name)
+    if target is not None and target not in configured:
+        return fail(
+            f"provider '{name}' fallback target '{target}' is not configured "
+            f"(choose one of: {', '.join(configured) or 'none'})"
+        )
+    active = active_fallback(name)
+    if active is not None and (target is None or target == active):
+        print(f"fallback already active: {name} -> {active}")
         return 0
+    candidates = [target] if target is not None else configured
+    if not candidates:
+        return fail(f"provider '{name}' has no configured fallback providers")
     path = _fallback_state_path(name)
     previous = path.read_text() if path.is_file() else None
-    _atomic_write(path, json.dumps({
-        "provider": target,
-        "reason": str(reason),
-        "activated_at": int(time.time()),
-    }, sort_keys=True) + "\n", 0o600)
-    rc = engine_switch()
-    if rc != 0:
+    last_error = "no fallback candidate has a valid profile"
+    for candidate in candidates:
+        profiles = provider_files(candidate)
+        if not profiles or not any(_profile_error(profile) is None for profile in profiles):
+            print(f"router: skipping fallback '{candidate}': no valid profiles", file=sys.stderr)
+            continue
+        _atomic_write(path, json.dumps({
+            "provider": candidate,
+            "reason": str(reason),
+            "activated_at": int(time.time()),
+        }, sort_keys=True) + "\n", 0o600)
+        rc = engine_switch()
+        if rc == 0:
+            print(f"fallback active: {name} -> {candidate} ({reason})")
+            return 0
+        last_error = f"fallback '{candidate}' failed to start"
         if previous is None:
             path.unlink(missing_ok=True)
         else:
             _atomic_write(path, previous, 0o600)
-        return rc
-    print(f"fallback active: {name} -> {target} ({reason})")
-    return 0
+    return fail(f"provider '{name}': {last_error}")
 
 
 def deactivate_fallback(name: str) -> int:
@@ -836,7 +894,7 @@ def deactivate_fallback(name: str) -> int:
 def fallback_status(name: str) -> dict:
     """Return configured and active fallback state for status/CLI consumers."""
     return {
-        "configured": configured_fallback(name),
+        "configured": configured_fallbacks(name),
         "active": active_fallback(name),
     }
 

@@ -569,6 +569,64 @@ def test_config_rejects_fallback_cycles(tmp_path):
     assert router.load_config() == 1
 
 
+def test_config_accepts_ordered_fallback_chain_and_legacy_alias(tmp_path):
+    router = load_router(tmp_path)
+    router.CONFIG_FILE.write_text(json.dumps({
+        "port": 2080,
+        "providers": {
+            "proton": {"fallback_providers": ["cloudflare", "mullvad"]},
+            "cloudflare": {},
+            "mullvad": {},
+        },
+        "routes": [],
+        "vpn": {},
+    }))
+
+    assert router.load_config() == 0
+    assert router.configured_fallbacks("proton") == ["cloudflare", "mullvad"]
+
+    router._providers = {
+        "proton": {"fallback_provider": "cloudflare"},
+        "cloudflare": {},
+    }
+    assert router.configured_fallbacks("proton") == ["cloudflare"]
+
+
+def test_config_rejects_fallback_chain_cycles(tmp_path):
+    router = load_router(tmp_path)
+    router.CONFIG_FILE.write_text(json.dumps({
+        "port": 2080,
+        "providers": {
+            "proton": {"fallback_providers": ["cloudflare"]},
+            "cloudflare": {"fallback_providers": ["mullvad"]},
+            "mullvad": {"fallback_providers": ["proton"]},
+        },
+        "routes": [],
+        "vpn": {},
+    }))
+
+    assert router.load_config() == 1
+
+
+def test_activate_fallback_tries_next_valid_candidate(tmp_path, monkeypatch):
+    router = load_router(tmp_path)
+    (tmp_path / "providers" / "mullvad").mkdir(parents=True)
+    (tmp_path / "providers" / "mullvad" / "mullvad.conf").write_text("fake")
+    router._providers = {
+        "proton": {
+            "directory": "providers/proton",
+            "fallback_providers": ["cloudflare", "mullvad"],
+        },
+        "cloudflare": {"directory": "providers/cloudflare"},
+        "mullvad": {"directory": "providers/mullvad"},
+    }
+    monkeypatch.setattr(router, "_profile_error", lambda _profile: None)
+    monkeypatch.setattr(router, "engine_switch", lambda: 0)
+
+    assert router.activate_fallback("proton") == 0
+    assert router.active_fallback("proton") == "mullvad"
+
+
 def test_rotation_reports_failure_when_probe_fails_without_rollback(tmp_path, monkeypatch):
     router = load_router(tmp_path)
     provider_dir = tmp_path / "providers" / "proton"

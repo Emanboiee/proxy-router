@@ -15,9 +15,10 @@ keeps the route table conservative; `proxy-router setup --preset` applies the
 validated Proton/WARP presets explicitly.
 
 On the current deployment, OpenCode Zen uses the Proton pool and Roblox uses
-Cloudflare WARP. Proton routes declare Cloudflare WARP as their explicit
-provider fallback; direct egress remains the final fallback only when the
-configured tunnel route is removed or the router is down.
+Cloudflare WARP. Providers can declare ordered fallback chains—Proton can use
+Cloudflare WARP, Mullvad, or another configured provider—while direct egress
+remains the final fallback only when the configured tunnel route is removed or
+the router is down.
 
 Core CLI runs on macOS, Linux, and Windows. The macOS-only bits (`up`/`down`
 and the launchd keep-alive) are guarded and print a clear message elsewhere.
@@ -57,6 +58,8 @@ proxy-router setup --guide all
 proxy-router setup --import-proton ~/Downloads/protonvpn-*.conf
 proxy-router setup --import-warp ~/Downloads/wgcf-profile.conf  # optional
 proxy-router setup --preset
+proxy-router setup --fallback proton --fallback-to cloudflare,mullvad
+proxy-router setup --keepalive-install  # macOS: supervise unattended 24/7 operation
 proxy-router setup --check
 proxy-router setup --bridge-install  # install the Hermes OpenCode rotation bridge
 proxy-router setup --bridge-force-install  # overwrite an existing bridge file
@@ -112,7 +115,8 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py rotate <provider> --force   # switch anyway, ignoring cooldowns and blocked exits
 ./router.py rotate <provider> --no-probe # stop current server, start next profile, skip egress probe
 ./router.py rotate --if-due      # scheduled rotation: only when the interval elapsed (exit 3 = not due)
-./router.py failover proton on     # route Proton domains through its configured fallback
+./router.py failover proton on     # activate the first usable configured fallback
+./router.py failover proton on --to mullvad  # choose one configured fallback explicitly
 ./router.py failover proton off    # clear fallback and restore Proton routes
 ./router.py failover proton status --json
 ./router.py provider-count proton # rotation candidates (retry budget)
@@ -127,6 +131,9 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py setup                  # custom setup TUI
 ./router.py setup --guide all      # print Proton + WARP guides
 ./router.py setup --preset         # enable OpenCode->Proton and Roblox->WARP presets
+./router.py setup --fallback proton --fallback-to cloudflare,mullvad
+./router.py setup --fallback-clear proton
+./router.py setup --keepalive-install  # install the macOS 24/7 launchd supervisor
 ./router.py setup --check          # validate imported profiles without networking
 ./router.py setup --bridge-install # install/verify the Hermes OpenCode rotation bridge
 ./router.py setup --bridge-check   # verify the installed bridge without writing
@@ -202,16 +209,20 @@ Rotation is then egress-aware instead of blind round-robin:
   automation never rotates on a reputation-block HTTP status. During active
   fallback it probes the fallback endpoint through the primary route and
   reports the result as `fallback`; a dead fallback still exits 1.
-- A provider can declare `fallback_provider` (the deployment maps Proton to
-  Cloudflare WARP). When rotation exhausts the primary pool, the wrapper,
-  keepalive, or Hermes rotation bridge writes a private runtime marker, then
-  hard-stops the current sing-box process and starts once with the primary
-  endpoint removed; matching routes and DNS then use the fallback. `egress
-  check` probes the fallback path through the matching primary route and reports
-  it as `fallback`. Clear it explicitly with `failover proton off` after
-  Proton has been validated again. Provider-pinned probe URLs are accepted only
-  when their host is routed through that provider; safe-list default providers
-  use the global egress probe URL when no explicit route domain exists.
+- A provider can declare an ordered `fallback_providers` chain (the legacy
+  singular `fallback_provider` key is still accepted; setup migrates it). The
+  deployment can map Proton to Cloudflare WARP, Mullvad, or any other
+  configured provider. When rotation exhausts the primary pool, the wrapper,
+  keepalive, or Hermes rotation bridge tries the chain in order, hard-stops the
+  current sing-box process, and starts once with the primary endpoint removed;
+  matching routes and DNS then use the selected fallback. `egress check`
+  probes the fallback path through the matching primary route and reports it as
+  `fallback`. Clear it explicitly with `failover proton off` after Proton has
+  been validated again. `setup --fallback proton --fallback-to ...` edits the
+  chain without touching the running engine. Provider-pinned probe URLs are
+  accepted only when their host is routed through that provider; safe-list
+  default providers use the global egress probe URL when no explicit route
+  domain exists.
 - A `sing-box.json.last-good` snapshot (atomic, 0600) is written whenever a
   freshly built config validates AND the engine demonstrably comes up with it;
   if a later reload's config fails validation or the engine fails to come up,

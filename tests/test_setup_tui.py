@@ -3,6 +3,7 @@ import io
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -180,7 +181,58 @@ class ApplyPresetsTests(unittest.TestCase):
     def test_adds_fallback_to_existing_proton_provider(self):
         setup_tui.apply_presets(self.config)
         data = json.loads(self.config.read_text())
-        self.assertEqual(data["providers"]["proton"]["fallback_provider"], "cloudflare")
+        self.assertEqual(data["providers"]["proton"]["fallback_providers"], ["cloudflare"])
+
+
+class FallbackSetupTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(setup_tui, self.root)
+        self.config = self.root / "router.json"
+        self.config.write_text(json.dumps({
+            "port": 2080,
+            "providers": {
+                "proton": {"directory": "providers/proton", "fallback_provider": "cloudflare"},
+                "cloudflare": {"directory": "providers/cloudflare"},
+                "mullvad": {"directory": "providers/mullvad"},
+            },
+            "routes": [],
+            "custom": {"preserve": True},
+        }, indent=2) + "\n")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_configure_fallback_migrates_and_preserves_config(self):
+        result = setup_tui.configure_fallback(self.config, "proton", "cloudflare,mullvad")
+        data = json.loads(self.config.read_text())
+        self.assertEqual(result["fallback_providers"], ["cloudflare", "mullvad"])
+        self.assertEqual(data["providers"]["proton"]["fallback_providers"], ["cloudflare", "mullvad"])
+        self.assertNotIn("fallback_provider", data["providers"]["proton"])
+        self.assertEqual(data["custom"], {"preserve": True})
+
+    def test_configure_fallback_empty_clears_chain(self):
+        setup_tui.configure_fallback(self.config, "proton", [])
+        data = json.loads(self.config.read_text())
+        self.assertNotIn("fallback_provider", data["providers"]["proton"])
+        self.assertNotIn("fallback_providers", data["providers"]["proton"])
+
+    def test_configure_fallback_rejects_unknown_candidate(self):
+        with self.assertRaises(ValueError):
+            setup_tui.configure_fallback(self.config, "proton", "ghost")
+
+    @mock.patch("setup_tui.subprocess.run")
+    def test_keepalive_install_passes_router_root(self, run):
+        script = self.root / "examples" / "install-launchd.sh"
+        script.parent.mkdir(parents=True)
+        script.write_text("#!/bin/sh\n")
+        run.return_value = subprocess.CompletedProcess([], 0)
+
+        self.assertEqual(setup_tui._cmd_keepalive_install(self.root), 0)
+        command, = run.call_args.args
+        self.assertEqual(command[:2], ["bash", str(script)])
+        self.assertEqual(run.call_args.kwargs["env"]["PROXY_ROUTER_DIR"], str(self.root))
 
 
 class CustomPresetTests(unittest.TestCase):
