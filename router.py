@@ -2653,7 +2653,11 @@ def rotate(name: str, *, reason: str | None = None, force: bool = False, probe: 
     set_active(name, previous)
     record_rotation(name, previous)
     print(f"switched {name} -> {previous.stem} (rollback)")
-    return engine_switch()
+    rollback_rc = engine_switch()
+    # The rollback restored service, but the requested rotation failed. A
+    # non-zero result is required so callers can activate the configured
+    # provider fallback instead of treating the rollback as success.
+    return rollback_rc if rollback_rc != 0 else 1
 
 
 def provider_count(name: str) -> int:

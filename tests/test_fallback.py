@@ -158,7 +158,7 @@ def test_rotate_uses_hard_switch_for_selection_and_rollback(tmp_path, monkeypatc
     router.set_active("proton", provider_dir / "a.conf")
     monkeypatch.setattr(router, "probe_profile", lambda *_args: (False, {"ok": False}))
 
-    assert router.rotate("proton") == 0
+    assert router.rotate("proton") == 1
     assert events == ["switch", "switch"]
     assert (tmp_path / "state" / "proton.active").read_text() == "a"
 

@@ -1025,7 +1025,7 @@ class RotationEgressTests(unittest.TestCase):
     def test_rotate_probe_failure_rolls_back(self):
         router.set_active("proton", self._profile("a"))
         with mock.patch.object(router, "probe_profile", return_value=(False, {"ok": False})) as probe:
-            self.assertEqual(router.rotate("proton"), 0)
+            self.assertEqual(router.rotate("proton"), 1)
         self.assertEqual(self._active(), "a")
         self.assertTrue(router.is_cooled_down("proton", self._profile("b")))
         probe.assert_called_once()
@@ -1037,7 +1037,7 @@ class RotationEgressTests(unittest.TestCase):
         # rollback restore must NOT clear that mark (ping-pong A->B->A->C->A).
         router.set_active("proton", self._profile("a"))
         with mock.patch.object(router, "probe_profile", return_value=(False, {"ok": False})):
-            self.assertEqual(router.rotate("proton", reason="503"), 0)
+            self.assertEqual(router.rotate("proton", reason="503"), 1)
         self.assertEqual(self._active(), "a")  # rolled back to previous
         self.assertTrue(router.is_cooled_down("proton", self._profile("a")))  # mark survived
         self.assertTrue(router.is_cooled_down("proton", self._profile("b")))  # failed switch also cooled
@@ -1049,13 +1049,13 @@ class RotationEgressTests(unittest.TestCase):
         # restoring it on rollback MUST undo that so last-good is usable now.
         router.set_active("proton", self._profile("a"))
         with mock.patch.object(router, "probe_profile", return_value=(False, {"ok": False})):
-            self.assertEqual(router.rotate("proton"), 0)
+            self.assertEqual(router.rotate("proton"), 1)
         self.assertEqual(self._active(), "a")
         self.assertFalse(router.is_cooled_down("proton", self._profile("a")))
 
     def test_rotate_probe_failure_without_previous_keeps_switch(self):
         with mock.patch.object(router, "probe_profile", return_value=(False, {"ok": False})):
-            self.assertEqual(router.rotate("proton"), 0)
+            self.assertEqual(router.rotate("proton"), 1)
         self.assertEqual(self._active(), "a")
 
     def test_rotate_no_probe_skips_probe(self):
