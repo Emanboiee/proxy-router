@@ -1663,9 +1663,9 @@ class EgressSweepTests(unittest.TestCase):
         joined = "".join(c.args[0] for c in write.call_args_list)
         self.assertIn("0/3 alive", joined)
 
-    def test_unknown_provider_is_error_but_not_dead(self):
+    def test_unknown_provider_is_error_and_dead(self):
         rc = router.egress_sweep("ghost")
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         self.probe.assert_not_called()
         self.rotate.assert_not_called()
 
@@ -1678,7 +1678,7 @@ class EgressSweepTests(unittest.TestCase):
                 "proton": {"directory": "providers/proton",
                            "probe_url": "https://pinned.example/probe"},
             },
-            "routes": [{"id": "example-com", "domains": ["example.com"], "provider": "proton"}],
+            "routes": [{"id": "example-com", "domains": ["example.com", "pinned.example"], "provider": "proton"}],
         }
         (self.root / "router.json").write_text(json.dumps(config))
         self.assertEqual(router.load_config(), 0)
@@ -2047,17 +2047,28 @@ class RoutingModeTests(unittest.TestCase):
         # it and pick the next tunneled route domain.
         router._routing = {"mode": "safe-list", "direct_domains": ["example.com"],
                            "default_provider": "proton"}
-        self.assertIsNone(router.probe_url_for("proton"))  # only domain is direct → no tunneled path
+        self.assertEqual(router.probe_url_for("proton"), router.DEFAULT_PROBE_URL)
         router._routes = [
             {"id": "example-com", "domains": ["example.com"], "provider": "proton"},
             {"id": "opencode-ai", "domains": ["opencode.ai"], "provider": "proton"},
         ]
-        self.assertEqual(router.probe_url_for("proton"), "https://opencode.ai")
+        self.assertEqual(router.probe_url_for("proton"), router.DEFAULT_PROBE_URL)
 
-    def test_probe_url_for_does_not_skip_in_default_or_vpn_list(self):
-        # direct_domains only pin direct in safe-list mode; in default/vpn-list
-        # the list is ignored, so the normal first-domain probe must remain.
-        router._routing = {"mode": "vpn-list", "direct_domains": ["example.com"]}
+    def test_probe_url_for_skips_direct_whitelisted_subdomains(self):
+        router._routing = {"mode": "safe-list", "direct_domains": ["example.com"],
+                           "default_provider": "proton"}
+        router._routes = [
+            {"id": "www-example", "domains": ["www.example.com"], "provider": "proton"},
+            {"id": "opencode-ai", "domains": ["opencode.ai"], "provider": "proton"},
+        ]
+        self.assertEqual(router.probe_url_for("proton"), router.DEFAULT_PROBE_URL)
+
+    def test_probe_url_for_rejects_unrouted_provider_pin(self):
+        router._providers["proton"]["probe_url"] = "https://unrouted.example/probe"
+        self.assertEqual(router.probe_url_for("proton"), "https://example.com")
+        router._providers["proton"].pop("probe_url", None)
+        router._routing = {"mode": "vpn-list", "direct_domains": ["example.com"],
+                           "vpn_domains": ["example.com"]}
         self.assertEqual(router.probe_url_for("proton"), "https://example.com")
         router._routing = {}
         self.assertEqual(router.probe_url_for("proton"), "https://example.com")
@@ -2071,6 +2082,7 @@ class RoutingModeTests(unittest.TestCase):
             "cooldown_seconds": 60,
             "probe_url": "https://www.roblox.com/robots.txt",
         }
+        router._routes.append({"id": "roblox", "domains": ["roblox.com"], "provider": "cloudflare"})
         self.assertEqual(router.probe_url_for("cloudflare"),
                          "https://www.roblox.com/robots.txt")
         # provider without a pin still uses the route pick

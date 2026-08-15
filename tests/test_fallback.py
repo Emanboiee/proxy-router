@@ -191,6 +191,34 @@ def test_fallback_remaps_routes_dns_and_removes_primary_endpoint(tmp_path):
     }]
 
 
+def test_fallback_remaps_safe_list_default_provider(tmp_path):
+    router = load_router(tmp_path)
+    configure_build(router, tmp_path, fallback_active=True)
+    router._routing = {
+        "mode": "safe-list",
+        "direct_domains": [],
+        "default_provider": "proton",
+    }
+
+    config, _ = router.build_singbox_config()
+
+    assert config["route"]["final"] == "cloudflare"
+
+
+def test_fallback_safe_list_default_has_a_routed_probe_target(tmp_path):
+    router = load_router(tmp_path)
+    configure_build(router, tmp_path, fallback_active=True)
+    router._routes = []
+    router._routing = {
+        "mode": "safe-list",
+        "direct_domains": [],
+        "default_provider": "proton",
+    }
+    router._egress_settings = {"probe_url": "https://health.example"}
+
+    assert router.probe_url_for("cloudflare") == "https://health.example"
+
+
 def test_fallback_activation_and_recovery_are_atomic(tmp_path, monkeypatch):
     router = load_router(tmp_path)
     proton_dir = tmp_path / "providers" / "proton"
@@ -213,6 +241,82 @@ def test_fallback_activation_and_recovery_are_atomic(tmp_path, monkeypatch):
     assert router.deactivate_fallback("proton") == 0
     assert router.active_fallback("proton") is None
     assert len(reloads) == 2
+
+
+def test_egress_sweep_marks_provider_dead_when_no_valid_profiles(tmp_path, monkeypatch, capsys):
+    router = load_router(tmp_path)
+    provider_dir = tmp_path / "providers" / "proton"
+    provider_dir.mkdir(parents=True)
+    (provider_dir / "broken.conf").write_text("not a wireguard profile")
+    router._providers = {"proton": {"directory": "providers/proton"}}
+    router.current_mode = lambda: "proxy"
+    router.listener_up = lambda: True
+    monkeypatch.setattr(router, "_profile_error", lambda _profile: "malformed")
+
+    assert router.egress_sweep("proton", as_json=True) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["dead"] == ["proton"]
+    assert payload["results"]["proton"]["error"] == "no valid profiles"
+
+
+def test_egress_sweep_marks_unknown_provider_dead(tmp_path, monkeypatch, capsys):
+    router = load_router(tmp_path)
+    router._providers = {"proton": {}}
+    router.current_mode = lambda: "proxy"
+    router.listener_up = lambda: True
+
+    assert router.egress_sweep("missing", as_json=True) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["dead"] == ["missing"]
+    assert payload["results"]["missing"]["error"] == "unknown provider"
+
+
+def test_egress_sweep_probes_active_fallback(tmp_path, monkeypatch, capsys):
+    router = load_router(tmp_path)
+    router._providers = {
+        "proton": {"fallback_provider": "cloudflare"},
+        "cloudflare": {},
+    }
+    router.current_mode = lambda: "proxy"
+    router.listener_up = lambda: True
+    marker = tmp_path / "state" / "fallback"
+    marker.mkdir(parents=True)
+    (marker / "proton.json").write_text(json.dumps({"provider": "cloudflare"}))
+    monkeypatch.setattr(
+        router,
+        "_check_active_fallback",
+        lambda _primary, _fallback: (tmp_path / "warp.conf", "dead", {"dns_ok": False}),
+    )
+
+    assert router.egress_sweep("proton", as_json=True) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["dead"] == ["proton"]
+    assert payload["results"]["proton"] == {
+        "dns_ok": False,
+        "fallback_profile": "warp",
+        "fallback_provider": "cloudflare",
+        "ok": False,
+        "status": "fallback",
+    }
+
+
+def test_egress_sweep_deduplicates_dead_provider_on_switch_failure(tmp_path, monkeypatch, capsys):
+    router = load_router(tmp_path)
+    provider_dir = tmp_path / "providers" / "proton"
+    provider_dir.mkdir(parents=True)
+    for stem in ("a", "b"):
+        (provider_dir / f"{stem}.conf").write_text("fake")
+    router._providers = {"proton": {"directory": "providers/proton"}}
+    router.current_mode = lambda: "proxy"
+    router.listener_up = lambda: True
+    router.set_active("proton", provider_dir / "a.conf")
+    monkeypatch.setattr(router, "_profile_error", lambda _profile: None)
+    monkeypatch.setattr(router, "probe_profile", lambda *_args: (False, {"ok": False}))
+    monkeypatch.setattr(router, "engine_switch", lambda: 1)
+
+    assert router.egress_sweep("proton", as_json=True) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["dead"] == ["proton"]
 
 
 def test_fallback_marker_rolls_back_when_reload_fails(tmp_path, monkeypatch):
@@ -374,6 +478,27 @@ def test_egress_sweep_restores_original_when_all_profiles_are_dead(tmp_path, mon
     assert router.egress_sweep("proton") == 1
     assert events == ["b", "c", "a"]
     assert (tmp_path / "state" / "proton.active").read_text() == "a"
+
+
+def test_egress_sweep_restores_original_after_partial_switch_failure(tmp_path, monkeypatch):
+    router = load_router(tmp_path)
+    provider_dir, events = _configure_sweep(router, tmp_path, monkeypatch)
+
+    def switch():
+        stem = router.persisted_active("proton").stem
+        events.append(stem)
+        return 1 if stem == "c" else 0
+
+    monkeypatch.setattr(router, "engine_switch", switch)
+    monkeypatch.setattr(
+        router,
+        "probe_profile",
+        lambda _name, _profile: (False, {"latency_ms": None, "status": None}),
+    )
+
+    assert router.egress_sweep("proton") == 1
+    assert events == ["b", "c", "a"]
+    assert router.persisted_active("proton") == provider_dir / "a.conf"
 
 
 def test_force_rotation_is_blocked_while_fallback_is_active(tmp_path, monkeypatch):

@@ -851,42 +851,72 @@ def _open_probe(opener, request, timeout: float):
 
 
 def probe_url_for(name: str) -> str | None:
-    """Probe target for a provider: the first routed domain of that provider,
-    so the probe actually rides the tunnel end-to-end (a URL that matches no
-    route would go out direct and measure the wrong path). None when the
-    provider has no route domain to probe through.
+    """Return a probe target whose host is actually routed through ``name``.
 
-    An explicit ``probe_url`` on the provider entry wins over the route
-    pick: some routed domains (e.g. roblox.com's bot-protection landing
-    page) hang or redirect even on a healthy tunnel, which would
-    false-mark the exit dead. Operators pin a light, reliable target
-    (e.g. https://www.roblox.com/robots.txt) when that happens.
-
-    In safe-list routing mode, domains whitelisted as ``direct_domains`` are
-    sent DIRECT by the route table; probing such a host would measure the
-    direct path, not the tunnel, and false-alive a dead exit — so those are
-    skipped here and the next tunneled route domain is picked (only in
-    safe-list mode: in default/vpn-list the list is not pinned direct). When
-    every route domain of the provider is direct-whitelisted there is no
-    tunneled path to probe; None is returned (egress check then skips the
-    provider instead of trusting a direct-path result).
+    Provider pins are convenience overrides, not proof of routing: an unrouted
+    pin would measure direct egress. Safe-list direct-domain suffixes are also
+    excluded, including subdomains.
     """
+    routing = routing_state()
+    direct = frozenset(routing.get("direct_domains") or []) \
+        if routing.get("mode") == "safe-list" else frozenset()
+
+    def matches_domain(host: str, domain: str) -> bool:
+        domain = domain.lstrip("*.").strip().lower()
+        return bool(domain) and (host == domain or host.endswith("." + domain))
+
+    def is_direct(host: str) -> bool:
+        return any(matches_domain(host, domain) for domain in direct)
+
+    def is_tunneled(host: str) -> bool:
+        if not host or is_direct(host):
+            return False
+        if routing.get("mode") == "safe-list":
+            default_provider = routing.get("default_provider")
+            if isinstance(default_provider, str) and _effective_route_provider(default_provider) == name:
+                return True
+        for route in _routes:
+            if route.get("provider") != name:
+                continue
+            for domain in route.get("domains", []):
+                route_host = domain.lstrip("*.").strip().lower()
+                if not matches_domain(host, route_host):
+                    continue
+                if routing.get("mode") == "vpn-list":
+                    vpn_domains = routing.get("vpn_domains") or []
+                    if not any(matches_domain(route_host, vpn) for vpn in vpn_domains):
+                        continue
+                return True
+        return False
+
     entry = _providers.get(name)
     if isinstance(entry, dict):
         pinned = entry.get("probe_url")
         if isinstance(pinned, str) and pinned.startswith("https://"):
-            return pinned
-    direct = frozenset((routing_state().get("direct_domains") or [])) \
-        if routing_state().get("mode") == "safe-list" else frozenset()
+            host = urllib.parse.urlsplit(pinned).hostname
+            if host and is_tunneled(host.lower()):
+                return pinned
+
+    if routing.get("mode") == "safe-list":
+        default_provider = routing.get("default_provider")
+        if isinstance(default_provider, str) and _effective_route_provider(default_provider) == name:
+            default_probe = egress_settings().get("probe_url")
+            host = urllib.parse.urlsplit(default_probe).hostname if isinstance(default_probe, str) else None
+            if host and is_tunneled(host.lower()):
+                return default_probe
+
     for route in _routes:
         if route.get("provider") != name:
             continue
         for host in route.get("domains", []):
-            host = host.lstrip("*.").strip()
-            if host and "." in host and not host.startswith("."):
-                if host in direct:
-                    continue  # safe-list mode: routed direct, not the tunnel
-                return f"https://{host}"
+            host = host.lstrip("*.").strip().lower()
+            if not host or "." not in host or host.startswith(".") or is_direct(host):
+                continue
+            if routing.get("mode") == "vpn-list":
+                vpn_domains = routing.get("vpn_domains") or []
+                if not any(matches_domain(host, vpn) for vpn in vpn_domains):
+                    continue
+            return f"https://{host}"
     return None
 
 
@@ -1674,7 +1704,8 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
             if not cidrs or not all(isinstance(cidr, str) and cidr for cidr in cidrs):
                 raise SystemExit(f"selective tun: {ruleset_path} has no valid ip_cidr entries")
             provider = selective_data.get("provider", _vpn.get("selective_provider", "cloudflare"))
-            if provider not in active:
+            effective_provider = _effective_route_provider(provider)
+            if effective_provider not in active:
                 raise SystemExit(f"selective tun: provider '{provider}' has no active profile")
             tag = f"ruleset-{selective}"
             rule_sets.append({
@@ -1686,7 +1717,7 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
             tun["route_address_set"] = [tag]
             # Once a matching packet enters the TUN, send it through the
             # selected provider. The TUN field only controls OS capture.
-            rules.insert(0, {"rule_set": [tag], "outbound": provider})
+            rules.insert(0, {"rule_set": [tag], "outbound": effective_provider})
         else:
             tun["auto_route"] = True
         # Keep the mixed proxy listener ALONGSIDE the TUN: apps pinned to
@@ -1717,7 +1748,7 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
         # direct rides the default provider. Fail the build with a precise
         # error when that provider has no active profile - never emit a
         # dangling final.
-        default_provider = routing["default_provider"]
+        default_provider = _effective_route_provider(routing["default_provider"])
         if default_provider not in active:
             raise SystemExit(
                 f"routing mode 'safe-list': default_provider '{default_provider}' has no active profile; "
@@ -3171,10 +3202,21 @@ def egress_sweep(name: str | None = None, as_json: bool = False) -> int:
     for provider in providers:
         if provider not in _providers:
             results[provider] = {"error": "unknown provider"}
+            dead.append(provider)
             continue
         fallback = active_fallback(provider)
         if fallback:
-            results[provider] = {"status": "fallback", "fallback_provider": fallback}
+            fallback_profile, status, record = _check_active_fallback(provider, fallback)
+            results[provider] = {
+                "status": "fallback",
+                "fallback_provider": fallback,
+                "fallback_profile": fallback_profile.stem if fallback_profile else None,
+                "ok": status != "dead",
+            }
+            if record is not None and record.get("dns_ok") is not None:
+                results[provider]["dns_ok"] = record["dns_ok"]
+            if status == "dead":
+                dead.append(provider)
             continue
         # Keep only parseable profiles so one bad *.conf cannot wedge the
         # sweep (F6); log every skipped filename (F2), same as rotate.
@@ -3187,6 +3229,7 @@ def egress_sweep(name: str | None = None, as_json: bool = False) -> int:
             valid.append(profile)
         if not valid:
             results[provider] = {"error": "no valid profiles"}
+            dead.append(provider)
             continue
         current = persisted_active(provider) or resolve_active(provider)
         original = current if current in valid else None
@@ -3245,12 +3288,19 @@ def egress_sweep(name: str | None = None, as_json: bool = False) -> int:
             best_profile = next(p for p in ordered if p.stem == best)
             if switch_to(best_profile) != 0:
                 switch_failed = True
+        if switch_failed:
+            if provider not in dead:
+                dead.append(provider)
+            if original is not None and actual != original:
+                if switch_to(original) != 0:
+                    print(
+                        f"router: could not restore original profile {original.name} for '{provider}'",
+                        file=sys.stderr,
+                    )
         elif not alive:
             dead.append(provider)
-        if switch_failed:
-            dead.append(provider)
-        elif not alive and original is not None:
-            switch_to(original)
+            if original is not None:
+                switch_to(original)
         results[provider] = entry
     if as_json:
         print(json.dumps({"dead": dead, "results": results}, indent=2, sort_keys=True))

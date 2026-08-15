@@ -187,7 +187,9 @@ Rotation is then egress-aware instead of blind round-robin:
   hard server switch, so the first-request flake of a fresh WireGuard
   handshake never false-marks an exit failed. When nothing is alive the
   original active profile is restored when possible and exit code 1 signals a
-  provider with zero alive exits (`--json` names them under `dead`).
+  provider with zero alive exits (`--json` names them under `dead`). An active
+  fallback is not skipped: the fallback endpoint is probed and a dead fallback
+  makes the sweep fail too.
 - `egress check` is the read-only liveness view used by the keepalive self-heal
   loop: it probes the ACTIVE exit(s) through the running tunnel and classifies
   each one `alive` (HTTP response rode the tunnel), `degraded` (an HTTP status
@@ -207,7 +209,9 @@ Rotation is then egress-aware instead of blind round-robin:
   endpoint removed; matching routes and DNS then use the fallback. `egress
   check` probes the fallback path through the matching primary route and reports
   it as `fallback`. Clear it explicitly with `failover proton off` after
-  Proton has been validated again.
+  Proton has been validated again. Provider-pinned probe URLs are accepted only
+  when their host is routed through that provider; safe-list default providers
+  use the global egress probe URL when no explicit route domain exists.
 - A `sing-box.json.last-good` snapshot (atomic, 0600) is written whenever a
   freshly built config validates AND the engine demonstrably comes up with it;
   if a later reload's config fails validation or the engine fails to come up,

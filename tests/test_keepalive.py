@@ -57,6 +57,17 @@ case "$cmd" in
     esac
     ;;
   rotate)
+    if [ -n "${FAKE_ROUTER_ROTATE_FAIL:-}" ]; then exit 1; fi
+    exit 0
+    ;;
+  failover)
+    if [ "${3:-}" = "status" ]; then
+      if [ -n "${FAKE_ROUTER_FALLBACK_ACTIVE:-}" ]; then
+        echo "fallback proton: configured=cloudflare active=cloudflare"
+      else
+        echo "fallback proton: configured=cloudflare active=none"
+      fi
+    fi
     exit 0
     ;;
 esac
@@ -73,7 +84,7 @@ class KeepaliveHarness:
 
     def __init__(self, *, interval="1", fail_ensures="", egress="alive",
                  probe_every="4", dead_strikes="2", storm_window="600",
-                 max_rotations="2"):
+                 max_rotations="2", rotate_fail=False, fallback_active=False):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
         (self.root / "bin").mkdir()
@@ -103,6 +114,10 @@ class KeepaliveHarness:
         env["FAKE_ROUTER_LOG"] = str(self.log)
         env["FAKE_ROUTER_ENSURE_COUNT"] = str(self.count)
         env["FAKE_ROUTER_EGRESS_FILE"] = str(self.egress_file)
+        if rotate_fail:
+            env["FAKE_ROUTER_ROTATE_FAIL"] = "1"
+        if fallback_active:
+            env["FAKE_ROUTER_FALLBACK_ACTIVE"] = "1"
         if fail_ensures:
             env["FAKE_ROUTER_FAIL_ENSURES"] = fail_ensures
         self.env = env
@@ -262,6 +277,21 @@ class KeepaliveEgressCheckTests(unittest.TestCase):
             h.wait_lines(20)
             rotates = [l for l in h.lines() if l.startswith("rotate proton")]
             self.assertGreaterEqual(len(rotates), 4, f"expected rotation churn: {rotates}")
+        finally:
+            h.close()
+
+
+class KeepaliveFallbackTests(unittest.TestCase):
+    def test_dead_active_fallback_is_not_reported_as_recovered(self):
+        h = KeepaliveHarness(egress="dead", probe_every="1", dead_strikes="1",
+                             storm_window="3600", max_rotations="50",
+                             rotate_fail=True, fallback_active=True)
+        try:
+            lines = h.wait_lines(20)
+            h.close()
+            self.assertIn("failover proton status", lines)
+            self.assertNotIn("failover proton on --reason timeout", lines)
+            self.assertIn("already active; waiting for the next dead check", h.err)
         finally:
             h.close()
 

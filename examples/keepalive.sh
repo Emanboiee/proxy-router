@@ -101,9 +101,16 @@ rotate_dead() {
   if "$ROOT/router.py" rotate "$provider" --reason timeout; then
     :
   else
-    echo "router: rotate '$provider' failed; activating configured fallback" >&2
+    echo "router: rotate '$provider' failed; checking configured fallback" >&2
+    fallback_state=$("$ROOT/router.py" failover "$provider" status 2>/dev/null || true)
+    active_fallback=$(printf '%s\n' "$fallback_state" | sed -n 's/.* active=\([^ ]*\).*/\1/p')
+    if [ -n "$active_fallback" ] && [ "$active_fallback" != "none" ]; then
+      echo "router: fallback '$active_fallback' already active; waiting for the next dead check" >&2
+      return
+    fi
     if ! "$ROOT/router.py" failover "$provider" on --reason timeout >/dev/null 2>&1; then
       echo "router: fallback for '$provider' failed; will retry after the next dead check" >&2
+      return
     fi
   fi
   rotations=$((rotations + 1))
