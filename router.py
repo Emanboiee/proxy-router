@@ -415,6 +415,11 @@ def write_default_config(force: bool = False) -> int:
                     "provider": "proton",
                 },
                 {
+                    "id": "proton-ip-check",
+                    "domains": ["whatismyip.com"],
+                    "provider": "proton",
+                },
+                {
                     "id": "roblox",
                     "domains": ["roblox.com", "rbxcdn.com", "robloxlabs.com", "rblx.com"],
                     "provider": "cloudflare",

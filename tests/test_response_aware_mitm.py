@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import types
 from pathlib import Path
@@ -85,3 +86,42 @@ def test_non_target_429_is_left_alone(monkeypatch):
     observer.response(flow)
     assert flow.response.status_code == 429
     assert flow.metadata == {}
+
+
+def test_recent_event_log_keeps_one_bounded_backup(tmp_path, monkeypatch):
+    addon = load_addon(monkeypatch)
+    log_path = tmp_path / "response-aware.log"
+    event_log = addon.RecentEventLog(log_path, max_bytes=220, backups=1)
+
+    for index in range(8):
+        event_log.write("429_detected", host="api.opencode.ai", status=429, attempt=index)
+
+    assert log_path.exists()
+    assert Path(str(log_path) + ".1").exists()
+    assert not Path(str(log_path) + ".2").exists()
+    assert log_path.stat().st_size <= 220
+    records = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert records
+    assert all(record["event"] == "429_detected" for record in records)
+    assert all("headers" not in record and "body" not in record for record in records)
+
+
+def test_429_failure_is_written_to_recent_event_log(tmp_path, monkeypatch):
+    addon = load_addon(monkeypatch)
+    observer = addon.ResponseAwareOpenCode(log_file=tmp_path / "response-aware.log")
+
+    class Request:
+        host = "api.opencode.ai"
+        method = "POST"
+
+    class Response:
+        status_code = 429
+
+    flow = types.SimpleNamespace(request=Request(), response=Response(), metadata={})
+    observer._rotate = lambda *_args: False
+    observer.response(flow)
+
+    records = [json.loads(line) for line in observer.log_file.read_text().splitlines()]
+    assert [record["event"] for record in records] == ["429_detected", "rotation_failed"]
+    assert records[0]["host"] == "api.opencode.ai"
+    assert records[0]["method"] == "POST"

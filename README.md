@@ -151,6 +151,20 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py down                 # disable macOS system proxy only (engine keeps running)
 ```
 
+### Response-aware error recovery (opt-in)
+
+The isolated response-aware sidecar keeps the stable `127.0.0.1:2080` proxy
+unchanged. It retains only a bounded recent JSONL event log (current log plus
+one rotated backup), with request headers and bodies excluded:
+
+```sh
+RESPONSE_AWARE_ENABLED=1 examples/response-aware.sh start
+examples/response-aware.sh logs
+```
+
+The sidecar requires an explicitly trusted isolated mitmproxy CA for HTTPS
+clients; it never installs a production CA or changes system proxy settings.
+
 Every state-changing command takes an exclusive lock, so concurrent calls
 are safe; read-only commands (`status`, `routes`, `provider-count`, `vpn
 status`, `init`) do not.
