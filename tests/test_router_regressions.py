@@ -90,6 +90,46 @@ def test_selective_tun_uses_address_set_and_keeps_auto_route(tmp_path):
     }
 
 
+def test_routes_tun_captures_route_rules_without_ruleset_address_set(tmp_path):
+    router = load_router(tmp_path)
+    profile = tmp_path / "proton.conf"
+    router._providers = {"proton": {}}
+    router._routes = [{"id": "opencode", "provider": "proton", "domains": ["opencode.ai"]}]
+    router._vpn = {"capture": "routes"}
+    router._routing = {"mode": "default", "vpn_domains": ["opencode.ai"]}
+    router._port = 2080
+    router.current_mode = lambda: "tun"
+    router._usable_profile = lambda name, preferred=None: profile
+    router.parse_wireguard = lambda path: {
+        "type": "wireguard", "tag": "", "address": ["10.0.0.2/32"],
+        "private_key": "secret", "peers": [{"address": "192.0.2.1", "port": 1,
+        "public_key": "public", "allowed_ips": ["0.0.0.0/0"]}],
+    }
+    router.dns_server_for = lambda path: "1.1.1.1"
+
+    config, _active = router.build_singbox_config()
+    tun = config["inbounds"][0]
+    assert tun["auto_route"] is True
+    assert "route_address_set" not in tun
+    assert any(r.get("outbound") == "proton" and "opencode.ai" in r.get("domain_suffix", [])
+               for r in config["route"]["rules"])
+    assert config["route"]["final"] == "direct"
+
+
+def test_transparent_tun_ensure_fails_open_to_proxy_mode(tmp_path, monkeypatch):
+    router = load_router(tmp_path)
+    router.MODE_FILE.parent.mkdir(parents=True)
+    router.MODE_FILE.write_text("tun")
+    router.MANUAL_OFF_FILE = tmp_path / "state" / "manual-off"
+    router._vpn = {"capture": "routes"}
+    monkeypatch.setattr(router, "engine_start", lambda: 1)
+    monkeypatch.setattr(router, "engine_stop", lambda: 0)
+    monkeypatch.setattr(router, "system_proxy_off", lambda: 0)
+
+    assert router.engine_ensure() == 1
+    assert router.current_mode() == "proxy"
+
+
 def test_tun_mode_keeps_mixed_proxy_listener(tmp_path):
     # ROOT CAUSE:
     #

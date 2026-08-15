@@ -407,6 +407,24 @@ def configure_fallback(config_path, primary: str, candidates: list[str] | str) -
     return {"provider": primary, "fallback_providers": candidates}
 
 
+def configure_transparent(config_path, enabled: bool = True) -> dict:
+    """Select route-based TUN capture without starting or reloading the engine."""
+    config_path = Path(config_path)
+    if config_path.is_file():
+        data = json.loads(config_path.read_text())
+    else:
+        data = _default_config()
+    vpn = data.setdefault("vpn", {})
+    if not isinstance(vpn, dict):
+        raise ValueError("vpn configuration must be an object")
+    capture = "routes" if enabled else "ruleset"
+    vpn["capture"] = capture
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(data, indent=2) + "\n")
+    os.chmod(config_path, 0o600)
+    return {"capture": capture}
+
+
 def custom_preset_path(root: Path, name: str) -> Path:
     """Path of the custom preset file for ``name`` under ``root/presets/``.
 
@@ -2056,6 +2074,10 @@ def main(argv=None, root=None) -> int:
                         help="comma-separated fallback providers for --fallback; empty clears it")
     parser.add_argument("--fallback-clear", metavar="PRIMARY",
                         help="clear a provider's fallback chain")
+    parser.add_argument("--transparent", action="store_true",
+                        help="configure route-based TUN capture for configured domains")
+    parser.add_argument("--transparent-off", action="store_true",
+                        help="restore the existing selective ruleset TUN capture")
     parser.add_argument("--keepalive-install", action="store_true",
                         help="install the macOS launchd 24/7 supervisor")
     parser.add_argument("--keepalive-remove", action="store_true",
@@ -2110,6 +2132,16 @@ def main(argv=None, root=None) -> int:
         except (ValueError, json.JSONDecodeError, OSError) as exc:
             print(_style(f"setup: fallback configuration failed: {exc}", _Ansi.RED), file=sys.stderr)
             rc = max(rc, 1)
+    if args.transparent or args.transparent_off:
+        try:
+            if args.transparent and args.transparent_off:
+                raise ValueError("choose --transparent or --transparent-off, not both")
+            result = configure_transparent(ROOT / "router.json", enabled=args.transparent)
+            print(_style(f"setup: TUN capture = {result['capture']}", _Ansi.GREEN))
+            print("setup: run `proxy-router vpn on` (or `reload` if TUN is already active); the engine was not restarted.")
+        except (ValueError, json.JSONDecodeError, OSError) as exc:
+            print(_style(f"setup: transparent mode configuration failed: {exc}", _Ansi.RED), file=sys.stderr)
+            rc = max(rc, 1)
     if args.keepalive_install or args.keepalive_remove:
         if args.keepalive_install and args.keepalive_remove:
             print("setup: choose --keepalive-install or --keepalive-remove, not both", file=sys.stderr)
@@ -2153,7 +2185,8 @@ def main(argv=None, root=None) -> int:
     if args.bridge_check:
         rc = max(rc, _cmd_bridge_check(ROOT))
     if not (args.guide or args.check or args.import_proton or args.import_warp or args.fallback
-            or args.fallback_clear or args.keepalive_install or args.keepalive_remove
+            or args.fallback_clear or args.transparent or args.transparent_off
+            or args.keepalive_install or args.keepalive_remove
             or args.preset or args.bridge_install
             or args.bridge_force_install or args.bridge_check):
         rc = wizard(ROOT)

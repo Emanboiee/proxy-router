@@ -289,6 +289,11 @@ def load_config() -> int:
     vpn = data.get("vpn", {})
     if not isinstance(providers, dict) or not providers:
         return fail("no providers configured")
+    if not isinstance(vpn, dict):
+        return fail(f"bad {CONFIG_FILE.name}: vpn must be an object")
+    capture = vpn.get("capture")
+    if capture is not None and capture not in ("ruleset", "routes"):
+        return fail(f"bad {CONFIG_FILE.name}: vpn.capture must be 'ruleset' or 'routes'")
     if not all(isinstance(name, str) and _PROVIDER_NAME.fullmatch(name) and isinstance(entry, dict)
                for name, entry in providers.items()):
         return fail(f"bad {CONFIG_FILE.name}: provider names/entries are invalid")
@@ -419,6 +424,7 @@ def write_default_config(force: bool = False) -> int:
             # stays "direct" and nothing is tunneled unless listed.
             "routing": {"mode": "vpn-list", "vpn_domains": []},
             "vpn": {
+                "capture": "ruleset",
                 "address": DEFAULT_TUN_ADDRESS,
                 "mtu": DEFAULT_TUN_MTU,
                 "stack": DEFAULT_TUN_STACK,
@@ -1744,7 +1750,12 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
         # ``route_address_set`` while leaving unmatched destinations on the
         # OS route table. ``auto_route`` must remain enabled on macOS; the
         # selective address-set is what prevents a default-route detour.
-        selective = _vpn.get("selective")
+        capture = _vpn.get("capture")
+        if capture is None:
+            capture = "ruleset" if _vpn.get("selective") else "routes"
+        if capture not in ("ruleset", "routes"):
+            raise SystemExit("vpn.capture must be 'ruleset' or 'routes'")
+        selective = _vpn.get("selective") if capture == "ruleset" else None
         rule_sets: list[dict] = []
         if selective:
             if not isinstance(selective, str) or not _PROVIDER_NAME.fullmatch(selective):
@@ -2374,7 +2385,16 @@ def engine_ensure() -> int:
         # mode instead of declaring victory (M13).
         if engine_alive() and engine_mode_consistent():
             return 0
-        return engine_start()
+        rc = engine_start()
+        if rc != 0 and _vpn.get("capture") == "routes":
+            # Route-based TUN is explicitly fail-open: remove a dead utun
+            # state and leave normal applications on their ordinary routes.
+            engine_stop()
+            set_mode("proxy")
+            if sys.platform == "darwin":
+                system_proxy_off()
+            print("router: transparent TUN unavailable; failing open to direct egress", file=sys.stderr)
+        return rc
     # Proxy mode: only a listener owned by OUR engine is "up". A foreign
     # process answering the port while our pid is dead/mismatched is NOT
     # healthy (F1): start the engine instead of declaring victory.
@@ -2983,6 +3003,32 @@ def vpn_restart() -> int:
     if rc != 0:
         return rc
     return vpn_on()
+
+
+def vpn_capture(scope: str) -> int:
+    """Set TUN capture scope and reload an already-running TUN engine."""
+    if scope not in ("ruleset", "routes"):
+        return fail("vpn capture scope must be 'ruleset' or 'routes'")
+    try:
+        data = json.loads(CONFIG_FILE.read_text())
+        if not isinstance(data, dict):
+            return fail(f"bad {CONFIG_FILE.name}: top level must be an object")
+        vpn = data.get("vpn", {})
+        if not isinstance(vpn, dict):
+            return fail(f"bad {CONFIG_FILE.name}: vpn must be an object")
+        vpn["capture"] = scope
+        data["vpn"] = vpn
+        _atomic_write(CONFIG_FILE, json.dumps(data, indent=2) + "\n", 0o600)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        return fail(f"could not write {CONFIG_FILE.name}: {exc}")
+    _vpn.clear()
+    _vpn.update(vpn)
+    if current_mode() == "tun" and engine_alive():
+        rc = engine_reload()
+        if rc != 0:
+            return rc
+    print(f"vpn: capture={scope} (engine not started)")
+    return 0
 
 
 def _status_report() -> tuple[int, str]:
@@ -3875,8 +3921,10 @@ def main() -> int:
     init = sub.add_parser("init")
     init.add_argument("--force", action="store_true", help="overwrite an existing router.json")
 
-    vpn = sub.add_parser("vpn", help="toggle TUN mode (vpn on|off|restart|status)")
-    vpn.add_argument("action", choices=["on", "off", "restart", "status"])
+    vpn = sub.add_parser("vpn", help="toggle TUN mode (on|off|restart|status|capture)")
+    vpn.add_argument("action", choices=["on", "off", "restart", "status", "capture"])
+    vpn.add_argument("capture", nargs="?", choices=["ruleset", "routes"],
+                     help="TUN capture scope for `vpn capture`")
 
     setup = sub.add_parser("setup", help="interactive Proton/WARP setup wizard")
     setup.add_argument("setup_args", nargs=argparse.REMAINDER)
@@ -4119,6 +4167,10 @@ def main() -> int:
             return routing_cli_remove(args.mode, args.domain)
         parser.error("routing needs an action: show | set | add | remove")
     if args.cmd == "vpn":
+        if args.action == "capture":
+            if args.capture is None:
+                parser.error("vpn capture needs a scope: routes | ruleset")
+            return _with_lock(lambda: vpn_capture(args.capture))
         if args.action == "on":
             route_watcher_stop()
             return _with_lock(vpn_on)

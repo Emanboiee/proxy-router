@@ -7,9 +7,9 @@ localhost:2080 clients when macOS exposes them through ``lsof``, and probes a
 critical routed domain after it is observed. It rotates the provider only for
 persistent destination-specific transport failures.
 
-Scope is intentionally honest: HTTP-proxy mode can observe traffic that uses
-127.0.0.1:2080, not applications that bypass the proxy. Full-device coverage
-requires sing-box TUN or a macOS Network Extension and is a separate mode.
+In proxy mode it can only observe traffic that uses 127.0.0.1:2080. In route-
+based TUN mode it can observe routed destinations from sing-box logs even when
+applications bypass the proxy; client attribution remains unavailable.
 """
 from __future__ import annotations
 
@@ -357,8 +357,13 @@ def status(root: Path | None = None) -> dict:
         pid = int(pid_file(root).read_text().strip())
     except (OSError, ValueError):
         pid = None
+    try:
+        mode = (root / "state" / "mode").read_text().strip()
+    except OSError:
+        mode = "proxy"
+    scope = "tun + proxy-observable" if mode == "tun" else "proxy-observable only"
     return {"enabled": enabled_file(root).is_file(), "running": bool(pid and _pid_running(pid, root)), "pid": pid,
-            "events": events_file(root).is_file(), "scope": "proxy-observable only", "targets": list(critical_domains(root))}
+            "events": events_file(root).is_file(), "scope": scope, "targets": list(critical_domains(root))}
 
 
 def start(root: Path | None = None, *, interval: float = DEFAULT_INTERVAL) -> dict:

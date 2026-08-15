@@ -222,6 +222,14 @@ class FallbackSetupTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             setup_tui.configure_fallback(self.config, "proton", "ghost")
 
+    def test_configure_transparent_preserves_provider_and_routes(self):
+        result = setup_tui.configure_transparent(self.config, enabled=True)
+        data = json.loads(self.config.read_text())
+        self.assertEqual(result["capture"], "routes")
+        self.assertEqual(data["vpn"]["capture"], "routes")
+        self.assertEqual(data["providers"]["proton"]["fallback_provider"], "cloudflare")
+        self.assertEqual(data["custom"], {"preserve": True})
+
     @mock.patch("setup_tui.subprocess.run")
     def test_keepalive_install_passes_router_root(self, run):
         script = self.root / "examples" / "install-launchd.sh"

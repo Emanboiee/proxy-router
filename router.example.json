@@ -41,6 +41,7 @@
     "vpn_domains": []
   },
   "vpn": {
+    "capture": "ruleset",
     "address": [
       "172.19.0.1/30"
     ],

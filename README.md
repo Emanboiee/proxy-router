@@ -103,6 +103,8 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py vpn off              # stop the TUN, back to proxy mode
 ./router.py vpn restart          # stop + re-enter TUN in one step (single elevation prompt)
 ./router.py vpn status           # show current mode and liveness
+./router.py vpn capture routes   # TUN-capture all traffic; route rules choose VPN vs direct
+./router.py vpn capture ruleset  # restore a named IP-CIDR ruleset capture
 ./router.py elevate install      # one-time macOS admin prompt; afterwards engine commands run
                                  # without prompts (vpn on/off/restart, reload, ensure, rotate)
 ./router.py elevate uninstall    # remove the passwordless-sudo grant
@@ -133,6 +135,8 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py setup --preset         # enable OpenCode->Proton and Roblox->WARP presets
 ./router.py setup --fallback proton --fallback-to cloudflare,mullvad
 ./router.py setup --fallback-clear proton
+./router.py setup --transparent  # apps need no HTTP_PROXY; configured routes use TUN
+./router.py setup --transparent-off
 ./router.py setup --keepalive-install  # install the macOS 24/7 launchd supervisor
 ./router.py setup --check          # validate imported profiles without networking
 ./router.py setup --bridge-install # install/verify the Hermes OpenCode rotation bridge
@@ -290,11 +294,31 @@ Where it is consumed:
 ## VPN (TUN) mode
 
 `vpn on` switches the engine from a local mixed proxy (`127.0.0.1:2080`) to a
-system TUN interface. sing-box `auto_route` then captures **all** traffic at
-the IP layer — including apps that ignore system proxy settings — while the
-same route rules still decide which domains go through which provider and
-everything else exits `direct`. `vpn off` returns to proxy mode; `ensure`,
-`reload`, `add`/`remove` and `rotate` all respect whatever mode is active.
+system TUN interface. The capture scope is controlled by `vpn.capture`:
+
+- `"routes"` is the transparent, app-independent mode. sing-box captures all
+  traffic at the IP layer—including apps that ignore proxy settings—then the
+  normal domain/provider rules send configured targets through their effective
+  provider and unmatched traffic to `direct`.
+- `"ruleset"` preserves the narrower IP-CIDR mode. `selective`/
+  `selective_provider` choose a named ruleset such as `rulesets/roblox.json`;
+  only those addresses enter the TUN.
+
+Set it without hand-editing JSON:
+
+```sh
+proxy-router setup --transparent
+proxy-router vpn on
+```
+
+or use `proxy-router vpn capture routes` directly. Transparent mode is
+explicitly fail-open: if a TUN restart fails, the router tears down the failed
+TUN state, persists proxy mode, disables the macOS system proxy, and ordinary
+applications can use their normal direct routes. The router's configured
+provider routes are not magically healthy during that gap; this is a UX/IP
+leak trade-off, not a tunnel-health claim. `vpn off` returns to proxy mode;
+`ensure`, `reload`, `add`/`remove` and `rotate` all respect whatever mode is
+active.
 
 Platform notes:
 
@@ -325,11 +349,13 @@ TUN options live under `"vpn"` in `router.json`:
 itself is tunneled (e.g. a school/proxy filter with a reduced inner MTU),
 the WireGuard packets fragment or get dropped, which reads as "TUN is
 slow". Measure the endpoint path with `ping -D -s <size> <endpoint>` and
-set `mtu` to `path_mtu - 80` (WireGuard overhead); 1280 is a safe
-default. `selective`/`selective_provider` is an optional IP-CIDR capture
-list from `rulesets/<name>.json` — only use it when you want TUN to
-capture exactly one site; with it set, all other domains fall out to
-direct and are NOT tunneled.
+set `mtu` to `path_mtu - 80` (WireGuard overhead); 1280 is a safe default.
+
+`capture` is `"ruleset"` by default for compatibility; set it to `"routes"`
+for app-independent transparent capture. `selective`/`selective_provider` is
+only used with `capture: "ruleset"` and selects an IP-CIDR list from
+`rulesets/<name>.json` — with route-based capture, domain routing rules are the
+source of truth.
 
 Two more knobs in `"vpn"` control address-family policy:
 
