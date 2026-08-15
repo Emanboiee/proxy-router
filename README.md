@@ -15,8 +15,9 @@ keeps the route table conservative; `proxy-router setup --preset` applies the
 validated Proton/WARP presets explicitly.
 
 On the current deployment, OpenCode Zen uses the Proton pool and Roblox uses
-Cloudflare WARP. Direct egress remains the fallback when all tunnel exits are
-unhealthy.
+Cloudflare WARP. Proton routes declare Cloudflare WARP as their explicit
+provider fallback; direct egress remains the final fallback only when the
+configured tunnel route is removed or the router is down.
 
 Core CLI runs on macOS, Linux, and Windows. The macOS-only bits (`up`/`down`
 and the launchd keep-alive) are guarded and print a clear message elsewhere.
@@ -106,11 +107,14 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py add --domain example.com --provider proton [--id my-route]
 ./router.py add --ip 1.2.3.0/24 --provider proton [--id my-route]
 ./router.py remove <id>
-./router.py rotate <provider>    # switch to next healthy profile, hot reload
+./router.py rotate <provider>    # stop current server, start next healthy profile
 ./router.py rotate <provider> --reason 503|429|timeout|1010  # mark CURRENT exit failed upstream, prefer a different one
 ./router.py rotate <provider> --force   # switch anyway, ignoring cooldowns and blocked exits
-./router.py rotate <provider> --no-probe # skip the post-switch egress probe
+./router.py rotate <provider> --no-probe # stop current server, start next profile, skip egress probe
 ./router.py rotate --if-due      # scheduled rotation: only when the interval elapsed (exit 3 = not due)
+./router.py failover proton on     # route Proton domains through its configured fallback
+./router.py failover proton off    # clear fallback and restore Proton routes
+./router.py failover proton status --json
 ./router.py provider-count proton # rotation candidates (retry budget)
 ./router.py with-proxy [--timeout-ms 300] [--force-proxy|--force-direct] -- <cmd...>
                                  # fail-open runner: exec <cmd> through the proxy when up, else direct
@@ -157,6 +161,10 @@ end-to-end (a URL matching no route would go out direct and measure the wrong
 path).
 
 Rotation is then egress-aware instead of blind round-robin:
+- A provider rotation is a hard server switch: the generated config is checked,
+  the current owned sing-box process is stopped, and the selected profile is
+  started fresh. Route-table edits still use hot reload because they do not
+  change the WireGuard server.
 
 - Profiles with a fresh OK probe are preferred, fastest latency first;
   unknown profiles come next; profiles with repeated failures (`fail_threshold`,
@@ -175,13 +183,11 @@ Rotation is then egress-aware instead of blind round-robin:
   running tunnel (not just the active exit), persisting per-profile health,
   cooldown, and blocked markers, then ends on the best alive profile - lowest
   latency first, unmeasured alive profiles ranking after measured ones. It
-  hops through the pool in wrap order (one `rotate` per step, engine reloaded
-  each hop) with a short settle wait after each switch, so the first-request
-  flake of a fresh WireGuard handshake never false-marks an exit failed. When
-  nothing is alive the tunnel stays on the current profile and exit code 1
-  signals a provider with zero alive exits (`--json` names them under
-  `dead`). A sweep reloads the engine only when a strictly better exit was
-  found, so a healthy sweep is cheap.
+  hops through the pool in wrap order with a short settle wait after each
+  hard server switch, so the first-request flake of a fresh WireGuard
+  handshake never false-marks an exit failed. When nothing is alive the
+  original active profile is restored when possible and exit code 1 signals a
+  provider with zero alive exits (`--json` names them under `dead`).
 - `egress check` is the read-only liveness view used by the keepalive self-heal
   loop: it probes the ACTIVE exit(s) through the running tunnel and classifies
   each one `alive` (HTTP response rode the tunnel), `degraded` (an HTTP status
@@ -191,7 +197,17 @@ Rotation is then egress-aware instead of blind round-robin:
   `dns_ok` in the egress record when determinable: `dead` with `dns_ok: false`
   means resolution through the tunnel failed, `dns_ok: true` means a later
   dial/read stage failed. Exit code is 1 only when an exit is `dead`, so
-  automation never rotates on a reputation-block HTTP status.
+  automation never rotates on a reputation-block HTTP status. During active
+  fallback it probes the fallback endpoint through the primary route and
+  reports the result as `fallback`; a dead fallback still exits 1.
+- A provider can declare `fallback_provider` (the deployment maps Proton to
+  Cloudflare WARP). When rotation exhausts the primary pool, the wrapper,
+  keepalive, or Hermes rotation bridge writes a private runtime marker, then
+  hard-stops the current sing-box process and starts once with the primary
+  endpoint removed; matching routes and DNS then use the fallback. `egress
+  check` probes the fallback path through the matching primary route and reports
+  it as `fallback`. Clear it explicitly with `failover proton off` after
+  Proton has been validated again.
 - A `sing-box.json.last-good` snapshot (atomic, 0600) is written whenever a
   freshly built config validates AND the engine demonstrably comes up with it;
   if a later reload's config fails validation or the engine fails to come up,

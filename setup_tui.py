@@ -346,7 +346,11 @@ def apply_presets(config_path, opencode=True, warp_roblox=True) -> dict:
 
     added: list[str] = []
     if opencode:
-        providers.setdefault("proton", {"directory": "providers/proton", "cooldown_seconds": 60})
+        proton_config = providers.setdefault("proton", {})
+        proton_config.setdefault("directory", "providers/proton")
+        proton_config.setdefault("cooldown_seconds", 60)
+        if warp_roblox or "cloudflare" in providers:
+            proton_config["fallback_provider"] = "cloudflare"
         if not any(r.get("id") == "opencode-zen" for r in routes):
             routes.append(dict(_PRESET_ROUTES["opencode-zen"]))
             added.append("opencode-zen")
@@ -428,8 +432,13 @@ def apply_preset_by_name(root: Path, name: str) -> dict:
     added: list[str] = []
     for route in preset.get("routes", []):
         if route.get("provider") and route["provider"] not in providers:
-            providers.setdefault(route["provider"], {
-                "directory": f"providers/{route['provider']}", "cooldown_seconds": 60})
+            provider_config = {
+                "directory": f"providers/{route['provider']}",
+                "cooldown_seconds": 60,
+            }
+            if route["provider"] == "proton" and "cloudflare" in providers:
+                provider_config["fallback_provider"] = "cloudflare"
+            providers.setdefault(route["provider"], provider_config)
         if not any(r.get("id") == route.get("id") for r in routes):
             routes.append(dict(route))
             added.append(str(route.get("id")))

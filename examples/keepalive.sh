@@ -101,7 +101,10 @@ rotate_dead() {
   if "$ROOT/router.py" rotate "$provider" --reason timeout; then
     :
   else
-    echo "router: rotate '$provider' failed; will retry after the next dead check" >&2
+    echo "router: rotate '$provider' failed; activating configured fallback" >&2
+    if ! "$ROOT/router.py" failover "$provider" on --reason timeout >/dev/null 2>&1; then
+      echo "router: fallback for '$provider' failed; will retry after the next dead check" >&2
+    fi
   fi
   rotations=$((rotations + 1))
   strikes=0
@@ -143,8 +146,8 @@ while true; do
     fi
     # Time-based full-pool sweep: on the first successful ensure, and every
     # SWEEP_EVERY seconds after, probe EVERY profile of every provider and
-    # end on the best alive exit (the sweep only reloads when a better exit
-    # is found; exit 1 means some provider has no alive profile at all).
+    # end on the best alive exit (each profile hop is a hard server switch;
+    # a failed/empty sweep restores the original active profile when possible).
     sweep_now=$(date +%s)
     if [ "$last_sweep" -eq 0 ] || [ $((sweep_now - last_sweep)) -ge "$SWEEP_EVERY" ]; then
       if "$ROOT/router.py" egress sweep --json >/dev/null 2>&1; then

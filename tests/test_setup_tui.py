@@ -177,6 +177,11 @@ class ApplyPresetsTests(unittest.TestCase):
         data = json.loads(self.config.read_text())
         self.assertEqual(data["providers"]["proton"]["cooldown_seconds"], 60)
 
+    def test_adds_fallback_to_existing_proton_provider(self):
+        setup_tui.apply_presets(self.config)
+        data = json.loads(self.config.read_text())
+        self.assertEqual(data["providers"]["proton"]["fallback_provider"], "cloudflare")
+
 
 class CustomPresetTests(unittest.TestCase):
     """Named presets: listing, apply-by-name, and custom preset creation."""

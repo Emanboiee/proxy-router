@@ -43,10 +43,13 @@ case "${1:-}" in
         ;;
     esac
     if [ -n "$REASON" ]; then
-      "$ROUTER" rotate "$PROVIDER" --reason "$REASON"
-    else
-      "$ROUTER" rotate "$PROVIDER"
+      if "$ROUTER" rotate "$PROVIDER" --reason "$REASON"; then
+        exit 0
+      fi
+    elif "$ROUTER" rotate "$PROVIDER"; then
+      exit 0
     fi
+    "$ROUTER" failover "$PROVIDER" on --reason "${REASON:-transport}"
     ;;
   help|-h|--help|"")
     printf 'usage: %s rotate [REASON] [OPENCODE_PROVIDER=proton]\n' "$0" >&2

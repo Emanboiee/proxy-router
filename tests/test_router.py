@@ -250,7 +250,7 @@ class RotationTests(unittest.TestCase):
     def test_rotate_walks_forward_through_pool_before_wrapping(self):
         _write_conf(self.root / "providers" / "proton" / "c.conf")
         router.set_active("proton", self.root / "providers" / "proton" / "b.conf")
-        with mock.patch.object(router, "engine_reload", return_value=0):
+        with mock.patch.object(router, "engine_switch", return_value=0):
             self.assertEqual(router.rotate("proton"), 0)
             self.assertEqual((self.root / "state" / "proton.active").read_text(), "c")
             self.assertEqual(router.rotate("proton"), 0)
@@ -964,14 +964,14 @@ class RotationEgressTests(unittest.TestCase):
         router._routes = [{"id": "example-com", "domains": ["example.com"], "provider": "proton"}]
         router._port = 2080
         router._vpn = {}
-        self.reload_patch = mock.patch.object(router, "engine_reload", return_value=0)
-        self.engine_reload = self.reload_patch.start()
+        self.switch_patch = mock.patch.object(router, "engine_switch", return_value=0)
+        self.engine_switch = self.switch_patch.start()
         self.probe_patch = mock.patch.object(router, "probe_profile", return_value=(True, {"ok": True}))
         self.probe = self.probe_patch.start()
 
     def tearDown(self):
         self.probe_patch.stop()
-        self.reload_patch.stop()
+        self.switch_patch.stop()
         self._tmp.cleanup()
 
     def _profile(self, stem):
@@ -1029,8 +1029,8 @@ class RotationEgressTests(unittest.TestCase):
         self.assertEqual(self._active(), "a")
         self.assertTrue(router.is_cooled_down("proton", self._profile("b")))
         probe.assert_called_once()
-        # first reload for the switch, second for the rollback
-        self.assertEqual(self.engine_reload.call_count, 2)
+        # first hard switch for the selection, second for the rollback
+        self.assertEqual(self.engine_switch.call_count, 2)
 
     def test_rotate_reason_probe_failure_keeps_reason_cooldown(self):
         # A --reason rotation marks the current profile FAILED upstream; the
@@ -1588,14 +1588,14 @@ class EgressSweepTests(unittest.TestCase):
                                              return_value=(True, {"ok": True, "latency_ms": 10.0,
                                                                  "status": 200}))
         self.probe = self.probe_patch.start()
-        self.reload_patch = mock.patch.object(router, "engine_reload", return_value=0)
-        self.engine_reload = self.reload_patch.start()
+        self.switch_patch = mock.patch.object(router, "engine_switch", return_value=0)
+        self.engine_switch = self.switch_patch.start()
         self.sleep_patch = mock.patch.object(router.time, "sleep")
         self.sleep_patch.start()
 
     def tearDown(self):
         self.sleep_patch.stop()
-        self.reload_patch.stop()
+        self.switch_patch.stop()
         self.probe_patch.stop()
         self.rotate_patch.stop()
         self.listener.stop()
@@ -1621,11 +1621,8 @@ class EgressSweepTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         stems = [call.args[1].stem for call in self.probe.call_args_list]
         self.assertEqual(stems, ["a", "b", "c"])
-        # one force/no-probe hop before every non-first profile
-        self.assertEqual([c.args[0] for c in self.rotate.call_args_list], ["proton", "proton"])
-        for call in self.rotate.call_args_list:
-            self.assertTrue(call.kwargs["force"])
-            self.assertFalse(call.kwargs["probe"])
+        # hard-switch before every non-first profile and restore the winner.
+        self.assertEqual(self.engine_switch.call_count, 3)
 
     def test_ends_on_best_alive_profile(self):
         router.set_active("proton", self._profile("a"))
@@ -1638,18 +1635,18 @@ class EgressSweepTests(unittest.TestCase):
             rc = router.egress_sweep("proton")
         self.assertEqual(rc, 0)
         self.assertEqual(router.persisted_active("proton").stem, "b")
-        self.engine_reload.assert_called_once()
+        self.assertEqual(self.engine_switch.call_count, 3)
         joined = "".join(c.args[0] for c in write.call_args_list)
         self.assertIn("switched proton -> b (sweep)", joined)
 
     def test_keeps_current_when_already_best(self):
         # all profiles alive at the same latency: first tested (the current
-        # one) wins, so the sweep must NOT reload the engine.
+        # one) wins, so the sweep returns to it after probing the pool.
         router.set_active("proton", self._profile("a"))
         rc = router.egress_sweep("proton")
         self.assertEqual(rc, 0)
         self.assertEqual(router.persisted_active("proton").stem, "a")
-        self.engine_reload.assert_not_called()
+        self.assertEqual(self.engine_switch.call_count, 3)
 
     def test_all_profiles_dead_exit_one_no_switch(self):
         router.set_active("proton", self._profile("a"))
@@ -1661,8 +1658,8 @@ class EgressSweepTests(unittest.TestCase):
         with mock.patch("sys.stdout.write") as write:
             rc = router.egress_sweep("proton")
         self.assertEqual(rc, 1)
-        self.engine_reload.assert_not_called()
-        self.assertEqual(router.persisted_active("proton").stem, "a")  # left on current
+        self.assertEqual(self.engine_switch.call_count, 3)
+        self.assertEqual(router.persisted_active("proton").stem, "a")  # restored
         joined = "".join(c.args[0] for c in write.call_args_list)
         self.assertIn("0/3 alive", joined)
 
@@ -1832,11 +1829,11 @@ class ErrorPolicyTests(unittest.TestCase):
         router._vpn = {}
         router._error_policy = None
         router._egress_settings = dict(router.DEFAULT_EGRESS_SETTINGS)
-        self.reload_patch = mock.patch.object(router, "engine_reload", return_value=0)
-        self.reload_patch.start()
+        self.switch_patch = mock.patch.object(router, "engine_switch", return_value=0)
+        self.switch_patch.start()
 
     def tearDown(self):
-        self.reload_patch.stop()
+        self.switch_patch.stop()
         router._error_policy = None
         self._tmp.cleanup()
 
@@ -2299,7 +2296,7 @@ class ScheduledRotationTests(unittest.TestCase):
         backdated = int(time.time()) - 7200  # two full intervals ago
         (self.root / "state" / "proton.rotation").write_text(
             json.dumps({"profile": "a", "at": backdated}), encoding="utf-8")
-        with mock.patch.object(router, "engine_reload", return_value=0), \
+        with mock.patch.object(router, "engine_switch", return_value=0), \
                 mock.patch.object(router, "probe_profile", return_value=(True, {"ok": True})):
             self.assertEqual(router.rotate_due("proton"), 0)
         self.assertGreater(self._rotation_record(), backdated)
@@ -2369,7 +2366,7 @@ class RotationPolicyTests(unittest.TestCase):
         path.write_text(str(int(time.time()) + 3600))
 
     def _rotate_ranked(self):
-        with mock.patch.object(router, "engine_reload", return_value=0), \
+        with mock.patch.object(router, "engine_switch", return_value=0), \
                 mock.patch.object(router, "probe_profile", return_value=(True, {"ok": True})):
             return router.rotate("proton")
 

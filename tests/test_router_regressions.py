@@ -906,6 +906,7 @@ def test_elevate_prefers_sudo_n_when_granted(tmp_path, monkeypatch):
 def test_elevate_falls_back_to_admin_dialog(tmp_path, monkeypatch):
     router = load_router(tmp_path)
     monkeypatch.setattr(router, "_sudoers_installed", lambda: False)
+    monkeypatch.setattr(router.sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr(router, "_elevate_macos", lambda: 99)
     assert router._elevate() == 99
 
