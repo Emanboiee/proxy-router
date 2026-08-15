@@ -905,6 +905,77 @@ def fallback_status(name: str) -> dict:
     }
 
 
+def _response_host_matches(host: str, domain: str) -> bool:
+    """Match a response-observer host without allowing suffix lookalikes."""
+    host = str(host or "").strip().lower().rstrip(".")
+    domain = str(domain or "").lstrip("*.").strip().lower().rstrip(".")
+    return bool(host and domain and (host == domain or host.endswith("." + domain)))
+
+
+def response_provider_for_host(host: str) -> str | None:
+    """Return the configured route provider responsible for ``host``."""
+    for route in _routes:
+        provider = route.get("provider")
+        if not isinstance(provider, str):
+            continue
+        for domain in route.get("domains", []):
+            if _response_host_matches(host, domain):
+                return provider
+    return None
+
+
+def _response_event_marker(provider: str) -> Path:
+    return ROOT / "state" / "response-events" / f"{provider}.json"
+
+
+def response_event(host: str, status: int, *, provider: str | None = None,
+                   dedupe_seconds: int = 5) -> int:
+    """Handle a response-aware proxy event and rotate the effective route.
+
+    This is intentionally a narrow event sink: only HTTP 429 responses for a
+    configured routed host can mutate provider state. The caller owns request
+    replay; this command only performs the hard switch/fallback transaction.
+    """
+    try:
+        status = int(status)
+    except (TypeError, ValueError):
+        return fail("response-event: status must be an integer")
+    if status != 429:
+        print(f"response-event: ignored HTTP {status} for {host}")
+        return 0
+    route_provider = response_provider_for_host(host)
+    if route_provider is None:
+        return fail(f"response-event: host '{host}' is not routed")
+    if provider is not None and provider != route_provider:
+        return fail(f"response-event: host '{host}' routes through '{route_provider}', not '{provider}'")
+
+    marker = _response_event_marker(route_provider)
+    now = int(time.time())
+    try:
+        previous = json.loads(marker.read_text()) if marker.exists() else {}
+        last_at = int(previous.get("at", 0))
+    except (OSError, ValueError, TypeError):
+        last_at = 0
+    if dedupe_seconds > 0 and now - last_at < dedupe_seconds:
+        print(f"response-event: suppressed duplicate 429 for {host}")
+        return 0
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps({"at": now, "host": str(host).lower(), "status": status}) + "\n")
+    try:
+        marker.chmod(0o600)
+    except OSError:
+        pass
+
+    effective = active_fallback(route_provider) or route_provider
+    print(f"response-event: HTTP 429 for {host}; rotating {effective}")
+    rc = rotate(effective, reason=str(status))
+    if rc == 0:
+        return 0
+    if effective != route_provider:
+        return rc
+    return activate_fallback(route_provider, reason=str(status))
+
+
 def _open_probe(opener, request, timeout: float):
     """Open ``request`` through an opener that may be a urllib OpenerDirector
     (use .open) or a plain callable injected by tests, mirroring monitor.py."""
@@ -3961,6 +4032,13 @@ def main() -> int:
     r_rot.add_argument("--no-probe", action="store_true",
                        help="skip the post-switch egress probe")
 
+    r_event = sub.add_parser("response-event", help="handle an observed upstream response")
+    r_event.add_argument("--host", required=True, help="destination hostname observed by the proxy")
+    r_event.add_argument("--status", required=True, type=int, help="HTTP response status")
+    r_event.add_argument("--provider", default=None, help="expected route provider")
+    r_event.add_argument("--dedupe-seconds", type=int, default=5,
+                         help="suppress duplicate events for this many seconds")
+
     w_proxy = sub.add_parser("with-proxy", help="run a command through the proxy when up, else direct (fail-open)")
     w_proxy.add_argument("--timeout-ms", type=int, default=300, help="listener probe timeout (default 300)")
     w_proxy_group = w_proxy.add_mutually_exclusive_group()
@@ -4134,6 +4212,11 @@ def main() -> int:
             parser.error("rotate needs a provider (or use --if-due for scheduled rotation)")
         return _with_lock(lambda: rotate(args.provider, reason=args.reason, force=args.force,
                                          probe=not args.no_probe, to=args.to))
+    if args.cmd == "response-event":
+        return _with_lock(lambda: response_event(
+            args.host, args.status, provider=args.provider,
+            dedupe_seconds=args.dedupe_seconds,
+        ))
     if args.cmd == "failover":
         if args.action == "on":
             return _with_lock(lambda: activate_fallback(
