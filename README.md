@@ -14,8 +14,9 @@ stays up (config is hot-reloaded via SIGHUP, no restart). The default template
 keeps the route table conservative; `proxy-router setup --preset` applies the
 validated Proton/WARP presets explicitly.
 
-On the current deployment, OpenCode Zen uses the Proton pool and Roblox uses
-Cloudflare WARP. Direct egress remains the fallback when all tunnel exits are
+Providers are bring-your-own: drop WireGuard profiles under
+`providers/<name>/` (see the guides) and reference the provider name from
+routes. Direct egress remains the fallback when all tunnel exits are
 unhealthy.
 
 Core CLI runs on macOS, Linux, and Windows. The macOS-only bits (`up`/`down`

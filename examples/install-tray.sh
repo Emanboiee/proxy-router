@@ -10,7 +10,11 @@ set -euo pipefail
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ROOT="${PROXY_ROUTER_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
-PYTHON="${PYTHON:-/opt/anaconda3/bin/python3}"
+PYTHON="${PYTHON:-$(command -v python3 || true)}"
+if [ -z "$PYTHON" ]; then
+  echo "python3 not found on PATH; set PYTHON=/path/to/python3" >&2
+  exit 1
+fi
 PLIST_SRC="$ROOT/examples/com.proxy-router.tray.plist.template"
 PLIST_DST="$HOME/Library/LaunchAgents/com.proxy-router.tray.plist"
 LOG_DIR="$HOME/Library/Logs/proxy-router"
@@ -55,7 +59,7 @@ ATHOME="$HOME"
 sed -e "s|@ROOT@|$ROOT|g" \
     -e "s|@PYTHON@|$PYTHON|g" \
     -e "s|@LOG_DIR@|$LOG_DIR|g" \
-    -e "s|@PATH@|/opt/homebrew/bin:/opt/anaconda3/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin|g" \
+    -e "s|@PATH@|/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin|g" \
     "$PLIST_SRC" > "$PLIST_DST"
 
 chmod 644 "$PLIST_DST"

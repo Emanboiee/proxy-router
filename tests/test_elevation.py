@@ -49,7 +49,7 @@ def _block_pid_read():
 
 class SudoersRulesTests(unittest.TestCase):
     def test_rules_cover_start_and_stop(self):
-        rules = router._sudoers_rules("kyson", "/usr/bin/python3", "/opt/pr/router.py")
+        rules = router._sudoers_rules("alice", "/usr/bin/python3", "/opt/pr/router.py")
         lines = rules.strip().splitlines()
         cmds = [l.split("NOPASSWD: ", 1)[1] for l in lines[1:]]
         self.assertIn("/usr/bin/python3 /opt/pr/router.py start", cmds)
@@ -96,7 +96,7 @@ class EngineRunsAsRootTests(unittest.TestCase):
         with mock.patch("os.stat") as st:
             st.return_value.st_uid = 0
             with mock.patch.object(router.subprocess, "run") as run:
-                run.return_value.stdout = "kyson\n"
+                run.return_value.stdout = "alice\n"
                 self.assertFalse(router._engine_runs_as_root())
 
     def test_never_root_on_windows(self):
@@ -235,7 +235,7 @@ class ElevateFallbackTests(unittest.TestCase):
              mock.patch.object(router.sys.stdin, "isatty", return_value=True), \
              mock.patch.object(router, "_elevate_macos", return_value=42) as dialog, \
              mock.patch.object(router.subprocess, "run",
-                               return_value=self._probe(1, "kyson is not in the sudoers file")):
+                               return_value=self._probe(1, "alice is not in the sudoers file")):
             rc = router._elevate()
         self.assertEqual(rc, 42)
         dialog.assert_called_once()

@@ -351,20 +351,20 @@ def write_default_config(force: bool = False) -> int:
         data = {
             "port": DEFAULT_PORT,
             "providers": {
-                "proton": {"directory": "providers/proton", "cooldown_seconds": 60},
-                "cloudflare": {"directory": "providers/cloudflare", "cooldown_seconds": 60,
-                               "error_policy": {"429": {"action": "cooldown", "seconds": 300}}},
+                "primary-vpn": {"directory": "providers/primary-vpn", "cooldown_seconds": 60},
+                "fallback-vpn": {"directory": "providers/fallback-vpn", "cooldown_seconds": 60,
+                                 "error_policy": {"429": {"action": "cooldown", "seconds": 300}}},
             },
             "routes": [
                 {
                     "id": "opencode-zen",
                     "domains": ["opencode.ai"],
-                    "provider": "proton",
+                    "provider": "primary-vpn",
                 },
                 {
                     "id": "roblox",
                     "domains": ["roblox.com", "rbxcdn.com", "robloxlabs.com", "rblx.com"],
-                    "provider": "cloudflare",
+                    "provider": "fallback-vpn",
                 },
             ],
             # vpn-list with an empty list is the safe default: route.final
@@ -3375,7 +3375,7 @@ def _sudoers_installed() -> bool:
     Executes (not lists) the read-only `vpn status` command with `-n`.
     `sudo -n -l` is a false positive when a sudoers rule exists but still
     requires a password: listing succeeds but executing fails, e.g. a
-    plain `kyson ALL=(ALL) ALL` entry. Every sudoers rule shares the
+    plain `alice ALL=(ALL) ALL` entry. Every sudoers rule shares the
     interpreter + script prefix, so one execution proves the whole set."""
     if os.geteuid() == 0 or not shutil.which("sudo"):
         return os.geteuid() == 0

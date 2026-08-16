@@ -820,7 +820,7 @@ def test_needs_elevation_noninteractive_lifts_when_sudoers_installed(tmp_path, m
 
 def test_sudoers_rules_render_all_command_shapes():
     router = load_router(Path("/tmp/pr-test"))
-    rules = router._sudoers_rules("kyson", "/usr/bin/python3", "/opt/pr/router.py")
+    rules = router._sudoers_rules("alice", "/usr/bin/python3", "/opt/pr/router.py")
     lines = rules.strip().splitlines()
     assert lines[0].startswith("# Managed by `proxy-router elevate install`")
     cmds = [l.split("NOPASSWD: ", 1)[1] for l in lines[1:]]

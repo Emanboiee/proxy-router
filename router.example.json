@@ -1,12 +1,12 @@
 {
   "port": 2080,
   "providers": {
-    "proton": {
-      "directory": "providers/proton",
+    "primary-vpn": {
+      "directory": "providers/primary-vpn",
       "cooldown_seconds": 60
     },
-    "cloudflare": {
-      "directory": "providers/cloudflare",
+    "fallback-vpn": {
+      "directory": "providers/fallback-vpn",
       "cooldown_seconds": 60,
       "error_policy": {
         "429": {
@@ -22,7 +22,7 @@
       "domains": [
         "opencode.ai"
       ],
-      "provider": "proton"
+      "provider": "primary-vpn"
     },
     {
       "id": "roblox",
@@ -32,7 +32,7 @@
         "robloxlabs.com",
         "rblx.com"
       ],
-      "provider": "cloudflare"
+      "provider": "fallback-vpn"
     }
   ],
   "routing": {

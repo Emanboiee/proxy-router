@@ -161,7 +161,7 @@ class RunElevatedFallbackTests(unittest.TestCase):
         with mock.patch.object(tray, "_sudoers_ok", return_value=True), \
              mock.patch.object(tray.subprocess, "run") as run:
             run.side_effect = [
-                self._probe(1, stderr="kyson is not in the sudoers file"),
+                self._probe(1, stderr="alice is not in the sudoers file"),
                 self._probe(0, stdout="stopped"),
             ]
             rc, out = self.client._run_elevated("stop")
