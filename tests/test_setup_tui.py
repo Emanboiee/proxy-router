@@ -2,6 +2,7 @@
 import io
 import json
 import os
+import plistlib
 import stat
 import subprocess
 import sys
@@ -792,6 +793,12 @@ class AutocheckConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(ValueError):
                 setup_tui.configure_autocheck(Path(tmp) / "router.json", interval=0)
+
+    def test_disabled_autocheck_does_not_respawn_successfully(self):
+        template = Path(__file__).resolve().parents[1] / "examples" / "com.proxy-router.keepalive.plist.template"
+        with template.open("rb") as handle:
+            plist = plistlib.load(handle)
+        self.assertEqual(plist["KeepAlive"], {"SuccessfulExit": False})
 
 
 if __name__ == "__main__":
