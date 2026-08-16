@@ -19,9 +19,6 @@ if [ -n "${PROXY_ROUTER_BIN:-}" ]; then
 elif [ -n "${PROXY_ROUTER_ROOT:-}" ] && [ -x "$PROXY_ROUTER_ROOT/router.py" ]; then
   export PROXY_ROUTER_ROOT
   ROUTER="$PROXY_ROUTER_ROOT/router.py"
-elif [ -z "${PROXY_ROUTER_ROOT:-}" ] && [ -x "$HOME/proxy-router-fallback-pr/router.py" ] && [ -d "$ROOT/providers" ]; then
-  export PROXY_ROUTER_ROOT="$ROOT"
-  ROUTER="$HOME/proxy-router-fallback-pr/router.py"
 else
   ROUTER="$ROOT/router.py"
 fi

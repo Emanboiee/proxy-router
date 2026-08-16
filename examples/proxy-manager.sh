@@ -15,11 +15,6 @@ router_py() {
     printf '%s\n' "$PROXY_ROUTER_ROOT/router.py"
     return 0
   fi
-  if [ -z "${PROXY_ROUTER_ROOT:-}" ] && [ -x "$HOME/proxy-router-fallback-pr/router.py" ] && [ -d "$HOME/proxy-router/providers" ]; then
-    export PROXY_ROUTER_ROOT="$HOME/proxy-router"
-    printf '%s\n' "$HOME/proxy-router-fallback-pr/router.py"
-    return 0
-  fi
   local candidate
   for candidate in \
     "$SCRIPT_DIR/router.py" \

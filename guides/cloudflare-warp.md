@@ -127,7 +127,7 @@ chmod 600 providers/cloudflare/*.conf
   WARP alternate port and reload:
   ```sh
   sed -i '' 's/^Endpoint = engage.cloudflareclient.com:2408$/Endpoint = engage.cloudflareclient.com:4500/' providers/cloudflare/warp.conf
-  proxy-router reload   # sudo: /opt/anaconda3/bin/python3 .../router.py reload
+  proxy-router reload   # sudo: /usr/bin/python3 .../router.py reload
   ```
   Cloudflare's WARP endpoint listens on several UDP ports — `2408`, `500`,
   `1701`, `4500`. `4500` (NAT-T) is the least likely to be filtered and is a
