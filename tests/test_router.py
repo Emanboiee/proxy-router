@@ -616,30 +616,38 @@ class EngineEnsureConsistencyTests(unittest.TestCase):
     def test_proxy_listener_up_returns_without_start(self):
         with mock.patch.object(router, "listener_up", return_value=True), \
              mock.patch.object(router, "engine_alive", return_value=True), \
+             mock.patch.object(router, "route_watcher_start") as watcher, \
              mock.patch.object(router, "engine_start", side_effect=AssertionError("must not start")):
             self.assertEqual(router.engine_ensure(), 0)
+        watcher.assert_called_once()
 
     def test_tun_alive_and_consistent_is_healthy(self):
         router.set_mode("tun")
         with mock.patch.object(router, "engine_alive", return_value=True), \
              mock.patch.object(router, "engine_mode_consistent", return_value=True), \
+             mock.patch.object(router, "route_watcher_start") as watcher, \
              mock.patch.object(router, "engine_start", side_effect=AssertionError("must not start")):
             self.assertEqual(router.engine_ensure(), 0)
+        watcher.assert_called_once()
 
     def test_tun_alive_but_inconsistent_restarts(self):
         router.set_mode("tun")
         with mock.patch.object(router, "engine_alive", return_value=True), \
              mock.patch.object(router, "engine_mode_consistent", return_value=False), \
+             mock.patch.object(router, "route_watcher_start") as watcher, \
              mock.patch.object(router, "engine_start", return_value=77) as start:
             self.assertEqual(router.engine_ensure(), 77)
         start.assert_called_once()
+        watcher.assert_not_called()
 
     def test_tun_down_starts(self):
         router.set_mode("tun")
         with mock.patch.object(router, "engine_alive", return_value=False), \
+             mock.patch.object(router, "route_watcher_start") as watcher, \
              mock.patch.object(router, "engine_start", return_value=0) as start:
             self.assertEqual(router.engine_ensure(), 0)
         start.assert_called_once()
+        watcher.assert_called_once()
 
 
 class VpnOnRollbackTests(unittest.TestCase):

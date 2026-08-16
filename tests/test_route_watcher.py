@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import route_watcher as w
 
@@ -51,6 +52,12 @@ class RouteWatcherTests(unittest.TestCase):
         self.assertFalse(guard.record_transport_failure(100.0))
         self.assertFalse(guard.record_transport_failure(161.0))
 
+    def test_guard_does_not_combine_different_targets(self):
+        guard = w.RotationGuard()
+        self.assertFalse(guard.record_transport_failure(100.0, "opencode.ai"))
+        self.assertFalse(guard.record_transport_failure(101.0, "roblox.com"))
+        self.assertTrue(guard.record_transport_failure(102.0, "opencode.ai"))
+
     def test_critical_domains_are_config_driven(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -81,6 +88,60 @@ class RouteWatcherTests(unittest.TestCase):
         result = w.probe_target(Path("/tmp"), "opencode.ai", runner=fake_runner)
         self.assertTrue(result["transport_failure"])
         self.assertFalse(result["ok"])
+
+    def test_worker_cleanup_cannot_remove_newer_worker_markers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "state" / "route-watcher").mkdir(parents=True)
+            w.pid_file(root).write_text("222\n")
+            w.enabled_file(root).write_text("enabled\n")
+
+            w._cleanup_worker_state(root, 111)
+
+            self.assertEqual(w.pid_file(root).read_text(), "222\n")
+            self.assertTrue(w.enabled_file(root).is_file())
+
+    def test_worker_cleanup_removes_its_own_markers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "state" / "route-watcher").mkdir(parents=True)
+            w.pid_file(root).write_text("111\n")
+            w.enabled_file(root).write_text("enabled\n")
+
+            w._cleanup_worker_state(root, 111)
+
+            self.assertFalse(w.pid_file(root).exists())
+            self.assertFalse(w.enabled_file(root).exists())
+
+    def test_worker_only_probes_configured_routed_domains(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "state" / "route-watcher").mkdir(parents=True)
+            (root / "router.json").write_text(json.dumps({
+                "routes": [{"id": "opencode", "domains": ["opencode.ai"]}],
+            }))
+            probed = []
+            sleeps = 0
+
+            def fake_sleep(_seconds):
+                nonlocal sleeps
+                sleeps += 1
+                if sleeps == 1:
+                    (root / "sing-box.log").write_text(
+                        "INFO inbound connection to example.com:443\n"
+                        "INFO inbound connection to opencode.ai:443\n"
+                    )
+                else:
+                    raise StopIteration
+
+            with mock.patch.object(w, "client_snapshot", return_value=[]), \
+                    mock.patch.object(w, "probe_target", side_effect=lambda _root, host: probed.append(host) or {
+                        "transport_failure": False, "host": host,
+                    }):
+                with self.assertRaises(StopIteration):
+                    w.worker(root, interval=0.5, sleep=fake_sleep)
+
+            self.assertEqual(probed, ["opencode.ai"])
 
 
 if __name__ == "__main__":

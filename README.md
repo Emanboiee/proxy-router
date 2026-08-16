@@ -346,6 +346,11 @@ system TUN interface. The capture scope is controlled by `vpn.capture`:
   route-based sniff rule identifies TLS/HTTP hostnames, the normal
   domain/provider rules send configured targets through their effective
   provider, and unmatched traffic goes to `direct`.
+- In `"routes"` mode, clients should use their normal upstream URL and should
+  not set `HTTP_PROXY`/`HTTPS_PROXY` or a proxy base URL such as
+  `http://127.0.0.1:2080`; TUN capture performs the selective redirect.
+- The `127.0.0.1:2080` listener remains available only for clients that
+  explicitly need an HTTP/mixed proxy and for router health probes.
 - `"ruleset"` preserves the narrower IP-CIDR mode. `selective`/
   `selective_provider` choose a named ruleset such as `rulesets/roblox.json`;
   only those addresses enter the TUN.

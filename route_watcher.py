@@ -192,20 +192,23 @@ class RotationGuard:
     """Persistent-failure guard used by the standalone worker."""
 
     def __init__(self) -> None:
-        self.failure_times: collections.deque[float] = collections.deque()
-        self.last_rotate = 0.0
+        self.failure_times: dict[str, collections.deque[float]] = {}
+        self.last_rotate: dict[str, float] = {}
 
-    def record_transport_failure(self, now: float) -> bool:
-        while self.failure_times and now - self.failure_times[0] > FAILURE_WINDOW_SECONDS:
-            self.failure_times.popleft()
-        self.failure_times.append(now)
-        if len(self.failure_times) < MIN_TRANSPORT_FAILURES:
+    def record_transport_failure(self, now: float, target: str = "*") -> bool:
+        target = normalize_host(target) or "*"
+        failures = self.failure_times.setdefault(target, collections.deque())
+        while failures and now - failures[0] > FAILURE_WINDOW_SECONDS:
+            failures.popleft()
+        failures.append(now)
+        if len(failures) < MIN_TRANSPORT_FAILURES:
             return False
-        if self.last_rotate and now - self.last_rotate < ROTATE_COOLDOWN_SECONDS:
-            self.failure_times.clear()
+        last_rotate = self.last_rotate.get(target, 0.0)
+        if last_rotate and now - last_rotate < ROTATE_COOLDOWN_SECONDS:
+            failures.clear()
             return False
-        self.last_rotate = now
-        self.failure_times.clear()
+        self.last_rotate[target] = now
+        failures.clear()
         return True
 
 
@@ -313,7 +316,7 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
                     append_event(root, event)
                     if is_critical:
                         last_target[host] = now
-                        if event.get("failure") and guard.record_transport_failure(now):
+                        if event.get("failure") and guard.record_transport_failure(now, host):
                             result = rotate_provider(root)
                             append_event(root, {"kind": "rotation", "observed_at": time.time(), **result})
                 elif event["kind"] == "client":
@@ -327,13 +330,12 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
                 last_probe[host] = now
                 result = probe_target(root, host)
                 append_event(root, {"kind": "probe", "observed_at": time.time(), **result})
-                if result.get("transport_failure") and guard.record_transport_failure(now):
+                if result.get("transport_failure") and guard.record_transport_failure(now, host):
                     rotation = rotate_provider(root)
                     append_event(root, {"kind": "rotation", "observed_at": time.time(), **rotation})
             sleep(max(0.5, float(interval)))
     finally:
-        pid_file(root).unlink(missing_ok=True)
-        enabled_file(root).unlink(missing_ok=True)
+        _cleanup_worker_state(root, os.getpid())
     return 0
 
 
@@ -361,6 +363,17 @@ def _pid_running(pid: int, root: Path | None = None) -> bool:
     return True
 
 
+def _cleanup_worker_state(root: Path, owner_pid: int) -> None:
+    """Remove watcher markers only when they still belong to this worker."""
+    try:
+        if pid_file(root).read_text().strip() != str(owner_pid):
+            return
+    except (OSError, ValueError):
+        return
+    pid_file(root).unlink(missing_ok=True)
+    enabled_file(root).unlink(missing_ok=True)
+
+
 def status(root: Path | None = None) -> dict:
     root = Path(root) if root is not None else ROOT
     try:
@@ -382,14 +395,18 @@ def start(root: Path | None = None, *, interval: float = DEFAULT_INTERVAL) -> di
     if current["running"]:
         return {"started": False, "already_running": True, "pid": current["pid"]}
     state_dir(root).mkdir(parents=True, exist_ok=True)
+    # Publish the start intent before spawning so the child cannot observe a
+    # missing enable marker and exit during the tiny parent/child race.
+    enabled_file(root).write_text("enabled\n", encoding="ascii")
+    os.chmod(enabled_file(root), 0o600)
     command = [sys.executable, str(Path(__file__).resolve()), "--worker", "--root", str(root), "--interval", str(interval)]
     try:
         proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL, start_new_session=True)
     except OSError as exc:
+        enabled_file(root).unlink(missing_ok=True)
         return {"started": False, "error": f"{type(exc).__name__}: {exc}"}
     pid_file(root).write_text(str(proc.pid), encoding="ascii")
-    enabled_file(root).write_text("enabled\n", encoding="ascii")
     os.chmod(pid_file(root), 0o600)
     os.chmod(enabled_file(root), 0o600)
     return {"started": True, "pid": proc.pid, "interval": interval}

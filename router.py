@@ -2474,11 +2474,16 @@ def engine_ensure() -> int:
         # (status/vpn status report it as down); restart into the persisted
         # mode instead of declaring victory (M13).
         if engine_alive() and engine_mode_consistent():
+            route_watcher_start()
             return 0
         rc = engine_start()
+        if rc == 0:
+            route_watcher_start()
+            return 0
         if rc != 0 and _vpn.get("capture") == "routes":
             # Route-based TUN is explicitly fail-open: remove a dead utun
             # state and leave normal applications on their ordinary routes.
+            route_watcher_stop()
             engine_stop()
             set_mode("proxy")
             if sys.platform == "darwin":
@@ -2489,8 +2494,14 @@ def engine_ensure() -> int:
     # process answering the port while our pid is dead/mismatched is NOT
     # healthy (F1): start the engine instead of declaring victory.
     if listener_up() and engine_alive():
+        route_watcher_start()
         return 0
-    return engine_start()
+    rc = engine_start()
+    if rc == 0:
+        route_watcher_start()
+    else:
+        route_watcher_stop()
+    return rc
 
 
 def engine_stop() -> int:
@@ -3018,8 +3029,9 @@ def vpn_on() -> int:
         if engine_alive() and engine_mode_consistent():
             print("vpn: tun already up")
             # Idempotent re-entry must leave the same surface state as a
-            # fresh start: tun mode has no local listener, so the system
-            # proxy must be off (a stale proxy points at the dead port).
+            # fresh start: TUN capture uses the mixed listener only as an
+            # explicit compatibility lane, while ordinary apps stay direct.
+            route_watcher_start()
             if sys.platform == "darwin":
                 system_proxy_off()
             return 0
