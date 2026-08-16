@@ -61,6 +61,11 @@ DEFAULT_EGRESS_SETTINGS = {
     "fail_threshold": 2,
     "slow_latency_ms": 1200.0,
     "ok_window": 86400,
+    # A just-switched WireGuard exit handshakes fine but can blackhole inner
+    # TLS for its first seconds of life (measured on Proton free: ~10-30s).
+    # Switch-adjacent probes retry once after this settle window before the
+    # caller treats the exit as dead; 0 disables the retry.
+    "probe_settle_seconds": 20.0,
 }
 # Optional scheduled rotation (router.json top-level ``rotation``): churn the
 # active provider's exit every ``interval_seconds`` (0/absent = off) with
@@ -514,6 +519,10 @@ def mark_cooldown(name: str, profile: Path, seconds: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(str(int(time.time()) + seconds))
     os.chmod(path, 0o600)
+    # Elevated (root) rotations write these markers; the user-level
+    # keepalive/CLI must stay able to read and re-write them.
+    _hand_back_ownership(path)
+    _hand_back_ownership(path.parent)
 
 
 # ---------------------------------------------------------------------------
@@ -711,7 +720,10 @@ def read_egress(name: str, profile: Path) -> dict:
 
 
 def write_egress(name: str, profile: Path, record: dict) -> None:
-    _atomic_write(egress_record_path(name, profile), json.dumps(record, indent=2, sort_keys=True) + "\n", 0o600)
+    path = egress_record_path(name, profile)
+    _atomic_write(path, json.dumps(record, indent=2, sort_keys=True) + "\n", 0o600)
+    _hand_back_ownership(path)
+    _hand_back_ownership(path.parent)
 
 
 def record_egress(name: str, profile: Path, *, ok: bool, latency_ms: float | None = None,
@@ -1021,6 +1033,14 @@ def _open_probe(opener, request, timeout: float):
     return opener(request, timeout=timeout)
 
 
+# Landing pages behind Cloudflare bot management (opencode.ai) intermittently
+# reset non-browser probe clients, which false-marks healthy exits dead (seen
+# live: `egress check` reported "probe connection" on an exit that was serving
+# real traffic at that moment). These hosts have a light, public, bot-lenient
+# path the probe uses instead of the bare landing page.
+_PROBE_DOMAIN_PATHS = {"opencode.ai": "/zen/v1/models"}
+
+
 def probe_url_for(name: str) -> str | None:
     """Return a probe target whose host is actually routed through ``name``.
 
@@ -1087,7 +1107,7 @@ def probe_url_for(name: str) -> str | None:
                 vpn_domains = routing.get("vpn_domains") or []
                 if not any(matches_domain(host, vpn) for vpn in vpn_domains):
                     continue
-            return f"https://{host}"
+            return f"https://{host}{_PROBE_DOMAIN_PATHS.get(host, '')}"
     return None
 
 
@@ -1165,6 +1185,31 @@ def probe_profile(name: str, profile: Path, *, port: int | None = None) -> tuple
         mark_cooldown(name, profile, seconds)
         print(f"router: marked {profile.stem} failed (transport/{reason}; cooldown {seconds}s)", file=sys.stderr)
     return result["ok"], record
+
+
+def _probe_with_settle(name: str, profile: Path, *, port: int | None = None) -> tuple[bool, dict | None]:
+    """Probe once, and on failure retry once after the settle window.
+
+    Used only for switch-adjacent probes (``rotate``/``egress sweep``): a
+    freshly switched WireGuard exit routinely completes its handshake but
+    blackholes inner TLS for its first seconds of life, so a single
+    immediate probe false-marks healthy exits dead and triggers rollback
+    churn. Steady-state probes (``egress check``) keep their single-shot,
+    multi-strike semantics. Set ``egress.probe_settle_seconds`` to 0 to
+    disable the retry."""
+    ok, record = probe_profile(name, profile, port=port)
+    if ok:
+        return ok, record
+    try:
+        settle = max(0.0, float(egress_settings().get("probe_settle_seconds", 20.0)))
+    except (TypeError, ValueError):
+        settle = 20.0
+    if settle <= 0:
+        return ok, record
+    print(f"router: probe failed for {profile.stem}; retrying once after {settle:.0f}s settle",
+          file=sys.stderr)
+    time.sleep(settle)
+    return probe_profile(name, profile, port=port)
 
 
 _DNS_ERROR_RE = re.compile(
@@ -1298,7 +1343,9 @@ def _egress_rank(record: dict, now: int | None = None) -> tuple[int, float]:
 def record_rotation(name: str, profile: Path) -> None:
     """Persist the last switch (profile + epoch) for status --json."""
     record = {"profile": profile.stem, "at": int(time.time())}
-    _atomic_write(ROOT / "state" / f"{name}.rotation", json.dumps(record, indent=2, sort_keys=True) + "\n", 0o600)
+    path = ROOT / "state" / f"{name}.rotation"
+    _atomic_write(path, json.dumps(record, indent=2, sort_keys=True) + "\n", 0o600)
+    _hand_back_ownership(path)
 
 
 def scheduled_interval() -> int:
@@ -1527,6 +1574,7 @@ def set_active(name: str, profile: Path) -> None:
     state.parent.mkdir(parents=True, exist_ok=True)
     state.write_text(profile.stem)
     os.chmod(state, 0o600)
+    _hand_back_ownership(state)
 
 
 def _profile_error(profile: Path) -> str | None:
@@ -2760,7 +2808,7 @@ def rotate(name: str, *, reason: str | None = None, force: bool = False, probe: 
         probe = False
     if not probe:
         return 0
-    ok, _ = probe_profile(name, chosen)
+    ok, _ = _probe_with_settle(name, chosen)
     if ok:
         return 0
     # The new exit did not come up cleanly: restore the last good profile
@@ -3513,7 +3561,7 @@ def egress_sweep(name: str | None = None, as_json: bool = False) -> int:
                 break
             if actual != original:
                 time.sleep(1.5)  # WireGuard handshake settle
-            ok, record = probe_profile(provider, profile)
+            ok, record = _probe_with_settle(provider, profile)
             entry[profile.stem] = {
                 "ok": ok,
                 "latency_ms": record.get("latency_ms") if record else None,

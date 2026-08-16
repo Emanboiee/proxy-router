@@ -965,6 +965,8 @@ class RotationEgressTests(unittest.TestCase):
         router._routes = [{"id": "example-com", "domains": ["example.com"], "provider": "proton"}]
         router._port = 2080
         router._vpn = {}
+        # unit tests: no settle-retry (dedicated tests exercise it explicitly)
+        router._egress_settings = {**router.DEFAULT_EGRESS_SETTINGS, "probe_settle_seconds": 0}
         self.reload_patch = mock.patch.object(router, "engine_reload", return_value=0)
         self.engine_reload = self.reload_patch.start()
         self.switch_patch = mock.patch.object(router, "engine_switch", return_value=0)
@@ -973,6 +975,7 @@ class RotationEgressTests(unittest.TestCase):
         self.probe = self.probe_patch.start()
 
     def tearDown(self):
+        router._egress_settings = {}
         self.probe_patch.stop()
         self.switch_patch.stop()
         self.reload_patch.stop()
@@ -1071,18 +1074,41 @@ class RotationEgressTests(unittest.TestCase):
             self.assertEqual(router.rotate("proton"), 1)
         self.assertEqual(self._active(), "a")
 
+    def test_rotate_retries_probe_once_after_settle(self):
+        # A fresh WireGuard exit can blackhole inner TLS for its first
+        # seconds: one retry after the settle window must rescue the switch
+        # instead of rolling back a healthy exit.
+        router.set_active("proton", self._profile("a"))
+        router._egress_settings = {**router.DEFAULT_EGRESS_SETTINGS, "probe_settle_seconds": 25}
+        with mock.patch.object(router, "listener_up", return_value=True), \
+                mock.patch.object(router.time, "sleep") as slept, \
+                mock.patch.object(router, "probe_profile",
+                                  side_effect=[(False, {"ok": False}), (True, {"ok": True})]) as probe:
+            self.assertEqual(router.rotate("proton"), 0)
+        self.assertEqual(probe.call_count, 2)
+        slept.assert_called_once_with(25.0)
+        self.assertEqual(self._active(), "b")  # kept the switched exit
+
     def test_rotate_no_probe_skips_probe(self):
         router.set_active("proton", self._profile("a"))
         with mock.patch.object(router, "probe_profile", side_effect=AssertionError("must not probe")):
             self.assertEqual(router.rotate("proton", probe=False), 0)
         self.assertEqual(self._active(), "b")
 
-    def test_rotate_tun_mode_does_not_probe(self):
+    def test_rotate_tun_mode_probes_only_with_mixed_listener(self):
+        # TUN capture keeps the 127.0.0.1 mixed listener, so rotation probes
+        # when it answers and skips the probe when nothing listens.
         router.set_mode("tun")
         router.set_active("proton", self._profile("a"))
-        with mock.patch.object(router, "probe_profile", side_effect=AssertionError("must not probe")):
+        with mock.patch.object(router, "listener_up", return_value=False), \
+                mock.patch.object(router, "probe_profile", side_effect=AssertionError("must not probe")):
             self.assertEqual(router.rotate("proton"), 0)
         self.assertEqual(self._active(), "b")
+        with mock.patch.object(router, "listener_up", return_value=True), \
+                mock.patch.object(router, "probe_profile", return_value=(True, {"ok": True})) as probe:
+            self.assertEqual(router.rotate("proton"), 0)
+        probe.assert_called_once()
+        self.assertEqual(self._active(), "c")
 
     def test_rotate_records_last_rotation(self):
         router.set_active("proton", self._profile("a"))
@@ -1620,6 +1646,7 @@ class EgressSweepTests(unittest.TestCase):
                                              return_value=(True, {"ok": True, "latency_ms": 10.0,
                                                                  "status": 200}))
         self.probe = self.probe_patch.start()
+        router._egress_settings = {**router.DEFAULT_EGRESS_SETTINGS, "probe_settle_seconds": 0}
         self.reload_patch = mock.patch.object(router, "engine_reload", return_value=0)
         self.engine_reload = self.reload_patch.start()
         self.switch_patch = mock.patch.object(router, "engine_switch", return_value=0)
@@ -1628,6 +1655,7 @@ class EgressSweepTests(unittest.TestCase):
         self.sleep_patch.start()
 
     def tearDown(self):
+        router._egress_settings = {}
         self.sleep_patch.stop()
         self.switch_patch.stop()
         self.reload_patch.stop()
@@ -1662,6 +1690,20 @@ class EgressSweepTests(unittest.TestCase):
         # sweep never routes through rotate()
         self.rotate.assert_not_called()
         self.assertEqual(self.engine_switch.call_count, 3)
+
+    def test_sweep_retries_failed_probe_after_settle(self):
+        router._egress_settings = {**router.DEFAULT_EGRESS_SETTINGS, "probe_settle_seconds": 20}
+        router.set_active("proton", self._profile("a"))
+        self._probe(
+            (False, {"ok": False, "latency_ms": None, "status": None}),
+            (True, {"ok": True, "latency_ms": 40.0, "status": 200}),
+            (True, {"ok": True, "latency_ms": 50.0, "status": 200}),
+            (True, {"ok": True, "latency_ms": 60.0, "status": 200}),
+        )
+        rc = router.egress_sweep("proton")
+        self.assertEqual(rc, 0)
+        # profile a: fail, then settle-retry ok; b and c pass first try
+        self.assertEqual([c.args[1].stem for c in self.probe.call_args_list], ["a", "a", "b", "c"])
 
     def test_does_not_probe_unactivated_profiles_after_hop_failure(self):
         router.set_active("proton", self._profile("a"))
@@ -1885,7 +1927,7 @@ class ErrorPolicyTests(unittest.TestCase):
         router._port = 2080
         router._vpn = {}
         router._error_policy = None
-        router._egress_settings = dict(router.DEFAULT_EGRESS_SETTINGS)
+        router._egress_settings = {**router.DEFAULT_EGRESS_SETTINGS, "probe_settle_seconds": 0}
         self.reload_patch = mock.patch.object(router, "engine_reload", return_value=0)
         self.reload_patch.start()
         self.switch_patch = mock.patch.object(router, "engine_switch", return_value=0)
@@ -2124,6 +2166,12 @@ class RoutingModeTests(unittest.TestCase):
         self.assertEqual(router.probe_url_for("proton"), "https://example.com")
         router._routing = {}
         self.assertEqual(router.probe_url_for("proton"), "https://example.com")
+
+    def test_probe_url_for_uses_bot_lenient_path_for_opencode(self):
+        # opencode.ai's Cloudflare-fronted landing page intermittently resets
+        # non-browser probe clients; the public models endpoint is stable.
+        router._routes = [{"id": "zen", "domains": ["opencode.ai"], "provider": "proton"}]
+        self.assertEqual(router.probe_url_for("proton"), "https://opencode.ai/zen/v1/models")
 
     def test_probe_url_for_uses_provider_pinned_probe_url_first(self):
         # roblox.com's bot-protection landing hangs even on a healthy tunnel;
