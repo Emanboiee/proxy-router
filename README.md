@@ -342,9 +342,15 @@ Where it is consumed:
 system TUN interface. The capture scope is controlled by `vpn.capture`:
 
 - `"routes"` is the transparent, app-independent mode. sing-box captures all
-  traffic at the IP layer—including apps that ignore proxy settings—then the
-  normal domain/provider rules send configured targets through their effective
-  provider and unmatched traffic to `direct`.
+  traffic at the IP layer—including apps that ignore proxy settings—then a
+  route-based sniff rule identifies TLS/HTTP hostnames, the normal
+  domain/provider rules send configured targets through their effective
+  provider, and unmatched traffic goes to `direct`.
+- In `"routes"` mode, clients should use their normal upstream URL and should
+  not set `HTTP_PROXY`/`HTTPS_PROXY` or a proxy base URL such as
+  `http://127.0.0.1:2080`; TUN capture performs the selective redirect.
+- The `127.0.0.1:2080` listener remains available only for clients that
+  explicitly need an HTTP/mixed proxy and for router health probes.
 - `"ruleset"` preserves the narrower IP-CIDR mode. `selective`/
   `selective_provider` choose a named ruleset such as `rulesets/roblox.json`;
   only those addresses enter the TUN.
@@ -365,7 +371,10 @@ leak trade-off, not a tunnel-health claim. `vpn off` returns to proxy mode;
 `ensure`, `reload`, `add`/`remove` and `rotate` all respect whatever mode is
 active.
 
-Platform notes:
+The mixed `127.0.0.1:2080` listener remains alongside the TUN inbound, so
+Hermes and other proxy-pinned clients keep working while ordinary apps use
+transparent capture. The routed-connection watcher stays active in both modes
+and observes every configured routed domain, not only `opencode.ai`.
 
 - **Linux**: needs root for the TUN device + route table (iproute2)
   (`sudo proxy-router vpn on`).
