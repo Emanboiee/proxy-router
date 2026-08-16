@@ -27,6 +27,7 @@ import glob
 import io
 import json
 import os
+import time
 import re
 import select
 import shutil
@@ -1373,17 +1374,19 @@ def _line_wizard(root: Path) -> int:
 # ---------------------------------------------------------------------------
 
 # TUI menu keeps the same actions plus Quit (digit 0; q/Q/ESC also quit).
+# Home dashboard destinations. Screens are one key away; the dashboard
+# itself summarizes the whole deployment (engine, mode, exits, pool health).
 TUI_MENU = [
-    ("1", "Start proxy-router (engine + tray autostart)"),
-    ("2", "Stop proxy-router"),
-    ("3", "Add a VPN provider (step-by-step wizard)"),
-    ("4", "Settings: TUN mode, rotation & autoroute"),
-    ("5", "Presets: browse / apply / create (built-in + custom)"),
+    ("1", "Servers: browse pools, pick exits, rotate"),
+    ("2", "Routing: modes, domains, presets"),
+    ("3", "Fallbacks: chains, on/off/status"),
+    ("4", "Add a VPN provider (step-by-step wizard)"),
+    ("5", "Settings: engine, TUN mode, rotation & autoroute"),
     ("6", "Check provider health"),
-    ("7", "Routing modes (show / switch / add-remove domain)"),
-    ("8", "Install / verify the OpenCode bridge (Hermes rotation gateway)"),
-    ("r", "Routing modes (show / switch / add-remove domain)"),
-    ("s", "Presets: apply by name / create custom (built-in + custom)"),
+    ("e", "Start proxy-router (engine + tray autostart)"),
+    ("x", "Stop proxy-router"),
+    ("b", "Install / verify the OpenCode bridge (Hermes rotation gateway)"),
+    ("r", "Routing: modes, domains, presets"),
     ("0", "Quit"),
 ]
 TUI_MENU_INDEX = {key: index for index, (key, _) in enumerate(TUI_MENU)}
@@ -1393,6 +1396,8 @@ DOWN = "\x1b[B"
 ESC = "\x1b"
 ENTER = "\r"
 BACKSPACE = "\x7f"
+LEFT = "\x1b[D"
+RIGHT = "\x1b[C"
 
 _ANSI_ESC_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
@@ -1404,16 +1409,20 @@ def _strip_ansi(text: str) -> str:
 
 @dataclasses.dataclass
 class TuiState:
-    """Pure TUI state; view is one of "menu" | "settings" | "guide" |
-    "import" | "routing" | "routing_prompt" | "provider" | "rotation". """
+    """Pure TUI state; view is one of "home" | "servers" | "fallbacks" |
+    "settings" | "guide" | "import" | "routing" | "routing_prompt" |
+    "provider" | "rotation". """
 
-    view: str = "menu"
+    view: str = "home"
     cursor: int = 0
     guide_provider: str = "proton"
     guide_lines: list = dataclasses.field(default_factory=list)
     guide_scroll: int = 0
     import_provider: str = "proton"
     import_text: str = ""
+    servers_provider: str = ""    # "" = first configured provider
+    servers_cursor: int = 0
+    fallbacks_provider: int = 0
     routing_lines: list = dataclasses.field(default_factory=list)
     routing_prompt_label: str = ""
     routing_prompt_text: str = ""
@@ -1460,6 +1469,172 @@ def _wrap_guide(text: str, width: int) -> list[str]:
         else:
             lines.extend(textwrap.wrap(line, width) or [""])
     return lines
+
+
+def _render_chrome(title: str, body: list[str], state: TuiState, footer: str,
+                   cursor_line: int | None = None) -> list[str]:
+    """Bordered frame with scroll windowing, shared by the dashboard screens."""
+    inner = max(state.cols - 2, 30)
+    reserved = 7  # top, title, separator, separator, footer, bottom + margin
+    visible = max(1, state.rows - reserved)
+    window: list[str] = []
+    if len(body) > visible:
+        anchor = len(body) - 1 if cursor_line is None else max(0, min(cursor_line, len(body) - 1))
+        half = visible // 2
+        start = max(0, min(anchor - half, len(body) - visible))
+        window = body[start:start + visible]
+    else:
+        window = body[:visible]
+    if len(body) > visible:
+        first = body.index(window[0]) + 1
+        footer = f"{footer}  ·  lines {first}-{first + len(window) - 1}/{len(body)}"
+    lines = ["\u250c" + "\u2500" * inner + "\u2510"]
+    lines.append("\u2502" + _style(_fit(f" {title} ", inner), _Ansi.BOLD, _Ansi.CYAN) + "\u2502")
+    lines.append("\u251c" + "\u2500" * inner + "\u2524")
+    for line in window:
+        lines.append("\u2502" + _fit(_strip_ansi(line), inner) + "\u2502")
+    lines.append("\u251c" + "\u2500" * inner + "\u2524")
+    lines.append("\u2502" + _fit(footer, inner) + "\u2502")
+    lines.append("\u2514" + "\u2500" * inner + "\u2518")
+    return lines
+
+
+def _tui_config(root: Path) -> dict:
+    try:
+        return json.loads((root / "router.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _tui_providers(root: Path) -> list[str]:
+    providers = _tui_config(root).get("providers") or {}
+    return [name for name in providers if isinstance(providers[name], dict)]
+
+
+def _tui_active(root: Path, provider: str) -> str:
+    try:
+        return (root / "state" / f"{provider}.active").read_text().strip()
+    except OSError:
+        return ""
+
+
+def _tui_engine_up(root: Path) -> bool:
+    try:
+        pid = int((root / "sing-box.pid").read_text().strip())
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _tui_fallback_chain(provider: str, entry: dict) -> list[str]:
+    raw = entry.get("fallback_providers")
+    if raw is None:
+        raw = entry.get("fallback_provider")
+    if raw is None:
+        return []
+    return raw if isinstance(raw, list) else [raw]
+
+
+def _tui_profiles(root: Path, provider: str) -> list[tuple[str, str]]:
+    """(stem, marker) per profile: "ok" | "dead" | "cooling" | "".
+    Reads the same state files the router writes; never spawns a probe."""
+    config = _tui_config(root)
+    directory = (config.get("providers") or {}).get(provider, {}).get("directory", f"providers/{provider}")
+    confs = sorted((root / directory).glob("*.conf"))
+    active = _tui_active(root, provider)
+    now = time.time()
+    rows: list[tuple[str, str]] = []
+    for conf in confs:
+        record = {}
+        try:
+            record = json.loads((root / "state" / "egress" / provider / f"{conf.stem}.json").read_text())
+        except (OSError, json.JSONDecodeError):
+            pass
+        cooling = False
+        try:
+            until = int((root / "state" / "cooldowns" / provider / f"{conf.stem}.until").read_text().strip())
+            cooling = until > now
+        except (OSError, ValueError):
+            pass
+        if record.get("blocked"):
+            marker = "blocked"
+        elif cooling:
+            marker = "cooling"
+        elif record.get("ok") is True:
+            marker = "ok"
+        elif record.get("ok") is False:
+            marker = "dead"
+        else:
+            marker = ""
+        rows.append((conf.stem, "active" if conf.stem == active else marker))
+    return rows
+
+
+def _render_home(state: TuiState) -> list[str]:
+    root = state.root
+    config = _tui_config(root)
+    mode = _read_vpn_mode(root)
+    engine = "UP" if _tui_engine_up(root) else "down"
+    body: list[str] = [f"engine {engine}   mode {mode}", ""]
+    for provider in _tui_providers(root):
+        entry = (config.get("providers") or {}).get(provider, {})
+        profiles = _tui_profiles(root, provider)
+        active = _tui_active(root, provider) or "-"
+        healthy = sum(1 for _stem, marker in profiles if marker in ("ok", "active"))
+        chain = _tui_fallback_chain(provider, entry)
+        chain_text = " -> ".join(chain) if chain else "-"
+        body.append(f" {provider}: exit {active} | {healthy}/{len(profiles)} healthy | fallback {chain_text}")
+    status_height = len(body)
+    body.append("")
+    for index, (key, label) in enumerate(TUI_MENU):
+        cursor = ">" if index == state.cursor % len(TUI_MENU) else " "
+        body.append(f" {cursor} [{key}] {label}")
+    return _render_chrome("proxy-router", body, state, "j/k move · enter select · h home · q quit",
+                          cursor_line=status_height + state.cursor % len(TUI_MENU))
+
+
+def _render_servers(state: TuiState) -> list[str]:
+    providers = _tui_providers(state.root)
+    if not providers:
+        return _render_chrome("servers", [" no providers configured - add one first (4)"],
+                              state, "esc home")
+    provider = state.servers_provider if state.servers_provider in providers else providers[0]
+    state.servers_provider = provider
+    profiles = _tui_profiles(state.root, provider)
+    glyphs = {"active": "\u25cf", "ok": "\u25cf", "dead": "\u2715", "cooling": "\u25cb", "blocked": "\u26a0", "": "\u00b7"}
+    labels = {"active": "active", "ok": "ok", "dead": "dead", "cooling": "cooling", "blocked": "blocked", "": "unprobed"}
+    body = [f" {provider}  ({providers.index(provider) + 1}/{len(providers)})", ""]
+    if not profiles:
+        body.append(" no profiles imported for this provider")
+    for index, (stem, marker) in enumerate(profiles):
+        cursor = ">" if index == state.cursor % max(1, len(profiles)) else " "
+        body.append(f" {cursor} {glyphs.get(marker, '\u00b7')} {stem}  {labels.get(marker, '')}")
+    return _render_chrome("servers", body, state,
+                          "h/l provider · j/k exit · r rotate · enter set active · esc home")
+
+
+def _render_fallbacks(state: TuiState) -> list[str]:
+    providers = _tui_providers(state.root)
+    if not providers:
+        return _render_chrome("fallbacks", [" no providers configured"], state, "esc home")
+    index = state.fallbacks_provider % len(providers)
+    provider = providers[index]
+    entry = (_tui_config(state.root).get("providers") or {}).get(provider, {})
+    chain = _tui_fallback_chain(provider, entry)
+    active = ""
+    try:
+        marker = json.loads((state.root / "state" / "fallback" / f"{provider}.json").read_text())
+        active = marker.get("provider", "")
+    except (OSError, json.JSONDecodeError, AttributeError):
+        pass
+    body = [
+        f" provider: {provider}  ({index + 1}/{len(providers)})",
+        "",
+        f" chain:  {' -> '.join(chain) if chain else '(none configured)'}",
+        f" active: {active or 'none'}",
+    ]
+    return _render_chrome("fallbacks", body, state, "h/l provider · 1 failover on · 2 failover off · esc home")
 
 
 def _render_menu(state: TuiState) -> list[str]:
@@ -1689,6 +1864,12 @@ def _render_settings(state: TuiState) -> list[str]:
 
 def render_frame(state: TuiState) -> list[str]:
     """Build the full frame (header, body, footer) as a list of screen lines."""
+    if state.view == "home":
+        return _render_home(state)
+    if state.view == "servers":
+        return _render_servers(state)
+    if state.view == "fallbacks":
+        return _render_fallbacks(state)
     if state.view == "guide":
         return _render_guide(state)
     if state.view == "import":
@@ -1724,14 +1905,29 @@ def _select_item(state: TuiState, index: int) -> TuiState:
     if key == "0":
         state.quit = True
     elif key == "1":
-        state.action = ("engine_start",)
-    elif key == "2":
-        state.action = ("engine_stop",)
+        state.view = "servers"
+        state.servers_provider = ""
+        state.servers_cursor = 0
+    elif key in ("2", "r"):
+        state.view = "routing"
+        state.preset_browser = False
+        state.routing_lines = _routing_lines(state.root) or ["routing modes"]
+        state.routing_prompt_text = ""
     elif key == "3":
-        state.view = "provider"
+        state.view = "fallbacks"
     elif key == "4":
+        state.view = "provider"
+    elif key == "5":
         state.view = "settings"
-    elif key in ("5", "s"):
+    elif key == "e":
+        state.action = ("engine_start",)
+    elif key == "x":
+        state.action = ("engine_stop",)
+    elif key == "b":
+        state.action = ("bridge_install",)
+    elif key == "6":
+        state.action = ("check",)
+    elif key == "s":
         # Preset browser: renders read-only, mutation flows through
         # state.action like routing changes.
         state.view = "routing"
@@ -1742,17 +1938,6 @@ def _select_item(state: TuiState, index: int) -> TuiState:
         except OSError:
             state.routing_lines = ["presets: (unreadable)"]
         state.routing_prompt_text = ""
-    elif key == "6":
-        state.action = ("check",)
-    elif key in ("7", "r"):
-        # Read-only rendering; mutations flow through the router CLI via
-        # state.action, exactly like every other TUI action.
-        state.view = "routing"
-        state.preset_browser = False
-        state.routing_lines = _routing_lines(state.root) or ["routing modes"]
-        state.routing_prompt_text = ""
-    elif key == "8":
-        state.action = ("bridge_install",)
     return state
 
 
@@ -1767,9 +1952,72 @@ def apply_key(state: TuiState, key: str) -> TuiState:
     state = copy.copy(state)
     state.action = None
 
+    if key in ("h", "H") and state.view not in ("home", "routing_prompt", "import"):
+        # one-key return to the dashboard from anywhere
+        state.view = "home"
+        return state
+
+    if state.view == "home":
+        if key in (UP, "k", "K"):
+            state.cursor = (state.cursor - 1) % len(TUI_MENU)
+        elif key in (DOWN, "j", "J"):
+            state.cursor = (state.cursor + 1) % len(TUI_MENU)
+        elif key in ("q", "Q", ESC, "\x03", "\x04"):
+            state.quit = True
+        elif key in (ENTER, "\n"):
+            return _select_item(state, state.cursor)
+        elif key in TUI_MENU_INDEX:
+            state.cursor = TUI_MENU_INDEX[key]
+            return _select_item(state, state.cursor)
+        return state
+
+    if state.view == "servers":
+        providers = _tui_providers(state.root)
+        if not providers:
+            if key in (ESC, "q", "Q"):
+                state.view = "home"
+            return state
+        if not state.servers_provider or state.servers_provider not in providers:
+            state.servers_provider = providers[0]
+        profiles = _tui_profiles(state.root, state.servers_provider)
+        if key in (ESC, "q", "Q"):
+            state.view = "home"
+        elif key in ("h", "H") or key == LEFT:
+            index = providers.index(state.servers_provider)
+            state.servers_provider = providers[(index - 1) % len(providers)]
+            state.servers_cursor = 0
+        elif key in ("l", "L") or key == RIGHT:
+            index = providers.index(state.servers_provider)
+            state.servers_provider = providers[(index + 1) % len(providers)]
+            state.servers_cursor = 0
+        elif key in (UP, "k", "K") and profiles:
+            state.servers_cursor = (state.servers_cursor - 1) % len(profiles)
+        elif key in (DOWN, "j", "J") and profiles:
+            state.servers_cursor = (state.servers_cursor + 1) % len(profiles)
+        elif key in ("r", "R"):
+            state.action = ("rotate_provider", state.servers_provider)
+        elif key in (ENTER, "\n") and profiles:
+            stem, _state = profiles[state.servers_cursor]
+            state.action = ("rotate_to", state.servers_provider, stem)
+        return state
+
+    if state.view == "fallbacks":
+        providers = _tui_providers(state.root)
+        if key in (ESC, "q", "Q"):
+            state.view = "home"
+        elif providers and key in ("h", "H", LEFT):
+            state.fallbacks_provider = (state.fallbacks_provider - 1) % len(providers)
+        elif providers and key in ("l", "L", RIGHT):
+            state.fallbacks_provider = (state.fallbacks_provider + 1) % len(providers)
+        elif providers and key in ("1",):
+            state.action = ("failover_on", providers[state.fallbacks_provider % len(providers)])
+        elif providers and key in ("2",):
+            state.action = ("failover_off", providers[state.fallbacks_provider % len(providers)])
+        return state
+
     if state.view == "guide":
         if key in ("q", "Q", ESC, ENTER, "\n"):
-            state.view = "provider" if state.provider_wizard_import else "menu"
+            state.view = "provider" if state.provider_wizard_import else "home"
         elif key in ("i", "I") and state.provider_wizard_import:
             # Offer one-click jump to profile import for the wizard's provider.
             state.view = "import"
@@ -1785,7 +2033,7 @@ def apply_key(state: TuiState, key: str) -> TuiState:
 
     if state.view == "provider":
         if key in (ESC, "q", "Q"):
-            state.view = "menu"
+            state.view = "home"
         elif key == "1":
             _open_guide(state, "proton")
             state.provider_wizard_import = True
@@ -1796,7 +2044,7 @@ def apply_key(state: TuiState, key: str) -> TuiState:
 
     if state.view == "settings":
         if key in (ESC, "q", "Q"):
-            state.view = "menu"
+            state.view = "home"
         elif key == "1":
             state.action = ("vpn_toggle",)
         elif key == "2":
@@ -1821,10 +2069,10 @@ def apply_key(state: TuiState, key: str) -> TuiState:
 
     if state.view == "import":
         if key == ESC:
-            state.view = "provider" if state.provider_wizard_import else "menu"
+            state.view = "provider" if state.provider_wizard_import else "home"
         elif key in (ENTER, "\n"):
             path = state.import_text.strip()
-            state.view = "menu"
+            state.view = "home"
             if not path:
                 state.status = "import cancelled: empty path"
                 state.status_ok = False
@@ -1839,7 +2087,7 @@ def apply_key(state: TuiState, key: str) -> TuiState:
 
     if state.view == "routing":
         if key in (ESC, "q", "Q"):
-            state.view = "menu"
+            state.view = "home"
         elif state.preset_browser:
             if key == "1":
                 state.view = "routing_prompt"
@@ -1885,7 +2133,7 @@ def apply_key(state: TuiState, key: str) -> TuiState:
 
     if state.view == "routing_prompt":
         if key == ESC:
-            state.view = state.prompt_return_view or ("routing" if state.preset_browser else "menu")
+            state.view = state.prompt_return_view or ("routing" if state.preset_browser else "home")
             state.preset_step = 0
             state.prompt_return_view = ""
         elif key in (ENTER, "\n"):
@@ -1915,7 +2163,7 @@ def apply_key(state: TuiState, key: str) -> TuiState:
                     state.action = ("preset_create", state.preset_name,
                                     state.preset_provider, text)
             else:
-                state.view = state.prompt_return_view or ("routing" if state.preset_browser else "menu")
+                state.view = state.prompt_return_view or ("routing" if state.preset_browser else "home")
                 state.prompt_return_view = ""
                 if not text:
                     state.status = "routing change cancelled: empty input"
@@ -2033,6 +2281,18 @@ def _execute_action(action: tuple, root: Path) -> tuple[str, int]:
             except ValueError as exc:
                 buf.write(str(exc))
                 rc = 1
+        elif kind == "rotate_provider":
+            rc = _router_command(root, "rotate", action[1])
+            buf.write(f"rotated {action[1]} (in place; settle retry applies)")
+        elif kind == "rotate_to":
+            rc = _router_command(root, "rotate", action[1], "--to", action[2])
+            buf.write(f"set {action[1]} exit -> {action[2]}")
+        elif kind == "failover_on":
+            rc = _router_command(root, "failover", action[1], "on")
+            buf.write(f"failover {action[1]} on (first valid chain member)")
+        elif kind == "failover_off":
+            rc = _router_command(root, "failover", action[1], "off")
+            buf.write(f"failover {action[1]} off (primary restored)")
         elif kind == "bridge_install":
             rc = _cmd_bridge_install(root)
         elif kind == "routing":
@@ -2123,7 +2383,7 @@ def _tui_wizard(root: Path) -> int:
             if state.action is not None:
                 text, rc = _execute_action(state.action, root)
                 state.action = None
-                state.view = "menu"
+                state.view = "home"
                 state.status = text or ("command finished" if rc == 0 else "command failed")
                 state.status_ok = rc == 0
     except KeyboardInterrupt:
