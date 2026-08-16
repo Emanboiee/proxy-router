@@ -1,7 +1,6 @@
 """Unit tests for proxy_tray.py (stdlib only, no GUI deps — the
 module's pystray/PIL imports are guarded)."""
 import importlib.util
-import os
 import sys
 import tempfile
 import unittest

@@ -12,7 +12,6 @@ profile, so it is written mode 0600 alongside the input profiles.
 from __future__ import annotations
 
 import argparse
-import base64
 import configparser
 import datetime
 import getpass
@@ -135,7 +134,7 @@ def _sing_box_missing_message() -> str:
     """
     bundled = ROOT / "bin" / ("sing-box.exe" if os.name == "nt" else "sing-box")
     env_value = os.environ.get("SING_BOX")
-    tried = [f"env SING_BOX (set, missing)" if env_value else "env SING_BOX=(unset)",
+    tried = ["env SING_BOX (set, missing)" if env_value else "env SING_BOX=(unset)",
              f"{bundled} (missing)"]
     if sys.platform == "darwin" and os.name != "nt":
         tried.extend(("/opt/homebrew/bin/sing-box (missing)",
@@ -2208,7 +2207,7 @@ def _any_our_engine_running() -> bool:
         ).stdout
     except (OSError, subprocess.TimeoutExpired):
         return False
-    return f"sing-box run" in out and str(SING_BOX_CONFIG) in out
+    return "sing-box run" in out and str(SING_BOX_CONFIG) in out
 
 
 def _pid_matches(pid: int) -> bool:
@@ -2240,7 +2239,7 @@ def _pid_matches(pid: int) -> bool:
         ).stdout
     except (OSError, subprocess.TimeoutExpired):
         return False
-    return f"sing-box run" in out and str(SING_BOX_CONFIG) in out
+    return "sing-box run" in out and str(SING_BOX_CONFIG) in out
 
 
 def engine_alive() -> bool:
@@ -4165,7 +4164,6 @@ def cmd_elevate(action: str) -> int:
         print("elevate: interpreter or script path changed; rewriting rules", file=sys.stderr)
 
     tmp = SUDOERS_FILE.with_name(SUDOERS_FILE.name + ".tmp")
-    payload = base64.b64encode(rules.encode()).decode()
     tmp.write_bytes(b"")
     tmp.write_text(rules)
     os.chmod(tmp, 0o440)

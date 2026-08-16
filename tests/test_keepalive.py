@@ -149,7 +149,7 @@ class KeepaliveHarness:
     def lines(self) -> list[str]:
         if not self.log.is_file():
             return []
-        return [l for l in self.log.read_text().splitlines() if l.strip()]
+        return [line for line in self.log.read_text().splitlines() if line.strip()]
 
     def set_egress(self, state: str) -> None:
         self.egress_file.write_text(state)
@@ -221,24 +221,24 @@ class KeepaliveEgressCheckTests(unittest.TestCase):
             # The scheduled-rotation check (`rotate --if-due`) runs every
             # healthy tick and self-gates on its interval; the boot self-test
             # must never trigger an EMERGENCY provider rotation.
-            rotates = [l for l in lines if l.startswith("rotate proton")]
+            rotates = [line for line in lines if line.startswith("rotate proton")]
             self.assertEqual(rotates, [])
             # cadence: periodic checks every PROBE_EVERY(2) ensures after boot.
             # `rotate --if-due` entries are tick noise, so measure gaps on the
             # filtered list. restore_fallbacks() probes once right after the
             # sweep, so drop the `egress check` that directly follows a sweep
             # line too (the sweep cadence is measured separately).
-            checks = [l for l in lines if l == "egress check"]
+            checks = [line for line in lines if line == "egress check"]
             self.assertGreaterEqual(len(checks), 4, f"too few checks: {lines}")
             restore_probes = {
-                i + 1 for i, l in enumerate(lines)
-                if l == "egress sweep --json" and i + 1 < len(lines)
+                i + 1 for i, line in enumerate(lines)
+                if line == "egress sweep --json" and i + 1 < len(lines)
                 and lines[i + 1] == "egress check"
             }
-            ticks = [l for i, l in enumerate(lines)
+            ticks = [line for i, line in enumerate(lines)
                      if i not in restore_probes
-                     and l not in {"rotate --if-due", "egress sweep --json"}]
-            check_lines = [i for i, l in enumerate(ticks) if l == "egress check"]
+                     and line not in {"rotate --if-due", "egress sweep --json"}]
+            check_lines = [i for i, line in enumerate(ticks) if line == "egress check"]
             gaps = [b - a for a, b in zip(check_lines, check_lines[1:])]
             # every PROBE_EVERY ensures triggers a check; log distance is
             # PROBE_EVERY + 1 because the ensure line sits between checks
@@ -252,7 +252,7 @@ class KeepaliveEgressCheckTests(unittest.TestCase):
         try:
             lines = h.wait_lines(40)
             h.close()
-            rotates = [l for l in lines if l.startswith("rotate proton")]
+            rotates = [line for line in lines if line.startswith("rotate proton")]
             self.assertEqual(len(rotates), 1,
                              f"storm guard must cap rotations at 1: {rotates}")
             self.assertIn("boot self-test: active tunnel is dead", h.err,
@@ -268,10 +268,10 @@ class KeepaliveEgressCheckTests(unittest.TestCase):
         try:
             h.wait_lines(30)
             lines = h.lines()
-            rotates = [l for l in lines if l.startswith("rotate proton")]
+            rotates = [line for line in lines if line.startswith("rotate proton")]
             self.assertGreaterEqual(len(rotates), 3, f"expected repeated rotations: {lines}")
             # consecutive rotates must be separated by >= 2 dead checks
-            positions = [i for i, l in enumerate(lines) if l.startswith("rotate proton")]
+            positions = [i for i, line in enumerate(lines) if line.startswith("rotate proton")]
             for a, b in zip(positions, positions[1:]):
                 between = lines[a + 1:b]
                 self.assertGreaterEqual(between.count("egress check"), 2,
@@ -285,14 +285,14 @@ class KeepaliveEgressCheckTests(unittest.TestCase):
         try:
             h.wait_lines(14)
             lines = h.lines()
-            rotates = [l for l in lines if l.startswith("rotate proton")]
+            rotates = [line for line in lines if line.startswith("rotate proton")]
             self.assertGreaterEqual(len(rotates), 2, f"expected rotations: {lines}")
             h.set_egress("alive")
             time.sleep(0.3)  # let the loop hit at least one successful check
             before = len(h.lines())
             h.wait_lines(before + 12)
             tail = h.lines()[before:]
-            tail_rotates = [l for l in tail if l.startswith("rotate proton")]
+            tail_rotates = [line for line in tail if line.startswith("rotate proton")]
             self.assertEqual(tail_rotates, [], f"rotated AFTER a successful check: {tail}")
         finally:
             h.close()
@@ -304,7 +304,7 @@ class KeepaliveEgressCheckTests(unittest.TestCase):
                              storm_window="0", max_rotations="1")
         try:
             h.wait_lines(20)
-            rotates = [l for l in h.lines() if l.startswith("rotate proton")]
+            rotates = [line for line in h.lines() if line.startswith("rotate proton")]
             self.assertGreaterEqual(len(rotates), 4, f"expected rotation churn: {rotates}")
         finally:
             h.close()

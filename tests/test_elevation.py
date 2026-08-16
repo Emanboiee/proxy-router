@@ -51,12 +51,12 @@ class SudoersRulesTests(unittest.TestCase):
     def test_rules_cover_start_and_stop(self):
         rules = router._sudoers_rules("alice", "/usr/bin/python3", "/opt/pr/router.py")
         lines = rules.strip().splitlines()
-        cmds = [l.split("NOPASSWD: ", 1)[1] for l in lines[1:]]
+        cmds = [line.split("NOPASSWD: ", 1)[1] for line in lines[1:]]
         self.assertIn("/usr/bin/python3 /opt/pr/router.py start", cmds)
         self.assertIn("/usr/bin/python3 /opt/pr/router.py stop", cmds)
         # Exact grant surface: tray Connect/Disconnect + engine commands only.
         self.assertEqual(len(cmds), 10)
-        self.assertTrue(all(" ALL=(root) NOPASSWD: " in l for l in lines[1:]))
+        self.assertTrue(all(" ALL=(root) NOPASSWD: " in line for line in lines[1:]))
 
 
 class EngineRunsAsRootTests(unittest.TestCase):

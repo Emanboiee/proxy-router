@@ -30,7 +30,6 @@ import shutil
 import subprocess
 import sys
 import threading
-import time
 from dataclasses import dataclass, field
 
 try:
@@ -950,7 +949,6 @@ def selftest(root: str) -> int:
         return 1
     client = RouterClient(root)
     st = client.status()
-    rc = 0 if not st.error else 1
     print(f"parsed: up={st.up} mode={st.mode} watcher={st.watcher} "
           f"routing={st.routing_mode} exits={st.active_providers}")
     if st.error:
