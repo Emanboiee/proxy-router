@@ -30,10 +30,14 @@ if [ -n "${SING_BOX:-}" ] && [ -f "$SING_BOX" ]; then
   BIN_SOURCE="$SING_BOX"
 fi
 
-mkdir -p "$PREFIX/bin" "$PREFIX/examples" "$PREFIX/providers" "$USER_BIN"
+mkdir -p "$PREFIX/bin" "$PREFIX/examples" "$PREFIX/providers" "$PREFIX/guides" "$PREFIX/presets" "$PREFIX/rulesets" "$USER_BIN"
 
-cp "$SCRIPT_DIR/router.py" "$PREFIX/router.py"
-chmod 755 "$PREFIX/router.py"
+for runtime_file in router.py setup_tui.py monitor.py route_watcher.py proxy_tray.py; do
+  cp "$SCRIPT_DIR/$runtime_file" "$PREFIX/$runtime_file"
+  chmod 755 "$PREFIX/$runtime_file"
+done
+cp "$SCRIPT_DIR/keepalive.sh" "$PREFIX/keepalive.sh"
+chmod 755 "$PREFIX/keepalive.sh"
 
 if [ -f "$BIN_SOURCE" ] && [ -x "$BIN_SOURCE" ]; then
   cp "$BIN_SOURCE" "$PREFIX/bin/sing-box"
@@ -48,6 +52,21 @@ cp "$SCRIPT_DIR/README.md" "$PREFIX/README.md"
 cp "$SCRIPT_DIR/LICENSE" "$PREFIX/LICENSE"
 cp -R "$SCRIPT_DIR/examples/." "$PREFIX/examples/"
 chmod 755 "$PREFIX/examples/"*.sh 2>/dev/null || true
+
+# Bundled guides and data are defaults, not live configuration. Never replace
+# a user's custom preset/ruleset with a later installer run.
+copy_missing_tree() {
+  local name source target
+  name="$1"
+  for source in "$SCRIPT_DIR/$name"/*; do
+    [ -e "$source" ] || continue
+    target="$PREFIX/$name/$(basename "$source")"
+    [ -e "$target" ] || cp -R "$source" "$target"
+  done
+}
+copy_missing_tree guides
+copy_missing_tree presets
+copy_missing_tree rulesets
 
 # Live config: only ever created once; reruns must not clobber it.
 if [ ! -f "$PREFIX/router.json" ]; then

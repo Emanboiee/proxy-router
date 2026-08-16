@@ -80,11 +80,6 @@ _FRIENDLY_ERRORS = (
     ("no valid profiles", "no usable profiles found — re-add your .conf under Setup"),
 )
 
-# Longest tail line _humanize keeps: the sing-box missing-binary message
-# (darwin) is ~424 chars, so 500 keeps it fully visible (issue #11).
-_MAX_DETAIL = 500
-
-
 # stderr markers that prove `sudo -n` DENIED (vs the command itself
 # failing). A sudoers grant is a snapshot of the command shapes at install
 # time, so a command added later (e.g. `start`/`stop` for issue #12) can
@@ -95,6 +90,10 @@ _SUDO_DENIAL_TOKENS = (
     "not in the sudoers",
     "must have a tty",
 )
+
+# Longest tail line _humanize keeps: the sing-box missing-binary message
+# (darwin) is ~424 chars, so 500 keeps it fully visible (issue #11).
+_MAX_DETAIL = 500
 
 
 def _sudoers_ok(python: str, router: str) -> bool:
@@ -209,7 +208,13 @@ class RouterStatus:
                     "ok": bool(rec.get("ok")),
                     "latency_ms": rec.get("latency_ms"),
                     "status": rec.get("status"),
-                    "error": rec.get("error") or rec.get("upstream_error"),
+                    # Keep transport probe failures separate from explicit
+                    # upstream failures. The former are often transient and
+                    # should not turn the menu into a wall of red warnings.
+                    "error": rec.get("error"),
+                    "upstream_error": rec.get("upstream_error"),
+                    "blocked": bool(rec.get("blocked")),
+                    "exhausted": bool(rec.get("exhausted")),
                 }
             provider_map[name] = {
                 "active": active,
@@ -248,14 +253,15 @@ class RouterStatus:
         ok = egress.get("ok")
         # A lane can probe ok while the exit is actually rate-limited or
         # exhausted upstream (record keeps `upstream_error` across probes).
-        warn = bool(egress.get("upstream_error") or egress.get("error")
+        # Transport-level probe failures (SSL EOF/timeout) are deliberately
+        # quiet in the tray. Keep explicit upstream failures and hard markers
+        # visible because they affect real traffic.
+        warn = bool(egress.get("upstream_error") or egress.get("blocked")
                     or egress.get("exhausted"))
         if warn:
             mark = "▲"
         elif ok:
             mark = "●"
-        elif ok is False:
-            mark = "○"
         else:
             mark = "·"
         return f"{name} {mark} {tag}"
@@ -269,9 +275,18 @@ class RouterStatus:
         rec = (self.providers.get(name, {}).get("egress") or {}).get(profile)
         if not rec:
             return ""
-        err = rec.get("error") or rec.get("upstream_error")
-        if err:
-            return " ! " + _friendly_egress_error(err)
+        upstream_error = rec.get("upstream_error")
+        if upstream_error:
+            return " ! " + _friendly_egress_error(upstream_error)
+        if rec.get("blocked"):
+            return " ! blocked"
+        if rec.get("exhausted"):
+            return " ! rate-limited"
+        # An HTTP response is meaningful degradation; a transport-only probe
+        # failure is not. The latter is retained internally for rotation but
+        # omitted from the user-facing menu because it is commonly transient.
+        if rec.get("error") and rec.get("status") is not None:
+            return " ! " + _friendly_egress_error(rec["error"])
         lat = rec.get("latency_ms")
         if isinstance(lat, (int, float)):
             return f" · {lat:.0f}ms"
@@ -296,12 +311,25 @@ class RouterClient:
     def __init__(self, root: str):
         self.root = root
         self.python = sys.executable or "python3"
-        self.router = os.path.join(root, "router.py")
+        configured_router = os.environ.get("PROXY_ROUTER_BIN")
+        self.router: str
+        self._uses_deployed_router = False
+        if configured_router:
+            self.router = configured_router
+        else:
+            deployed = os.path.join(os.path.expanduser("~"), "proxy-router-fallback-pr", "router.py")
+            if os.path.isfile(deployed) and os.path.isdir(os.path.join(root, "providers")):
+                self.router = deployed
+                self._uses_deployed_router = True
+            else:
+                self.router = os.path.join(root, "router.py")
         self._active_provider: str | None = None
 
     def _run(self, *args: str) -> tuple[int, str]:
         cmd = [self.python, self.router, *args]
         env = dict(os.environ)
+        if self._uses_deployed_router:
+            env["PROXY_ROUTER_ROOT"] = self.root
         try:
             p = subprocess.run(
                 cmd, capture_output=True, text=True,
@@ -862,16 +890,14 @@ class TrayApp:
 
             def pick_exit_items():
                 sub = []
-                # Clickable exits first (healthy, then offline/SSL "try
-                # anyway" picks); hard-disabled (blocked/exhausted) last.
+                # Clickable exits first; hard-disabled (blocked/exhausted)
+                # last. Transport probe failures stay clickable but quiet.
                 def sort_key(p):
                     return (self._exit_disabled(st, name, p),
                             self._exit_try_anyway(st, name, p), p)
                 for p in sorted(profiles, key=sort_key):
                     try_anyway = self._exit_try_anyway(st, name, p)
                     label = f"{p}{st.profile_health(name, p)}"
-                    if try_anyway:
-                        label += " · try anyway"
                     sub.append(pystray.MenuItem(
                         label,
                         make_exit_action(provider=name, profile=p, force=try_anyway),

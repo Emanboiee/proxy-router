@@ -1526,6 +1526,22 @@ class EgressCheckCommandTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(self.live.call_count, 1)
 
+    def test_active_fallback_is_not_probed_as_primary(self):
+        router._providers["proton"]["fallback_provider"] = "cloudflare"
+        router.set_active("proton", self.root / "providers" / "proton" / "a.conf")
+        router.set_active("cloudflare", self.root / "providers" / "cloudflare" / "b.conf")
+        marker = self.root / "state" / "fallback"
+        marker.mkdir(parents=True)
+        (marker / "proton.json").write_text(json.dumps({"provider": "cloudflare"}))
+        with mock.patch("sys.stdout.write") as write:
+            rc = router.egress_check(as_json=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.live.call_count, 1)
+        data = json.loads("".join(c.args[0] for c in write.call_args_list))
+        self.assertEqual(data["results"]["proton"]["status"], "fallback")
+        self.assertEqual(data["results"]["proton"]["fallback_provider"], "cloudflare")
+        self.assertEqual(data["results"]["cloudflare"]["status"], "alive")
+
     def test_provider_without_profiles_is_skipped_not_dead(self):
         # empty provider dir: no active profile, nothing to probe, so it must
         # be skipped rather than counted as a dead tunnel.
@@ -1626,6 +1642,21 @@ class EgressSweepTests(unittest.TestCase):
         for call in self.rotate.call_args_list:
             self.assertTrue(call.kwargs["force"])
             self.assertFalse(call.kwargs["probe"])
+
+    def test_does_not_probe_unactivated_profiles_after_hop_failure(self):
+        router.set_active("proton", self._profile("a"))
+        self.rotate.side_effect = [0, 1]
+        self._probe(
+            (True, {"ok": True, "latency_ms": 10.0, "status": 200}),
+            (True, {"ok": True, "latency_ms": 20.0, "status": 200}),
+        )
+        rc = router.egress_sweep("proton")
+        self.assertEqual(rc, 1)
+        self.assertEqual([call.args[1].stem for call in self.probe.call_args_list], ["a", "b"])
+        active = router.persisted_active("proton")
+        self.assertIsNotNone(active)
+        assert active is not None
+        self.assertEqual(active.stem, "a")
 
     def test_ends_on_best_alive_profile(self):
         router.set_active("proton", self._profile("a"))

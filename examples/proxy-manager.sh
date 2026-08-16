@@ -11,12 +11,22 @@ router_py() {
     printf '%s\n' "$PROXY_ROUTER_BIN"
     return 0
   fi
+  if [ -n "${PROXY_ROUTER_ROOT:-}" ] && [ -x "${PROXY_ROUTER_ROOT}/router.py" ]; then
+    printf '%s\n' "$PROXY_ROUTER_ROOT/router.py"
+    return 0
+  fi
+  if [ -z "${PROXY_ROUTER_ROOT:-}" ] && [ -x "$HOME/proxy-router-fallback-pr/router.py" ] && [ -d "$HOME/proxy-router/providers" ]; then
+    export PROXY_ROUTER_ROOT="$HOME/proxy-router"
+    printf '%s\n' "$HOME/proxy-router-fallback-pr/router.py"
+    return 0
+  fi
   local candidate
   for candidate in \
     "$SCRIPT_DIR/router.py" \
     "$(dirname "$SCRIPT_DIR")/router.py" \
-    "$(dirname "$SCRIPT_DIR")/proxy-router/router.py" \
     "$HOME/.local/share/proxy-router/router.py" \
+    "$HOME/proxy-router/router.py" \
+    "$(dirname "$SCRIPT_DIR")/proxy-router/router.py" \
   ; do
     if [ -f "$candidate" ] && [ -x "$candidate" ]; then
       printf '%s\n' "$candidate"
@@ -47,13 +57,19 @@ case "${1:-}" in
         ;;
     esac
     if [ -n "$REASON" ]; then
-      "$ROUTER" rotate "$PROVIDER" --reason "$REASON"
+      if "$ROUTER" rotate "$PROVIDER" --reason "$REASON"; then
+        exit 0
+      fi
+      "$ROUTER" failover "$PROVIDER" on --reason "$REASON"
     else
-      "$ROUTER" rotate "$PROVIDER"
+      if "$ROUTER" rotate "$PROVIDER"; then
+        exit 0
+      fi
+      "$ROUTER" failover "$PROVIDER" on --reason transport
     fi
     ;;
   help|-h|--help|"")
-    printf 'usage: %s rotate [REASON] [OPENCODE_PROVIDER=<name>]\n' "$0" >&2
+    printf 'usage: %s rotate [REASON] [PROXY_ROUTER_ROOT=PATH] [OPENCODE_PROVIDER=<name>]\n' "$0" >&2
     exit 0
     ;;
   *)

@@ -80,11 +80,6 @@ _FRIENDLY_ERRORS = (
     ("no valid profiles", "no usable profiles found — re-add your .conf under Setup"),
 )
 
-# Longest tail line _humanize keeps: the sing-box missing-binary message
-# (darwin) is ~424 chars, so 500 keeps it fully visible (issue #11).
-_MAX_DETAIL = 500
-
-
 # stderr markers that prove `sudo -n` DENIED (vs the command itself
 # failing). A sudoers grant is a snapshot of the command shapes at install
 # time, so a command added later (e.g. `start`/`stop` for issue #12) can
@@ -95,6 +90,10 @@ _SUDO_DENIAL_TOKENS = (
     "not in the sudoers",
     "must have a tty",
 )
+
+# Longest tail line _humanize keeps: the sing-box missing-binary message
+# (darwin) is ~424 chars, so 500 keeps it fully visible (issue #11).
+_MAX_DETAIL = 500
 
 
 def _sudoers_ok(python: str, router: str) -> bool:

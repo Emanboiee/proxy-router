@@ -3,7 +3,10 @@
   "providers": {
     "primary-vpn": {
       "directory": "providers/primary-vpn",
-      "cooldown_seconds": 60
+      "cooldown_seconds": 60,
+      "fallback_providers": [
+        "fallback-vpn"
+      ]
     },
     "fallback-vpn": {
       "directory": "providers/fallback-vpn",
@@ -25,6 +28,13 @@
       "provider": "primary-vpn"
     },
     {
+      "id": "egress-ip-check",
+      "domains": [
+        "whatismyip.com"
+      ],
+      "provider": "primary-vpn"
+    },
+    {
       "id": "roblox",
       "domains": [
         "roblox.com",
@@ -40,6 +50,7 @@
     "vpn_domains": []
   },
   "vpn": {
+    "capture": "ruleset",
     "address": [
       "172.19.0.1/30"
     ],
@@ -56,6 +67,22 @@
     "fail_threshold": 2,
     "slow_latency_ms": 1200,
     "ok_window": 86400
+  },
+  "rotation": {
+    "interval_seconds": 7200,
+    "jitter_seconds": 300,
+    "policy": "latency"
+  },
+  "keepalive": {
+    "preset": "balanced",
+    "enabled": true,
+    "interval": 15,
+    "max_backoff": 300,
+    "probe_every": 4,
+    "dead_strikes": 2,
+    "storm_window": 600,
+    "max_rotations": 2,
+    "sweep_every": 1800
   },
   "error_policy": {
     "default": {
@@ -90,10 +117,5 @@
       "action": "block",
       "seconds": 3600
     }
-  },
-  "rotation": {
-    "interval_seconds": 7200,
-    "jitter_seconds": 300,
-    "policy": "latency"
   }
 }

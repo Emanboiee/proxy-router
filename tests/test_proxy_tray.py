@@ -122,8 +122,8 @@ class HumanizeTests(unittest.TestCase):
         # 160-char cap cut it into an unexplained "Connect: Failed" (#11).
         out = "router: could not start sing-box: " + "candidate-path " * 40
         detail = tray._humanize(out)
-        self.assertGreater(len(detail), 160)
-        self.assertEqual(len(detail), tray._MAX_DETAIL)
+        self.assertGreater(len(detail), 160)  # old cap would cut at 160
+        self.assertEqual(len(detail), tray._MAX_DETAIL)  # cap keeps the full detail
 
     def test_sing_box_not_found_maps_to_friendly_next_step(self):
         detail = tray._humanize(
@@ -185,6 +185,46 @@ class RunElevatedFallbackTests(unittest.TestCase):
         self.assertEqual((rc, out), (0, "stopped"))
         self.assertEqual(run.call_args.args[0][0], "sudo")
         self.assertEqual(run.call_count, 1)
+
+
+class TransientProbePresentationTests(unittest.TestCase):
+    def _status(self, record):
+        return tray.RouterStatus(
+            up=True,
+            providers={
+                "proton": {
+                    "active": "06-SG-FREE-4",
+                    "profiles": ["06-SG-FREE-4"],
+                    "egress": {"06-SG-FREE-4": record},
+                }
+            },
+        )
+
+    def test_transport_probe_failure_is_quiet_but_stays_force_clickable(self):
+        status = self._status({
+            "ok": False,
+            "status": None,
+            "error": "URLError: <urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING]>",
+            "upstream_error": None,
+            "blocked": False,
+            "exhausted": False,
+        })
+        app = object.__new__(tray.TrayApp)
+        self.assertEqual(status.profile_health("proton", "06-SG-FREE-4"), "")
+        self.assertNotIn("▲", status.provider_label("proton"))
+        self.assertTrue(app._exit_try_anyway(status, "proton", "06-SG-FREE-4"))
+
+    def test_explicit_upstream_failure_stays_visible(self):
+        status = self._status({
+            "ok": True,
+            "status": 200,
+            "error": None,
+            "upstream_error": "429",
+            "blocked": False,
+            "exhausted": True,
+        })
+        self.assertIn("▲", status.provider_label("proton"))
+        self.assertIn("rate-limited", status.profile_health("proton", "06-SG-FREE-4"))
 
 
 if __name__ == "__main__":

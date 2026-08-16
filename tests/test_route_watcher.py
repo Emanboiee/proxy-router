@@ -65,6 +65,43 @@ class RouteWatcherTests(unittest.TestCase):
                 ("opencode.ai", "api.opencode.ai"),
             )
 
+    def test_proxy_port_and_provider_are_config_driven(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "router.json").write_text(json.dumps({
+                "port": 2091,
+                "routes": [{"id": "opencode-ai", "domains": ["opencode.ai"], "provider": "cloudflare"}],
+            }))
+            self.assertEqual(w.proxy_port(root), 2091)
+            self.assertEqual(w.route_provider(root, "api.opencode.ai"), "cloudflare")
+
+    def test_route_provider_uses_active_fallback_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "router.json").write_text(json.dumps({
+                "providers": {"proton": {"fallback_provider": "cloudflare"}},
+                "routes": [{"id": "opencode-ai", "domains": ["opencode.ai"], "provider": "proton"}],
+            }))
+            marker = root / "state" / "fallback"
+            marker.mkdir(parents=True)
+            (marker / "proton.json").write_text(json.dumps({"provider": "cloudflare"}))
+
+            self.assertEqual(w.route_provider(root, "opencode.ai"), "cloudflare")
+
+    def test_probe_uses_configured_proxy_port(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "router.json").write_text(json.dumps({"port": 2091}))
+            calls = []
+
+            def fake_runner(command, **kwargs):
+                calls.append(command)
+                return SimpleNamespace(returncode=0, stdout="200", stderr="")
+
+            result = w.probe_target(root, "opencode.ai", runner=fake_runner)
+            self.assertFalse(result["transport_failure"])
+            self.assertIn("http://127.0.0.1:2091", calls[0])
+
     def test_probe_http_failure_is_not_transport_failure(self):
         def fake_runner(*args, **kwargs):
             return SimpleNamespace(returncode=0, stdout="503", stderr="")

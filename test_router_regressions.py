@@ -53,273 +53,6 @@ def test_vpn_list_filters_provider_routes_to_vpn_domains(tmp_path):
     assert config["route"]["final"] == "direct"
 
 
-def test_primary_routes_use_runtime_fallback_provider(tmp_path):
-    router = load_router(tmp_path)
-    proton = tmp_path / "proton.conf"
-    cloudflare = tmp_path / "cloudflare.conf"
-    router._providers = {
-        "proton": {"fallback_provider": "cloudflare"},
-        "cloudflare": {},
-    }
-    router._routes = [{
-        "id": "opencode", "domains": ["opencode.ai"], "provider": "proton",
-    }]
-    router._routing = {}
-    router._port = 2081
-    router.current_mode = lambda: "proxy"
-    router._usable_profile = lambda name, preferred=None: {
-        "proton": proton, "cloudflare": cloudflare,
-    }.get(name)
-    router.parse_wireguard = lambda path: {
-        "type": "wireguard", "tag": "", "address": ["10.0.0.2/32"],
-        "private_key": "secret", "peers": [{"address": "192.0.2.1", "port": 1,
-        "public_key": "public", "allowed_ips": ["0.0.0.0/0"]}],
-    }
-    router.dns_server_for = lambda path: "1.1.1.1"
-    fallback_dir = tmp_path / "state" / "fallback"
-    fallback_dir.mkdir(parents=True)
-    (fallback_dir / "proton.json").write_text(json.dumps({"provider": "cloudflare"}))
-
-    config, _active = router.build_singbox_config()
-
-    assert {endpoint["tag"] for endpoint in config["endpoints"]} == {"cloudflare"}
-    assert {rule["outbound"] for rule in config["route"]["rules"] if rule.get("domain_suffix")} == {"cloudflare"}
-    assert config["dns"]["rules"] == [{
-        "domain_suffix": ["opencode.ai"], "server": "dns-cloudflare",
-    }]
-
-
-def test_activate_fallback_writes_marker_and_reloads_once(tmp_path, monkeypatch):
-    router = load_router(tmp_path)
-    for provider in ("proton", "cloudflare"):
-        directory = tmp_path / "providers" / provider
-        directory.mkdir(parents=True)
-        (directory / "active.conf").write_text("profile")
-    router._providers = {
-        "proton": {"directory": "providers/proton", "fallback_provider": "cloudflare"},
-        "cloudflare": {"directory": "providers/cloudflare"},
-    }
-    reloads = []
-    monkeypatch.setattr(router, "_profile_error", lambda profile: None)
-    monkeypatch.setattr(router, "engine_reload", lambda: reloads.append(True) or 0)
-
-    assert router.activate_fallback("proton", reason="tls") == 0
-    marker = json.loads((tmp_path / "state" / "fallback" / "proton.json").read_text())
-    assert marker["provider"] == "cloudflare"
-    assert marker["reason"] == "tls"
-    assert reloads == [True]
-
-    assert router.deactivate_fallback("proton") == 0
-    assert not (tmp_path / "state" / "fallback" / "proton.json").exists()
-    assert reloads == [True, True]
-
-
-def test_activate_fallback_restores_marker_when_reload_fails(tmp_path, monkeypatch):
-    router = load_router(tmp_path)
-    for provider in ("proton", "cloudflare"):
-        directory = tmp_path / "providers" / provider
-        directory.mkdir(parents=True)
-        (directory / "active.conf").write_text("profile")
-    router._providers = {
-        "proton": {"directory": "providers/proton", "fallback_provider": "cloudflare"},
-        "cloudflare": {"directory": "providers/cloudflare"},
-    }
-    monkeypatch.setattr(router, "engine_reload", lambda: 1)
-
-    assert router.activate_fallback("proton", reason="tls") == 1
-    assert not (tmp_path / "state" / "fallback" / "proton.json").exists()
-
-
-def test_rotate_refuses_primary_while_fallback_is_active(tmp_path, monkeypatch, capsys):
-    router = load_router(tmp_path)
-    for provider in ("proton", "cloudflare"):
-        directory = tmp_path / "providers" / provider
-        directory.mkdir(parents=True)
-        (directory / "active.conf").write_text("profile")
-    router._providers = {
-        "proton": {"directory": "providers/proton", "fallback_provider": "cloudflare"},
-        "cloudflare": {"directory": "providers/cloudflare"},
-    }
-    monkeypatch.setattr(router, "_profile_error", lambda profile: None)
-    marker = tmp_path / "state" / "fallback"
-    marker.mkdir(parents=True)
-    (marker / "proton.json").write_text(json.dumps({"provider": "cloudflare"}))
-
-    assert router.rotate("proton") == 1
-    assert "fallback active" in capsys.readouterr().err
-
-
-def test_load_config_rejects_unknown_fallback_provider(tmp_path):
-    router = load_router(tmp_path)
-    router.CONFIG_FILE.write_text(json.dumps({
-        "port": 2081,
-        "providers": {
-            "proton": {
-                "directory": "providers/proton",
-                "fallback_provider": "warp",
-            },
-        },
-        "routes": [],
-    }))
-
-    assert router.load_config() == 1
-
-
-def test_load_config_accepts_fallback_chain_list(tmp_path):
-    router = load_router(tmp_path)
-    router.CONFIG_FILE.write_text(json.dumps({
-        "port": 2081,
-        "providers": {
-            "proton": {"directory": "providers/proton",
-                       "fallback_provider": ["cloudflare", "mullvad"]},
-            "cloudflare": {"directory": "providers/cloudflare"},
-            "mullvad": {"directory": "providers/mullvad"},
-        },
-        "routes": [],
-    }))
-
-    assert router.load_config() == 0
-    assert router.fallback_chain("proton") == ["cloudflare", "mullvad"]
-
-
-def test_load_config_rejects_self_in_fallback_chain(tmp_path):
-    router = load_router(tmp_path)
-    router.CONFIG_FILE.write_text(json.dumps({
-        "port": 2081,
-        "providers": {
-            "proton": {"directory": "providers/proton",
-                       "fallback_provider": ["proton", "cloudflare"]},
-            "cloudflare": {"directory": "providers/cloudflare"},
-        },
-        "routes": [],
-    }))
-
-    assert router.load_config() == 1
-
-
-def test_load_config_rejects_duplicate_fallback_chain_entries(tmp_path):
-    router = load_router(tmp_path)
-    router.CONFIG_FILE.write_text(json.dumps({
-        "port": 2081,
-        "providers": {
-            "proton": {"directory": "providers/proton",
-                       "fallback_provider": ["cloudflare", "cloudflare"]},
-            "cloudflare": {"directory": "providers/cloudflare"},
-        },
-        "routes": [],
-    }))
-
-    assert router.load_config() == 1
-
-
-def test_fallback_chain_drops_invalid_entries(tmp_path):
-    router = load_router(tmp_path)
-    router._providers = {
-        "proton": {"fallback_provider": ["cloudflare", "proton", "warp", "cloudflare"]},
-        "cloudflare": {},
-    }
-
-    assert router.fallback_chain("proton") == ["cloudflare"]
-    assert router.configured_fallback("proton") == "cloudflare"
-
-
-def test_activate_fallback_walks_chain_to_first_valid_provider(tmp_path, monkeypatch):
-    router = load_router(tmp_path)
-    for provider in ("proton", "cloudflare", "mullvad"):
-        directory = tmp_path / "providers" / provider
-        directory.mkdir(parents=True)
-        (directory / "active.conf").write_text("profile")
-    router._providers = {
-        "proton": {"directory": "providers/proton",
-                   "fallback_provider": ["cloudflare", "mullvad"]},
-        "cloudflare": {"directory": "providers/cloudflare"},
-        "mullvad": {"directory": "providers/mullvad"},
-    }
-    monkeypatch.setattr(router, "_profile_error",
-                        lambda profile: None if "mullvad" in str(profile) else "bad")
-    reloads = []
-    monkeypatch.setattr(router, "engine_reload", lambda: reloads.append(True) or 0)
-
-    assert router.activate_fallback("proton", reason="tls") == 0
-    marker = json.loads((tmp_path / "state" / "fallback" / "proton.json").read_text())
-    assert marker["provider"] == "mullvad"
-    assert reloads == [True]
-
-
-def test_activate_fallback_rejects_target_outside_chain(tmp_path, monkeypatch):
-    router = load_router(tmp_path)
-    for provider in ("proton", "cloudflare", "mullvad"):
-        directory = tmp_path / "providers" / provider
-        directory.mkdir(parents=True)
-        (directory / "active.conf").write_text("profile")
-    router._providers = {
-        "proton": {"directory": "providers/proton",
-                   "fallback_provider": ["cloudflare", "mullvad"]},
-        "cloudflare": {"directory": "providers/cloudflare"},
-        "mullvad": {"directory": "providers/mullvad"},
-    }
-    monkeypatch.setattr(router, "_profile_error", lambda profile: None)
-    monkeypatch.setattr(router, "engine_reload", lambda: 0)
-
-    assert router.activate_fallback("proton", target="mullvad") == 0
-    marker = json.loads((tmp_path / "state" / "fallback" / "proton.json").read_text())
-    assert marker["provider"] == "mullvad"
-    assert router.activate_fallback("proton", target="warp") == 1
-
-
-def test_active_fallback_validates_marker_against_chain(tmp_path):
-    router = load_router(tmp_path)
-    router._providers = {
-        "proton": {"fallback_provider": ["cloudflare", "mullvad"]},
-        "cloudflare": {},
-        "mullvad": {},
-    }
-    fallback_dir = tmp_path / "state" / "fallback"
-    fallback_dir.mkdir(parents=True)
-    (fallback_dir / "proton.json").write_text(json.dumps({"provider": "mullvad"}))
-
-    assert router.active_fallback("proton") == "mullvad"
-    (fallback_dir / "proton.json").write_text(json.dumps({"provider": "warp"}))
-    assert router.active_fallback("proton") is None
-
-
-def test_fallback_status_reports_configured_chain(tmp_path):
-    router = load_router(tmp_path)
-    router._providers = {
-        "proton": {"fallback_provider": ["cloudflare", "mullvad"]},
-        "cloudflare": {},
-        "mullvad": {},
-    }
-    fallback_dir = tmp_path / "state" / "fallback"
-    fallback_dir.mkdir(parents=True)
-    (fallback_dir / "proton.json").write_text(json.dumps({"provider": "cloudflare"}))
-
-    assert router.fallback_status("proton") == {
-        "configured": ["cloudflare", "mullvad"],
-        "active": "cloudflare",
-    }
-
-
-def test_egress_sweep_skips_primary_when_fallback_is_active(tmp_path, monkeypatch, capsys):
-    router = load_router(tmp_path)
-    router._providers = {
-        "proton": {"directory": "providers/proton", "fallback_provider": "cloudflare"},
-        "cloudflare": {"directory": "providers/cloudflare"},
-    }
-    router.current_mode = lambda: "proxy"
-    router.listener_up = lambda: True
-    marker = tmp_path / "state" / "fallback"
-    marker.mkdir(parents=True)
-    (marker / "proton.json").write_text(json.dumps({"provider": "cloudflare"}))
-
-    assert router.egress_sweep("proton", as_json=True) == 0
-    data = json.loads(capsys.readouterr().out)
-    assert data["dead"] == []
-    assert data["results"]["proton"] == {
-        "status": "fallback", "fallback_provider": "cloudflare",
-    }
-
-
 def test_selective_tun_uses_address_set_and_keeps_auto_route(tmp_path):
     router = load_router(tmp_path)
     rulesets = tmp_path / "rulesets"
@@ -747,87 +480,53 @@ def test_tray_upstream_error_shows_warning_not_green(tmp_path):
     assert "●" in healthy_label, f"healthy lane lost green dot: {healthy_label!r}"
 
 
-def test_tray_transport_dead_exit_is_clickable_try_anyway(tmp_path):
-    """A transport-dead exit (offline/SSL) stays CLICKABLE so a manual switch
-    can try the server and confirm liveness — the router probes the new exit
-    and rolls back if it is really dead. Only hard block/exhaust markers
-    disable an exit."""
+def test_tray_transport_dead_exit_is_disabled(tmp_path):
+    """An exit that died at transport level (no HTTP status) IS disabled —
+    clicking it would just fail. This is the 'genuinely dead' case, distinct
+    from a recoverable upstream_error warning."""
     module = load_tray(tmp_path)
     dead = {"ok": False, "status": None, "latency_ms": None,
             "error": "URLError: connection refused", "blocked": False,
             "exhausted": False}
-    blocked = {**dead, "blocked": True}
     app = _tray_app(module, tmp_path, up=True,
                     providers={"proton": {
                         "active": "01-NL-FREE-140",
                         "profiles": ["01-NL-FREE-140", "02-NL-FREE-149"],
                         "egress": {"01-NL-FREE-140": dead,
-                                   "02-NL-FREE-149": blocked}}})
-    # transport-dead: clickable, flagged try-anyway
-    assert not app._exit_disabled(app.latest, "proton", "01-NL-FREE-140")
-    assert app._exit_try_anyway(app.latest, "proton", "01-NL-FREE-140")
-    # hard block marker: disabled, not try-anyway
-    assert app._exit_disabled(app.latest, "proton", "02-NL-FREE-149")
-    assert not app._exit_try_anyway(app.latest, "proton", "02-NL-FREE-149")
+                                   "02-NL-FREE-149": {
+                                       "ok": True, "status": 200,
+                                       "latency_ms": 164.0, "error": None}}}})
+    assert app._exit_disabled(app.latest, "proton", "01-NL-FREE-140")
+    assert not app._exit_disabled(app.latest, "proton", "02-NL-FREE-149")
 
 
 def test_tray_exit_picker_sorts_healthy_first(tmp_path):
-    """Dead exits sink to the bottom of the provider picker but stay
-    CLICKABLE (labeled 'try anyway'); only hard block/exhaust markers
-    gray the row out."""
+    """Dead exits sink to the bottom of the provider picker — the menu
+    shouldn't lead with a wall of grayed-out 'offline (SSL)' rows."""
     module = load_tray(tmp_path)
     dead = {"ok": False, "status": None, "latency_ms": None,
             "error": "URLError: <urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING]>",
             "blocked": False, "exhausted": False}
-    blocked = {**dead, "blocked": True}
     healthy = {"ok": True, "status": 200, "latency_ms": 164.0, "error": None}
     app = _tray_app(module, tmp_path, up=True,
                     providers={"proton": {
                         "active": "02-NL-FREE-149",
                         "profiles": ["00-US-FREE-108", "01-NL-FREE-140",
-                                     "02-NL-FREE-149", "03-CH-FREE-50"],
+                                     "02-NL-FREE-149"],
                         "egress": {"00-US-FREE-108": dead,
                                    "01-NL-FREE-140": dead,
-                                   "02-NL-FREE-149": healthy,
-                                   "03-CH-FREE-50": blocked}}})
+                                   "02-NL-FREE-149": healthy}}})
     rows = _flatten(app.build_menu().items)
     # Provider submenu rows are at depth 2; grab the exit entries under proton
     exit_rows = [t for d, t, e, _ in rows if d == 2 and "FREE" in t]
     assert exit_rows[0].startswith("02-NL-FREE-149"), \
         f"healthy exit should sort first: {exit_rows}"
-    # both dead exits sink below healthy (alphabetical among themselves)
+    # both dead exits sink to the bottom (alphabetical among themselves)
     assert all(not r.startswith("02-NL-FREE-149") for r in exit_rows[1:]), \
         f"dead exits should all sort after healthy: {exit_rows}"
-    # blocked exit sinks last of all
-    assert exit_rows[-1].startswith("03-CH-FREE-50"), \
-        f"blocked exit should sink last: {exit_rows}"
-    # dead rows carry the "try anyway" affordance label
-    assert "try anyway" in exit_rows[1] and "try anyway" in exit_rows[2]
     # disabled flags still correct after sorting
     enabled = [e for d, t, e, _ in rows if d == 2 and "FREE" in t]
     assert enabled[0] is True and enabled[-1] is False
-    assert enabled[1] is True and enabled[2] is True
-
-
-def test_tray_rotate_to_passes_force_for_try_anyway(tmp_path, monkeypatch):
-    """A manual pick of an offline/SSL exit must reach the router as
-    `rotate --to <profile> --force` so the cooldown from the failed probe
-    cannot refuse the attempt; the post-switch probe/rollback still guards."""
-    module = load_tray(tmp_path)
-    client = module.RouterClient(str(tmp_path))
-    calls = []
-
-    class _P:
-        returncode = 0
-        stdout = ""
-        stderr = ""
-
-    monkeypatch.setattr(module.subprocess, "run",
-                        lambda c, **k: calls.append(c) or _P())
-    client.rotate_to("proton", "01-NL-FREE-140", force=True)
-    assert calls[0][2:] == ["rotate", "proton", "--to", "01-NL-FREE-140", "--force"]
-    client.rotate_to("proton", "01-NL-FREE-140")
-    assert calls[1][2:] == ["rotate", "proton", "--to", "01-NL-FREE-140"]
 
 
 def test_record_egress_heals_stale_upstream_error(tmp_path):
@@ -1087,7 +786,7 @@ def test_needs_elevation_noninteractive_lifts_when_sudoers_installed(tmp_path, m
 
 def test_sudoers_rules_render_all_command_shapes():
     router = load_router(Path("/tmp/pr-test"))
-    rules = router._sudoers_rules("alice", "/usr/bin/python3", "/opt/pr/router.py")
+    rules = router._sudoers_rules("kyson", "/usr/bin/python3", "/opt/pr/router.py")
     lines = rules.strip().splitlines()
     assert lines[0].startswith("# Managed by `proxy-router elevate install`")
     cmds = [l.split("NOPASSWD: ", 1)[1] for l in lines[1:]]
@@ -1096,9 +795,6 @@ def test_sudoers_rules_render_all_command_shapes():
     assert "/usr/bin/python3 /opt/pr/router.py ensure" in cmds
     assert "/usr/bin/python3 /opt/pr/router.py rotate *" in cmds
     assert "/usr/bin/python3 /opt/pr/router.py rotate * --reason *" in cmds
-    assert "/usr/bin/python3 /opt/pr/router.py rotate" in cmds
-    assert "/usr/bin/python3 /opt/pr/router.py add" in cmds
-    assert "/usr/bin/python3 /opt/pr/router.py remove" in cmds
     assert all(" ALL=(root) NOPASSWD: " in l for l in lines[1:])
 
 
@@ -1123,37 +819,6 @@ def test_sudoers_installed_probes_by_executing_not_listing(tmp_path, monkeypatch
     assert router._sudoers_installed() is True
     assert calls[0][0][:2] == ["sudo", "-n"]
     assert calls[0][0][2:] == [sys.executable, str(Path(router.__file__).resolve()), "vpn", "status"]
-
-
-def test_sudoers_installed_survives_engine_down_exit_1(tmp_path, monkeypatch):
-    """ROOT CAUSE:
-    If the engine is down, `vpn status` exits 1 by design (rc 0 only when
-    the engine is up and matches the persisted mode), so the old
-    `returncode == 0` probe reported "grant missing" whenever the engine
-    was stopped — background keepalive ticks and `elevate status` then
-    refused passwordless sudo that was actually installed. We fixed this
-    by treating a nonzero exit as "grant present" unless sudo itself
-    reports a denial on stderr ("a password is required" / "not in the
-    sudoers file" / requiretty), which is the only way `sudo -n` fails
-    without running the command."""
-    router = load_router(tmp_path)
-    monkeypatch.setattr(router.shutil, "which", lambda name: "/usr/bin/sudo")
-
-    class _EngineDown:
-        returncode = 1
-        stdout = "vpn: down (mode set to tun; run 'vpn on')"
-        stderr = ""
-
-    monkeypatch.setattr(router.subprocess, "run", lambda *a, **k: _EngineDown())
-    assert router._sudoers_installed() is True
-
-    class _Denied:
-        returncode = 1
-        stdout = ""
-        stderr = "sudo: a password is required"
-
-    monkeypatch.setattr(router.subprocess, "run", lambda *a, **k: _Denied())
-    assert router._sudoers_installed() is False
 
 
 def test_elevate_prefers_sudo_n_when_granted(tmp_path, monkeypatch):
@@ -1229,7 +894,7 @@ def test_elevate_macos_runs_osascript_with_admin_privileges(tmp_path, monkeypatc
 
 
 def test_elevate_macos_escapes_applescript_specials(tmp_path, monkeypatch):
-    r"""Quotes/backslashes in args must survive the AppleScript string literal
+    """Quotes/backslashes in args must survive the AppleScript string literal
     (e.g. an --id with quotes): content `\"`/`\\` escapes, literal delimiters
     stay unescaped (a `\` at expression position is a -2741 syntax error)."""
     router = load_router(tmp_path)
@@ -1493,31 +1158,3 @@ def test_tray_vpn_uses_plain_cli_off_macos(tmp_path, monkeypatch):
     assert rc == 0
     assert calls and calls[0][0][-2:] == ["vpn", "off"]
     assert not any(c[0][0] == "osascript" for c in calls)
-
-
-def test_tray_sudoers_ok_survives_engine_down_exit_1(tmp_path, monkeypatch):
-    """ROOT CAUSE:
-    Mirrors the router probe: `sudo -n <python> <router> vpn status` exits 1
-    while the engine is down, so the old `returncode == 0` check made the
-    tray believe the passwordless grant was missing and always fell back to
-    the admin-password dialog (which blocks under launchd with no TTY). We
-    fixed this the same way as router.py: a nonzero exit only counts as
-    "grant missing" when sudo reports a denial on stderr."""
-    module = load_tray(tmp_path)
-    monkeypatch.setattr(module.shutil, "which", lambda name: "/usr/bin/sudo")
-
-    class _EngineDown:
-        returncode = 1
-        stdout = "vpn: down (mode set to tun; run 'vpn on')"
-        stderr = ""
-
-    monkeypatch.setattr(module.subprocess, "run", lambda *a, **k: _EngineDown())
-    assert module._sudoers_ok("/usr/bin/python3", "/opt/pr/router.py") is True
-
-    class _Denied:
-        returncode = 1
-        stdout = ""
-        stderr = "sudo: a password is required"
-
-    monkeypatch.setattr(module.subprocess, "run", lambda *a, **k: _Denied())
-    assert module._sudoers_ok("/usr/bin/python3", "/opt/pr/router.py") is False

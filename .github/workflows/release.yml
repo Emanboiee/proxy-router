@@ -80,7 +80,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cp router.py README.md LICENSE .gitignore router.example.json dist/proxy-router/
+          cp router.py setup_tui.py monitor.py route_watcher.py proxy_tray.py keepalive.sh README.md LICENSE .gitignore router.example.json dist/proxy-router/
+          cp -R guides presets rulesets dist/proxy-router/
           if [ "${{ matrix.archive }}" = "tar.gz" ]; then
             cp install.sh dist/proxy-router/
           else
@@ -92,7 +93,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist/proxy-router/examples
-          cp examples/* dist/proxy-router/examples/ 2>/dev/null || cp examples/keepalive.sh examples/com.proxy-router.keepalive.plist.template examples/install-launchd.sh examples/hermes-opencode.sh dist/proxy-router/examples/
+          cp -R examples/. dist/proxy-router/examples/
 
       - name: Archive
         shell: bash
@@ -124,8 +125,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist/proxy-router
-          cp router.py README.md LICENSE .gitignore router.example.json dist/proxy-router/
-          cp -R tests examples install.sh install.ps1 .github dist/proxy-router/
+          cp router.py setup_tui.py monitor.py route_watcher.py proxy_tray.py keepalive.sh README.md LICENSE .gitignore router.example.json dist/proxy-router/
+          cp -R tests examples guides presets rulesets install.sh install.ps1 .github dist/proxy-router/
           tar -czf "proxy-router-${GITHUB_REF_NAME}-source.tar.gz" -C dist proxy-router
 
       - name: Upload source

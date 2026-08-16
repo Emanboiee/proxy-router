@@ -14,27 +14,11 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 if [ ! -f "$ROOT/router.py" ] && [ -f "$(dirname "$ROOT")/router.py" ]; then
   ROOT="$(dirname "$ROOT")"
 fi
-if [ -n "${PROXY_ROUTER_BIN:-}" ]; then
-  ROUTER="$PROXY_ROUTER_BIN"
-elif [ -n "${PROXY_ROUTER_ROOT:-}" ] && [ -x "$PROXY_ROUTER_ROOT/router.py" ]; then
-  export PROXY_ROUTER_ROOT
-  ROUTER="$PROXY_ROUTER_ROOT/router.py"
-elif [ -z "${PROXY_ROUTER_ROOT:-}" ] && [ -x "$HOME/proxy-router-fallback-pr/router.py" ] && [ -d "$ROOT/providers" ]; then
-  export PROXY_ROUTER_ROOT="$ROOT"
-  ROUTER="$HOME/proxy-router-fallback-pr/router.py"
-else
-  ROUTER="$ROOT/router.py"
-fi
+ROUTER="$ROOT/router.py"
 HERMES_BIN="${HERMES_BIN:-hermes}"
 MAX_ATTEMPTS="${OPENCODE_MAX_ATTEMPTS:-}"
 RETRY_DELAY="${OPENCODE_RETRY_DELAY_SECONDS:-15}"
-PROVIDER="${OPENCODE_PROVIDER:-}"
-if [ -z "$PROVIDER" ]; then
-  echo "hermes-opencode: OPENCODE_PROVIDER is not set." >&2
-  echo "  Set it to the provider whose pool should back the retries," >&2
-  echo "  e.g. OPENCODE_PROVIDER=proton (see 'router.py status' for names)." >&2
-  exit 2
-fi
+PROVIDER="${OPENCODE_PROVIDER:-proton}"
 TMP_OUTPUT=$(mktemp "${TMPDIR:-/tmp}/hermes-opencode.XXXXXX")
 trap 'rm -f "$TMP_OUTPUT"' EXIT
 
@@ -140,13 +124,8 @@ while ((attempt < MAX_ATTEMPTS)); do
   fi
 
   # Wait a fixed 15s (override with OPENCODE_RETRY_DELAY_SECONDS) before
-  # retrying the exact same model command, through the rotated server or
-  # directly when the proxy is down.
-  if [ -n "$PROXY_URL" ]; then
-    printf '[opencode] waiting %ss before retrying %s on the rotated server\n' "$RETRY_DELAY" "$*" >&2
-  else
-    printf '[opencode] waiting %ss before retrying %s directly\n' "$RETRY_DELAY" "$*" >&2
-  fi
+  # retrying the exact same model command on the freshly rotated server.
+  printf '[opencode] waiting %ss before retrying %s on the rotated server\n' "$RETRY_DELAY" "$*" >&2
   sleep "$RETRY_DELAY"
 done
 

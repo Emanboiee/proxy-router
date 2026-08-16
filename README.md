@@ -16,8 +16,9 @@ validated Proton/WARP presets explicitly.
 
 Providers are bring-your-own: drop WireGuard profiles under
 `providers/<name>/` (see the guides) and reference the provider name from
-routes. Direct egress remains the fallback when all tunnel exits are
-unhealthy.
+routes. A provider may declare an ordered `fallback_providers` chain, so its
+routed domains keep working when its pool goes dead; direct egress remains
+the final fallback when all tunnel exits are unhealthy or the router is down.
 
 Core CLI runs on macOS, Linux, and Windows. The macOS-only bits (`up`/`down`
 and the launchd keep-alive) are guarded and print a clear message elsewhere.
@@ -112,6 +113,9 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py rotate <provider> --force   # switch anyway, ignoring cooldowns and blocked exits
 ./router.py rotate <provider> --no-probe # skip the post-switch egress probe
 ./router.py rotate --if-due      # scheduled rotation: only when the interval elapsed (exit 3 = not due)
+./router.py failover <provider> on [--to <fallback>]  # route the provider's domains through its configured fallback chain (first valid entry, or the named member)
+./router.py failover <provider> off    # clear fallback and restore the provider's routes
+./router.py failover <provider> status --json   # configured chain + active fallback
 ./router.py provider-count proton # rotation candidates (retry budget)
 ./router.py with-proxy [--timeout-ms 300] [--force-proxy|--force-direct] -- <cmd...>
                                  # fail-open runner: exec <cmd> through the proxy when up, else direct
@@ -193,6 +197,20 @@ Rotation is then egress-aware instead of blind round-robin:
   means resolution through the tunnel failed, `dns_ok: true` means a later
   dial/read stage failed. Exit code is 1 only when an exit is `dead`, so
   automation never rotates on a reputation-block HTTP status.
+- A provider can declare `fallback_provider` (the deployment maps Proton to
+  Cloudflare WARP). The value may be a single provider name or an **ordered
+  list** forming a fallback chain, e.g.
+  `"fallback_provider": ["cloudflare", "mullvad"]` — entries are validated at
+  load (must name another configured provider, no self/duplicates) and the
+  chain is walked in order, so the first entry with valid profiles wins. When
+  rotation exhausts the primary pool, the wrapper, keepalive, or Hermes
+  rotation bridge writes a private runtime marker and reloads once with the
+  primary endpoint removed; matching routes and DNS then use the chosen
+  fallback. `failover <name> on [--to <provider>]` activates the first valid
+  chain entry (or a specific member); `failover <name> status --json` reports
+  both `configured` (the full chain) and `active`. `egress check`/`sweep`
+  report `fallback` instead of probing Proton through WARP. Clear it
+  explicitly with `failover proton off` after Proton has been validated again.
 - A `sing-box.json.last-good` snapshot (atomic, 0600) is written whenever a
   freshly built config validates AND the engine demonstrably comes up with it;
   if a later reload's config fails validation or the engine fails to come up,
@@ -329,11 +347,12 @@ admin-password dialog on every run, grant passwordless sudo once:
 ./router.py elevate uninstall  # remove the grant
 ```
 
-The sudoers file only authorizes the exact engine command shapes for this
-interpreter + script path (NOPASSWD for `start`, `stop`, `vpn *`, `reload`,
-`ensure`, `rotate *`, `rotate * --reason *`). `*` in sudoers matches exactly
-one argv token and sudo execs the command directly (no shell), so there is no
-argv injection surface; state files are handed back to the invoking user via
+The sudoers file only authorizes router engine subcommands for this interpreter
+script path (NOPASSWD for `start`, `stop`, `vpn *`, `reload`, `ensure`,
+`rotate`, `add`, and `remove`, plus the explicit legacy rotate shapes).
+The no-argument sudoers entries allow the validated option forms for those
+subcommands; sudo execs the command directly (no shell), so shell syntax is
+not interpreted as part of the grant. State files are handed back to the invoking user via
 the `SUDO_UID`/`SUDO_GID` sudo sets automatically. With the grant in place,
 the interactive dialog path is skipped and background keepalive/launchd ticks
 can also elevate silently — `vpn on`/`vpn off`/`vpn restart` never prompt
@@ -468,6 +487,18 @@ rotation; a healthy tunnel logs `router: boot self-test ok`. Keepalive
 rotations are capped at `PROXY_KEEPALIVE_MAX_ROTATIONS` (default 2) per
 `PROXY_KEEPALIVE_STORM_WINDOW` seconds (default 600), so a genuinely broken
 pool can never rotation-storm.
+
+Fallback is part of the same self-heal loop. When a dead pool refuses to
+rotate, `rotate_dead` activates the provider's configured fallback
+(`failover <provider> on --reason timeout`) instead of giving up, so routed
+domains keep working through the fallback tunnel. While a fallback is active,
+`egress check`/`sweep` report `fallback` and never probe the primary pool.
+On the full-pool sweep cadence (`PROXY_KEEPALIVE_SWEEP_EVERY`, default 1800s)
+the keepalive therefore attempts ONE restore per fallback-parked provider:
+it clears the marker (`failover off`), probes the primary live through the
+tunnel, keeps the fallback cleared when the primary answers, and re-activates
+the fallback when the primary is still dead. The sweep cadence throttles the
+restore, so a genuinely dead primary never causes a failover off/on storm.
 
 ## Scheduled rotation
 
