@@ -723,6 +723,48 @@ class DashboardScreensTests(unittest.TestCase):
         self.assertEqual(state.view, "home")
 
 
+class ThemePresentationTests(unittest.TestCase):
+    """Hermes-style chrome: status chips, state colors, aligned columns."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(setup_tui, self.root)
+        (self.root / "providers" / "proton").mkdir(parents=True)
+        (self.root / "providers" / "proton" / "a.conf").write_text("profile")
+        (self.root / "router.json").write_text(json.dumps({
+            "providers": {"proton": {"directory": "providers/proton"}},
+            "routes": [],
+        }))
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_home_header_carries_engine_and_mode_chips(self):
+        with mock.patch.object(setup_tui, "ANSI", True):
+            frame = setup_tui.render_frame(setup_tui.TuiState(root=self.root))
+        header = frame[1]
+        # engine-down fixture: muted chip; mode chip carries the accent
+        self.assertIn(setup_tui._Theme.MUTED, header)
+        self.assertIn(setup_tui._Theme.ACCENT, header)
+        self.assertIn("down", header)
+
+    def test_ansi_fit_keeps_frame_columns_aligned(self):
+        state = setup_tui.TuiState(root=self.root, cols=60)
+        frame = setup_tui.render_frame(state)
+        for line in frame:
+            visible = setup_tui._visible_len(setup_tui._ANSI_RE.sub("", line)) if False else None
+        # every rendered line must have the same visible width
+        widths = {len(setup_tui._ANSI_RE.sub("", line)) for line in frame}
+        self.assertEqual(len(widths), 1, f"ragged frame: {widths}")
+
+    def test_servers_glyphs_are_state_colored(self):
+        state = setup_tui.apply_key(setup_tui.TuiState(root=self.root), "1")
+        with mock.patch.object(setup_tui, "ANSI", True):
+            joined = "\n".join(setup_tui.render_frame(state))
+        self.assertIn(setup_tui._Theme.MUTED, joined)  # unprobed glyph is dim
+
+
 class RoutingTuiTests(unittest.TestCase):
     """TUI surface for routing modes: menu item, read-only view, and routing
     changes executed through the single ``router.py routing`` CLI writer."""

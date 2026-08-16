@@ -1450,6 +1450,37 @@ def _initial_state(root: Path | None = None) -> TuiState:
     return state
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _visible_len(text: str) -> int:
+    return len(_ANSI_RE.sub("", text))
+
+
+def _fit_ansi(text: str, width: int) -> str:
+    """_fit for strings that may carry ANSI styling: pad/clip by the
+    VISIBLE width so colors never break column alignment."""
+    plain = _ANSI_RE.sub("", text)
+    if len(plain) > width:
+        if width <= 1:
+            return plain[:width]
+        return plain[: width - 1] + "\u2026"
+    return text + " " * (width - len(plain))
+
+
+class _Theme:
+    """Hermes-style presentation tokens: one accent, quiet chrome, state
+    colors reused across every dashboard screen."""
+
+    ACCENT = _Ansi.CYAN
+    MUTED = _Ansi.ORANGE  # reuse the existing dim tone for hints/footers
+    OK = "\x1b[32m"
+    WARN = "\x1b[33m"
+    ERR = "\x1b[31m"
+    BOLD = _Ansi.BOLD
+    RESET = _Ansi.RESET
+
+
 def _fit(text: str, width: int) -> str:
     """Truncate/pad ``text`` to exactly ``width`` columns."""
     if len(text) > width:
@@ -1472,7 +1503,8 @@ def _wrap_guide(text: str, width: int) -> list[str]:
 
 
 def _render_chrome(title: str, body: list[str], state: TuiState, footer: str,
-                   cursor_line: int | None = None) -> list[str]:
+                   cursor_line: int | None = None,
+                   chips: list[tuple[str, str]] | None = None) -> list[str]:
     """Bordered frame with scroll windowing, shared by the dashboard screens."""
     inner = max(state.cols - 2, 30)
     reserved = 7  # top, title, separator, separator, footer, bottom + margin
@@ -1489,12 +1521,17 @@ def _render_chrome(title: str, body: list[str], state: TuiState, footer: str,
         first = body.index(window[0]) + 1
         footer = f"{footer}  ·  lines {first}-{first + len(window) - 1}/{len(body)}"
     lines = ["\u250c" + "\u2500" * inner + "\u2510"]
-    lines.append("\u2502" + _style(_fit(f" {title} ", inner), _Ansi.BOLD, _Ansi.CYAN) + "\u2502")
+    header = _style(f" {title} ", _Theme.BOLD, _Theme.ACCENT)
+    if chips:
+        chip_text = " ".join(_style(text, _Theme.BOLD, color) for text, color in chips)
+        pad = inner - _visible_len(header) - _visible_len(chip_text) - 1
+        header = header + " " * max(1, pad) + chip_text
+    lines.append("\u2502" + _fit_ansi(header, inner) + "\u2502")
     lines.append("\u251c" + "\u2500" * inner + "\u2524")
     for line in window:
-        lines.append("\u2502" + _fit(_strip_ansi(line), inner) + "\u2502")
+        lines.append("\u2502" + _fit_ansi(line, inner) + "\u2502")
     lines.append("\u251c" + "\u2500" * inner + "\u2524")
-    lines.append("\u2502" + _fit(footer, inner) + "\u2502")
+    lines.append("\u2502" + _style(_fit(footer, inner), _Theme.MUTED) + "\u2502")
     lines.append("\u2514" + "\u2500" * inner + "\u2518")
     return lines
 
@@ -1576,7 +1613,9 @@ def _render_home(state: TuiState) -> list[str]:
     config = _tui_config(root)
     mode = _read_vpn_mode(root)
     engine = "UP" if _tui_engine_up(root) else "down"
-    body: list[str] = [f"engine {engine}   mode {mode}", ""]
+    engine_chip = ("\u25cf UP", _Theme.OK) if engine == "UP" else ("\u25cb down", _Theme.MUTED)
+    mode_chip = ("tun" if mode == "tun" else "proxy", _Theme.ACCENT)
+    body: list[str] = [""]
     for provider in _tui_providers(root):
         entry = (config.get("providers") or {}).get(provider, {})
         profiles = _tui_profiles(root, provider)
@@ -1584,14 +1623,16 @@ def _render_home(state: TuiState) -> list[str]:
         healthy = sum(1 for _stem, marker in profiles if marker in ("ok", "active"))
         chain = _tui_fallback_chain(provider, entry)
         chain_text = " -> ".join(chain) if chain else "-"
-        body.append(f" {provider}: exit {active} | {healthy}/{len(profiles)} healthy | fallback {chain_text}")
+        health = _style(f"{healthy}/{len(profiles)} healthy", _Theme.OK if healthy else _Theme.ERR)
+        body.append(f" {_tint_provider(provider)}: exit {active} | {health} | fallback {chain_text}")
     status_height = len(body)
     body.append("")
     for index, (key, label) in enumerate(TUI_MENU):
         cursor = ">" if index == state.cursor % len(TUI_MENU) else " "
         body.append(f" {cursor} [{key}] {label}")
     return _render_chrome("proxy-router", body, state, "j/k move · enter select · h home · q quit",
-                          cursor_line=status_height + state.cursor % len(TUI_MENU))
+                          cursor_line=status_height + state.cursor % len(TUI_MENU),
+                          chips=[engine_chip, mode_chip])
 
 
 def _render_servers(state: TuiState) -> list[str]:
@@ -1602,6 +1643,8 @@ def _render_servers(state: TuiState) -> list[str]:
     provider = state.servers_provider if state.servers_provider in providers else providers[0]
     state.servers_provider = provider
     profiles = _tui_profiles(state.root, provider)
+    glyph_color = {"active": _Theme.OK, "ok": _Theme.OK, "dead": _Theme.ERR,
+                   "cooling": _Theme.MUTED, "blocked": _Theme.WARN, "": _Theme.MUTED}
     glyphs = {"active": "\u25cf", "ok": "\u25cf", "dead": "\u2715", "cooling": "\u25cb", "blocked": "\u26a0", "": "\u00b7"}
     labels = {"active": "active", "ok": "ok", "dead": "dead", "cooling": "cooling", "blocked": "blocked", "": "unprobed"}
     body = [f" {provider}  ({providers.index(provider) + 1}/{len(providers)})", ""]
@@ -1609,9 +1652,11 @@ def _render_servers(state: TuiState) -> list[str]:
         body.append(" no profiles imported for this provider")
     for index, (stem, marker) in enumerate(profiles):
         cursor = ">" if index == state.cursor % max(1, len(profiles)) else " "
-        body.append(f" {cursor} {glyphs.get(marker, '\u00b7')} {stem}  {labels.get(marker, '')}")
+        glyph = _style(glyphs.get(marker, "\u00b7"), glyph_color.get(marker, _Theme.MUTED))
+        body.append(f" {cursor} {glyph} {stem}  {labels.get(marker, '')}")
     return _render_chrome("servers", body, state,
-                          "h/l provider · j/k exit · r rotate · enter set active · esc home")
+                          "h/l provider · j/k exit · r rotate · enter set active · esc home",
+                          chips=[(_tint_provider(provider), _Theme.BOLD)])
 
 
 def _render_fallbacks(state: TuiState) -> list[str]:
@@ -1632,9 +1677,10 @@ def _render_fallbacks(state: TuiState) -> list[str]:
         f" provider: {provider}  ({index + 1}/{len(providers)})",
         "",
         f" chain:  {' -> '.join(chain) if chain else '(none configured)'}",
-        f" active: {active or 'none'}",
+        f" active: {_style(active or 'none', _Theme.OK if active else _Theme.MUTED)}",
     ]
-    return _render_chrome("fallbacks", body, state, "h/l provider · 1 failover on · 2 failover off · esc home")
+    return _render_chrome("fallbacks", body, state, "h/l provider · 1 failover on · 2 failover off · esc home",
+                          chips=[(_tint_provider(provider), _Theme.BOLD)])
 
 
 def _render_menu(state: TuiState) -> list[str]:
