@@ -1674,7 +1674,7 @@ class EgressCheckCommandTests(unittest.TestCase):
         # blame a different profile for the tunnel's health).
         router.set_active("proton", self.root / "providers" / "proton" / "a.conf")
         router.mark_cooldown("proton", self.root / "providers" / "proton" / "a.conf", 300)
-        with mock.patch("sys.stdout.write") as write:
+        with mock.patch("sys.stdout.write"):
             rc = router.egress_check("proton")
         self.assertEqual(rc, 0)
         _, kwargs = self.live.call_args
@@ -1867,6 +1867,87 @@ class EgressSweepTests(unittest.TestCase):
             rc = router.egress_sweep("proton")
         self.assertEqual(rc, 0)
         self.assertEqual(urls, ["https://example.com/probe"] * 3)
+
+
+class DoctorTests(unittest.TestCase):
+    """router.py doctor: read-only health audit."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(router, self.root)
+        (self.root / "providers" / "proton").mkdir(parents=True)
+        _write_conf(self.root / "providers" / "proton" / "a.conf")
+        self.config = self.root / "router.json"
+        self.config.write_text(json.dumps({
+            "port": 2080,
+            "providers": {"proton": {"directory": "providers/proton"}},
+            "routes": [{"id": "zen", "domains": ["opencode.ai"], "provider": "proton"}],
+        }))
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_doctor_passes_with_valid_setup(self):
+        with mock.patch.object(router, "resolve_sing_box", return_value=Path("/usr/local/bin/sing-box")), \
+                mock.patch.object(router, "sing_box_at_least", return_value=True), \
+                mock.patch.object(router, "engine_alive", return_value=False), \
+                mock.patch.object(router, "shutil") as shutil_mock:
+            shutil_mock.which.return_value = None
+            with mock.patch("sys.stdout.write"):
+                rc = router.doctor()
+        self.assertEqual(rc, 0)
+
+    def test_doctor_fails_on_empty_pool(self):
+        (self.root / "providers" / "proton" / "a.conf").unlink()
+        with mock.patch.object(router, "resolve_sing_box", return_value=Path("/usr/local/bin/sing-box")), \
+                mock.patch.object(router, "sing_box_at_least", return_value=True), \
+                mock.patch.object(router, "engine_alive", return_value=False), \
+                mock.patch.object(router, "shutil") as shutil_mock:
+            shutil_mock.which.return_value = None
+            with mock.patch("sys.stdout.write"):
+                rc = router.doctor()
+        self.assertEqual(rc, 1)
+
+
+class DriftWatchdogTests(unittest.TestCase):
+    """ensure heals engine-config drift with an in-place reload."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(router, self.root)
+        router._providers = {"proton": {"directory": "providers/proton"}}
+        router._routes = []
+        router._vpn = {}
+        router._port = 2080
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_ensure_reloads_when_config_drifted(self):
+        reloads = []
+        with mock.patch.object(router, "engine_alive", return_value=True), \
+                mock.patch.object(router, "engine_mode_consistent", return_value=True), \
+                mock.patch.object(router, "_config_drifted", return_value=True), \
+                mock.patch.object(router, "engine_reload",
+                                  lambda *a, **k: reloads.append(True) or 0), \
+                mock.patch.object(router, "route_watcher_start"), \
+                mock.patch.object(router, "current_mode", return_value="tun"):
+            self.assertEqual(router.engine_ensure(), 0)
+        self.assertEqual(reloads, [True])
+
+    def test_ensure_leaves_matching_config_alone(self):
+        reloads = []
+        with mock.patch.object(router, "engine_alive", return_value=True), \
+                mock.patch.object(router, "engine_mode_consistent", return_value=True), \
+                mock.patch.object(router, "_config_drifted", return_value=False), \
+                mock.patch.object(router, "engine_reload",
+                                  lambda *a, **k: reloads.append(True) or 0), \
+                mock.patch.object(router, "route_watcher_start"), \
+                mock.patch.object(router, "current_mode", return_value="tun"):
+            self.assertEqual(router.engine_ensure(), 0)
+        self.assertEqual(reloads, [])
 
 
 class LastGoodConfigTests(unittest.TestCase):

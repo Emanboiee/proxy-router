@@ -2607,6 +2607,23 @@ def engine_switch() -> int:
     return 1
 
 
+def _config_drifted() -> bool:
+    """True when the running engine's config no longer matches what the
+    current router.json + active markers would generate.
+
+    Live-verified failure mode (2026-08-17): after heavy route/marker
+    editing the on-disk sing-box.json diverged from reality — the proxy
+    listener TLS-failed while transparent capture served traffic, until a
+    manual reload converged. The ensure watchdog heals that drift with the
+    same graceful in-place reload rotations use."""
+    try:
+        fresh, _active = build_singbox_config()
+        running = json.loads(SING_BOX_CONFIG.read_text())
+    except (SystemExit, KeyError, ValueError, OSError, configparser.Error, json.JSONDecodeError):
+        return False  # never block ensure on a build/read problem
+    return json.dumps(fresh, sort_keys=True) != json.dumps(running, sort_keys=True)
+
+
 def engine_ensure() -> int:
     if MANUAL_OFF_FILE.is_file():
         # The user disconnected manually (tray Disconnect / `router.py
@@ -2621,6 +2638,11 @@ def engine_ensure() -> int:
         # (status/vpn status report it as down); restart into the persisted
         # mode instead of declaring victory (M13).
         if engine_alive() and engine_mode_consistent():
+            if _config_drifted():
+                print("router: engine config drifted from router.json; reloading in place", file=sys.stderr)
+                rc = engine_reload()
+                if rc != 0:
+                    return rc
             route_watcher_start()
             return 0
         rc = engine_start()
@@ -2641,6 +2663,11 @@ def engine_ensure() -> int:
     # process answering the port while our pid is dead/mismatched is NOT
     # healthy (F1): start the engine instead of declaring victory.
     if listener_up() and engine_alive():
+        if _config_drifted():
+            print("router: engine config drifted from router.json; reloading in place", file=sys.stderr)
+            rc = engine_reload()
+            if rc != 0:
+                return rc
         route_watcher_start()
         return 0
     rc = engine_start()
@@ -3312,6 +3339,56 @@ def _status_report() -> tuple[int, str]:
         # file or a recycled/foreign process); never report that as up.
         return 1, "down (foreign listener on 127.0.0.1:{}; run 'start')".format(_port)
     return 1, "down (proxy mode; run 'vpn on' for tun, 'start' for proxy)"
+
+
+def doctor() -> int:
+    """One-command health audit: config, pools, engine, sing-box, grants.
+
+    Read-only (no probes, no engine actions). exit 0 when nothing failed;
+    warnings never fail the run — they are drift the self-heal loop or the
+    operator should know about, not outages."""
+    findings: list[tuple[str, str, str]] = []
+
+    def note(severity: str, area: str, detail: str) -> None:
+        findings.append((severity, area, detail))
+
+    if load_config() != 0:
+        note("fail", "config", "router.json rejected: run 'router.py status' for the reason")
+    else:
+        note("ok", "config", f"{len(_providers)} provider(s), {len(_routes)} route(s), mode {current_mode()}")
+        for name in _providers:
+            count = len(provider_files(name))
+            (note("fail", "pool", f"provider '{name}' has no profiles (drop .conf files into its directory)")
+             if count == 0 else note("ok", "pool", f"{name}: {count} profile(s), active {persisted_active(name) or '-'}"))
+    sing_box = resolve_sing_box()
+    if sing_box is None:
+        note("fail", "sing-box", _sing_box_missing_message())
+    elif not sing_box_at_least(MIN_SING_BOX_VERSION):
+        note("fail", "sing-box", _sing_box_version_message(MIN_SING_BOX_VERSION))
+    else:
+        note("ok", "sing-box", str(sing_box))
+    if engine_alive():
+        drift = "config DRIFTED from router.json (ensure reloads it in place on the next tick)" \
+            if _config_drifted() else "config matches router.json"
+        note("ok" if "matches" in drift else "warn", "engine", f"alive, mode {current_mode()} — {drift}")
+    else:
+        note("warn", "engine", f"down (mode {current_mode()}); run 'router.py ensure' to start it")
+    if os.geteuid() != 0 and shutil.which("sudo"):
+        note("ok" if _sudoers_installed() else "warn", "elevate",
+             "passwordless engine grant active" if _sudoers_installed()
+             else "grant absent; run 'router.py elevate install' to stop root-owned state churn")
+    if sys.platform == "darwin":
+        probe = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
+        has_agent = "com.proxy-router.keepalive" in (probe.stdout or "")
+        note("ok" if has_agent else "warn", "keepalive",
+             "launchd agent loaded" if has_agent else "launchd agent NOT loaded (examples/install-launchd.sh)")
+    for severity, area, detail in findings:
+        mark = {"ok": "[ok]  ", "warn": "[warn]", "fail": "[FAIL]"}[severity]
+        print(f"{mark} {area:<10} {detail}")
+    fails = sum(1 for severity, _a, _d in findings if severity == "fail")
+    warns = sum(1 for severity, _a, _d in findings if severity == "warn")
+    print(f"doctor: {len(findings) - fails - warns} ok · {warns} warn · {fails} fail")
+    return 1 if fails else 0
 
 
 def vpn_status() -> int:
@@ -4185,6 +4262,7 @@ def main() -> int:
     sub.add_parser("start")
     sub.add_parser("stop")
     status = sub.add_parser("status")
+    sub.add_parser("doctor", help="one-command health audit (read-only)")
     status.add_argument("--json", action="store_true", help="machine-readable status (JSON)")
     sub.add_parser("reload")
     sub.add_parser("routes")
@@ -4419,6 +4497,8 @@ def main() -> int:
                 print(f"router: warning: could not write manual-off marker: {e}",
                       file=sys.stderr)
         return rc
+    if args.cmd == "doctor":
+        return doctor()
     if args.cmd == "status":
         if resolve_sing_box() is None:
             print(f"router: {_sing_box_missing_message()}", file=sys.stderr)

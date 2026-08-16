@@ -11,6 +11,7 @@ tests can assert on:
 - the rotation storm guard (MAX_ROTATIONS per STORM_WINDOW),
 - reset-on-success, and the boot self-test.
 """
+import json
 import os
 import signal
 import subprocess
@@ -306,6 +307,38 @@ class KeepaliveEgressCheckTests(unittest.TestCase):
             h.wait_lines(20)
             rotates = [line for line in h.lines() if line.startswith("rotate proton")]
             self.assertGreaterEqual(len(rotates), 4, f"expected rotation churn: {rotates}")
+        finally:
+            h.close()
+
+
+class KeepaliveSweepStaggerTests(unittest.TestCase):
+    """A sweep defers when the newest rotation is inside the stagger window."""
+
+    def test_sweep_defers_right_after_rotation(self):
+        import time as _time
+        h = KeepaliveHarness(interval="2")
+        try:
+            rotation = h.root / "state" / "proton.rotation"
+            rotation.parent.mkdir(parents=True, exist_ok=True)
+            rotation.write_text(json.dumps({"profile": "a", "at": int(_time.time())}))
+            h.wait_lines(6)
+            lines = h.lines()
+            self.assertNotIn("egress sweep --json", lines,
+                             f"sweep ran inside the stagger window: {lines}")
+            h.close()
+            self.assertIn("sweep deferred", h.err, f"defer note missing: {h.err!r}")
+        finally:
+            h.close()
+
+    def test_sweep_runs_when_rotation_is_old(self):
+        import time as _time
+        h = KeepaliveHarness(interval="2")
+        try:
+            rotation = h.root / "state" / "proton.rotation"
+            rotation.parent.mkdir(parents=True, exist_ok=True)
+            rotation.write_text(json.dumps({"profile": "a", "at": int(_time.time()) - 3600}))
+            h.wait_lines(6)
+            self.assertIn("egress sweep --json", h.lines())
         finally:
             h.close()
 
