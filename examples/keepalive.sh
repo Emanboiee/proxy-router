@@ -130,24 +130,37 @@ rotate_dead() {
     strikes=0
     return
   fi
+  # Count every recovery attempt, including a failed rotate/fallback attempt.
+  # Otherwise an exhausted provider can be retried forever every probe tick.
+  rotations=$((rotations + 1))
+  strikes=0
   echo "router: rotating '$provider' after dead tunnel checks" >&2
   if "$ROOT/router.py" rotate "$provider" --reason timeout; then
     :
   else
     echo "router: rotate '$provider' failed; checking configured fallback" >&2
     fallback_state=$("$ROOT/router.py" failover "$provider" status 2>/dev/null || true)
+    configured_fallback=$(printf '%s\n' "$fallback_state" | sed -n 's/.* configured=\([^ ]*\).*/\1/p')
     active_fallback=$(printf '%s\n' "$fallback_state" | sed -n 's/.* active=\([^ ]*\).*/\1/p')
-    if [ -n "$active_fallback" ] && [ "$active_fallback" != "none" ]; then
-      echo "router: fallback '$active_fallback' already active; waiting for the next dead check" >&2
-      return
-    fi
+    case "$active_fallback" in
+      ""|none|no|false|0|off|OFF)
+        ;;
+      *)
+        echo "router: fallback '$active_fallback' already active; waiting for the next dead check" >&2
+        return
+        ;;
+    esac
+    case "$configured_fallback" in
+      ""|none|no|false|0|off|OFF)
+        echo "router: no configured fallback for '$provider'; backing off" >&2
+        return
+        ;;
+    esac
     if ! "$ROOT/router.py" failover "$provider" on --reason timeout >/dev/null 2>&1; then
       echo "router: fallback for '$provider' failed; will retry after the next dead check" >&2
       return
     fi
   fi
-  rotations=$((rotations + 1))
-  strikes=0
 }
 
 while true; do
