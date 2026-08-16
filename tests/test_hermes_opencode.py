@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_tls_eof_activates_fallback_and_retries(tmp_path):
     script = tmp_path / "hermes-opencode.sh"
-    shutil.copy2(ROOT / "hermes-opencode.sh", script)
+    shutil.copy2(ROOT / "examples" / "hermes-opencode.sh", script)
     script.chmod(0o755)
 
     state = tmp_path / "calls"
@@ -52,6 +52,7 @@ def test_tls_eof_activates_fallback_and_retries(tmp_path):
     env = dict(os.environ)
     env.update({
         "HERMES_BIN": str(hermes),
+        "OPENCODE_PROVIDER": "proton",
         "OPENCODE_MAX_ATTEMPTS": "2",
         "OPENCODE_RETRY_DELAY_SECONDS": "0",
         "TMPDIR": str(tmp_path),

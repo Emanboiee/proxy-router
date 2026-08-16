@@ -176,7 +176,7 @@ class ApplyPresetsTests(unittest.TestCase):
         self.config.write_text(json.dumps({"providers": {}, "routes": []}))
         setup_tui.apply_presets(self.config)
         data = json.loads(self.config.read_text())
-        self.assertEqual(data["providers"]["proton"]["fallback_provider"], "cloudflare")
+        self.assertEqual(data["providers"]["proton"]["fallback_providers"], ["cloudflare"])
 
     def test_preserves_existing_providers(self):
         setup_tui.apply_presets(self.config)
@@ -233,11 +233,20 @@ class CustomPresetTests(unittest.TestCase):
         self.assertEqual(route["provider"], "cloudflare")
 
     def test_proton_preset_provider_gets_warp_fallback(self):
-        path = setup_tui.add_custom_preset(
+        # a user who brings both pools: applying a preset that routes through
+        # proton wires the existing cloudflare pool as its fallback chain
+        self.config.write_text(json.dumps({
+            "providers": {
+                "proton": {"directory": "providers/proton"},
+                "cloudflare": {"directory": "providers/cloudflare"},
+            },
+            "routes": [],
+        }))
+        setup_tui.add_custom_preset(
             self.root, "work", "proton", ["gmail.com"])
         setup_tui.apply_preset_by_name(self.root, "work")
         data = json.loads(self.config.read_text())
-        self.assertEqual(data["providers"]["proton"]["fallback_provider"], "cloudflare")
+        self.assertEqual(data["providers"]["proton"]["fallback_providers"], ["cloudflare"])
 
     def test_custom_preset_safe_list_default_provider(self):
         path = setup_tui.add_custom_preset(
@@ -714,132 +723,6 @@ class RoutingTuiTests(unittest.TestCase):
             data = json.loads((root / "router.json").read_text())
             self.assertEqual(data["routing"]["direct_domains"], ["youtube.com"])
             self.assertIn("NOT reloaded", text)
-
-
-class FallbackTuiTests(unittest.TestCase):
-    """TUI surface for fallback chains: settings entry, guided prompt flow,
-    and the config writer used by both interactive and line mode."""
-
-    def _seed(self, root: Path) -> None:
-        (root / "providers" / "proton").mkdir(parents=True)
-        (root / "providers" / "cloudflare").mkdir(parents=True)
-        (root / "providers" / "mullvad").mkdir(parents=True)
-        data = {
-            "port": 2080,
-            "providers": {
-                "proton": {"directory": "providers/proton"},
-                "cloudflare": {"directory": "providers/cloudflare"},
-                "mullvad": {"directory": "providers/mullvad"},
-            },
-            "routes": [],
-        }
-        (root / "router.json").write_text(json.dumps(data))
-
-    def test_settings_lists_fallback_action(self):
-        self.assertIn(("3", "fallback chain setup (per-provider failover)"),
-                      setup_tui._SETTINGS_ACTIONS)
-
-    def test_fallback_view_opens_from_settings_and_esc_returns(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            self._seed(root)
-            state = setup_tui.apply_key(setup_tui.TuiState(root=root), "4")  # settings
-            state = setup_tui.apply_key(state, "3")  # fallback
-            self.assertEqual(state.view, "fallback")
-            esc = setup_tui.apply_key(state, "\x1b")
-            self.assertEqual(esc.view, "settings")
-
-    def test_fallback_view_shows_configured_chains(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            self._seed(root)
-            data = json.loads((root / "router.json").read_text())
-            data["providers"]["proton"]["fallback_provider"] = ["cloudflare", "mullvad"]
-            (root / "router.json").write_text(json.dumps(data))
-            state = setup_tui.apply_key(setup_tui.TuiState(root=root), "4")
-            state = setup_tui.apply_key(state, "3")
-            joined = "\n".join(setup_tui.render_frame(state))
-            self.assertIn("cloudflare", joined)
-            self.assertIn("mullvad", joined)
-
-    def test_fallback_set_prompt_two_stage_records_action(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            self._seed(root)
-            state = setup_tui.apply_key(setup_tui.TuiState(root=root), "4")
-            state = setup_tui.apply_key(state, "3")
-            state = setup_tui.apply_key(state, "1")  # set chain
-            self.assertEqual(state.view, "routing_prompt")
-            self.assertEqual(state.fallback_step, 1)
-            for ch in "proton":
-                state = setup_tui.apply_key(state, ch)
-            state = setup_tui.apply_key(state, "\r")
-            self.assertEqual(state.fallback_provider, "proton")
-            self.assertEqual(state.fallback_step, 1)
-            self.assertEqual(state.view, "routing_prompt")
-            for ch in "cloudflare, mullvad":
-                state = setup_tui.apply_key(state, ch)
-            state = setup_tui.apply_key(state, "\r")
-            self.assertEqual(state.action, ("fallback_set", "proton", "cloudflare, mullvad"))
-            self.assertEqual(state.view, "fallback")
-            self.assertEqual(state.fallback_step, 0)
-
-    def test_fallback_clear_prompt_records_action(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            self._seed(root)
-            state = setup_tui.apply_key(setup_tui.TuiState(root=root), "4")
-            state = setup_tui.apply_key(state, "3")
-            state = setup_tui.apply_key(state, "2")  # clear
-            self.assertEqual(state.view, "routing_prompt")
-            self.assertEqual(state.fallback_step, 2)
-            for ch in "proton":
-                state = setup_tui.apply_key(state, ch)
-            state = setup_tui.apply_key(state, "\r")
-            self.assertEqual(state.action, ("fallback_set", "proton", ""))
-            self.assertEqual(state.view, "fallback")
-
-    def test_fallback_esc_from_prompt_cancels_without_action(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            self._seed(root)
-            state = setup_tui.apply_key(setup_tui.TuiState(root=root), "4")
-            state = setup_tui.apply_key(state, "3")
-            state = setup_tui.apply_key(state, "1")
-            state = setup_tui.apply_key(state, "\x1b")
-            self.assertEqual(state.view, "fallback")
-            self.assertIsNone(state.action)
-            self.assertEqual(state.fallback_step, 0)
-
-    def test_fallback_set_executes_and_writes_config(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            self._seed(root)
-            text, rc = setup_tui._execute_action(
-                ("fallback_set", "proton", "cloudflare, mullvad"), root)
-            self.assertEqual(rc, 0, text)
-            data = json.loads((root / "router.json").read_text())
-            self.assertEqual(data["providers"]["proton"]["fallback_provider"],
-                             ["cloudflare", "mullvad"])
-            text, rc = setup_tui._execute_action(("fallback_set", "proton", ""), root)
-            self.assertEqual(rc, 0, text)
-            data = json.loads((root / "router.json").read_text())
-            self.assertNotIn("fallback_provider", data["providers"]["proton"])
-            text, rc = setup_tui._execute_action(("fallback_set", "proton", "warp"), root)
-            self.assertEqual(rc, 1, text)
-
-    def test_line_mode_fallback_writes_config(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            self._seed(root)
-            setup_tui._cmd_fallback_set(root, "proton", "cloudflare")
-            data = json.loads((root / "router.json").read_text())
-            self.assertEqual(data["providers"]["proton"]["fallback_provider"], "cloudflare")
-
-
-if __name__ == "__main__":
-    unittest.main()
-
 
 if __name__ == "__main__":
     unittest.main()

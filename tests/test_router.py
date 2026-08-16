@@ -250,7 +250,8 @@ class RotationTests(unittest.TestCase):
     def test_rotate_walks_forward_through_pool_before_wrapping(self):
         _write_conf(self.root / "providers" / "proton" / "c.conf")
         router.set_active("proton", self.root / "providers" / "proton" / "b.conf")
-        with mock.patch.object(router, "engine_reload", return_value=0):
+        with mock.patch.object(router, "engine_reload", return_value=0), \
+                mock.patch.object(router, "engine_switch", return_value=0):
             self.assertEqual(router.rotate("proton"), 0)
             self.assertEqual((self.root / "state" / "proton.active").read_text(), "c")
             self.assertEqual(router.rotate("proton"), 0)
@@ -966,11 +967,14 @@ class RotationEgressTests(unittest.TestCase):
         router._vpn = {}
         self.reload_patch = mock.patch.object(router, "engine_reload", return_value=0)
         self.engine_reload = self.reload_patch.start()
+        self.switch_patch = mock.patch.object(router, "engine_switch", return_value=0)
+        self.engine_switch = self.switch_patch.start()
         self.probe_patch = mock.patch.object(router, "probe_profile", return_value=(True, {"ok": True}))
         self.probe = self.probe_patch.start()
 
     def tearDown(self):
         self.probe_patch.stop()
+        self.switch_patch.stop()
         self.reload_patch.stop()
         self._tmp.cleanup()
 
@@ -1024,20 +1028,25 @@ class RotationEgressTests(unittest.TestCase):
 
     def test_rotate_probe_failure_rolls_back(self):
         router.set_active("proton", self._profile("a"))
-        with mock.patch.object(router, "probe_profile", return_value=(False, {"ok": False})) as probe:
-            self.assertEqual(router.rotate("proton"), 0)
+        with mock.patch.object(router, "listener_up", return_value=True), \
+                mock.patch.object(router, "probe_profile", return_value=(False, {"ok": False})) as probe:
+            # rollback restores service but still reports the failed rotation
+            # (non-zero) so callers can activate the configured fallback
+            self.assertEqual(router.rotate("proton"), 1)
         self.assertEqual(self._active(), "a")
         self.assertTrue(router.is_cooled_down("proton", self._profile("b")))
         probe.assert_called_once()
-        # first reload for the switch, second for the rollback
-        self.assertEqual(self.engine_reload.call_count, 2)
+        # first hard switch for the rotation, second for the rollback
+        self.assertEqual(self.engine_switch.call_count, 2)
 
     def test_rotate_reason_probe_failure_keeps_reason_cooldown(self):
         # A --reason rotation marks the current profile FAILED upstream; the
         # rollback restore must NOT clear that mark (ping-pong A->B->A->C->A).
         router.set_active("proton", self._profile("a"))
-        with mock.patch.object(router, "probe_profile", return_value=(False, {"ok": False})):
-            self.assertEqual(router.rotate("proton", reason="503"), 0)
+        with mock.patch.object(router, "listener_up", return_value=True), \
+                mock.patch.object(router, "probe_profile", return_value=(False, {"ok": False})):
+            # rollback restores service but reports the failed rotation (1)
+            self.assertEqual(router.rotate("proton", reason="503"), 1)
         self.assertEqual(self._active(), "a")  # rolled back to previous
         self.assertTrue(router.is_cooled_down("proton", self._profile("a")))  # mark survived
         self.assertTrue(router.is_cooled_down("proton", self._profile("b")))  # failed switch also cooled
@@ -1048,14 +1057,18 @@ class RotationEgressTests(unittest.TestCase):
         # Plain rotations only mildly cool the previous profile as preference;
         # restoring it on rollback MUST undo that so last-good is usable now.
         router.set_active("proton", self._profile("a"))
-        with mock.patch.object(router, "probe_profile", return_value=(False, {"ok": False})):
-            self.assertEqual(router.rotate("proton"), 0)
+        with mock.patch.object(router, "listener_up", return_value=True), \
+                mock.patch.object(router, "probe_profile", return_value=(False, {"ok": False})):
+            self.assertEqual(router.rotate("proton"), 1)
         self.assertEqual(self._active(), "a")
         self.assertFalse(router.is_cooled_down("proton", self._profile("a")))
 
     def test_rotate_probe_failure_without_previous_keeps_switch(self):
-        with mock.patch.object(router, "probe_profile", return_value=(False, {"ok": False})):
-            self.assertEqual(router.rotate("proton"), 0)
+        with mock.patch.object(router, "listener_up", return_value=True), \
+                mock.patch.object(router, "probe_profile", return_value=(False, {"ok": False})):
+            # no previous profile to restore: the failed switch stays put
+            # and the failure is reported so callers can fall back
+            self.assertEqual(router.rotate("proton"), 1)
         self.assertEqual(self._active(), "a")
 
     def test_rotate_no_probe_skips_probe(self):
@@ -1434,11 +1447,13 @@ class EgressCheckCommandTests(unittest.TestCase):
         self.live_patch = mock.patch.object(router, "check_egress_live", side_effect=list(results))
         self.live = self.live_patch.start()
 
-    def test_requires_proxy_mode(self):
+    def test_works_in_tun_mode_via_mixed_listener(self):
+        # TUN capture keeps the 127.0.0.1 mixed listener alongside the TUN
+        # inbound, so the check no longer refuses tun mode.
         router.set_mode("tun")
         with mock.patch("sys.stdout.write"):
             rc = router.egress_check()
-        self.assertEqual(rc, 1)
+        self.assertEqual(rc, 0)
 
     def test_requires_listener(self):
         self.listener.stop()
@@ -1536,7 +1551,8 @@ class EgressCheckCommandTests(unittest.TestCase):
         with mock.patch("sys.stdout.write") as write:
             rc = router.egress_check(as_json=True)
         self.assertEqual(rc, 0)
-        self.assertEqual(self.live.call_count, 1)
+        # one probe through the fallback marker, one for cloudflare as itself
+        self.assertEqual(self.live.call_count, 2)
         data = json.loads("".join(c.args[0] for c in write.call_args_list))
         self.assertEqual(data["results"]["proton"]["status"], "fallback")
         self.assertEqual(data["results"]["proton"]["fallback_provider"], "cloudflare")
@@ -1606,11 +1622,14 @@ class EgressSweepTests(unittest.TestCase):
         self.probe = self.probe_patch.start()
         self.reload_patch = mock.patch.object(router, "engine_reload", return_value=0)
         self.engine_reload = self.reload_patch.start()
+        self.switch_patch = mock.patch.object(router, "engine_switch", return_value=0)
+        self.engine_switch = self.switch_patch.start()
         self.sleep_patch = mock.patch.object(router.time, "sleep")
         self.sleep_patch.start()
 
     def tearDown(self):
         self.sleep_patch.stop()
+        self.switch_patch.stop()
         self.reload_patch.stop()
         self.probe_patch.stop()
         self.rotate_patch.stop()
@@ -1625,11 +1644,13 @@ class EgressSweepTests(unittest.TestCase):
         self.probe_patch = mock.patch.object(router, "probe_profile", side_effect=list(results))
         self.probe = self.probe_patch.start()
 
-    def test_requires_proxy_mode(self):
+    def test_works_in_tun_mode_via_mixed_listener(self):
+        # TUN capture keeps the 127.0.0.1 mixed listener, so the sweep can
+        # probe through it in either mode.
         router.set_mode("tun")
         with mock.patch("sys.stdout.write"):
             rc = router.egress_sweep()
-        self.assertEqual(rc, 1)
+        self.assertEqual(rc, 0)
 
     def test_probes_every_profile_once_in_wrap_order(self):
         router.set_active("proton", self._profile("a"))
@@ -1637,15 +1658,15 @@ class EgressSweepTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         stems = [call.args[1].stem for call in self.probe.call_args_list]
         self.assertEqual(stems, ["a", "b", "c"])
-        # one force/no-probe hop before every non-first profile
-        self.assertEqual([c.args[0] for c in self.rotate.call_args_list], ["proton", "proton"])
-        for call in self.rotate.call_args_list:
-            self.assertTrue(call.kwargs["force"])
-            self.assertFalse(call.kwargs["probe"])
+        # hops are direct hard switches (a->b, b->c, then back to the best);
+        # sweep never routes through rotate()
+        self.rotate.assert_not_called()
+        self.assertEqual(self.engine_switch.call_count, 3)
 
     def test_does_not_probe_unactivated_profiles_after_hop_failure(self):
         router.set_active("proton", self._profile("a"))
-        self.rotate.side_effect = [0, 1]
+        # hop a->b succeeds, hop b->c fails, restore-to-original is a third switch
+        self.engine_switch.side_effect = [0, 1, 0]
         self._probe(
             (True, {"ok": True, "latency_ms": 10.0, "status": 200}),
             (True, {"ok": True, "latency_ms": 20.0, "status": 200}),
@@ -1669,7 +1690,8 @@ class EgressSweepTests(unittest.TestCase):
             rc = router.egress_sweep("proton")
         self.assertEqual(rc, 0)
         self.assertEqual(router.persisted_active("proton").stem, "b")
-        self.engine_reload.assert_called_once()
+        # a->b, b->c, then back to the best (b)
+        self.assertEqual(self.engine_switch.call_count, 3)
         joined = "".join(c.args[0] for c in write.call_args_list)
         self.assertIn("switched proton -> b (sweep)", joined)
 
@@ -1692,14 +1714,15 @@ class EgressSweepTests(unittest.TestCase):
         with mock.patch("sys.stdout.write") as write:
             rc = router.egress_sweep("proton")
         self.assertEqual(rc, 1)
-        self.engine_reload.assert_not_called()
-        self.assertEqual(router.persisted_active("proton").stem, "a")  # left on current
+        # every exit is probed via a hard switch, then the original restored
+        self.assertEqual(self.engine_switch.call_count, 3)
+        self.assertEqual(router.persisted_active("proton").stem, "a")  # restored
         joined = "".join(c.args[0] for c in write.call_args_list)
         self.assertIn("0/3 alive", joined)
 
-    def test_unknown_provider_is_error_but_not_dead(self):
+    def test_unknown_provider_is_an_error(self):
         rc = router.egress_sweep("ghost")
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         self.probe.assert_not_called()
         self.rotate.assert_not_called()
 
@@ -1710,7 +1733,7 @@ class EgressSweepTests(unittest.TestCase):
             "port": 2080,
             "providers": {
                 "proton": {"directory": "providers/proton",
-                           "probe_url": "https://pinned.example/probe"},
+                           "probe_url": "https://example.com/probe"},
             },
             "routes": [{"id": "example-com", "domains": ["example.com"], "provider": "proton"}],
         }
@@ -1728,7 +1751,7 @@ class EgressSweepTests(unittest.TestCase):
              mock.patch("sys.stdout.write"):
             rc = router.egress_sweep("proton")
         self.assertEqual(rc, 0)
-        self.assertEqual(urls, ["https://pinned.example/probe"] * 3)
+        self.assertEqual(urls, ["https://example.com/probe"] * 3)
 
 
 class LastGoodConfigTests(unittest.TestCase):
@@ -1865,8 +1888,11 @@ class ErrorPolicyTests(unittest.TestCase):
         router._egress_settings = dict(router.DEFAULT_EGRESS_SETTINGS)
         self.reload_patch = mock.patch.object(router, "engine_reload", return_value=0)
         self.reload_patch.start()
+        self.switch_patch = mock.patch.object(router, "engine_switch", return_value=0)
+        self.switch_patch.start()
 
     def tearDown(self):
+        self.switch_patch.stop()
         self.reload_patch.stop()
         router._error_policy = None
         self._tmp.cleanup()
@@ -2081,17 +2107,20 @@ class RoutingModeTests(unittest.TestCase):
         # it and pick the next tunneled route domain.
         router._routing = {"mode": "safe-list", "direct_domains": ["example.com"],
                            "default_provider": "proton"}
-        self.assertIsNone(router.probe_url_for("proton"))  # only domain is direct → no tunneled path
-        router._routes = [
-            {"id": "example-com", "domains": ["example.com"], "provider": "proton"},
-            {"id": "opencode-ai", "domains": ["opencode.ai"], "provider": "proton"},
-        ]
-        self.assertEqual(router.probe_url_for("proton"), "https://opencode.ai")
+        # safe-list default provider carries all unrouted traffic, so the
+        # generic egress probe URL is a valid tunneled target
+        default_probe = router.egress_settings()["probe_url"]
+        self.assertEqual(router.probe_url_for("proton"), default_probe)
+        # a pinned probe_url whose host is direct-whitelisted measures the
+        # direct path and must be rejected in favor of the default target
+        router._providers["proton"]["probe_url"] = "https://example.com/pinned"
+        self.assertEqual(router.probe_url_for("proton"), default_probe)
 
     def test_probe_url_for_does_not_skip_in_default_or_vpn_list(self):
         # direct_domains only pin direct in safe-list mode; in default/vpn-list
         # the list is ignored, so the normal first-domain probe must remain.
-        router._routing = {"mode": "vpn-list", "direct_domains": ["example.com"]}
+        router._routing = {"mode": "vpn-list", "vpn_domains": ["example.com"],
+                           "direct_domains": ["example.com"]}
         self.assertEqual(router.probe_url_for("proton"), "https://example.com")
         router._routing = {}
         self.assertEqual(router.probe_url_for("proton"), "https://example.com")
@@ -2105,6 +2134,8 @@ class RoutingModeTests(unittest.TestCase):
             "cooldown_seconds": 60,
             "probe_url": "https://www.roblox.com/robots.txt",
         }
+        router._routes = router._routes + [
+            {"id": "roblox", "domains": ["roblox.com"], "provider": "cloudflare"}]
         self.assertEqual(router.probe_url_for("cloudflare"),
                          "https://www.roblox.com/robots.txt")
         # provider without a pin still uses the route pick
@@ -2126,7 +2157,9 @@ class RoutingModeTests(unittest.TestCase):
         config, _ = router.build_singbox_config()
         rules = config["route"]["rules"]
         self.assertEqual(rules[0], {"protocol": "dns", "action": "hijack-dns"})
-        self.assertEqual(rules[1], {"domain_suffix": ["youtube.com"], "outbound": "direct"})
+        # sniff recovers hostnames for the raw-IP TUN flows before routing
+        self.assertEqual(rules[1], {"action": "sniff"})
+        self.assertEqual(rules[2], {"domain_suffix": ["youtube.com"], "outbound": "direct"})
         self.assertEqual(config["route"]["final"], "proton")
 
     def test_safe_list_bad_default_provider_fails_build(self):
@@ -2331,6 +2364,7 @@ class ScheduledRotationTests(unittest.TestCase):
         (self.root / "state" / "proton.rotation").write_text(
             json.dumps({"profile": "a", "at": backdated}), encoding="utf-8")
         with mock.patch.object(router, "engine_reload", return_value=0), \
+                mock.patch.object(router, "engine_switch", return_value=0), \
                 mock.patch.object(router, "probe_profile", return_value=(True, {"ok": True})):
             self.assertEqual(router.rotate_due("proton"), 0)
         self.assertGreater(self._rotation_record(), backdated)
@@ -2401,6 +2435,7 @@ class RotationPolicyTests(unittest.TestCase):
 
     def _rotate_ranked(self):
         with mock.patch.object(router, "engine_reload", return_value=0), \
+                mock.patch.object(router, "engine_switch", return_value=0), \
                 mock.patch.object(router, "probe_profile", return_value=(True, {"ok": True})):
             return router.rotate("proton")
 

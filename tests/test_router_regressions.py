@@ -99,19 +99,19 @@ def test_activate_fallback_writes_marker_and_reloads_once(tmp_path, monkeypatch)
         "proton": {"directory": "providers/proton", "fallback_provider": "cloudflare"},
         "cloudflare": {"directory": "providers/cloudflare"},
     }
-    reloads = []
+    switches = []
     monkeypatch.setattr(router, "_profile_error", lambda profile: None)
-    monkeypatch.setattr(router, "engine_reload", lambda: reloads.append(True) or 0)
+    monkeypatch.setattr(router, "engine_switch", lambda: switches.append(True) or 0)
 
     assert router.activate_fallback("proton", reason="tls") == 0
     marker = json.loads((tmp_path / "state" / "fallback" / "proton.json").read_text())
     assert marker["provider"] == "cloudflare"
     assert marker["reason"] == "tls"
-    assert reloads == [True]
+    assert switches == [True]
 
     assert router.deactivate_fallback("proton") == 0
     assert not (tmp_path / "state" / "fallback" / "proton.json").exists()
-    assert reloads == [True, True]
+    assert switches == [True, True]
 
 
 def test_activate_fallback_restores_marker_when_reload_fails(tmp_path, monkeypatch):
@@ -124,7 +124,7 @@ def test_activate_fallback_restores_marker_when_reload_fails(tmp_path, monkeypat
         "proton": {"directory": "providers/proton", "fallback_provider": "cloudflare"},
         "cloudflare": {"directory": "providers/cloudflare"},
     }
-    monkeypatch.setattr(router, "engine_reload", lambda: 1)
+    monkeypatch.setattr(router, "engine_switch", lambda: 1)
 
     assert router.activate_fallback("proton", reason="tls") == 1
     assert not (tmp_path / "state" / "fallback" / "proton.json").exists()
@@ -237,13 +237,13 @@ def test_activate_fallback_walks_chain_to_first_valid_provider(tmp_path, monkeyp
     }
     monkeypatch.setattr(router, "_profile_error",
                         lambda profile: None if "mullvad" in str(profile) else "bad")
-    reloads = []
-    monkeypatch.setattr(router, "engine_reload", lambda: reloads.append(True) or 0)
+    switches = []
+    monkeypatch.setattr(router, "engine_switch", lambda: switches.append(True) or 0)
 
     assert router.activate_fallback("proton", reason="tls") == 0
     marker = json.loads((tmp_path / "state" / "fallback" / "proton.json").read_text())
     assert marker["provider"] == "mullvad"
-    assert reloads == [True]
+    assert switches == [True]
 
 
 def test_activate_fallback_rejects_target_outside_chain(tmp_path, monkeypatch):
@@ -259,7 +259,7 @@ def test_activate_fallback_rejects_target_outside_chain(tmp_path, monkeypatch):
         "mullvad": {"directory": "providers/mullvad"},
     }
     monkeypatch.setattr(router, "_profile_error", lambda profile: None)
-    monkeypatch.setattr(router, "engine_reload", lambda: 0)
+    monkeypatch.setattr(router, "engine_switch", lambda: 0)
 
     assert router.activate_fallback("proton", target="mullvad") == 0
     marker = json.loads((tmp_path / "state" / "fallback" / "proton.json").read_text())
@@ -311,12 +311,16 @@ def test_egress_sweep_skips_primary_when_fallback_is_active(tmp_path, monkeypatc
     marker = tmp_path / "state" / "fallback"
     marker.mkdir(parents=True)
     (marker / "proton.json").write_text(json.dumps({"provider": "cloudflare"}))
+    # the sweep reports the parked primary via one fallback probe
+    monkeypatch.setattr(router, "_check_active_fallback",
+                        lambda provider, fallback: (None, "alive", None))
 
     assert router.egress_sweep("proton", as_json=True) == 0
     data = json.loads(capsys.readouterr().out)
     assert data["dead"] == []
     assert data["results"]["proton"] == {
         "status": "fallback", "fallback_provider": "cloudflare",
+        "fallback_profile": None, "ok": True,
     }
 
 
@@ -670,20 +674,25 @@ def test_tray_friendly_egress_error_mapping(tmp_path):
 
 
 def test_tray_exit_picker_humanizes_raw_error(tmp_path):
-    """profile_health must render a raw SSL/URLError as '! offline (SSL)',
-    not the Python error tail (the screenshot bug)."""
+    """profile_health keeps transport-only probe failures quiet (commonly
+    transient), but an HTTP-level degradation must render a friendly tag —
+    never the raw Python error tail (the screenshot bug)."""
     module = load_tray(tmp_path)
-    bad = {"ok": False, "status": None, "latency_ms": None,
-           "error": "URLError: <urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING, "
-                    "EOF occurred in violation of protocol (_ssl.c:983)]>",
-           "blocked": False, "exhausted": False}
+    transport_dead = {"ok": False, "status": None, "latency_ms": None,
+                      "error": "URLError: <urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING]>",
+                      "blocked": False, "exhausted": False}
+    http_degraded = {"ok": False, "status": 503, "latency_ms": None,
+                     "error": "URLError: <urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING]>",
+                     "blocked": False, "exhausted": False}
     app = _tray_app(module, tmp_path, up=True,
                     providers={"proton": {
                         "active": "01-NL-FREE-140",
-                        "profiles": ["01-NL-FREE-140"],
-                        "egress": {"01-NL-FREE-140": bad}}})
-    health = app.latest.profile_health("proton", "01-NL-FREE-140")
-    assert "offline (SSL)" in health, f"raw error tail leaked: {health!r}"
+                        "profiles": ["01-NL-FREE-140", "02-NL-FREE-149"],
+                        "egress": {"01-NL-FREE-140": transport_dead,
+                                   "02-NL-FREE-149": http_degraded}}})
+    assert app.latest.profile_health("proton", "01-NL-FREE-140") == ""
+    health = app.latest.profile_health("proton", "02-NL-FREE-149")
+    assert health.startswith(" ! "), f"HTTP degradation needs a warning: {health!r}"
     assert "urlopen" not in health.lower(), f"Python error leaked: {health!r}"
 
 
@@ -801,8 +810,8 @@ def test_tray_exit_picker_sorts_healthy_first(tmp_path):
     # blocked exit sinks last of all
     assert exit_rows[-1].startswith("03-CH-FREE-50"), \
         f"blocked exit should sink last: {exit_rows}"
-    # dead rows carry the "try anyway" affordance label
-    assert "try anyway" in exit_rows[1] and "try anyway" in exit_rows[2]
+    # transport-dead rows stay clickable and quiet (no warning text)
+    assert "!" not in exit_rows[1] and "!" not in exit_rows[2]
     # disabled flags still correct after sorting
     enabled = [e for d, t, e, _ in rows if d == 2 and "FREE" in t]
     assert enabled[0] is True and enabled[-1] is False

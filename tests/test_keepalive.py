@@ -81,10 +81,10 @@ case "$cmd" in
     esac
     ;;
   failover)
-    if [ "$2" = "off" ]; then
+    if [ "$3" = "off" ]; then
       rm -f "${FAKE_ROUTER_FALLBACK_FILE:-/dev/null}"
-    elif [ "$2" = "on" ] && [ -n "${FAKE_ROUTER_FALLBACK_FILE:-}" ]; then
-      printf '%s\n' "$3" > "$FAKE_ROUTER_FALLBACK_FILE"
+    elif [ "$3" = "on" ] && [ -n "${FAKE_ROUTER_FALLBACK_FILE:-}" ]; then
+      printf '%s\n' "$2" > "$FAKE_ROUTER_FALLBACK_FILE"
     fi
     exit 0
     ;;
