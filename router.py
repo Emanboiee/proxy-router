@@ -1111,14 +1111,79 @@ def probe_url_for(name: str) -> str | None:
     return None
 
 
+def _classify_probe_body(status: int, text: str) -> str | None:
+    """Reputation-block reason for an HTTP response body, else None."""
+    if re.search(r"error\s*code\s*[:=]?\s*1010|cloudflare.{0,20}1010", text, re.IGNORECASE):
+        return "cloudflare-1010"
+    if (status in (403, 1010)) and "cloudflare" in text.lower():
+        return "cloudflare-403"
+    return None
+
+
+def _probe_via_curl(*, port: int, url: str, timeout: float) -> dict:
+    """One probe via curl: its TLS handshake survives Cloudflare bot
+    management that resets python-urllib clients on fingerprint (seen live:
+    `egress check` reported dead on an exit serving HTTP 200 at that moment).
+    Same transport route_watcher's transparent probes already use. The
+    write-out line carries the HTTP status and total time; the response body
+    (first 4 KiB) feeds the reputation-block classification."""
+    connect = max(1.0, min(float(timeout), 4.0))
+    command = [
+        "curl", "--proxy", f"http://127.0.0.1:{port}", "--noproxy", "",
+        "--silent", "--show-error", "--output", "-",
+        "--write-out", "\n%{http_code} %{time_total}",
+        "--connect-timeout", f"{connect:g}", "--max-time", f"{float(timeout):g}",
+        url,
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, timeout=float(timeout) + 2.0)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "latency_ms": None, "status": None,
+                "error": _egress_error_text(exc), "block_reason": None}
+    out = (result.stdout or b"").decode("utf-8", "replace")
+    err = (result.stderr or b"").decode("utf-8", "replace")
+    status, latency_ms = 0, None
+    if "\n" in out:
+        body, tail = out.rsplit("\n", 1)
+        parts = tail.split()
+        if parts and parts[0].isdigit():
+            status = int(parts[0])
+            if len(parts) > 1:
+                try:
+                    latency_ms = round(float(parts[1]) * 1000.0, 2)
+                except ValueError:
+                    latency_ms = None
+        else:
+            body = out
+    else:
+        body = out
+    if status == 0:
+        # No HTTP response: transport-level failure; curl's stderr says why
+        # (exit 7 connect refused, 28 timeout, 35 SSL handshake, 56 read).
+        error = f"curl({result.returncode}): {err.strip()[-200:] or 'no response'}"
+        return {"ok": False, "latency_ms": None, "status": None,
+                "error": error, "block_reason": None}
+    reason = _classify_probe_body(status, body[:4096])
+    return {
+        "ok": reason is None,
+        "latency_ms": latency_ms,
+        "status": status,
+        "error": reason,
+        "block_reason": reason,
+    }
+
+
 def probe_egress(*, port: int | None = None, url: str | None = None, timeout: float | None = None,
                  opener=None, clock=time.monotonic) -> dict:
     """One small HTTP GET through the router's proxy listener (the tunnel) and
-    a parsed outcome: ok, latency, status, error. ``opener``/``clock`` are
-    injectable for tests, mirroring monitor.py."""
+    a parsed outcome: ok, latency, status, error. Prefers curl when installed
+    (bot-management-resistant TLS); ``opener``/``clock`` force the legacy
+    urllib path for tests and systems without curl."""
     port = port or _port
     url = url or egress_settings()["probe_url"]
     timeout = timeout if timeout is not None else egress_settings()["probe_timeout"]
+    if opener is None and shutil.which("curl") is not None:
+        return _probe_via_curl(port=port, url=url, timeout=float(timeout))
     if opener is None:
         proxy = f"http://127.0.0.1:{port}"
         opener = urllib.request.build_opener(
@@ -1135,11 +1200,7 @@ def probe_egress(*, port: int | None = None, url: str | None = None, timeout: fl
         latency = (clock() - started) * 1000.0
         status = int(getattr(response, "status", getattr(response, "code", 200)))
         text = body.decode("utf-8", "replace")
-        reason = None
-        if re.search(r"error\s*code\s*[:=]?\s*1010|cloudflare.{0,20}1010", text, re.IGNORECASE):
-            reason = "cloudflare-1010"
-        elif (status in (403, 1010)) and "cloudflare" in text.lower():
-            reason = "cloudflare-403"
+        reason = _classify_probe_body(status, text)
         return {
             "ok": reason is None,
             "latency_ms": round(latency, 2),
@@ -1294,6 +1355,12 @@ def check_egress_live(name: str, profile: Path, *, port: int | None = None,
     if url is None:
         return "alive", None
     probe = probe_egress(port=port, url=url)
+    if not probe["ok"] and probe["status"] is None:
+        # One transport-level blip (bot-managed reset, handshake race) must
+        # not dead-mark an exit that may be serving real traffic: retry once,
+        # briefly. A genuinely dead tunnel fails both probes.
+        time.sleep(2.0)
+        probe = probe_egress(port=port, url=url)
     if probe["ok"]:
         status, dns_ok = "alive", True
     elif probe["status"] is not None:
