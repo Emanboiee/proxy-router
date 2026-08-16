@@ -1128,7 +1128,7 @@ def test_sudoers_rules_render_all_command_shapes():
     rules = router._sudoers_rules("alice", "/usr/bin/python3", "/opt/pr/router.py")
     lines = rules.strip().splitlines()
     assert lines[0].startswith("# Managed by `proxy-router elevate install`")
-    cmds = [l.split("NOPASSWD: ", 1)[1] for l in lines[1:]]
+    cmds = [line.split("NOPASSWD: ", 1)[1] for line in lines[1:]]
     assert "/usr/bin/python3 /opt/pr/router.py vpn *" in cmds
     assert "/usr/bin/python3 /opt/pr/router.py reload" in cmds
     assert "/usr/bin/python3 /opt/pr/router.py ensure" in cmds
@@ -1137,13 +1137,13 @@ def test_sudoers_rules_render_all_command_shapes():
     assert "/usr/bin/python3 /opt/pr/router.py rotate" in cmds
     assert "/usr/bin/python3 /opt/pr/router.py add" in cmds
     assert "/usr/bin/python3 /opt/pr/router.py remove" in cmds
-    assert all(" ALL=(root) NOPASSWD: " in l for l in lines[1:])
+    assert all(" ALL=(root) NOPASSWD: " in line for line in lines[1:])
 
 
 def test_sudoers_installed_probes_by_executing_not_listing(tmp_path, monkeypatch):
     """ROOT CAUSE:
     If sudoers grants the user `ALL=(ALL) ALL` (password required, no
-    NOPASSWD marker), `sudo -n -l <cmd>` exits 0 and prints the rule, but
+    NOPASSWD marker), `sudo -n -line <cmd>` exits 0 and prints the rule, but
     `sudo -n <cmd>` fails with "a password is required" — the old list-based
     probe reported "passwordless sudo active" when running engine commands
     still prompts/fails. We fixed this by EXECUTING the read-only

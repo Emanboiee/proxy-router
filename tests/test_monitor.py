@@ -1,6 +1,5 @@
 """Tests for the opt-in monitor; no network or real daemons."""
 import json
-import os
 import stat
 import subprocess
 import sys

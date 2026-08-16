@@ -151,7 +151,7 @@ class ApplyPresetsTests(unittest.TestCase):
         self.assertEqual(route["provider"], "proton")
 
     def test_adds_roblox_route(self):
-        result = setup_tui.apply_presets(self.config)
+        setup_tui.apply_presets(self.config)
         self.assertIn("roblox", [r["id"] for r in json.loads(self.config.read_text())["routes"]])
 
     def test_idempotent_does_not_duplicate(self):

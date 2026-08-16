@@ -223,7 +223,22 @@ while true; do
     # end on the best alive exit (each profile hop is a hard server switch;
     # a failed/empty sweep restores the original active profile when possible).
     sweep_now=$(date +%s)
-    if [ "$last_sweep" -eq 0 ] || [ $((sweep_now - last_sweep)) -ge "$SWEEP_EVERY" ]; then
+    # Rotation/sweep stagger: a full-pool sweep hard-switches exit to exit;
+    # never run it right after a scheduled rotation flipped the active exit
+    # (the fresh session is still settling and the sweep would immediately
+    # hop away). PROXY_KEEPALIVE_STAGGER seconds after the newest rotation
+    # record, the sweep defers to the next tick.
+    STAGGER="${PROXY_KEEPALIVE_STAGGER:-300}"
+    newest_rotation=0
+    for rotation_file in "$ROOT"/state/*.rotation; do
+      [ -f "$rotation_file" ] || continue
+      rotated_at=$(sed -n 's/.*"at": *\([0-9]*\).*/\1/p' "$rotation_file" 2>/dev/null || echo 0)
+      case "$rotated_at" in ''|*[!0-9]*) rotated_at=0 ;; esac
+      [ "$rotated_at" -gt "$newest_rotation" ] && newest_rotation="$rotated_at"
+    done
+    if [ "$newest_rotation" -gt 0 ] && [ $((sweep_now - newest_rotation)) -lt "$STAGGER" ]; then
+      echo "router: sweep deferred (rotation ${STAGGER}s stagger window)" >&2
+    elif [ "$last_sweep" -eq 0 ] || [ $((sweep_now - last_sweep)) -ge "$SWEEP_EVERY" ]; then
       if "$ROOT/router.py" egress sweep --json >/dev/null 2>&1; then
         echo "router: full-pool egress sweep done"
       else
