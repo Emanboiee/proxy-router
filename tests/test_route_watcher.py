@@ -62,7 +62,7 @@ class RouteWatcherTests(unittest.TestCase):
             }))
             self.assertEqual(
                 w.critical_domains(root),
-                ("opencode.ai", "api.opencode.ai"),
+                ("opencode.ai", "api.opencode.ai", "roblox.com"),
             )
 
     def test_probe_http_failure_is_not_transport_failure(self):

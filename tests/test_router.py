@@ -1064,9 +1064,10 @@ class RotationEgressTests(unittest.TestCase):
             self.assertEqual(router.rotate("proton", probe=False), 0)
         self.assertEqual(self._active(), "b")
 
-    def test_rotate_tun_mode_does_not_probe(self):
+    def test_rotate_tun_mode_without_listener_does_not_probe(self):
         router.set_mode("tun")
         router.set_active("proton", self._profile("a"))
+        router.listener_up = lambda: False
         with mock.patch.object(router, "probe_profile", side_effect=AssertionError("must not probe")):
             self.assertEqual(router.rotate("proton"), 0)
         self.assertEqual(self._active(), "b")
@@ -2104,7 +2105,8 @@ class RoutingModeTests(unittest.TestCase):
         config, _ = router.build_singbox_config()
         rules = config["route"]["rules"]
         self.assertEqual(rules[0], {"protocol": "dns", "action": "hijack-dns"})
-        self.assertEqual(rules[1], {"domain_suffix": ["youtube.com"], "outbound": "direct"})
+        self.assertEqual(rules[1], {"action": "sniff"})
+        self.assertEqual(rules[2], {"domain_suffix": ["youtube.com"], "outbound": "direct"})
         self.assertEqual(config["route"]["final"], "proton")
 
     def test_safe_list_bad_default_provider_fails_build(self):

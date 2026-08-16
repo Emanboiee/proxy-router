@@ -99,15 +99,21 @@ def parse_line(line: str) -> dict | None:
 
 
 def critical_domains(root: Path) -> tuple[str, ...]:
-    """Read target domains from routes; opencode.ai is the default critical lane."""
+    """Read all configured routed domains for transparent-mode observation.
+
+    The watcher started as an OpenCode-only guard, but route-based TUN mode
+    exists specifically so the router can observe and selectively divert any
+    configured target without requiring an app-level proxy setting. Keep the
+    fallback for a fresh/partial config so OpenCode remains observable by
+    default.
+    """
     domains: list[str] = []
     try:
         config = json.loads((Path(root) / "router.json").read_text())
         for route in config.get("routes", []):
-            route_id = str(route.get("id", "")).lower()
             for domain in route.get("domains", []):
                 domain = normalize_host(str(domain))
-                if domain and ("opencode" in route_id or domain_matches(domain, "opencode.ai")):
+                if domain:
                     domains.append(domain)
     except (OSError, ValueError, TypeError):
         pass
@@ -283,6 +289,10 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
     guard = RotationGuard()
     try:
         while enabled_file(root).is_file():
+            # Routes can be added while the watcher is running. Refresh the
+            # target set each tick so transparent capture starts observing a
+            # newly configured domain without requiring a router restart.
+            domains = critical_domains(root)
             offset, lines = _read_new_lines(log_path, offset)
             for line in lines:
                 event = parse_line(line)

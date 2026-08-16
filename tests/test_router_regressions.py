@@ -111,6 +111,7 @@ def test_routes_tun_captures_route_rules_without_ruleset_address_set(tmp_path):
     tun = config["inbounds"][0]
     assert tun["auto_route"] is True
     assert "route_address_set" not in tun
+    assert config["route"]["rules"][1] == {"action": "sniff"}
     assert any(r.get("outbound") == "proton" and "opencode.ai" in r.get("domain_suffix", [])
                for r in config["route"]["rules"])
     assert config["route"]["final"] == "direct"
