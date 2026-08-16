@@ -10,6 +10,7 @@ import time
 import unittest
 import urllib.error
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -1313,6 +1314,56 @@ class EgressDnsProbeTests(unittest.TestCase):
             self.assertIsNone(router.egress_dns_probe("example.com"))
 
 
+class ProbeCurlTransportTests(unittest.TestCase):
+    """probe_egress prefers curl (bot-management-resistant TLS) and parses
+    its write-out line; urllib stays available when curl is absent."""
+
+    def _run(self, returncode=0, stdout=b"", stderr=b""):
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    def test_curl_response_parsed_to_ok_status_and_latency(self):
+        with mock.patch.object(router.shutil, "which", return_value="/usr/bin/curl"), \
+                mock.patch.object(router.subprocess, "run",
+                                  return_value=self._run(stdout=b'{"ok":true}\n200 0.123456')):
+            result = router.probe_egress(port=2080, url="https://example.com/x")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], 200)
+        self.assertEqual(result["latency_ms"], 123.46)
+        self.assertIsNone(result["block_reason"])
+
+    def test_curl_transport_failure_is_error_with_stderr_context(self):
+        result_run = self._run(returncode=35, stdout=b"\n000 0.000000",
+                               stderr=b"curl: (35) LibreSSL SSL_connect: SSL_ERROR_SYSCALL")
+        with mock.patch.object(router.shutil, "which", return_value="/usr/bin/curl"), \
+                mock.patch.object(router.subprocess, "run", return_value=result_run):
+            result = router.probe_egress(port=2080, url="https://example.com/x")
+        self.assertFalse(result["ok"])
+        self.assertIsNone(result["status"])
+        self.assertIn("SSL_ERROR_SYSCALL", result["error"])
+        self.assertEqual(router._transport_reason(result["error"]), "tls")
+
+    def test_curl_body_still_classifies_reputation_blocks(self):
+        body = b"error code: 1010 cloudflare\n403 0.250000"
+        with mock.patch.object(router.shutil, "which", return_value="/usr/bin/curl"), \
+                mock.patch.object(router.subprocess, "run",
+                                  return_value=self._run(stdout=body)):
+            result = router.probe_egress(port=2080, url="https://example.com/x")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], 403)
+        self.assertEqual(result["block_reason"], "cloudflare-1010")
+
+    def test_urllib_path_used_when_curl_absent(self):
+        def fail(request, timeout):
+            raise urllib.error.URLError("boom")
+        with mock.patch.object(router.shutil, "which", return_value=None), \
+                mock.patch.object(router.subprocess, "run",
+                                  side_effect=AssertionError("curl must not run")) as run, \
+                mock.patch.object(router, "_open_probe", side_effect=fail):
+            result = router.probe_egress(port=2080, url="https://example.com/x", opener=object())
+        self.assertFalse(result["ok"])
+        run.assert_not_called()
+
+
 class EgressLiveCheckTests(unittest.TestCase):
     """check_egress_live classification: alive / degraded / dead + dns_ok."""
 
@@ -1327,13 +1378,28 @@ class EgressLiveCheckTests(unittest.TestCase):
         router._routes = [{"id": "example-com", "domains": ["example.com"], "provider": "proton"}]
         router._port = 2080
         router._vpn = {}
+        # the transport-blip retry sleeps 2s; keep dead-class tests fast
+        self.sleep_patch = mock.patch.object(router.time, "sleep")
+        self.sleep_patch.start()
 
     def tearDown(self):
+        self.sleep_patch.stop()
         self._tmp.cleanup()
 
     def _probe(self, *, ok=False, status=None, error=None, block_reason=None):
         return {"ok": ok, "latency_ms": None, "status": status, "error": error,
                 "block_reason": block_reason}
+
+    def test_transport_blip_is_retried_before_dead_verdict(self):
+        # one reset, then a clean response: the exit must be alive
+        outcomes = [
+            self._probe(error="curl(35): SSL_ERROR_SYSCALL"),
+            self._probe(ok=True, status=200),
+        ]
+        with mock.patch.object(router, "probe_egress", side_effect=outcomes) as probe:
+            status, _record = router.check_egress_live("proton", self.profile)
+        self.assertEqual(status, "alive")
+        self.assertEqual(probe.call_count, 2)
 
     def test_probe_ok_is_alive_and_records_dns_ok(self):
         with mock.patch.object(router, "probe_egress",
@@ -1520,17 +1586,22 @@ class EgressCheckCommandTests(unittest.TestCase):
         router.set_active("cloudflare", self.root / "providers" / "cloudflare" / "b.conf")
         self.live_patch.stop()  # exercise the real check_egress_live/record path
         probes = [
+            # proton: transport-dead twice (the blip retry re-probes once)
             {"ok": False, "latency_ms": None, "status": None,
              "error": "URLError: timeout", "block_reason": None},
+            {"ok": False, "latency_ms": None, "status": None,
+             "error": "URLError: timeout", "block_reason": None},
+            # cloudflare: alive first try
             {"ok": True, "latency_ms": 42.0, "status": 200,
              "error": None, "block_reason": None},
         ]
         with mock.patch.object(router, "probe_egress", side_effect=probes) as probe, \
              mock.patch.object(router, "egress_dns_probe", return_value=False), \
+             mock.patch.object(router.time, "sleep"), \
              mock.patch("sys.stdout.write") as write:
             rc = router.egress_check()
         self.assertEqual(rc, 1)
-        self.assertEqual(probe.call_count, 2)
+        self.assertEqual(probe.call_count, 3)
         joined = "".join(str(c) for c in write.call_args_list)
         self.assertIn("dead: proton", joined)
         self.assertNotIn("dead: cloudflare", joined)
