@@ -163,6 +163,26 @@ def test_rotate_uses_hard_switch_for_selection_and_rollback(tmp_path, monkeypatc
     assert (tmp_path / "state" / "proton.active").read_text() == "a"
 
 
+def test_rotate_probes_through_mixed_listener_in_tun_mode(tmp_path, monkeypatch):
+    router = load_router(tmp_path)
+    provider_dir = tmp_path / "providers" / "proton"
+    provider_dir.mkdir(parents=True)
+    for stem in ("a", "b"):
+        (provider_dir / f"{stem}.conf").write_text("fake")
+    router._providers = {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}}
+    router._routes = [{"id": "opencode", "domains": ["opencode.ai"], "provider": "proton"}]
+    router.current_mode = lambda: "tun"
+    router.listener_up = lambda: True
+    monkeypatch.setattr(router, "_profile_error", lambda _profile: None)
+    monkeypatch.setattr(router, "engine_switch", lambda: 0)
+    router.set_active("proton", provider_dir / "a.conf")
+    probes = []
+    monkeypatch.setattr(router, "probe_profile", lambda *args: probes.append(args) or (True, {"ok": True}))
+
+    assert router.rotate("proton") == 0
+    assert len(probes) == 1
+
+
 def test_rotate_restores_active_marker_when_switch_fails(tmp_path, monkeypatch):
     router = load_router(tmp_path)
     provider_dir = tmp_path / "providers" / "proton"

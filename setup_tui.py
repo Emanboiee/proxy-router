@@ -38,6 +38,52 @@ from pathlib import Path
 
 _PRESET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 
+# Resource-aware keepalive profiles. Explicit CLI overrides can tune any of
+# these values without making users hand-edit JSON or environment variables.
+_AUTOCHECK_PRESETS = {
+    "off": {
+        "enabled": False,
+        "interval": 15,
+        "max_backoff": 300,
+        "probe_every": 4,
+        "dead_strikes": 2,
+        "storm_window": 600,
+        "max_rotations": 2,
+        "sweep_every": 1800,
+    },
+    "light": {
+        "enabled": True,
+        "interval": 30,
+        "max_backoff": 600,
+        "probe_every": 12,
+        "dead_strikes": 3,
+        "storm_window": 1800,
+        "max_rotations": 1,
+        "sweep_every": 7200,
+    },
+    "balanced": {
+        "enabled": True,
+        "interval": 15,
+        "max_backoff": 300,
+        "probe_every": 4,
+        "dead_strikes": 2,
+        "storm_window": 600,
+        "max_rotations": 2,
+        "sweep_every": 1800,
+    },
+    "aggressive": {
+        "enabled": True,
+        "interval": 10,
+        "max_backoff": 180,
+        "probe_every": 1,
+        "dead_strikes": 1,
+        "storm_window": 300,
+        "max_rotations": 3,
+        "sweep_every": 900,
+    },
+}
+_AUTOCHECK_NUMERIC = tuple(key for key in _AUTOCHECK_PRESETS["balanced"] if key != "enabled")
+
 try:
     import termios
     import tty
@@ -294,6 +340,49 @@ def import_profiles(source, destination, validator=None) -> dict:
         "files": files,
         "rejected_files": rejected_files,
     }
+
+
+def configure_autocheck(config_path, preset: str | None = None, **overrides) -> dict:
+    """Persist resource-aware keepalive settings without starting the engine.
+
+    ``preset`` is one of ``off``, ``light``, ``balanced``, or ``aggressive``.
+    Numeric overrides are validated and merged on top, making this suitable
+    for both a low-power laptop and a machine that can afford frequent pool
+    sweeps. Existing unrelated router settings are preserved.
+    """
+    config_path = Path(config_path)
+    if config_path.is_file():
+        data = json.loads(config_path.read_text())
+    else:
+        data = _default_config()
+    current = data.get("keepalive")
+    if not isinstance(current, dict):
+        current = {}
+    selected = preset or current.get("preset") or "balanced"
+    if selected not in _AUTOCHECK_PRESETS:
+        raise ValueError(f"unknown autocheck profile '{selected}'")
+    settings = dict(_AUTOCHECK_PRESETS[selected])
+    if preset is None:
+        for key, value in current.items():
+            if key in settings:
+                settings[key] = value
+    for key in _AUTOCHECK_NUMERIC:
+        value = overrides.get(key)
+        if value is None:
+            continue
+        try:
+            value = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"autocheck {key} must be an integer") from exc
+        if value < 1:
+            raise ValueError(f"autocheck {key} must be at least 1")
+        settings[key] = value
+    settings["preset"] = selected
+    data["keepalive"] = settings
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(data, indent=2) + "\n")
+    os.chmod(config_path, 0o600)
+    return settings
 
 
 # ---------------------------------------------------------------------------
@@ -645,6 +734,22 @@ def _cmd_import(root: Path, provider: str, paths) -> int:
     if merged["rejected"]:
         print(_style(f"setup: rejected {merged['rejected']} file(s)", _Ansi.YELLOW))
     return 0 if merged["imported"] else 1
+
+
+def _cmd_autocheck(root: Path, preset: str | None, overrides: dict) -> int:
+    try:
+        settings = configure_autocheck(root / "router.json", preset, **overrides)
+    except (ValueError, json.JSONDecodeError, OSError) as exc:
+        print(_style(f"setup: autocheck configuration failed: {exc}", _Ansi.RED), file=sys.stderr)
+        return 1
+    state = "enabled" if settings["enabled"] else "disabled"
+    print(_style(f"setup: autocheck {state} ({settings['preset']})", _Ansi.GREEN))
+    print(
+        "setup: interval={interval}s, probe_every={probe_every}, sweep_every={sweep_every}s, "
+        "dead_strikes={dead_strikes}, max_rotations={max_rotations}".format(**settings)
+    )
+    print("setup: run `setup --keepalive-install` to load/reload the launchd supervisor.")
+    return 0
 
 
 def _cmd_preset(root: Path) -> int:
@@ -2068,6 +2173,11 @@ def main(argv=None, root=None) -> int:
                         help="import WireGuard .conf file(s)/directory into providers/proton")
     parser.add_argument("--import-warp", nargs="+", metavar="PATH",
                         help="import WireGuard .conf file(s)/directory into providers/cloudflare")
+    parser.add_argument("--autocheck", choices=sorted(_AUTOCHECK_PRESETS), metavar="PROFILE",
+                        help="configure automatic health checks (off, light, balanced, aggressive)")
+    for key in _AUTOCHECK_NUMERIC:
+        parser.add_argument(f"--autocheck-{key.replace('_', '-')}", type=int, metavar="N",
+                            help=f"override autocheck {key}")
     parser.add_argument("--fallback", metavar="PRIMARY",
                         help="set a primary provider's ordered fallback chain")
     parser.add_argument("--fallback-to", metavar="PROVIDER,...",
@@ -2115,6 +2225,13 @@ def main(argv=None, root=None) -> int:
         rc = max(rc, _cmd_import(ROOT, "proton", args.import_proton))
     if args.import_warp:
         rc = max(rc, _cmd_import(ROOT, "cloudflare", args.import_warp))
+    autocheck_overrides = {
+        key: getattr(args, f"autocheck_{key}")
+        for key in _AUTOCHECK_NUMERIC
+        if getattr(args, f"autocheck_{key}") is not None
+    }
+    if args.autocheck or autocheck_overrides:
+        rc = max(rc, _cmd_autocheck(ROOT, args.autocheck, autocheck_overrides))
     if args.fallback or args.fallback_clear:
         try:
             if args.fallback and args.fallback_clear:
@@ -2184,7 +2301,8 @@ def main(argv=None, root=None) -> int:
         rc = max(rc, _cmd_bridge_install(ROOT, force=True))
     if args.bridge_check:
         rc = max(rc, _cmd_bridge_check(ROOT))
-    if not (args.guide or args.check or args.import_proton or args.import_warp or args.fallback
+    if not (args.guide or args.check or args.import_proton or args.import_warp
+            or args.autocheck or autocheck_overrides or args.fallback
             or args.fallback_clear or args.transparent or args.transparent_off
             or args.keepalive_install or args.keepalive_remove
             or args.preset or args.bridge_install

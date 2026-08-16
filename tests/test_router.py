@@ -616,30 +616,38 @@ class EngineEnsureConsistencyTests(unittest.TestCase):
     def test_proxy_listener_up_returns_without_start(self):
         with mock.patch.object(router, "listener_up", return_value=True), \
              mock.patch.object(router, "engine_alive", return_value=True), \
+             mock.patch.object(router, "route_watcher_start") as watcher, \
              mock.patch.object(router, "engine_start", side_effect=AssertionError("must not start")):
             self.assertEqual(router.engine_ensure(), 0)
+        watcher.assert_called_once()
 
     def test_tun_alive_and_consistent_is_healthy(self):
         router.set_mode("tun")
         with mock.patch.object(router, "engine_alive", return_value=True), \
              mock.patch.object(router, "engine_mode_consistent", return_value=True), \
+             mock.patch.object(router, "route_watcher_start") as watcher, \
              mock.patch.object(router, "engine_start", side_effect=AssertionError("must not start")):
             self.assertEqual(router.engine_ensure(), 0)
+        watcher.assert_called_once()
 
     def test_tun_alive_but_inconsistent_restarts(self):
         router.set_mode("tun")
         with mock.patch.object(router, "engine_alive", return_value=True), \
              mock.patch.object(router, "engine_mode_consistent", return_value=False), \
+             mock.patch.object(router, "route_watcher_start") as watcher, \
              mock.patch.object(router, "engine_start", return_value=77) as start:
             self.assertEqual(router.engine_ensure(), 77)
         start.assert_called_once()
+        watcher.assert_not_called()
 
     def test_tun_down_starts(self):
         router.set_mode("tun")
         with mock.patch.object(router, "engine_alive", return_value=False), \
+             mock.patch.object(router, "route_watcher_start") as watcher, \
              mock.patch.object(router, "engine_start", return_value=0) as start:
             self.assertEqual(router.engine_ensure(), 0)
         start.assert_called_once()
+        watcher.assert_called_once()
 
 
 class VpnOnRollbackTests(unittest.TestCase):
@@ -1064,9 +1072,10 @@ class RotationEgressTests(unittest.TestCase):
             self.assertEqual(router.rotate("proton", probe=False), 0)
         self.assertEqual(self._active(), "b")
 
-    def test_rotate_tun_mode_does_not_probe(self):
+    def test_rotate_tun_mode_without_listener_does_not_probe(self):
         router.set_mode("tun")
         router.set_active("proton", self._profile("a"))
+        router.listener_up = lambda: False
         with mock.patch.object(router, "probe_profile", side_effect=AssertionError("must not probe")):
             self.assertEqual(router.rotate("proton"), 0)
         self.assertEqual(self._active(), "b")
@@ -2104,7 +2113,8 @@ class RoutingModeTests(unittest.TestCase):
         config, _ = router.build_singbox_config()
         rules = config["route"]["rules"]
         self.assertEqual(rules[0], {"protocol": "dns", "action": "hijack-dns"})
-        self.assertEqual(rules[1], {"domain_suffix": ["youtube.com"], "outbound": "direct"})
+        self.assertEqual(rules[1], {"action": "sniff"})
+        self.assertEqual(rules[2], {"domain_suffix": ["youtube.com"], "outbound": "direct"})
         self.assertEqual(config["route"]["final"], "proton")
 
     def test_safe_list_bad_default_provider_fails_build(self):

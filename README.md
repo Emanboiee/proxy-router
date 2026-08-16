@@ -57,6 +57,8 @@ proxy-router init
 proxy-router setup --guide all
 proxy-router setup --import-proton ~/Downloads/protonvpn-*.conf
 proxy-router setup --import-warp ~/Downloads/wgcf-profile.conf  # optional
+proxy-router profile copy ~/Downloads/friend-proton.conf --provider proton
+proxy-router setup --autocheck light  # low-resource machine
 proxy-router setup --preset
 proxy-router setup --fallback proton --fallback-to cloudflare,mullvad
 proxy-router setup --keepalive-install  # macOS: supervise unattended 24/7 operation
@@ -129,6 +131,7 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py egress show [provider]   # print persisted egress records (JSON)
 ./router.py egress check [--provider <name>] [--json]  # read-only live check: exit 1 ONLY when an active exit is DEAD
 ./router.py egress sweep [provider] [--json]  # full-pool sweep: probe EVERY profile, end on the best alive exit
+./router.py profile copy PATH [PATH ...] --provider proton  # validate + copy shared .conf profiles safely
 ./router.py status --json         # machine-readable status for scripts/Hermes
 ./router.py setup                  # custom setup TUI
 ./router.py setup --guide all      # print Proton + WARP guides
@@ -138,6 +141,8 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py setup --transparent  # apps need no HTTP_PROXY; configured routes use TUN
 ./router.py setup --transparent-off
 ./router.py setup --keepalive-install  # install the macOS 24/7 launchd supervisor
+./router.py setup --autocheck off|light|balanced|aggressive  # resource-aware health-check preset
+./router.py setup --autocheck-sweep-every 7200 --autocheck-probe-every 12  # explicit tuning overrides
 ./router.py setup --check          # validate imported profiles without networking
 ./router.py setup --bridge-install # install/verify the Hermes OpenCode rotation bridge
 ./router.py setup --bridge-check   # verify the installed bridge without writing
@@ -150,6 +155,32 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py up                   # enable macOS system proxy (also ensures engine)
 ./router.py down                 # disable macOS system proxy only (engine keeps running)
 ```
+
+### Auto-check tuning and shared profiles
+
+The launchd keepalive reads the `keepalive` block from `router.json`. Choose a
+resource profile during setup:
+
+```sh
+proxy-router setup --autocheck light       # fewer probes/sweeps
+proxy-router setup --autocheck balanced    # default
+proxy-router setup --autocheck aggressive  # frequent health checks
+proxy-router setup --autocheck off          # leave the supervisor installed but idle
+```
+
+Every numeric knob also has a `--autocheck-*` override, and matching
+`PROXY_KEEPALIVE_*` environment variables take precedence for temporary
+runtime tuning. A shared WireGuard profile can be copied without hand-editing
+config:
+
+```sh
+proxy-router profile copy ~/Downloads/*.conf --provider proton
+```
+
+Files are structurally validated, renamed safely on collisions, written with
+`0600` permissions, and never printed. The router does not download arbitrary
+URLs or trust profile contents just because someone sent them. Tiny security
+win, surprisingly useful.
 
 ### Response-aware error recovery (opt-in)
 
@@ -311,9 +342,15 @@ Where it is consumed:
 system TUN interface. The capture scope is controlled by `vpn.capture`:
 
 - `"routes"` is the transparent, app-independent mode. sing-box captures all
-  traffic at the IP layer—including apps that ignore proxy settings—then the
-  normal domain/provider rules send configured targets through their effective
-  provider and unmatched traffic to `direct`.
+  traffic at the IP layer—including apps that ignore proxy settings—then a
+  route-based sniff rule identifies TLS/HTTP hostnames, the normal
+  domain/provider rules send configured targets through their effective
+  provider, and unmatched traffic goes to `direct`.
+- In `"routes"` mode, clients should use their normal upstream URL and should
+  not set `HTTP_PROXY`/`HTTPS_PROXY` or a proxy base URL such as
+  `http://127.0.0.1:2080`; TUN capture performs the selective redirect.
+- The `127.0.0.1:2080` listener remains available only for clients that
+  explicitly need an HTTP/mixed proxy and for router health probes.
 - `"ruleset"` preserves the narrower IP-CIDR mode. `selective`/
   `selective_provider` choose a named ruleset such as `rulesets/roblox.json`;
   only those addresses enter the TUN.
@@ -334,7 +371,10 @@ leak trade-off, not a tunnel-health claim. `vpn off` returns to proxy mode;
 `ensure`, `reload`, `add`/`remove` and `rotate` all respect whatever mode is
 active.
 
-Platform notes:
+The mixed `127.0.0.1:2080` listener remains alongside the TUN inbound, so
+Hermes and other proxy-pinned clients keep working while ordinary apps use
+transparent capture. The routed-connection watcher stays active in both modes
+and observes every configured routed domain, not only `opencode.ai`.
 
 - **Linux**: needs root for the TUN device + route table (iproute2)
   (`sudo proxy-router vpn on`).

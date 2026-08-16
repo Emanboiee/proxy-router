@@ -62,10 +62,11 @@ case "$cmd" in
     ;;
   failover)
     if [ "${3:-}" = "status" ]; then
+      configured="${FAKE_ROUTER_FALLBACK_CONFIGURED:-cloudflare}"
       if [ -n "${FAKE_ROUTER_FALLBACK_ACTIVE:-}" ]; then
-        echo "fallback proton: configured=cloudflare active=cloudflare"
+        echo "fallback proton: configured=$configured active=cloudflare"
       else
-        echo "fallback proton: configured=cloudflare active=none"
+        echo "fallback proton: configured=$configured active=none"
       fi
     fi
     exit 0
@@ -84,7 +85,8 @@ class KeepaliveHarness:
 
     def __init__(self, *, interval="1", fail_ensures="", egress="alive",
                  probe_every="4", dead_strikes="2", storm_window="600",
-                 max_rotations="2", rotate_fail=False, fallback_active=False):
+                 max_rotations="2", rotate_fail=False, fallback_active=False,
+                 fallback_configured="cloudflare"):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
         (self.root / "bin").mkdir()
@@ -118,6 +120,7 @@ class KeepaliveHarness:
             env["FAKE_ROUTER_ROTATE_FAIL"] = "1"
         if fallback_active:
             env["FAKE_ROUTER_FALLBACK_ACTIVE"] = "1"
+        env["FAKE_ROUTER_FALLBACK_CONFIGURED"] = fallback_configured
         if fail_ensures:
             env["FAKE_ROUTER_FAIL_ENSURES"] = fail_ensures
         self.env = env
@@ -292,6 +295,21 @@ class KeepaliveFallbackTests(unittest.TestCase):
             self.assertIn("failover proton status", lines)
             self.assertNotIn("failover proton on --reason timeout", lines)
             self.assertIn("already active; waiting for the next dead check", h.err)
+        finally:
+            h.close()
+
+    def test_failed_rotation_without_fallback_is_backed_off(self):
+        h = KeepaliveHarness(egress="dead", probe_every="1", dead_strikes="1",
+                             storm_window="3600", max_rotations="1",
+                             rotate_fail=True, fallback_configured="none")
+        try:
+            lines = h.wait_lines(20)
+            h.close()
+            self.assertEqual([l for l in lines if l.startswith("rotate proton")],
+                             ["rotate proton --reason timeout"])
+            self.assertNotIn("failover proton on --reason timeout", lines)
+            self.assertIn("no configured fallback", h.err)
+            self.assertIn("storm guard", h.err)
         finally:
             h.close()
 
