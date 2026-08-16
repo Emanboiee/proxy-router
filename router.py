@@ -12,11 +12,15 @@ profile, so it is written mode 0600 alongside the input profiles.
 from __future__ import annotations
 
 import argparse
+import base64
 import configparser
 import datetime
+import getpass
 import json
 import os
+import random
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -38,6 +42,10 @@ PID_FILE = ROOT / "sing-box.pid"
 LOG_FILE = ROOT / "sing-box.log"
 LOCK_FILE = ROOT / "state" / "engine.lock"
 MODE_FILE = ROOT / "state" / "mode"
+# Written by `router.py stop` (and the tray Disconnect); respected by
+# keepalive.sh so a manual disconnect is NOT resurrected on the next
+# ensure tick. Removed by `router.py start` / tray Connect.
+MANUAL_OFF_FILE = ROOT / "state" / "manual-off"
 DEFAULT_PORT = 2080
 DEFAULT_TUN_ADDRESS = ["172.19.0.1/30"]
 DEFAULT_TUN_MTU = 1500
@@ -54,6 +62,13 @@ DEFAULT_EGRESS_SETTINGS = {
     "slow_latency_ms": 1200.0,
     "ok_window": 86400,
 }
+# Optional scheduled rotation (router.json top-level ``rotation``): churn the
+# active provider's exit every ``interval_seconds`` (0/absent = off) with
+# ``jitter_seconds`` spread (default 300) instead of only rotating reactively
+# on failures, so upstream rate limits see a fresh egress IP on a cadence.
+DEFAULT_ROTATION_SETTINGS = {"interval_seconds": 0, "jitter_seconds": 300, "policy": "latency"}
+
+_rotation: dict = {}
 # Per-reason upstream-error policy (router.json top-level ``error_policy``,
 # then per-provider ``providers.<name>.error_policy``, then these built-in
 # defaults; closest scope wins). action: cooldown (rotate skips the lane until
@@ -88,7 +103,14 @@ def resolve_sing_box() -> str | None:
     if _sing_box_resolved:
         return _sing_box_cache
     bundled = ROOT / "bin" / ("sing-box.exe" if os.name == "nt" else "sing-box")
-    for candidate in (os.environ.get("SING_BOX"), str(bundled)):
+    candidates = [os.environ.get("SING_BOX"), str(bundled)]
+    if sys.platform == "darwin" and os.name != "nt":
+        # launchd does not inherit the login shell's PATH. Keep Homebrew's
+        # canonical locations as an explicit fallback so a GUI/keepalive
+        # process does not randomly report a perfectly installed engine as
+        # missing when PATH is incomplete.
+        candidates.extend(("/opt/homebrew/bin/sing-box", "/usr/local/bin/sing-box"))
+    for candidate in candidates:
         if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             _sing_box_cache = candidate
             _sing_box_resolved = True
@@ -99,9 +121,25 @@ def resolve_sing_box() -> str | None:
 
 
 def _sing_box_missing_message() -> str:
-    """One-line message naming every location the resolver checks."""
+    """Actionable one-line message naming every location the resolver checked.
+
+    Tray Connect shows the CLI's last line, so the real candidates (env,
+    bundled path, Homebrew locations, PATH) plus the minimum version and
+    download URL turn a bare "Sing-box not found" into a next step (issue
+    #11: the tray reported an unexplained "Connect: Failed").
+    """
     bundled = ROOT / "bin" / ("sing-box.exe" if os.name == "nt" else "sing-box")
-    return f"sing-box not found; set SING_BOX, bundle it at {bundled}, or install it on PATH"
+    env_value = os.environ.get("SING_BOX")
+    tried = [f"env SING_BOX (set, missing)" if env_value else "env SING_BOX=(unset)",
+             f"{bundled} (missing)"]
+    if sys.platform == "darwin" and os.name != "nt":
+        tried.extend(("/opt/homebrew/bin/sing-box (missing)",
+                      "/usr/local/bin/sing-box (missing)"))
+    tried.append("PATH (no 'sing-box')")
+    version = ".".join(map(str, MIN_SING_BOX_VERSION))
+    return (f"sing-box not found (tried: {', '.join(tried)}); "
+            f"install {version}+ from https://github.com/SagerNet/sing-box/releases "
+            f"at {bundled}, or set SING_BOX=/path/to/sing-box")
 
 
 # The generated sing-box.json uses features that do not exist before sing-box
@@ -173,17 +211,42 @@ def fail(message: str) -> int:
 def current_mode() -> str:
     """'proxy' (default) or 'tun'. Persisted in state/mode so ensure/reload
     keep running whatever the user last selected."""
-    if MODE_FILE.is_file():
-        mode = MODE_FILE.read_text().strip()
-        if mode in ("proxy", "tun"):
-            return mode
+    try:
+        if MODE_FILE.is_file():
+            mode = MODE_FILE.read_text().strip()
+            if mode in ("proxy", "tun"):
+                return mode
+    except OSError:
+        # Root-owned mode file (written by a sudo run whose ownership was
+        # not handed back) must not crash the regular-user CLI/keepalive.
+        return "proxy"
     return "proxy"
+
+
+def _hand_back_ownership(path: Path) -> None:
+    """Chown a state file back to the user who invoked sudo.
+
+    tun mode needs root, so `sudo vpn on` writes state files as root with
+    0600; the regular-user keepalive/CLI then cannot read them and treats
+    a live engine as dead (garbage pid file H6, unreadable mode/config),
+    churning restarts. SUDO_UID/SUDO_GID identify who to hand back to."""
+    if os.geteuid() != 0:
+        return
+    uid = os.environ.get("SUDO_UID")
+    gid = os.environ.get("SUDO_GID")
+    if not uid or not gid:
+        return
+    try:
+        os.chown(path, int(uid), int(gid))
+    except (OSError, ValueError):
+        pass
 
 
 def set_mode(mode: str) -> None:
     MODE_FILE.parent.mkdir(parents=True, exist_ok=True)
     MODE_FILE.write_text(mode)
     os.chmod(MODE_FILE, 0o600)
+    _hand_back_ownership(MODE_FILE)
 
 
 def _atomic_write(path: Path, text: str, mode: int = 0o600) -> None:
@@ -202,6 +265,7 @@ def _atomic_write(path: Path, text: str, mode: int = 0o600) -> None:
         os.chmod(temporary, mode)
         os.replace(temporary, path)
         temporary = None
+        _hand_back_ownership(path)
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
@@ -225,6 +289,11 @@ def load_config() -> int:
     vpn = data.get("vpn", {})
     if not isinstance(providers, dict) or not providers:
         return fail("no providers configured")
+    if not isinstance(vpn, dict):
+        return fail(f"bad {CONFIG_FILE.name}: vpn must be an object")
+    capture = vpn.get("capture")
+    if capture is not None and capture not in ("ruleset", "routes"):
+        return fail(f"bad {CONFIG_FILE.name}: vpn.capture must be 'ruleset' or 'routes'")
     if not all(isinstance(name, str) and _PROVIDER_NAME.fullmatch(name) and isinstance(entry, dict)
                for name, entry in providers.items()):
         return fail(f"bad {CONFIG_FILE.name}: provider names/entries are invalid")
@@ -232,10 +301,57 @@ def load_config() -> int:
         directory = entry.get("directory", f"providers/{name}")
         if not isinstance(directory, str):
             return fail(f"bad {CONFIG_FILE.name}: provider '{name}' directory must be a string")
+        legacy_fallback = entry.get("fallback_provider")
+        fallback_list = entry.get("fallback_providers")
+        if fallback_list is not None and legacy_fallback is not None:
+            return fail(
+                f"bad {CONFIG_FILE.name}: provider '{name}' cannot define both fallback_provider and fallback_providers"
+            )
+        if fallback_list is not None and (
+            not isinstance(fallback_list, list)
+            or any(not isinstance(target, str) for target in fallback_list)
+        ):
+            return fail(
+                f"bad {CONFIG_FILE.name}: provider '{name}' fallback_providers must be a string list"
+            )
+        if isinstance(fallback_list, list) and len(set(fallback_list)) != len(fallback_list):
+            return fail(
+                f"bad {CONFIG_FILE.name}: provider '{name}' fallback_providers must not contain duplicates"
+            )
+        fallbacks = fallback_list if fallback_list is not None else (
+            [legacy_fallback] if legacy_fallback is not None else []
+        )
+        if any(target == name or target not in providers for target in fallbacks):
+            field = "fallback_providers" if fallback_list is not None else "fallback_provider"
+            return fail(
+                f"bad {CONFIG_FILE.name}: provider '{name}' {field} must name another configured provider"
+            )
         try:
             (ROOT / directory).resolve().relative_to(ROOT)
         except ValueError:
             return fail(f"bad {CONFIG_FILE.name}: provider '{name}' directory escapes the router root")
+    def fallback_targets(provider: str) -> list[str]:
+        entry = providers[provider]
+        targets = entry.get("fallback_providers")
+        if isinstance(targets, list):
+            return targets
+        target = entry.get("fallback_provider")
+        return [target] if isinstance(target, str) else []
+
+    def check_fallback_path(provider: str, path: tuple[str, ...] = ()) -> str | None:
+        if provider in path:
+            return provider
+        next_path = path + (provider,)
+        for target in fallback_targets(provider):
+            cycle = check_fallback_path(target, next_path)
+            if cycle is not None:
+                return cycle
+        return None
+
+    for name in providers:
+        cycle = check_fallback_path(name)
+        if cycle is not None:
+            return fail(f"bad {CONFIG_FILE.name}: fallback chain cycle includes '{cycle}'")
     if not isinstance(routes, list) or not all(isinstance(route, dict) for route in routes) or not isinstance(vpn, dict):
         return fail(f"bad {CONFIG_FILE.name}: providers/routes/vpn have invalid types")
     routing = data.get("routing", {})
@@ -265,6 +381,7 @@ def load_config() -> int:
         return fail(f"bad {CONFIG_FILE.name}: {routing_error}")
     try:
         _load_error_policy(data, providers)
+        _load_rotation_settings(data)
     except ValueError as exc:
         return fail(f"bad {CONFIG_FILE.name}: {exc}")
     _load_egress_settings(data)
@@ -286,7 +403,8 @@ def write_default_config(force: bool = False) -> int:
         data = {
             "port": DEFAULT_PORT,
             "providers": {
-                "proton": {"directory": "providers/proton", "cooldown_seconds": 60},
+                "proton": {"directory": "providers/proton", "cooldown_seconds": 60,
+                           "fallback_providers": ["cloudflare"]},
                 "cloudflare": {"directory": "providers/cloudflare", "cooldown_seconds": 60,
                                "error_policy": {"429": {"action": "cooldown", "seconds": 300}}},
             },
@@ -294,6 +412,11 @@ def write_default_config(force: bool = False) -> int:
                 {
                     "id": "opencode-zen",
                     "domains": ["opencode.ai"],
+                    "provider": "proton",
+                },
+                {
+                    "id": "proton-ip-check",
+                    "domains": ["whatismyip.com"],
                     "provider": "proton",
                 },
                 {
@@ -306,9 +429,12 @@ def write_default_config(force: bool = False) -> int:
             # stays "direct" and nothing is tunneled unless listed.
             "routing": {"mode": "vpn-list", "vpn_domains": []},
             "vpn": {
+                "capture": "ruleset",
                 "address": DEFAULT_TUN_ADDRESS,
                 "mtu": DEFAULT_TUN_MTU,
                 "stack": DEFAULT_TUN_STACK,
+                "dns_transport": "udp",
+                "selective": "roblox",
             },
             "egress": {
                 "probe_url": DEFAULT_PROBE_URL,
@@ -318,6 +444,20 @@ def write_default_config(force: bool = False) -> int:
                 "fail_threshold": 2,
                 "slow_latency_ms": 1200,
                 "ok_window": 86400,
+            },
+            # Scheduled rotation: churn the active exits every 2h (with
+            # ±150s jitter) so upstream rate limits see a fresh egress IP.
+            "rotation": {"interval_seconds": 7200, "jitter_seconds": 300, "policy": "latency"},
+            "keepalive": {
+                "preset": "balanced",
+                "enabled": True,
+                "interval": 15,
+                "max_backoff": 300,
+                "probe_every": 4,
+                "dead_strikes": 2,
+                "storm_window": 600,
+                "max_rotations": 2,
+                "sweep_every": 1800,
             },
             "error_policy": {
                 "default": {"action": "cooldown", "seconds": 300},
@@ -531,6 +671,25 @@ def _load_egress_settings(data: dict) -> None:
     _egress_settings = settings
 
 
+def _load_rotation_settings(data: dict) -> None:
+    """Merge router.json's optional top-level ``rotation`` dict; raises
+    ValueError on invalid values so load_config rejects the config."""
+    global _rotation
+    supplied = data.get("rotation") if isinstance(data, dict) else None
+    interval = DEFAULT_ROTATION_SETTINGS["interval_seconds"]
+    jitter = DEFAULT_ROTATION_SETTINGS["jitter_seconds"]
+    policy = DEFAULT_ROTATION_SETTINGS["policy"]
+    if isinstance(supplied, dict):
+        interval = int(supplied.get("interval_seconds", interval))
+        jitter = int(supplied.get("jitter_seconds", jitter))
+        policy = supplied.get("policy", policy)
+    if interval < 0 or jitter < 0:
+        raise ValueError("rotation interval_seconds/jitter_seconds must be >= 0")
+    if policy not in ("latency", "least-recent"):
+        raise ValueError("rotation policy must be 'latency' or 'least-recent'")
+    _rotation = {"interval_seconds": interval, "jitter_seconds": jitter, "policy": policy}
+
+
 def egress_record_path(name: str, profile: Path) -> Path:
     """state/egress/<provider>/<profile>.json with a path-traversal guard."""
     stem = profile.stem
@@ -578,6 +737,11 @@ def record_egress(name: str, profile: Path, *, ok: bool, latency_ms: float | Non
         record["exhausted"] = False
         record["exhausted_at"] = None
         record["exhausted_until"] = None
+        # A passing probe heals a stale upstream_error marker (e.g. a 429
+        # from `rotate --reason` hours ago): the exit recovered, so the
+        # tray must stop warning/disable it.
+        record["upstream_error"] = None
+        record["upstream_error_at"] = None
     else:
         record["fails"] = int(record.get("fails") or 0) + 1
         record["latency_ms"] = None
@@ -639,6 +803,195 @@ def _egress_error_text(exc: Exception) -> str:
     return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
 
 
+def _fallback_state_path(name: str) -> Path:
+    """Return the private runtime marker for a provider failover."""
+    return ROOT / "state" / "fallback" / f"{name}.json"
+
+
+def configured_fallbacks(name: str) -> list[str]:
+    """Return the ordered configured fallback providers for ``name``.
+
+    ``fallback_provider`` is retained as a compatibility alias for existing
+    router.json files; new configurations should use ``fallback_providers``.
+    """
+    entry = _providers.get(name)
+    if not isinstance(entry, dict):
+        return []
+    targets = entry.get("fallback_providers")
+    if targets is None:
+        target = entry.get("fallback_provider")
+        targets = [target] if isinstance(target, str) else []
+    return [target for target in targets if target != name and target in _providers]
+
+
+def configured_fallback(name: str) -> str | None:
+    """Return the first configured fallback provider for ``name``."""
+    targets = configured_fallbacks(name)
+    return targets[0] if targets else None
+
+
+def active_fallback(name: str) -> str | None:
+    """Return the active runtime fallback, ignoring stale/invalid markers."""
+    targets = configured_fallbacks(name)
+    if not targets:
+        return None
+    try:
+        data = json.loads(_fallback_state_path(name).read_text())
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+    active = data.get("provider") if isinstance(data, dict) else None
+    return active if active in targets else None
+
+
+def _effective_route_provider(name: str) -> str:
+    """Map a primary route to its fallback only while failover is active."""
+    return active_fallback(name) or name
+
+
+def activate_fallback(name: str, *, target: str | None = None, reason: str = "transport") -> int:
+    """Activate one provider from ``name``'s ordered fallback chain.
+
+    With no explicit target, candidates are attempted in configured order. A
+    candidate with no valid profiles is skipped; a failed hard switch rolls its
+    marker/configuration back before the next candidate is tried.
+    """
+    if name not in _providers:
+        return fail(f"unknown provider '{name}'")
+    configured = configured_fallbacks(name)
+    if target is not None and target not in configured:
+        return fail(
+            f"provider '{name}' fallback target '{target}' is not configured "
+            f"(choose one of: {', '.join(configured) or 'none'})"
+        )
+    active = active_fallback(name)
+    if active is not None and (target is None or target == active):
+        print(f"fallback already active: {name} -> {active}")
+        return 0
+    candidates = [target] if target is not None else configured
+    if not candidates:
+        return fail(f"provider '{name}' has no configured fallback providers")
+    path = _fallback_state_path(name)
+    previous = path.read_text() if path.is_file() else None
+    last_error = "no fallback candidate has a valid profile"
+    for candidate in candidates:
+        profiles = provider_files(candidate)
+        if not profiles or not any(_profile_error(profile) is None for profile in profiles):
+            print(f"router: skipping fallback '{candidate}': no valid profiles", file=sys.stderr)
+            continue
+        _atomic_write(path, json.dumps({
+            "provider": candidate,
+            "reason": str(reason),
+            "activated_at": int(time.time()),
+        }, sort_keys=True) + "\n", 0o600)
+        rc = engine_switch()
+        if rc == 0:
+            print(f"fallback active: {name} -> {candidate} ({reason})")
+            return 0
+        last_error = f"fallback '{candidate}' failed to start"
+        if previous is None:
+            path.unlink(missing_ok=True)
+        else:
+            _atomic_write(path, previous, 0o600)
+    return fail(f"provider '{name}': {last_error}")
+
+
+def deactivate_fallback(name: str) -> int:
+    """Restore primary routing for ``name`` with one hard server switch."""
+    if name not in _providers:
+        return fail(f"unknown provider '{name}'")
+    path = _fallback_state_path(name)
+    if not path.is_file():
+        print(f"fallback inactive: {name}")
+        return 0
+    previous = path.read_text()
+    path.unlink(missing_ok=True)
+    rc = engine_switch()
+    if rc != 0:
+        _atomic_write(path, previous, 0o600)
+        return rc
+    print(f"fallback cleared: {name}")
+    return 0
+
+
+def fallback_status(name: str) -> dict:
+    """Return configured and active fallback state for status/CLI consumers."""
+    return {
+        "configured": configured_fallbacks(name),
+        "active": active_fallback(name),
+    }
+
+
+def _response_host_matches(host: str, domain: str) -> bool:
+    """Match a response-observer host without allowing suffix lookalikes."""
+    host = str(host or "").strip().lower().rstrip(".")
+    domain = str(domain or "").lstrip("*.").strip().lower().rstrip(".")
+    return bool(host and domain and (host == domain or host.endswith("." + domain)))
+
+
+def response_provider_for_host(host: str) -> str | None:
+    """Return the configured route provider responsible for ``host``."""
+    for route in _routes:
+        provider = route.get("provider")
+        if not isinstance(provider, str):
+            continue
+        for domain in route.get("domains", []):
+            if _response_host_matches(host, domain):
+                return provider
+    return None
+
+
+def _response_event_marker(provider: str) -> Path:
+    return ROOT / "state" / "response-events" / f"{provider}.json"
+
+
+def response_event(host: str, status: int, *, provider: str | None = None,
+                   dedupe_seconds: int = 5) -> int:
+    """Handle a response-aware proxy event and rotate the effective route.
+
+    This is intentionally a narrow event sink: only HTTP 429 responses for a
+    configured routed host can mutate provider state. The caller owns request
+    replay; this command only performs the hard switch/fallback transaction.
+    """
+    try:
+        status = int(status)
+    except (TypeError, ValueError):
+        return fail("response-event: status must be an integer")
+    if status != 429:
+        print(f"response-event: ignored HTTP {status} for {host}")
+        return 0
+    route_provider = response_provider_for_host(host)
+    if route_provider is None:
+        return fail(f"response-event: host '{host}' is not routed")
+    if provider is not None and provider != route_provider:
+        return fail(f"response-event: host '{host}' routes through '{route_provider}', not '{provider}'")
+
+    marker = _response_event_marker(route_provider)
+    now = int(time.time())
+    try:
+        previous = json.loads(marker.read_text()) if marker.exists() else {}
+        last_at = int(previous.get("at", 0))
+    except (OSError, ValueError, TypeError):
+        last_at = 0
+    if dedupe_seconds > 0 and now - last_at < dedupe_seconds:
+        print(f"response-event: suppressed duplicate 429 for {host}")
+        return 0
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps({"at": now, "host": str(host).lower(), "status": status}) + "\n")
+    try:
+        marker.chmod(0o600)
+    except OSError:
+        pass
+
+    effective = active_fallback(route_provider) or route_provider
+    print(f"response-event: HTTP 429 for {host}; rotating {effective}")
+    rc = rotate(effective, reason=str(status))
+    if rc == 0:
+        return 0
+    if effective != route_provider:
+        return rc
+    return activate_fallback(route_provider, reason=str(status))
+
+
 def _open_probe(opener, request, timeout: float):
     """Open ``request`` through an opener that may be a urllib OpenerDirector
     (use .open) or a plain callable injected by tests, mirroring monitor.py."""
@@ -649,42 +1002,72 @@ def _open_probe(opener, request, timeout: float):
 
 
 def probe_url_for(name: str) -> str | None:
-    """Probe target for a provider: the first routed domain of that provider,
-    so the probe actually rides the tunnel end-to-end (a URL that matches no
-    route would go out direct and measure the wrong path). None when the
-    provider has no route domain to probe through.
+    """Return a probe target whose host is actually routed through ``name``.
 
-    An explicit ``probe_url`` on the provider entry wins over the route
-    pick: some routed domains (e.g. roblox.com's bot-protection landing
-    page) hang or redirect even on a healthy tunnel, which would
-    false-mark the exit dead. Operators pin a light, reliable target
-    (e.g. https://www.roblox.com/robots.txt) when that happens.
-
-    In safe-list routing mode, domains whitelisted as ``direct_domains`` are
-    sent DIRECT by the route table; probing such a host would measure the
-    direct path, not the tunnel, and false-alive a dead exit — so those are
-    skipped here and the next tunneled route domain is picked (only in
-    safe-list mode: in default/vpn-list the list is not pinned direct). When
-    every route domain of the provider is direct-whitelisted there is no
-    tunneled path to probe; None is returned (egress check then skips the
-    provider instead of trusting a direct-path result).
+    Provider pins are convenience overrides, not proof of routing: an unrouted
+    pin would measure direct egress. Safe-list direct-domain suffixes are also
+    excluded, including subdomains.
     """
+    routing = routing_state()
+    direct = frozenset(routing.get("direct_domains") or []) \
+        if routing.get("mode") == "safe-list" else frozenset()
+
+    def matches_domain(host: str, domain: str) -> bool:
+        domain = domain.lstrip("*.").strip().lower()
+        return bool(domain) and (host == domain or host.endswith("." + domain))
+
+    def is_direct(host: str) -> bool:
+        return any(matches_domain(host, domain) for domain in direct)
+
+    def is_tunneled(host: str) -> bool:
+        if not host or is_direct(host):
+            return False
+        if routing.get("mode") == "safe-list":
+            default_provider = routing.get("default_provider")
+            if isinstance(default_provider, str) and _effective_route_provider(default_provider) == name:
+                return True
+        for route in _routes:
+            if route.get("provider") != name:
+                continue
+            for domain in route.get("domains", []):
+                route_host = domain.lstrip("*.").strip().lower()
+                if not matches_domain(host, route_host):
+                    continue
+                if routing.get("mode") == "vpn-list":
+                    vpn_domains = routing.get("vpn_domains") or []
+                    if not any(matches_domain(route_host, vpn) for vpn in vpn_domains):
+                        continue
+                return True
+        return False
+
     entry = _providers.get(name)
     if isinstance(entry, dict):
         pinned = entry.get("probe_url")
         if isinstance(pinned, str) and pinned.startswith("https://"):
-            return pinned
-    direct = frozenset((routing_state().get("direct_domains") or [])) \
-        if routing_state().get("mode") == "safe-list" else frozenset()
+            host = urllib.parse.urlsplit(pinned).hostname
+            if host and is_tunneled(host.lower()):
+                return pinned
+
+    if routing.get("mode") == "safe-list":
+        default_provider = routing.get("default_provider")
+        if isinstance(default_provider, str) and _effective_route_provider(default_provider) == name:
+            default_probe = egress_settings().get("probe_url")
+            host = urllib.parse.urlsplit(default_probe).hostname if isinstance(default_probe, str) else None
+            if host and is_tunneled(host.lower()):
+                return default_probe
+
     for route in _routes:
         if route.get("provider") != name:
             continue
         for host in route.get("domains", []):
-            host = host.lstrip("*.").strip()
-            if host and "." in host and not host.startswith("."):
-                if host in direct:
-                    continue  # safe-list mode: routed direct, not the tunnel
-                return f"https://{host}"
+            host = host.lstrip("*.").strip().lower()
+            if not host or "." not in host or host.startswith(".") or is_direct(host):
+                continue
+            if routing.get("mode") == "vpn-list":
+                vpn_domains = routing.get("vpn_domains") or []
+                if not any(matches_domain(host, vpn) for vpn in vpn_domains):
+                    continue
+            return f"https://{host}"
     return None
 
 
@@ -824,7 +1207,8 @@ def egress_dns_probe(host: str, *, port: int | None = None, timeout: float | Non
     return None
 
 
-def check_egress_live(name: str, profile: Path, *, port: int | None = None) -> tuple[str, dict | None]:
+def check_egress_live(name: str, profile: Path, *, port: int | None = None,
+                      url: str | None = None) -> tuple[str, dict | None]:
     """Live check of ``profile`` (provider ``name``'s active exit) THROUGH the
     running tunnel. Returns (status, record):
 
@@ -841,7 +1225,7 @@ def check_egress_live(name: str, profile: Path, *, port: int | None = None) -> t
     ``dns_ok`` when determined) and reputation-block reasons still raise a
     blocked marker, exactly like probe_profile.
     """
-    url = probe_url_for(name)
+    url = url or probe_url_for(name)
     if url is None:
         return "alive", None
     probe = probe_egress(port=port, url=url)
@@ -895,6 +1279,105 @@ def record_rotation(name: str, profile: Path) -> None:
     """Persist the last switch (profile + epoch) for status --json."""
     record = {"profile": profile.stem, "at": int(time.time())}
     _atomic_write(ROOT / "state" / f"{name}.rotation", json.dumps(record, indent=2, sort_keys=True) + "\n", 0o600)
+
+
+def scheduled_interval() -> int:
+    """Configured scheduled-rotation interval in seconds (0 = off)."""
+    try:
+        return int(_rotation.get("interval_seconds", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def rotation_policy() -> str:
+    """Configured exit-selection policy: 'latency' (default) or
+    'least-recent' (autoroute: prefer the exit used longest ago)."""
+    policy = _rotation.get("policy", DEFAULT_ROTATION_SETTINGS["policy"])
+    return policy if policy in ("latency", "least-recent") else DEFAULT_ROTATION_SETTINGS["policy"]
+
+
+def _lru_key(record: dict) -> int:
+    """Autoroute key: epoch of the exit's last verified OK probe (older =
+    preferred; 0 = never used = preferred first)."""
+    try:
+        return int(record.get("last_ok_at") or record.get("checked_at") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def last_rotation_at(name: str) -> int | None:
+    """Epoch of the last recorded rotation for ``name``
+    (state/<name>.rotation "at"), or None when there is no record."""
+    record = ROOT / "state" / f"{name}.rotation"
+    if not record.is_file():
+        return None
+    try:
+        return int(json.loads(record.read_text())["at"])
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return None
+
+
+def next_rotation_at(name: str) -> int | None:
+    """Epoch of the next scheduled rotation for ``name``, or None when
+    rotation is disabled or no rotation has ever been recorded."""
+    interval = scheduled_interval()
+    if interval <= 0:
+        return None
+    at = last_rotation_at(name)
+    if at is None:
+        return None
+    jitter = int(_rotation.get("jitter_seconds", DEFAULT_ROTATION_SETTINGS["jitter_seconds"]) or 0)
+    # Deterministic per-rotation jitter: seeded by the last rotation time, so
+    # repeated checks agree instead of re-rolling every tick and potentially
+    # deferring forever at the boundary.
+    offset = random.Random(at).randint(-(jitter // 2), jitter // 2) if jitter > 0 else 0
+    return at + interval + offset
+
+
+def rotate_due(provider: str | None = None) -> int:
+    """Scheduled rotation pass: rotate every provider whose interval elapsed.
+
+    Read-only when nothing is due (exit 3). Rotates via the normal ``rotate``
+    path (verify-then-switch, rollback, cooldowns); the current exit is NOT
+    marked as an upstream failure — a scheduled switch is a preference, not a
+    failure signal. Providers without a rotation record are seeded with now
+    (first rotation waits a full interval). Returns 0 when a provider was
+    rotated or seeded, 3 otherwise.
+    """
+    interval = scheduled_interval()
+    if interval <= 0:
+        return 3
+    if provider is not None:
+        names = [provider]
+    else:
+        suffix = ".active"
+        names = sorted(
+            p.name[: -len(suffix)]
+            for p in (ROOT / "state").glob(f"*{suffix}")
+            if p.name.endswith(suffix) and p.name[: -len(suffix)] in _providers
+        )
+    if not names:
+        return 3
+    now = int(time.time())
+    handled = False
+    for name in names:
+        at = last_rotation_at(name)
+        if at is None:
+            active = persisted_active(name)
+            if active is not None:
+                record_rotation(name, active)
+            else:
+                _atomic_write(
+                    ROOT / "state" / f"{name}.rotation",
+                    json.dumps({"profile": None, "at": now}, sort_keys=True) + "\n",
+                )
+            handled = True
+            continue
+        next_at = next_rotation_at(name)
+        if next_at is None or now < next_at:
+            continue
+        handled = rotate(name) == 0 or handled
+    return 0 if handled else 3
 
 
 def _clear_cooldown(name: str, profile: Path) -> None:
@@ -952,10 +1435,57 @@ def persisted_active(name: str) -> Path | None:
     profiles = provider_files(name)
     if not profiles:
         return None
+    live = configured_profile(name) if engine_alive() else None
+    if live is not None:
+        state = ROOT / "state" / f"{name}.active"
+        try:
+            marker = state.read_text().strip() if state.is_file() else ""
+        except OSError:
+            marker = ""
+        if marker != live.stem:
+            # The engine is the source of truth for a tunnel that is already
+            # running. Repair stale state before probes can blame the wrong exit.
+            set_active(name, live)
+        return live
     state = ROOT / "state" / f"{name}.active"
     if state.is_file():
         stem = state.read_text().strip()
         return next((p for p in profiles if p.stem == stem), None)
+    return None
+
+
+def configured_profile(name: str) -> Path | None:
+    """Return the provider profile represented by the generated sing-box config.
+
+    The active marker is desired state, not proof of what sing-box loaded.
+    Compare endpoint payloads in memory; never print or persist private keys.
+    """
+    if not SING_BOX_CONFIG.is_file():
+        return None
+    try:
+        config = json.loads(SING_BOX_CONFIG.read_text())
+        endpoint = next(
+            item for item in config.get("endpoints", [])
+            if item.get("tag") == name and item.get("type") == "wireguard"
+        )
+    except (json.JSONDecodeError, OSError, StopIteration, AttributeError, TypeError):
+        return None
+
+    def identity(value: dict) -> dict:
+        normalized = {
+            key: item for key, item in value.items()
+            if key not in {"tag", "domain_resolver"}
+        }
+        normalized.setdefault("mtu", DEFAULT_ENDPOINT_MTU)
+        return normalized
+
+    target = identity(endpoint)
+    for profile in provider_files(name):
+        try:
+            if identity(parse_wireguard(profile)) == target:
+                return profile
+        except (SystemExit, KeyError, ValueError, configparser.Error, OSError):
+            continue
     return None
 
 
@@ -995,14 +1525,14 @@ def _profile_error(profile: Path) -> str | None:
         return str(exc) or type(exc).__name__
 
 
-def _usable_profile(name: str) -> Path | None:
+def _usable_profile(name: str, preferred: Path | None = None) -> Path | None:
     """Profile for ``name`` that builds cleanly: the persisted active one when
     valid, else the first non-cooled valid profile. Malformed profiles are
     logged and skipped so one bad file never disables the provider (F6)."""
     profiles = provider_files(name)
     if not profiles:
         return None
-    active = resolve_active(name)
+    active = preferred or resolve_active(name)
     if active is not None:
         error = _profile_error(active)
         if error is None:
@@ -1167,11 +1697,32 @@ def dns_strategy() -> str:
     return strategy
 
 
-def build_singbox_config() -> tuple[dict, set[str]]:
+def dns_transport() -> str:
+    """DNS server transport for provider-pinned resolution.
+
+    Some networks drop UDP 53 to external resolvers (captive-portal/school
+    firewalls) while allowing DoH (TCP 443). ``vpn.dns_transport`` switches
+    the generated ``dns-<provider>`` servers between ``udp`` (default) and
+    ``https`` (DoH, 1.1.1.1) so tunneled domains still resolve there.
+    """
+    transport = _vpn.get("dns_transport", "udp")
+    if transport not in ("udp", "https"):
+        return "udp"
+    return transport
+
+
+def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tuple[dict, dict[str, Path]]:
     active: dict[str, dict] = {}
+    selected: dict[str, Path] = {}
     dns_map: dict[str, str] = {}
     for name in _providers:
-        profile = _usable_profile(name)
+        # A failed primary must not remain as a second live WireGuard tunnel
+        # underneath its fallback; that recreates concurrent-session and
+        # endpoint-contention failures.
+        if active_fallback(name):
+            continue
+        preferred = active_overrides.get(name) if active_overrides else None
+        profile = _usable_profile(name, preferred=preferred)
         if profile is None:
             continue
         try:
@@ -1188,6 +1739,7 @@ def build_singbox_config() -> tuple[dict, set[str]]:
         # deprecated implicit DNS rule path. DialerOptions is embedded flat.
         endpoint["domain_resolver"] = f"dns-{name}"
         active[name] = endpoint
+        selected[name] = profile
 
     # DNS resolution must NOT ride the tunnel: a WireGuard blip would then
     # take down resolution for the very request we're trying to route, which
@@ -1197,7 +1749,12 @@ def build_singbox_config() -> tuple[dict, set[str]]:
     # The resolved IP still gets dialed through the provider's endpoint
     # outbound, so the destination traffic stays provider-routed.
     dns_servers = [
-        {"type": "udp", "tag": f"dns-{name}", "server": dns_map[name]}
+        {
+            "type": dns_transport(),
+            "tag": f"dns-{name}",
+            "server": dns_map[name],
+            **({"server_port": 443} if dns_transport() == "https" else {}),
+        }
         for name in active
     ]
     # sing-box 1.12+: any dial without an explicit resolver needs
@@ -1216,9 +1773,19 @@ def build_singbox_config() -> tuple[dict, set[str]]:
         # tunnel. The rule comes first so a domain listed both here and in a
         # provider route always wins the direct resolver.
         dns_rules.append({"domain_suffix": list(routing["direct_domains"]), "server": "dns-local"})
+    vpn_domains = frozenset(routing["vpn_domains"])
     for route in _routes:
-        if route["provider"] in active and route.get("domains"):
-            dns_rules.append({"domain_suffix": route["domains"], "server": f"dns-{route['provider']}"})
+        route_provider = _effective_route_provider(route["provider"])
+        if route_provider not in active or not route.get("domains"):
+            continue
+        domains = route["domains"]
+        if routing_mode == "vpn-list":
+            domains = [
+                domain for domain in domains
+                if any(domain == vpn or domain.endswith("." + vpn) for vpn in vpn_domains)
+            ]
+        if domains:
+            dns_rules.append({"domain_suffix": domains, "server": f"dns-{route_provider}"})
 
     # Route rules: safe-list direct-domain pins first (a trusted domain is
     # never tunneled even if a provider route also mentions it), then the
@@ -1227,12 +1794,24 @@ def build_singbox_config() -> tuple[dict, set[str]]:
     # is byte-identical to the pre-routing-modes output.
     provider_rules = []
     for route in _routes:
-        if route["provider"] not in active:
+        route_provider = _effective_route_provider(route["provider"])
+        if route_provider not in active:
             continue
-        rule = {"outbound": route["provider"]}
+        rule = {"outbound": route_provider}
         if route.get("domains"):
-            rule["domain_suffix"] = route["domains"]
+            domains = route["domains"]
+            if routing_mode == "vpn-list":
+                domains = [
+                    domain for domain in domains
+                    if any(domain == vpn or domain.endswith("." + vpn) for vpn in vpn_domains)
+                ]
+            if domains:
+                rule["domain_suffix"] = domains
+            elif not route.get("ip_cidr"):
+                continue
         if route.get("ip_cidr"):
+            if routing_mode == "vpn-list":
+                continue
             rule["ip_cidr"] = route["ip_cidr"]
         provider_rules.append(rule)
     direct_pins: list[dict] = []
@@ -1244,16 +1823,74 @@ def build_singbox_config() -> tuple[dict, set[str]]:
     ]
 
     mode = current_mode()
+    rule_sets: list[dict] = []
     if mode == "tun":
-        inbounds = [{
+        tun: dict = {
             "type": "tun",
             "tag": "tun-in",
             "address": _vpn.get("address", DEFAULT_TUN_ADDRESS),
             "mtu": int(_vpn.get("mtu", DEFAULT_TUN_MTU)),
             "stack": _vpn.get("stack", DEFAULT_TUN_STACK),
-            "auto_route": True,
             "strict_route": False,
-        }]
+        }
+        # Selective TUN: sing-box installs only the routes from
+        # ``route_address_set`` while leaving unmatched destinations on the
+        # OS route table. ``auto_route`` must remain enabled on macOS; the
+        # selective address-set is what prevents a default-route detour.
+        capture = _vpn.get("capture")
+        if capture is None:
+            capture = "ruleset" if _vpn.get("selective") else "routes"
+        if capture not in ("ruleset", "routes"):
+            raise SystemExit("vpn.capture must be 'ruleset' or 'routes'")
+        selective = _vpn.get("selective") if capture == "ruleset" else None
+        rule_sets: list[dict] = []
+        if selective:
+            if not isinstance(selective, str) or not _PROVIDER_NAME.fullmatch(selective):
+                raise SystemExit("selective tun: name must contain only letters, digits, dots, underscores, or hyphens")
+            ruleset_path = ROOT / "rulesets" / f"{selective}.json"
+            try:
+                selective_data = json.loads(ruleset_path.read_text())
+            except FileNotFoundError:
+                raise SystemExit(f"selective tun: missing ruleset {ruleset_path}") from None
+            except (OSError, json.JSONDecodeError) as exc:
+                raise SystemExit(f"selective tun: could not read {ruleset_path}: {exc}") from None
+            if not isinstance(selective_data, dict) or not isinstance(selective_data.get("ip_cidr"), list):
+                raise SystemExit(f"selective tun: {ruleset_path} needs an ip_cidr string list")
+            cidrs = selective_data["ip_cidr"]
+            if not cidrs or not all(isinstance(cidr, str) and cidr for cidr in cidrs):
+                raise SystemExit(f"selective tun: {ruleset_path} has no valid ip_cidr entries")
+            provider = selective_data.get("provider", _vpn.get("selective_provider", "cloudflare"))
+            effective_provider = _effective_route_provider(provider)
+            if effective_provider not in active:
+                raise SystemExit(f"selective tun: provider '{provider}' has no active profile")
+            tag = f"ruleset-{selective}"
+            rule_sets.append({
+                "type": "inline",
+                "tag": tag,
+                "rules": [{"ip_cidr": cidrs}],
+            })
+            tun["auto_route"] = True
+            tun["route_address_set"] = [tag]
+            # Once a matching packet enters the TUN, send it through the
+            # selected provider. The TUN field only controls OS capture.
+            rules.insert(0, {"rule_set": [tag], "outbound": effective_provider})
+        else:
+            tun["auto_route"] = True
+            # Route-based TUN receives raw IP flows, so domain_suffix rules do
+            # not have a hostname until sing-box sniffs TLS/HTTP metadata.
+            # Place sniff after DNS hijacking and before provider rules; this
+            # keeps the transparent listener app-independent while preserving
+            # direct fallback for unmatched traffic.
+            rules.insert(0, {"action": "sniff"})
+        # Keep the mixed proxy listener ALONGSIDE the TUN: apps pinned to
+        # 127.0.0.1:PORT (hermes gateway, with-proxy, keepalive egress
+        # probes) must keep working while TUN captures everything else at
+        # the IP layer. Both inbound types share the same route rules, so
+        # no packet is processed twice.
+        inbounds = [
+            tun,
+            {"type": "mixed", "tag": "local-proxy", "listen": "127.0.0.1", "listen_port": _port},
+        ]
         route_final = "direct"
         # In tun mode the OS resolver's queries enter the tunnel; hijack them
         # into sing-box's DNS module so dns.rules still pin routed domains to
@@ -1273,7 +1910,7 @@ def build_singbox_config() -> tuple[dict, set[str]]:
         # direct rides the default provider. Fail the build with a precise
         # error when that provider has no active profile - never emit a
         # dangling final.
-        default_provider = routing["default_provider"]
+        default_provider = _effective_route_provider(routing["default_provider"])
         if default_provider not in active:
             raise SystemExit(
                 f"routing mode 'safe-list': default_provider '{default_provider}' has no active profile; "
@@ -1287,9 +1924,15 @@ def build_singbox_config() -> tuple[dict, set[str]]:
         "endpoints": list(active.values()),
         "outbounds": [{"type": "direct", "tag": "direct"}],
         "dns": {"servers": dns_servers, "rules": dns_rules, "strategy": dns_strategy()},
-        "route": {"auto_detect_interface": True, "default_domain_resolver": "dns-local", "rules": rules, "final": route_final},
+        "route": {
+            "auto_detect_interface": True,
+            "default_domain_resolver": "dns-local",
+            "rules": rules,
+            "rule_set": rule_sets,
+            "final": route_final,
+        },
     }
-    return config, set(active)
+    return config, selected
 
 
 def write_sing_box(config: dict) -> None:
@@ -1306,6 +1949,7 @@ def write_sing_box(config: dict) -> None:
         os.replace(temporary, SING_BOX_CONFIG)
         temporary = None
         os.chmod(SING_BOX_CONFIG, 0o600)
+        _hand_back_ownership(SING_BOX_CONFIG)
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
@@ -1373,6 +2017,9 @@ def restore_last_good() -> int:
         reload_log_from = log_offset()
         try:
             os.kill(pid, signal.SIGHUP)  # hot-reload the restored config in place
+        except PermissionError:
+            print("router: engine runs as root (started via sudo); restored config will apply on the next sudo start", file=sys.stderr)
+            return 1
         except ProcessLookupError:
             return engine_start(use_existing_config=True)
         if wait_engine(2.0, log_from=reload_log_from):
@@ -1385,6 +2032,35 @@ def listener_up() -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.settimeout(0.5)
         return sock.connect_ex(("127.0.0.1", _port)) == 0
+
+
+def _any_our_engine_running() -> bool:
+    """True when ANY sing-box process is running with our generated config
+    path in its command line.
+
+    Used when the pid file itself is unreadable (root-owned after a
+    `sudo vpn on`): same identity check as ``_pid_matches``, minus the pid."""
+    try:
+        if os.name == "nt":
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "(Get-CimInstance Win32_Process -Filter \"Name='sing-box.exe'\").CommandLine"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout
+            if out:
+                return str(SING_BOX_CONFIG) in out
+            out = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq sing-box.exe", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=3,
+            ).stdout
+            return "sing-box" in out.lower()
+        out = subprocess.run(
+            ["ps", "-ax", "-o", "command="],
+            capture_output=True, text=True, timeout=3,
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return f"sing-box run" in out and str(SING_BOX_CONFIG) in out
 
 
 def _pid_matches(pid: int) -> bool:
@@ -1427,15 +2103,28 @@ def engine_alive() -> bool:
         return False
     try:
         pid = int(PID_FILE.read_text().strip())
+    except PermissionError:
+        # Root-owned pid file (started via `sudo vpn on`): cannot read the
+        # pid, but liveness is verifiable from the process table; declaring
+        # the engine dead here churns a doomed regular-user restart that
+        # clobbers the pid file.
+        return _any_our_engine_running()
     except (ValueError, OSError):
         return False
     if not _pid_matches(pid):
         return False
+    trim_live_log_if_needed()
     try:
         if os.name == "nt":
             out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True, timeout=3).stdout
             return str(pid) in out
         os.kill(pid, 0)
+        return True
+    except PermissionError:
+        # Engine started via `sudo vpn on` runs as root: we may not probe
+        # it, but the pid file is ours and the process exists, so it is our
+        # engine (H3 foreign-PID check still holds — a recycled foreign pid
+        # file would never have been written by us).
         return True
     except (ProcessLookupError, ValueError, OSError):
         return False
@@ -1455,7 +2144,11 @@ def engine_mode_consistent() -> bool:
     inbounds = config.get("inbounds", [])
     if current_mode() == "tun":
         return any(i.get("type") == "tun" for i in inbounds)
-    return any(i.get("type") in ("mixed", "socks", "http") for i in inbounds)
+    # Engine builds always include the mixed proxy listener (kept in TUN
+    # mode too), so proxy mode is only consistent when there is NO tun.
+    return not any(i.get("type") == "tun" for i in inbounds) and any(
+        i.get("type") in ("mixed", "socks", "http") for i in inbounds
+    )
 
 
 def log_offset() -> int:
@@ -1524,9 +2217,72 @@ def wait_listener(timeout: float = 8.0) -> bool:
     return False
 
 
+def ensure_tray_started() -> None:
+    """Best-effort macOS menu-bar startup after an explicit engine start.
+
+    The tray is a separate launchd user agent, so ``router.py start`` must not
+    spawn a second tray process directly. Prefer kickstart when it is already
+    loaded; if the login agent exists but is not loaded yet, bootstrap that
+    exact plist once and kickstart it. Failures are warnings only because the
+    engine itself remains usable from the CLI.
+    """
+    if sys.platform != "darwin" or os.geteuid() == 0:
+        return
+    domain = f"gui/{os.getuid()}"
+    label = f"{domain}/com.proxy-router.tray"
+    plist = Path.home() / "Library" / "LaunchAgents" / "com.proxy-router.tray.plist"
+
+    def run_launchctl(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["launchctl", *args], capture_output=True, text=True, timeout=10,
+        )
+
+    try:
+        result = run_launchctl("kickstart", "-k", label)
+        if result.returncode == 0:
+            return
+        if plist.is_file():
+            boot = run_launchctl("bootstrap", domain, str(plist))
+            # bootstrap returns nonzero when a concurrently-starting login
+            # agent won the race; kickstart is still safe to retry afterward.
+            result = run_launchctl("kickstart", "-k", label)
+            if result.returncode == 0:
+                return
+            detail = (result.stderr or result.stdout or boot.stderr or boot.stdout
+                      or "launchctl failed").strip()
+        else:
+            detail = (result.stderr or result.stdout or
+                      f"missing tray plist: {plist}").strip()
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        detail = type(exc).__name__
+    print(f"router: tray startup warning: {detail[-200:]}", file=sys.stderr)
+
+
 # ---------------------------------------------------------------------------
 # engine lifecycle
 # ---------------------------------------------------------------------------
+
+def route_watcher_start() -> None:
+    """Start the independent routed-connection watcher best-effort."""
+    try:
+        import route_watcher
+
+        result = route_watcher.start(ROOT)
+        if result.get("error"):
+            print(f"router: route watcher unavailable: {result['error']}", file=sys.stderr)
+    except Exception as exc:  # watcher failure must not take down the proxy
+        print(f"router: route watcher unavailable: {type(exc).__name__}", file=sys.stderr)
+
+
+def route_watcher_stop() -> None:
+    """Stop only our watcher; never signal arbitrary processes."""
+    try:
+        import route_watcher
+
+        route_watcher.stop(ROOT)
+    except Exception as exc:
+        print(f"router: route watcher stop warning: {type(exc).__name__}", file=sys.stderr)
+
 
 def rotate_log_if_needed() -> None:
     """Archive an oversized sing-box.log to sing-box.log.1 (mirrors monitor.py's
@@ -1534,6 +2290,7 @@ def rotate_log_if_needed() -> None:
     log fd."""
     try:
         if LOG_FILE.stat().st_size < LOG_MAX_BYTES:
+            os.chmod(LOG_FILE, 0o600)
             return
     except OSError:
         return
@@ -1541,16 +2298,41 @@ def rotate_log_if_needed() -> None:
     archive.unlink(missing_ok=True)
     try:
         LOG_FILE.rename(archive)
+        os.chmod(archive, 0o600)
+    except OSError:
+        pass
+    try:
+        os.chmod(LOG_FILE, 0o600)
     except OSError:
         pass
 
 
-def engine_start(use_existing_config: bool = False) -> int:
+def trim_live_log_if_needed() -> None:
+    """Bound a live log without renaming the inode sing-box has open."""
+    try:
+        if LOG_FILE.stat().st_size < LOG_MAX_BYTES:
+            os.chmod(LOG_FILE, 0o600)
+            return
+        keep = LOG_MAX_BYTES - 256
+        with LOG_FILE.open("r+b") as handle:
+            handle.seek(-keep, os.SEEK_END)
+            tail = handle.read()
+            handle.seek(0)
+            handle.write(b"router: log trimmed; older entries archived by size\n")
+            handle.write(tail)
+            handle.truncate()
+        os.chmod(LOG_FILE, 0o600)
+    except (OSError, ValueError):
+        pass
+
+
+def engine_start(use_existing_config: bool = False, *, recover: bool = True) -> int:
     sing_box = resolve_sing_box()
     if sing_box is None:
         return fail(_sing_box_missing_message())
     if not sing_box_at_least(MIN_SING_BOX_VERSION):
         return fail(f"{_sing_box_version_message(MIN_SING_BOX_VERSION)}")
+    active: dict[str, Path] = {}
     if use_existing_config:
         # restore_last_good path: boot the sing-box.json file as it now
         # stands (already validated + written from last-good), without
@@ -1567,8 +2349,16 @@ def engine_start(use_existing_config: bool = False) -> int:
             return fail("no provider profile available (drop *.conf into providers/<name>/)")
         write_sing_box(config)
         if not validate_config():
+            if LAST_GOOD_FILE.is_file():
+                print("router: generated config failed validation; restoring last-good", file=sys.stderr)
+                return restore_last_good()
             return fail("sing-box config check failed")
-    engine_stop()
+    stop_rc = engine_stop()
+    if stop_rc != 0:
+        # The engine is root-owned (started via `sudo vpn on`) and could not
+        # be stopped: starting a second engine would clobber the pid file and
+        # strand the live root engine untracked.
+        return stop_rc
     # Only rotate here, with the old engine already stopped: renaming a live
     # engine's log would detach its (still open) fd and growth would continue
     # invisibly instead of being bounded.
@@ -1583,42 +2373,148 @@ def engine_start(use_existing_config: bool = False) -> int:
             popen_kwargs["start_new_session"] = True
         process = subprocess.Popen([sing_box, "run", "-c", str(SING_BOX_CONFIG)], **popen_kwargs)
     except OSError as exc:
+        if recover and not use_existing_config and LAST_GOOD_FILE.is_file():
+            print("router: could not start generated config; restoring last-good", file=sys.stderr)
+            return restore_last_good()
         return fail(f"could not start sing-box: {exc}")
     finally:
         if log_handle is not None:
             log_handle.close()
     PID_FILE.write_text(str(process.pid))
     os.chmod(PID_FILE, 0o600)
+    _hand_back_ownership(PID_FILE)
     if not wait_engine(log_from=log_offset()):
         engine_stop()
+        if recover and not use_existing_config and LAST_GOOD_FILE.is_file():
+            print("router: generated config failed to come up; restoring last-good", file=sys.stderr)
+            return restore_last_good()
         return fail("sing-box failed to come up")
     if not use_existing_config:
         # The engine demonstrably runs this config: snapshot it as last-good
-        # (a later failed reload/start can restore from it).
+        # (a later failed reload/start can restore from it) and persist the
+        # exact profile selection that was actually launched.
         write_last_good()
+        for provider, profile in active.items():
+            set_active(provider, profile)
+    else:
+        # A last-good restore is also allowed to repair stale marker state.
+        for provider in _providers:
+            live = configured_profile(provider)
+            if live is not None:
+                set_active(provider, live)
     return 0
 
 
+def engine_switch() -> int:
+    """Apply a provider switch with a hard stop/start lifecycle.
+
+    Route edits can use ``engine_reload``/SIGHUP, but changing WireGuard exits
+    must terminate the old process before the new tunnel is brought up. This
+    prevents the old session from surviving underneath the selected profile.
+    """
+    sing_box = resolve_sing_box()
+    if sing_box is None:
+        return fail(_sing_box_missing_message())
+    if not sing_box_at_least(MIN_SING_BOX_VERSION):
+        return fail(_sing_box_version_message(MIN_SING_BOX_VERSION))
+    previous_config = None
+    try:
+        if SING_BOX_CONFIG.is_file():
+            previous_config = SING_BOX_CONFIG.read_text()
+        # A hard switch is an explicit desired-state transition. Do not let
+        # configured_profile() prefer the still-running old engine while the
+        # new marker is being applied.
+        active_overrides: dict[str, Path] = {}
+        for name in _providers:
+            marker = ROOT / "state" / f"{name}.active"
+            if not marker.is_file():
+                continue
+            stem = marker.read_text().strip()
+            profile = next((p for p in provider_files(name) if p.stem == stem), None)
+            if profile is not None:
+                active_overrides[name] = profile
+        config, active = build_singbox_config(active_overrides=active_overrides)
+    except (SystemExit, KeyError, ValueError, OSError, configparser.Error) as exc:
+        return fail(f"could not build sing-box config: {exc}")
+    if not active:
+        return fail("no provider endpoint available")
+    write_sing_box(config)
+    if not validate_config():
+        if previous_config is not None:
+            _atomic_write(SING_BOX_CONFIG, previous_config, 0o600)
+        return fail("sing-box config check failed")
+    if engine_stop() != 0:
+        if previous_config is not None:
+            _atomic_write(SING_BOX_CONFIG, previous_config, 0o600)
+        return fail("engine stop failed during server switch")
+    if engine_start(use_existing_config=True) == 0:
+        write_last_good()
+        return 0
+    print("router: new server failed to start; restoring previous config", file=sys.stderr)
+    if previous_config is not None:
+        _atomic_write(SING_BOX_CONFIG, previous_config, 0o600)
+        if validate_config() and engine_start(use_existing_config=True) == 0:
+            return 1
+    if LAST_GOOD_FILE.is_file():
+        restore_last_good()
+    return 1
+
+
 def engine_ensure() -> int:
+    if MANUAL_OFF_FILE.is_file():
+        # The user disconnected manually (tray Disconnect / `router.py
+        # stop`). keepalive.sh also skips its ensure tick while the marker
+        # exists, but a stray direct `router.py ensure` must not resurrect
+        # the engine either.
+        print("router: manually disconnected (manual-off marker present); "
+              "run 'router.py start' to reconnect", file=sys.stderr)
+        return 0
     if current_mode() == "tun":
         # A proxy engine running while state/mode says tun is NOT healthy
         # (status/vpn status report it as down); restart into the persisted
         # mode instead of declaring victory (M13).
         if engine_alive() and engine_mode_consistent():
+            route_watcher_start()
             return 0
-        return engine_start()
+        rc = engine_start()
+        if rc == 0:
+            route_watcher_start()
+            return 0
+        if rc != 0 and _vpn.get("capture") == "routes":
+            # Route-based TUN is explicitly fail-open: remove a dead utun
+            # state and leave normal applications on their ordinary routes.
+            route_watcher_stop()
+            engine_stop()
+            set_mode("proxy")
+            if sys.platform == "darwin":
+                system_proxy_off()
+            print("router: transparent TUN unavailable; failing open to direct egress", file=sys.stderr)
+        return rc
     # Proxy mode: only a listener owned by OUR engine is "up". A foreign
     # process answering the port while our pid is dead/mismatched is NOT
     # healthy (F1): start the engine instead of declaring victory.
     if listener_up() and engine_alive():
+        route_watcher_start()
         return 0
-    return engine_start()
+    rc = engine_start()
+    if rc == 0:
+        route_watcher_start()
+    else:
+        route_watcher_stop()
+    return rc
 
 
 def engine_stop() -> int:
     if PID_FILE.is_file():
         try:
             pid = int(PID_FILE.read_text().strip())
+        except PermissionError:
+            # Root-owned pid file (started via `sudo vpn on`): the engine may
+            # be alive; keep the pid file and fail loudly (mirror of the kill
+            # PermissionError below) instead of unlinking a live engine's pid
+            # as "garbage" (H6).
+            print(_ROOT_ENGINE_HINT, file=sys.stderr)
+            return 1
         except (ValueError, OSError):
             # Garbage pid file (H6): treat as stale, clean it up, carry on.
             PID_FILE.unlink(missing_ok=True)
@@ -1636,21 +2532,31 @@ def engine_stop() -> int:
             else:
                 os.kill(pid, signal.SIGTERM)
                 time.sleep(0.4)
-                os.kill(pid, signal.SIGKILL)
+                # The process may have exited, or the PID may have been
+                # recycled during the grace period. Re-check ownership before
+                # sending a hard kill.
+                if _pid_matches(pid):
+                    os.kill(pid, signal.SIGKILL)
         except (ProcessLookupError, ValueError):
             pass
+        except PermissionError:
+            # Engine was started via `sudo vpn on` and runs as root; a
+            # regular-user stop cannot signal it. Keep the pid file (the
+            # engine IS alive) and tell the user to stop with sudo.
+            print(_ROOT_ENGINE_HINT, file=sys.stderr)
+            return 1
         PID_FILE.unlink(missing_ok=True)
     return 0
 
 
-def engine_reload() -> int:
+def engine_reload(active_overrides: dict[str, Path] | None = None) -> int:
     sing_box = resolve_sing_box()
     if sing_box is None:
         return fail(_sing_box_missing_message())
     if not sing_box_at_least(MIN_SING_BOX_VERSION):
         return fail(f"{_sing_box_version_message(MIN_SING_BOX_VERSION)}")
     try:
-        config, active = build_singbox_config()
+        config, active = build_singbox_config(active_overrides)
     except (SystemExit, KeyError, ValueError, OSError, configparser.Error) as exc:
         # Nothing was written or reloaded, so the running engine keeps its
         # old in-memory config; fail cleanly (no last-good restore needed).
@@ -1665,7 +2571,7 @@ def engine_reload() -> int:
         print("router: new sing-box config failed validation; restoring last-good", file=sys.stderr)
         return restore_last_good()
     if not PID_FILE.is_file():
-        if engine_start() != 0:
+        if engine_start(recover=False) != 0:
             print("router: engine failed to start with new config; restoring last-good", file=sys.stderr)
             return restore_last_good()
         return 0
@@ -1673,13 +2579,13 @@ def engine_reload() -> int:
         pid = int(PID_FILE.read_text().strip())
     except (ValueError, OSError):
         PID_FILE.unlink(missing_ok=True)
-        if engine_start() != 0:
+        if engine_start(recover=False) != 0:
             print("router: engine failed to start with new config; restoring last-good", file=sys.stderr)
             return restore_last_good()
         return 0
     if not _pid_matches(pid):
         PID_FILE.unlink(missing_ok=True)
-        if engine_start() != 0:
+        if engine_start(recover=False) != 0:
             print("router: engine failed to start with new config; restoring last-good", file=sys.stderr)
             return restore_last_good()
         return 0
@@ -1687,15 +2593,18 @@ def engine_reload() -> int:
         # Windows has no SIGHUP; stop+start applies the fresh config.
         if engine_stop() != 0:
             return fail("engine stop failed during reload")
-        if engine_start() != 0:
+        if engine_start(recover=False) != 0:
             print("router: engine failed to start with new config; restoring last-good", file=sys.stderr)
             return restore_last_good()
         return 0
     reload_log_from = log_offset()
     try:
         os.kill(pid, signal.SIGHUP)  # SIGHUP: sing-box hot-reloads the config in place
+    except PermissionError:
+        return fail("engine runs as root (started via sudo); run `router.py elevate install` once, "
+                    "or reload it now with `sudo python3 router.py reload`")
     except ProcessLookupError:
-        if engine_start() != 0:
+        if engine_start(recover=False) != 0:
             print("router: engine failed to start with new config; restoring last-good", file=sys.stderr)
             return restore_last_good()
         return 0
@@ -1706,13 +2615,14 @@ def engine_reload() -> int:
     # SIGHUP did not come up cleanly; try a full (re)start of the new config
     # before giving up and restoring last-good.
     print("router: engine did not come up after SIGHUP; trying a full start", file=sys.stderr)
-    if engine_start() != 0:
+    if engine_start(recover=False) != 0:
         print("router: engine failed to start with new config; restoring last-good", file=sys.stderr)
         return restore_last_good()
     return 0
 
 
-def rotate(name: str, *, reason: str | None = None, force: bool = False, probe: bool = True) -> int:
+def rotate(name: str, *, reason: str | None = None, force: bool = False, probe: bool = True,
+           to: str | None = None) -> int:
     """Switch to the next healthy profile for ``name``.
 
     - Egress-aware selection: cooled-down profiles are skipped as before, and
@@ -1722,10 +2632,16 @@ def rotate(name: str, *, reason: str | None = None, force: bool = False, probe: 
     - ``reason`` (rotate --reason): the CURRENT profile just failed upstream;
       it gets a longer cooldown + recorded reason (and a blocked marker for
       reputation-block reasons) so the next rotation prefers a different exit.
+    - ``to`` (rotate --to PROFILE): switch to this exact exit instead of the
+      ranked next one (used by the tray provider picker). The profile must
+      exist and parse; blocked exits are honored unless ``force``, so a manual
+      pick can still be refused when the exit is reputation-blocked.
     - Last-good rollback: after switching, the new exit is probed through the
       tunnel (proxy mode); if it fails to come up cleanly, the previous good
       profile is restored.
     """
+    if active_fallback(name):
+        return fail(f"provider '{name}': fallback active; clear it before rotating the primary")
     profiles = provider_files(name)
     if not profiles:
         return fail(f"provider '{name}' has no profiles")
@@ -1745,36 +2661,78 @@ def rotate(name: str, *, reason: str | None = None, force: bool = False, probe: 
     except (TypeError, ValueError):
         return fail(f"provider '{name}': cooldown_seconds must be an integer")
     current = persisted_active(name) or resolve_active(name)
+    chosen = None
+    if to is not None:
+        chosen = next((p for p in valid if p.stem == to), None)
+        if chosen is None:
+            return fail(f"provider '{name}': no valid profile named '{to}' (have {', '.join(p.stem for p in valid)})")
+        # Re-selecting the already-active exit is a no-op. It must NOT
+        # cooldown the current profile or fail on its own cooldown state
+        # -- the old code marked the current exit cooling, then refused
+        # the pick with "exit is cooling down", a nonsense error for a
+        # click that should just confirm "already on it".
+        if not force and chosen == current:
+            print(f"already on {name} -> {chosen.stem}")
+            return 0
     if reason is not None:
         _apply_upstream_failure(name, current, reason, seconds)
     elif current is not None and not is_cooled_down(name, current) and not force:
         mark_cooldown(name, current, seconds)
-    if current in valid:
-        start = valid.index(current) + 1
-        ordered = valid[start:] + valid[:start]
+    if to is not None:
+        assert chosen is not None  # resolved and validated in the block above
+        if not force and egress_is_blocked(name, chosen):
+            return fail(f"provider '{name}': exit '{to}' is blocked (use 'rotate --force' to override)")
+        if not force and current is not None and is_cooled_down(name, chosen) and chosen == current:
+            mark_cooldown(name, current, seconds)  # keep the manual pick from pinning a cooling exit
+        if not force and is_cooled_down(name, chosen):
+            return fail(f"provider '{name}': exit '{to}' is cooling down (use 'rotate --force' to override)")
     else:
-        ordered = valid
-    if force:
-        chosen = ordered[0]
-    else:
-        cooled = [p for p in ordered if not is_cooled_down(name, p)]
-        if not cooled:
-            return fail(f"provider '{name}': all profiles cooling down")
-        unblocked = [p for p in cooled if not egress_is_blocked(name, p)]
-        if not unblocked:
-            return fail(f"provider '{name}': no unblocked profile available (use 'rotate --force' to override)")
-        chosen = min(unblocked, key=lambda p: _egress_rank(read_egress(name, p)))
+        if current in valid:
+            start = valid.index(current) + 1
+            ordered = valid[start:] + valid[:start]
+        else:
+            ordered = valid
+        if force:
+            chosen = ordered[0]
+        else:
+            cooled = [p for p in ordered if not is_cooled_down(name, p)]
+            if not cooled:
+                return fail(f"provider '{name}': all profiles cooling down")
+            unblocked = [p for p in cooled if not egress_is_blocked(name, p)]
+            if not unblocked:
+                return fail(f"provider '{name}': no unblocked profile available (use 'rotate --force' to override)")
+            if rotation_policy() == "least-recent":
+                # Autoroute: among known-good exits (no repeated failures),
+                # prefer the one used longest ago so usage spreads across
+                # the pool and upstream rate limits see a fresh egress IP.
+                candidates = [
+                    p for p in unblocked
+                    if _egress_rank(read_egress(name, p))[0] < 3
+                ] or unblocked
+                chosen = min(candidates, key=lambda p: (_lru_key(read_egress(name, p)), p.stem))
+            else:
+                chosen = min(unblocked, key=lambda p: _egress_rank(read_egress(name, p)))
     if force:
         clear_blocked(name, chosen)
     previous = current
     set_active(name, chosen)
     record_rotation(name, chosen)
     print(f"switched {name} -> {chosen.stem}")
-    rc = engine_reload()
+    rc = engine_switch()
     if rc != 0:
+        # The new process never became healthy. Restore the previous active
+        # marker so future starts and route attribution match the config that
+        # was restored by engine_switch().
+        if previous is None:
+            (ROOT / "state" / f"{name}.active").unlink(missing_ok=True)
+        else:
+            set_active(name, previous)
         return rc
-    if probe and current_mode() != "proxy":
-        probe = False  # tun mode has no 127.0.0.1 listener to probe through
+    if probe and not listener_up():
+        # Transparent TUN keeps the mixed listener alongside the TUN inbound,
+        # so rotation can still validate the new profile through 127.0.0.1.
+        # Only skip the probe when no local listener is actually available.
+        probe = False
     if not probe:
         return 0
     ok, _ = probe_profile(name, chosen)
@@ -1785,7 +2743,7 @@ def rotate(name: str, *, reason: str | None = None, force: bool = False, probe: 
     print(f"router: egress probe failed for {chosen.stem}; restoring '{name}' to previous profile", file=sys.stderr)
     if previous is None or previous == chosen or previous not in valid or egress_is_blocked(name, previous):
         print("router: no usable previous profile to roll back to", file=sys.stderr)
-        return 0
+        return 1
     mark_cooldown(name, chosen, max(seconds * 2, int(egress_settings()["upstream_cooldown_seconds"])))
     if reason is None:
         # Plain rotations cooldown the previous profile only as a mild
@@ -1799,7 +2757,11 @@ def rotate(name: str, *, reason: str | None = None, force: bool = False, probe: 
     set_active(name, previous)
     record_rotation(name, previous)
     print(f"switched {name} -> {previous.stem} (rollback)")
-    return engine_reload()
+    rollback_rc = engine_switch()
+    # The rollback restored service, but the requested rotation failed. A
+    # non-zero result is required so callers can activate the configured
+    # provider fallback instead of treating the rollback as success.
+    return rollback_rc if rollback_rc != 0 else 1
 
 
 def provider_count(name: str) -> int:
@@ -2066,6 +3028,12 @@ def vpn_on() -> int:
     if current_mode() == "tun":
         if engine_alive() and engine_mode_consistent():
             print("vpn: tun already up")
+            # Idempotent re-entry must leave the same surface state as a
+            # fresh start: TUN capture uses the mixed listener only as an
+            # explicit compatibility lane, while ordinary apps stay direct.
+            route_watcher_start()
+            if sys.platform == "darwin":
+                system_proxy_off()
             return 0
         # state says tun but nothing consistent is running: reset to proxy so a
         # failed start below can't wedge a phantom tun, then fall through.
@@ -2109,6 +3077,14 @@ def vpn_on() -> int:
         set_mode(old_mode)
         if old_mode == "proxy" and not listener_up():
             engine_start()
+        return rc
+    # Tun mode routes ordinary traffic through the utun interface while the
+    # generated config keeps the mixed 127.0.0.1:<port> listener alongside it
+    # for proxy-pinned clients. Leaving the macOS system proxy enabled would
+    # still force browsers through that listener instead of using transparent
+    # capture, so disable it once tun is up.
+    if sys.platform == "darwin":
+        system_proxy_off()
     return rc
 
 
@@ -2119,7 +3095,50 @@ def vpn_off() -> int:
         return rc
     # Returning to proxy mode should leave the user with working connectivity
     # (M11): start the proxy engine so 127.0.0.1:<port> answers again.
-    return engine_start()
+    rc = engine_start()
+    # Back on the proxy: re-point the macOS system proxy at the listener so
+    # the browser keeps working without manual networksetup (mirror of the
+    # disable above; tun mode has no listener to point at).
+    if rc == 0 and sys.platform == "darwin":
+        system_proxy_on()
+    return rc
+
+
+def vpn_restart() -> int:
+    """Stop the current engine and bring TUN back up in a single operation.
+
+    One elevated invocation means one macOS admin-password prompt for the
+    whole cycle, instead of two with `vpn off && vpn on`."""
+    rc = engine_stop()
+    if rc != 0:
+        return rc
+    return vpn_on()
+
+
+def vpn_capture(scope: str) -> int:
+    """Set TUN capture scope and reload an already-running TUN engine."""
+    if scope not in ("ruleset", "routes"):
+        return fail("vpn capture scope must be 'ruleset' or 'routes'")
+    try:
+        data = json.loads(CONFIG_FILE.read_text())
+        if not isinstance(data, dict):
+            return fail(f"bad {CONFIG_FILE.name}: top level must be an object")
+        vpn = data.get("vpn", {})
+        if not isinstance(vpn, dict):
+            return fail(f"bad {CONFIG_FILE.name}: vpn must be an object")
+        vpn["capture"] = scope
+        data["vpn"] = vpn
+        _atomic_write(CONFIG_FILE, json.dumps(data, indent=2) + "\n", 0o600)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        return fail(f"could not write {CONFIG_FILE.name}: {exc}")
+    _vpn.clear()
+    _vpn.update(vpn)
+    if current_mode() == "tun" and engine_alive():
+        rc = engine_reload()
+        if rc != 0:
+            return rc
+    print(f"vpn: capture={scope} (engine not started)")
+    return 0
 
 
 def _status_report() -> tuple[int, str]:
@@ -2161,16 +3180,12 @@ def _provider_status(name: str) -> dict:
     # Report the PERSISTED active profile (what the engine is configured with)
     # rather than resolve_active(), which skips a cooled-down active when
     # picking the next candidate.
-    active_stem = None
-    state = ROOT / "state" / f"{name}.active"
-    try:
-        if state.is_file():
-            stem = state.read_text().strip()
-            if stem in profiles:
-                active_stem = stem
-    except (OSError, ValueError):
-        pass
+    active_profile = persisted_active(name)
+    active_stem = active_profile.stem if active_profile is not None else None
     entry = {"profiles": profiles, "active": active_stem}
+    fallback = fallback_status(name)
+    if fallback["configured"] or fallback["active"]:
+        entry["fallback"] = fallback
     cooldowns = {}
     for stem in profiles:
         path = ROOT / "state" / "cooldowns" / name / f"{stem}.until"
@@ -2200,7 +3215,8 @@ def _provider_status(name: str) -> dict:
 def status_json() -> dict:
     """Full machine-readable status for `status --json`."""
     rc, line = _status_report()
-    data = {"up": rc == 0, "state": line, "mode": current_mode(), "port": _port}
+    data = {"up": rc == 0, "state": line, "mode": current_mode(), "port": _port,
+            "sing_box": resolve_sing_box()}
     try:
         if PID_FILE.is_file():
             data["pid"] = int(PID_FILE.read_text().strip())
@@ -2215,15 +3231,51 @@ def status_json() -> dict:
         "ip_cidr": route.get("ip_cidr", []),
     } for route in _routes]
     data["routing"] = routing_state()
+    try:
+        cfg = json.loads(CONFIG_FILE.read_text())
+        data["preset"] = cfg.get("preset")
+    except (OSError, json.JSONDecodeError):
+        data["preset"] = None
+    try:
+        import route_watcher
+
+        data["watcher"] = route_watcher.status(ROOT)
+    except Exception:
+        data["watcher"] = {"running": False, "enabled": False, "scope": "proxy-observable only"}
+    rotation = {
+        "interval_seconds": scheduled_interval(),
+        "jitter_seconds": int(_rotation.get("jitter_seconds", DEFAULT_ROTATION_SETTINGS["jitter_seconds"]) or 0),
+        "policy": rotation_policy(),
+    }
+    if rotation["interval_seconds"] > 0:
+        next_times = [n for n in (next_rotation_at(name) for name in _providers) if n is not None]
+        if next_times:
+            rotation["next_at"] = min(next_times)
+    data["rotation"] = rotation
     return data
+
+
+def _check_active_fallback(primary: str, fallback: str) -> tuple[Path | None, str, dict | None]:
+    """Check the live fallback endpoint while preserving primary-route attribution."""
+    profile = persisted_active(fallback) or resolve_active(fallback)
+    if profile is None:
+        return None, "dead", None
+    status, record = check_egress_live(
+        fallback,
+        profile,
+        url=probe_url_for(primary),
+    )
+    return profile, status, record
 
 
 def egress_probe(name: str | None = None) -> int:
     """Probe the active exit of every provider (or just ``name``) through the
     tunnel, persist the outcome, print it as JSON; exit 1 when any probe
     failed."""
-    if current_mode() != "proxy":
-        return fail("egress probe requires proxy mode (tun has no 127.0.0.1 listener)")
+    # The generated tun config keeps the mixed 127.0.0.1:<port> listener
+    # alongside the TUN (config builder: "Keep the mixed proxy listener
+    # ALONGSIDE the TUN"), so probing through it exercises the same route
+    # rules and tunnel path in either mode.
     if not listener_up():
         return fail(f"engine not listening on 127.0.0.1:{_port}; start it first")
     providers = [name] if name is not None else list(_providers)
@@ -2235,6 +3287,20 @@ def egress_probe(name: str | None = None) -> int:
             any_failed = True
             continue
         active = persisted_active(provider) or resolve_active(provider)
+        fallback = active_fallback(provider)
+        if fallback:
+            fallback_profile, status, record = _check_active_fallback(provider, fallback)
+            results[provider] = {
+                "profile": active.stem if active else None,
+                "fallback_profile": fallback_profile.stem if fallback_profile else None,
+                "ok": status != "dead",
+                "status": "fallback",
+                "fallback_provider": fallback,
+            }
+            if record is not None and record.get("dns_ok") is not None:
+                results[provider]["dns_ok"] = record["dns_ok"]
+            any_failed = any_failed or status == "dead"
+            continue
         if active is None:
             results[provider] = {"error": "no active profile"}
             any_failed = True
@@ -2267,9 +3333,8 @@ def egress_check(name: str | None = None, as_json: bool = False) -> int:
     rotates exactly one provider. ``--json`` emits the same data as one JSON
     document.
     """
-    mode = current_mode()
-    if mode != "proxy":
-        return fail(f"egress check requires proxy mode (mode is '{mode}'; no 127.0.0.1 tunnel listener)")
+    # The tun config keeps the mixed listener (see egress_probe), so the
+    # read-only liveness check works through 127.0.0.1:<port> in either mode.
     if not listener_up():
         return fail(f"engine not listening on 127.0.0.1:{_port}; tunnel is down")
     if name is not None and name not in _providers:
@@ -2279,6 +3344,25 @@ def egress_check(name: str | None = None, as_json: bool = False) -> int:
     dead: list[str] = []
     for provider in providers:
         active = persisted_active(provider) or resolve_active(provider)
+        fallback = active_fallback(provider)
+        if fallback:
+            fallback_profile, status, record = _check_active_fallback(provider, fallback)
+            entry: dict = {
+                "profile": active.stem if active else None,
+                "fallback_profile": fallback_profile.stem if fallback_profile else None,
+                "ok": status != "dead",
+                "status": "fallback",
+                "fallback_provider": fallback,
+            }
+            if record is not None and record.get("dns_ok") is not None:
+                entry["dns_ok"] = record["dns_ok"]
+            if status == "dead":
+                entry["detail"] = "dns" if entry.get("dns_ok") is False else "probe connection"
+                dead.append(provider)
+            elif status == "degraded" and record is not None and record.get("status") is not None:
+                entry["detail"] = f"HTTP {record['status']}"
+            results[provider] = entry
+            continue
         if active is None:
             results[provider] = {"profile": None, "ok": True, "status": "skipped",
                                  "detail": "no active profile"}
@@ -2303,6 +3387,8 @@ def egress_check(name: str | None = None, as_json: bool = False) -> int:
             status = entry["status"]
             if status == "skipped":
                 print(f"{provider}: skipped (no active profile)")
+            elif status == "fallback":
+                print(f"{provider}: fallback ({entry.get('fallback_provider', 'unknown')})")
             elif status == "alive":
                 print(f"{provider}: alive ({entry['profile']})")
             elif status == "degraded":
@@ -2315,36 +3401,14 @@ def egress_check(name: str | None = None, as_json: bool = False) -> int:
 
 
 def egress_sweep(name: str | None = None, as_json: bool = False) -> int:
-    """Full-pool sweep: probe EVERY profile of every provider (or just
-    ``name``) through the running tunnel, persisting per-profile health,
-    cooldown, and blocked markers, then end on the best alive profile.
+    """Probe every profile once and leave the engine on the best alive one.
 
-    Unlike `egress check` (which probes only the ACTIVE exit), a sweep walks
-    the whole pool in wrap order - each profile is tested exactly once, the
-    engine hopping from exit to exit with a short settle wait after each hop
-    (the first request after a WireGuard switch can flake and would
-    false-mark a healthy exit failed/cooldown) - so health records for the
-    entire pool stay fresh and the tunnel ends on the fastest alive exit
-    instead of sitting on a stale-but-alive lane. ``rotate`` is called with
-    force=True + probe=False for hops: it advances in wrap order without
-    cooling the current profile and without rollback; it does reload the
-    engine so every probe rides the tunnel through the profile being tested.
-
-    Blocked/cooldown markers written by the probes persist exactly as they do
-    for `egress probe`; the final switch (``set_active`` + ``engine_reload``)
-    happens only when a strictly better (lower-latency; unmeasured alive
-    profiles rank after measured ones, ties go to the first tested) alive
-    profile exists, so a healthy sweep never reloads the engine. When nothing
-    is alive the tunnel is left on the current profile - nothing is restored,
-    nothing is switched.
-
-    Output: ``--json`` emits ``{"dead": [...], "results": {...}}``; human
-    mode prints one summary line per provider. Exit 1 when any provider was
-    swept and had zero alive profiles (an unknown provider is an error entry
-    but not a dead pool).
+    Every profile change is a hard engine switch. If no profile is alive, the
+    original active profile is restored when possible, so a diagnostic sweep
+    cannot strand the tunnel on the last dead profile it tested.
     """
-    if current_mode() != "proxy":
-        return fail("egress sweep requires proxy mode (tun has no 127.0.0.1 listener)")
+    # The tun config keeps the mixed listener (see egress_probe), so the
+    # full-pool sweep probes through 127.0.0.1:<port> in either mode.
     if not listener_up():
         return fail(f"engine not listening on 127.0.0.1:{_port}; start it first")
     providers = [name] if name is not None else list(_providers)
@@ -2353,6 +3417,21 @@ def egress_sweep(name: str | None = None, as_json: bool = False) -> int:
     for provider in providers:
         if provider not in _providers:
             results[provider] = {"error": "unknown provider"}
+            dead.append(provider)
+            continue
+        fallback = active_fallback(provider)
+        if fallback:
+            fallback_profile, status, record = _check_active_fallback(provider, fallback)
+            results[provider] = {
+                "status": "fallback",
+                "fallback_provider": fallback,
+                "fallback_profile": fallback_profile.stem if fallback_profile else None,
+                "ok": status != "dead",
+            }
+            if record is not None and record.get("dns_ok") is not None:
+                results[provider]["dns_ok"] = record["dns_ok"]
+            if status == "dead":
+                dead.append(provider)
             continue
         # Keep only parseable profiles so one bad *.conf cannot wedge the
         # sweep (F6); log every skipped filename (F2), same as rotate.
@@ -2365,18 +3444,50 @@ def egress_sweep(name: str | None = None, as_json: bool = False) -> int:
             valid.append(profile)
         if not valid:
             results[provider] = {"error": "no valid profiles"}
+            dead.append(provider)
             continue
         current = persisted_active(provider) or resolve_active(provider)
-        if current in valid:
-            start = valid.index(current)
+        original = current if current in valid else None
+        actual = original
+        if original is not None:
+            start = valid.index(original)
             ordered = valid[start:] + valid[:start]
         else:
             ordered = valid
         entry: dict[str, dict] = {}
-        for i, profile in enumerate(ordered):
-            if i > 0:
-                rotate(provider, force=True, probe=False)  # hop forward in wrap order
-                time.sleep(1.5)  # WireGuard handshake settle (avoids false transport cooling)
+        switch_failed = False
+
+        def switch_to(profile: Path) -> int:
+            nonlocal actual
+            if actual == profile:
+                return 0
+            previous = actual
+            set_active(provider, profile)
+            rc = engine_switch()
+            if rc != 0:
+                if previous is None:
+                    (ROOT / "state" / f"{provider}.active").unlink(missing_ok=True)
+                else:
+                    set_active(provider, previous)
+                actual = previous
+                return rc
+            actual = profile
+            record_rotation(provider, profile)
+            print(f"switched {provider} -> {profile.stem} (sweep)")
+            return 0
+
+        for profile in ordered:
+            if switch_to(profile) != 0:
+                entry[profile.stem] = {
+                    "ok": False,
+                    "latency_ms": None,
+                    "status": None,
+                    "error": "profile switch failed",
+                }
+                switch_failed = True
+                break
+            if actual != original:
+                time.sleep(1.5)  # WireGuard handshake settle
             ok, record = probe_profile(provider, profile)
             entry[profile.stem] = {
                 "ok": ok,
@@ -2384,17 +3495,27 @@ def egress_sweep(name: str | None = None, as_json: bool = False) -> int:
                 "status": record.get("status") if record else None,
             }
         alive = [stem for stem, r in entry.items() if r["ok"]]
-        if alive:
+        if alive and not switch_failed:
             best = min(alive, key=lambda stem: (
                 entry[stem]["latency_ms"] is None,
                 entry[stem]["latency_ms"] or 0.0,
             ))
-            if current is None or best != current.stem:
-                set_active(provider, next(p for p in ordered if p.stem == best))
-                engine_reload()
-                print(f"switched {provider} -> {best} (sweep)")
-        else:
+            best_profile = next(p for p in ordered if p.stem == best)
+            if switch_to(best_profile) != 0:
+                switch_failed = True
+        if switch_failed:
+            if provider not in dead:
+                dead.append(provider)
+            if original is not None and actual != original:
+                if switch_to(original) != 0:
+                    print(
+                        f"router: could not restore original profile {original.name} for '{provider}'",
+                        file=sys.stderr,
+                    )
+        elif not alive:
             dead.append(provider)
+            if original is not None:
+                switch_to(original)
         results[provider] = entry
     if as_json:
         print(json.dumps({"dead": dead, "results": results}, indent=2, sort_keys=True))
@@ -2402,6 +3523,9 @@ def egress_sweep(name: str | None = None, as_json: bool = False) -> int:
         for provider, entry in results.items():
             if "error" in entry:
                 print(f"{provider}: {entry['error']}")
+                continue
+            if entry.get("status") == "fallback":
+                print(f"{provider}: fallback ({entry['fallback_provider']})")
                 continue
             alive = [stem for stem, r in entry.items() if r["ok"]]
             best = min(alive, key=lambda stem: (
@@ -2433,7 +3557,28 @@ def egress_show(name: str | None = None) -> int:
 # macOS system proxy toggle
 # ---------------------------------------------------------------------------
 
+def network_services() -> list[str]:
+    """Return enabled macOS network services, excluding the separator row."""
+    try:
+        result = subprocess.run(
+            ["networksetup", "-listallnetworkservices"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if result.returncode != 0:
+        return []
+    services = []
+    for line in result.stdout.splitlines():
+        service = line.strip()
+        if not service or service.startswith("An asterisk") or service.startswith("*"):
+            continue
+        services.append(service)
+    return services
+
+
 def active_service_name() -> str | None:
+    """Return the service for the current default interface, when known."""
     try:
         iface = None
         out = subprocess.run(
@@ -2459,47 +3604,430 @@ def active_service_name() -> str | None:
 
 
 def system_proxy_on() -> int:
-    service = active_service_name()
-    if not service:
-        return fail("could not determine the active network service")
-    commands = [
-        ["networksetup", "-setwebproxy", service, "127.0.0.1", str(_port)],
-        ["networksetup", "-setsecurewebproxy", service, "127.0.0.1", str(_port)],
-        ["networksetup", "-setwebproxystate", service, "on"],
-        ["networksetup", "-setsecurewebproxystate", service, "on"],
-        ["networksetup", "-setproxybypassdomains", service, "*.local", "localhost", "127.0.0.1", "::1"],
-    ]
+    services = network_services()
+    if not services:
+        return fail("could not determine any macOS network services")
     try:
-        for command in commands:
-            subprocess.run(command, check=True, capture_output=True, timeout=10)
+        for service in services:
+            commands = [
+                ["networksetup", "-setwebproxy", service, "127.0.0.1", str(_port)],
+                ["networksetup", "-setsecurewebproxy", service, "127.0.0.1", str(_port)],
+                ["networksetup", "-setwebproxystate", service, "on"],
+                ["networksetup", "-setsecurewebproxystate", service, "on"],
+                # Manual proxy mode must win over PAC/WPAD. Otherwise a
+                # network-provided wpad.dat can silently replace or bypass
+                # 127.0.0.1:2080 for GUI apps.
+                ["networksetup", "-setautoproxystate", service, "off"],
+                ["networksetup", "-setproxyautodiscovery", service, "off"],
+                ["networksetup", "-setproxybypassdomains", service, "*.local", "localhost", "127.0.0.1", "::1"],
+            ]
+            for command in commands:
+                subprocess.run(command, check=True, capture_output=True, timeout=10)
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         return fail(f"could not enable system proxy: {exc}")
-    print(f"system proxy enabled on '{service}' -> 127.0.0.1:{_port}")
+    print(f"system proxy enabled on {len(services)} network service(s) -> 127.0.0.1:{_port}")
     return 0
 
 
 def system_proxy_off() -> int:
-    service = active_service_name()
-    if not service:
-        return fail("could not determine the active network service")
+    services = network_services()
+    if not services:
+        return fail("could not determine any macOS network services")
     try:
-        subprocess.run(
-            ["networksetup", "-setwebproxystate", service, "off"],
-            check=True, capture_output=True, timeout=10,
-        )
-        subprocess.run(
-            ["networksetup", "-setsecurewebproxystate", service, "off"],
-            check=True, capture_output=True, timeout=10,
-        )
+        for service in services:
+            subprocess.run(
+                ["networksetup", "-setwebproxystate", service, "off"],
+                check=True, capture_output=True, timeout=10,
+            )
+            subprocess.run(
+                ["networksetup", "-setsecurewebproxystate", service, "off"],
+                check=True, capture_output=True, timeout=10,
+            )
+            # Leaving PAC/WPAD enabled after Disconnect still allows macOS
+            # clients to select a network-provided proxy unexpectedly. Clear
+            # the automatic paths as part of the same direct-mode transition.
+            subprocess.run(
+                ["networksetup", "-setautoproxystate", service, "off"],
+                check=True, capture_output=True, timeout=10,
+            )
+            subprocess.run(
+                ["networksetup", "-setproxyautodiscovery", service, "off"],
+                check=True, capture_output=True, timeout=10,
+            )
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         return fail(f"could not disable system proxy: {exc}")
-    print(f"system proxy disabled ({service})")
+    print(f"system proxy disabled on {len(services)} network service(s)")
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Fail-open proxy runner
+# ---------------------------------------------------------------------------
+
+PROXY_ENV_VARS = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")
+
+
+def _config_port() -> int:
+    """Read the mixed-proxy port from router.json without full validation so
+    with-proxy stays usable even with a broken/missing config."""
+    try:
+        if CONFIG_FILE.is_file():
+            port = int(json.loads(CONFIG_FILE.read_text()).get("port", DEFAULT_PORT))
+            if 1 <= port <= 65535:
+                return port
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return DEFAULT_PORT
+
+
+def _listener_healthy(port: int, timeout: float) -> bool:
+    """True when a TCP listener answers on 127.0.0.1:port. Read-only probe:
+    never starts the engine, never touches state."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def with_proxy(cmd: list[str], *, timeout_ms: int = 300,
+               force_proxy: bool = False, force_direct: bool = False,
+               check: bool = False) -> int:
+    """Fail-open command runner: exec ``cmd`` through the local proxy when the
+    listener is up, otherwise strip the proxy env and run direct.
+
+    Use when:
+    - Wrapping apps pointed at 127.0.0.1:<port> (hermes, curl, ...) so they
+      keep working when the engine is stopped / manual-off.
+    - Health checks: ``--check`` prints the proxy URL and exits 0 when the
+      listener answers, exits 1 when it does not.
+
+    Expects:
+    - ``cmd``: argv to exec via os.execvpe (child replaces this process; exit
+      code flows through).
+    - ``--force-proxy`` refuses to run (exit 4) when the listener is down;
+      ``--force-direct`` skips the probe and always strips the proxy env.
+    - ``--check`` ignores ``cmd``.
+
+    Returns:
+    - Child exit code (exec path), 4 for a refused --force-proxy run, 1 for
+      --check when the listener is down, 1 for a missing command.
+    """
+    timeout = max(0.001, timeout_ms / 1000.0)
+    if check:
+        port = _config_port()
+        if _listener_healthy(port, timeout):
+            print(f"http://127.0.0.1:{port}")
+            return 0
+        return 1
+    if not cmd:
+        return fail("with-proxy: no command given (usage: router.py with-proxy [flags] -- <cmd...>)")
+    if force_proxy and force_direct:
+        return fail("with-proxy: --force-proxy and --force-direct are mutually exclusive")
+    port = _config_port()
+    healthy = _listener_healthy(port, timeout)
+    if force_proxy and not healthy:
+        print(f"router: proxy listener 127.0.0.1:{port} is down; refusing --force-proxy run", file=sys.stderr)
+        return 4
+    env = dict(os.environ)
+    if (healthy and not force_direct) or force_proxy:
+        url = f"http://127.0.0.1:{port}"
+        for var in PROXY_ENV_VARS:
+            env[var] = url
+    else:
+        for var in PROXY_ENV_VARS:
+            env.pop(var, None)
+    try:
+        os.execvpe(cmd[0], cmd, env)
+    except OSError as exc:
+        return fail(f"with-proxy: cannot execute {cmd[0]}: {exc}")
+    return 127  # unreachable: execvpe only returns on error
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+def _engine_runs_as_root() -> bool:
+    """True when the live engine process is owned by root.
+
+    An engine started via `sudo vpn on` keeps running as root after `vpn
+    off` returns to proxy mode. Its pid file is root-owned mode 0600, so a
+    regular user cannot read it; a root-owned pid file is therefore
+    treated as "the engine is root's" (any live process behind it was
+    spawned by root — re-reading it after a stale root file simply makes
+    the elevated run clean it up). A readable root-owned pid file is
+    confirmed against `ps` so a recycled pid never over-elevates. This
+    probe is read-only and safe from any invocation.
+    """
+    if os.name == "nt" or os.geteuid() == 0:
+        return False
+    try:
+        st = os.stat(PID_FILE)
+    except OSError:
+        return False
+    if st.st_uid != 0:
+        return False
+    try:
+        pid = int(PID_FILE.read_text().strip())
+    except PermissionError:
+        # Root-owned 0600 file, unreadable as a regular user: root's engine.
+        return True
+    except (ValueError, OSError):
+        return False
+    try:
+        probe = subprocess.run(
+            ["ps", "-o", "user=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=3,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return probe.stdout.strip() == "root"
+
+
+def _needs_elevation(args) -> bool:
+    """Whether this invocation must re-run as root before doing anything.
+
+    TUN mode needs root (utun creation, route table) and the engine then
+    runs as root, so `vpn on` and tun-mode engine commands cannot run as a
+    regular user. Proxy-mode engine commands must also elevate while the
+    engine ITSELF runs as root (started via `sudo vpn on`): a user-level
+    `stop` cannot signal it, and `start` would clobber the root-owned pid
+    file (issue #12 — the tray Stop failed with "Cannot stop because it is
+    run with sudo"). Only interactive macOS sessions elevate:
+    launchd/keepalive ticks have no TTY and must never pop a password
+    dialog on every interval (they keep the existing clear-error behavior
+    instead). Once `elevate install` granted passwordless sudo, elevation
+    is silent, so the TTY gate lifts and background ticks may also elevate.
+    """
+    if sys.platform != "darwin" or os.geteuid() == 0:
+        return False
+    if os.environ.get("PROXY_ROUTER_ELEVATED"):
+        return False
+    if not sys.stdin.isatty() and not _sudoers_installed():
+        return False
+    mode = current_mode()
+    if args.cmd == "vpn":
+        return args.action in ("on", "restart") or (args.action == "off" and mode == "tun")
+    return (args.cmd in ("start", "stop", "ensure", "reload", "rotate", "add", "remove")
+            and (mode == "tun" or _engine_runs_as_root()))
+
+
+def profile_copy(provider: str, sources: list[str]) -> int:
+    """Copy validated local WireGuard profiles into a configured provider.
+
+    This is the short, scriptable path for sharing profiles: it accepts files
+    or directories, sanitizes names, avoids overwrites, and preserves private
+    profile permissions without ever printing profile contents.
+    """
+    if not isinstance(provider, str) or not _PROVIDER_NAME.fullmatch(provider):
+        return fail(f"profile copy: invalid provider '{provider}'")
+    if provider not in _providers:
+        return fail(f"profile copy: unknown provider '{provider}'")
+    try:
+        import setup_tui
+        destination = provider_dir(provider)
+        results = []
+        for raw in sources:
+            source = Path(os.path.expanduser(raw))
+            results.append(setup_tui.import_profiles(source, destination))
+    except (OSError, ValueError, TypeError) as exc:
+        return fail(f"profile copy: {exc}")
+    imported = sum(result["imported"] for result in results)
+    rejected = sum(result["rejected"] for result in results)
+    files = [name for result in results for name in result["files"]]
+    rejected_files = [entry for result in results for entry in result["rejected_files"]]
+    if imported:
+        print(f"profile copy: imported {imported} profile(s) into {destination.relative_to(ROOT)}")
+        for name in files:
+            print(f"  + {name}")
+    for entry in rejected_files:
+        print(f"  - {entry['name']}: {entry['reason']}", file=sys.stderr)
+    if rejected:
+        print(f"profile copy: rejected {rejected} file(s)", file=sys.stderr)
+    return 0 if imported else 1
+
+
+def _elevate_macos() -> int:
+    """Re-run the current command with administrator privileges (macOS).
+
+    Instead of requiring the user to type `sudo python3 router.py vpn on`,
+    re-exec the exact same CLI through the standard macOS "… wants to make
+    changes" password dialog (osascript `do shell script … with administrator
+    privileges`), which asks for permission on every run.
+
+    SUDO_UID/SUDO_GID are injected so `_hand_back_ownership` hands state
+    files back to the invoking user; PROXY_ROUTER_ELEVATED prevents
+    recursion; PATH is passed through so the bundled sing-box still resolves.
+    """
+    env = (
+        f"SUDO_UID={os.getuid()} SUDO_GID={os.getgid()} "
+        f"PROXY_ROUTER_ELEVATED=1 "
+        f"PATH={shlex.quote(os.environ.get('PATH', ''))}"
+    )
+    cmd = shlex.join([sys.executable, os.path.abspath(__file__), *sys.argv[1:]])
+    shell_cmd = f"{env} {cmd}"
+    # AppleScript string literals accept only `\"` and `\\` escapes; escape
+    # the shell command's quotes/backslashes but keep the literal delimiters
+    # unescaped (a `\` at expression position is a syntax error).
+    content = shell_cmd.replace("\\", "\\\\").replace('"', '\\"')
+    script = f'do shell script "{content}" with administrator privileges'
+    proc = subprocess.run(["osascript", "-e", script], text=True)
+    if proc.returncode != 0:
+        print("router: elevation canceled or failed; run with sudo manually if needed",
+              file=sys.stderr)
+    return proc.returncode
+
+
+SUDOERS_FILE = Path("/etc/sudoers.d/91-proxy-router")
+
+# One NOPASSWD entry per engine-command shape the elevation path may run.
+# sudoers matches the FULL argv; `*` matches exactly one argument, so
+# multi-arg shapes get their own line. sudo execs the command directly
+# (no shell interpolation), so `*` can never smuggle arguments into the
+# interpreter or script.
+SUDOERS_COMMANDS = (
+    ("vpn", "*"),
+    ("start",),
+    ("stop",),
+    ("reload",),
+    ("ensure",),
+    ("rotate", "*"),
+    ("rotate", "*", "--reason", "*"),
+)
+
+# stderr markers that prove `sudo -n` DENIED (vs the command itself
+# failing). A sudoers grant is a snapshot of the command shapes at install
+# time, so a command added later (e.g. `start`/`stop` for issue #12) can
+# hit a denial even when the probe passes; callers fall back to the admin
+# dialog on these markers instead of surfacing a raw sudo error.
+_SUDO_DENIAL_TOKENS = (
+    "a password is required",
+    "not in the sudoers",
+    "must have a tty",
+)
+
+# Root-owned engine (started via `sudo vpn on`): a regular user cannot
+# signal it, so name the one-time grant and the manual sudo escape hatch
+# (issue #12). Shared by engine_stop's two PermissionError paths.
+_ROOT_ENGINE_HINT = ("router: engine runs as root (started via sudo); run "
+                     "`router.py elevate install` once to stop it from the tray, "
+                     "or stop it now with `sudo python3 router.py stop`")
+
+
+def _sudoers_rules(user: str, python: str, router_path: str) -> str:
+    """Render the sudoers NOPASSWD rules for the given interpreter + script."""
+    lines = ["# Managed by `proxy-router elevate install`; remove with `elevate uninstall`."]
+    for shape in SUDOERS_COMMANDS:
+        cmd = " ".join([python, router_path, *shape])
+        lines.append(f"{user} ALL=(root) NOPASSWD: {cmd}")
+    return "\n".join(lines) + "\n"
+
+
+def _sudoers_installed() -> bool:
+    """True when `sudo -n` may run this script's engine commands without a prompt.
+
+    Executes (not lists) the read-only `vpn status` command with `-n`.
+    `sudo -n -l` is a false positive when a sudoers rule exists but still
+    requires a password: listing succeeds but executing fails, e.g. a
+    plain `kyson ALL=(ALL) ALL` entry. Every sudoers rule shares the
+    interpreter + script prefix, so one execution proves the whole set."""
+    if os.geteuid() == 0 or not shutil.which("sudo"):
+        return os.geteuid() == 0
+    cmd = [sys.executable, os.path.abspath(__file__), "vpn", "status"]
+    probe = subprocess.run(["sudo", "-n", *cmd], capture_output=True, text=True)
+    if probe.returncode == 0:
+        return True
+    # `vpn status` exits 1 while the engine is down (rc 0 only when the
+    # engine is up and matches the persisted mode), so a nonzero exit is
+    # NOT proof the grant is missing. Only a sudo-level denial on stderr
+    # means the NOPASSWD rule is absent; `sudo -n` reports that denial
+    # there ("a password is required", "not in the sudoers file",
+    # requiretty) instead of running the command.
+    stderr = (probe.stderr or "").lower()
+    return not any(token in stderr for token in _SUDO_DENIAL_TOKENS)
+
+
+def _elevate() -> int:
+    """Re-run the current command as root: silently when `elevate install`
+    granted passwordless sudo, else through the macOS admin dialog.
+
+    A sudoers grant is a snapshot of the command shapes at install time; a
+    command added to the elevation surface afterwards (e.g. `start`/`stop`
+    for issue #12) can be denied even though the probe passes. A sudo-level
+    denial on stderr falls back to the admin dialog; a nonzero exit that is
+    NOT a denial is the elevated command itself failing and is returned
+    unchanged (no dialog for a real engine error)."""
+    if _sudoers_installed():
+        cmd = [sys.executable, os.path.abspath(__file__), *sys.argv[1:]]
+        probe = subprocess.run(["sudo", "-n", *cmd], capture_output=True, text=True)
+        if probe.returncode == 0:
+            return 0
+        stderr = (probe.stderr or "").lower()
+        if not any(token in stderr for token in _SUDO_DENIAL_TOKENS):
+            return probe.returncode
+    if not sys.stdin.isatty():
+        # keepalive/launchd tick: never pop an admin dialog. The TTY gate in
+        # _needs_elevation normally stops ticks from reaching this; a stale
+        # grant whose probed shape was denied would otherwise fall through
+        # to the dialog on every interval.
+        return 1
+    return _elevate_macos()
+
+
+def cmd_elevate(action: str) -> int:
+    """`elevate install|uninstall|status`: manage the one-time sudoers grant."""
+    if action == "status":
+        if _sudoers_installed():
+            print("elevate: passwordless sudo for engine commands is active")
+            return 0
+        print("elevate: not installed; run `router.py elevate install` for one-time setup",
+              file=sys.stderr)
+        return 1
+    if action == "uninstall":
+        if os.geteuid() != 0:
+            return _elevate()  # re-runs as root; silent when rules exist
+        # Rooted re-run: remove the file we manage.
+        if SUDOERS_FILE.exists():
+            SUDOERS_FILE.unlink()
+            print(f"elevate: removed {SUDOERS_FILE}")
+        return 0
+
+    rules = _sudoers_rules(getpass.getuser(), sys.executable, os.path.abspath(__file__))
+    if os.geteuid() != 0:
+        # One prompt (or none, if sudo already works): write, validate with
+        # visudo, then atomically install. Re-run as root and continue.
+        # `_elevate` (not a raw `sudo -n`) so a grant that lacks the
+        # `elevate install` shape (it never includes itself) falls back to
+        # the admin dialog instead of a raw sudo denial.
+        return _elevate()
+
+    if SUDOERS_FILE.exists():
+        existing = SUDOERS_FILE.read_text()
+        managed = existing.splitlines()[0].startswith("# Managed by `proxy-router")
+        if not managed:
+            print(f"elevate: {SUDOERS_FILE} exists with foreign content; move it aside first",
+                  file=sys.stderr)
+            return 1
+        if existing == rules:
+            print(f"elevate: already installed ({SUDOERS_FILE})")
+            return 0
+        print("elevate: interpreter or script path changed; rewriting rules", file=sys.stderr)
+
+    tmp = SUDOERS_FILE.with_name(SUDOERS_FILE.name + ".tmp")
+    payload = base64.b64encode(rules.encode()).decode()
+    tmp.write_bytes(b"")
+    tmp.write_text(rules)
+    os.chmod(tmp, 0o440)
+    if subprocess.run(["/usr/sbin/visudo", "-c", "-f", str(tmp)]).returncode != 0:
+        tmp.unlink(missing_ok=True)
+        print("elevate: generated sudoers rules failed visudo validation; nothing installed",
+              file=sys.stderr)
+        return 1
+    tmp.rename(SUDOERS_FILE)
+    print(f"elevate: installed {SUDOERS_FILE}; engine commands now run without a password prompt")
+    return 0
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(prog="router", description="selective WireGuard proxy router")
@@ -2539,14 +4067,19 @@ def main() -> int:
     init = sub.add_parser("init")
     init.add_argument("--force", action="store_true", help="overwrite an existing router.json")
 
-    vpn = sub.add_parser("vpn", help="toggle TUN mode (vpn on|off|status)")
-    vpn.add_argument("action", choices=["on", "off", "status"])
+    vpn = sub.add_parser("vpn", help="toggle TUN mode (on|off|restart|status|capture)")
+    vpn.add_argument("action", choices=["on", "off", "restart", "status", "capture"])
+    vpn.add_argument("capture", nargs="?", choices=["ruleset", "routes"],
+                     help="TUN capture scope for `vpn capture`")
 
     setup = sub.add_parser("setup", help="interactive Proton/WARP setup wizard")
     setup.add_argument("setup_args", nargs=argparse.REMAINDER)
 
     monitor = sub.add_parser("monitor", help="opt-in network monitoring")
     monitor.add_argument("monitor_args", nargs=argparse.REMAINDER)
+
+    watcher = sub.add_parser("watcher", help="standalone routed-connection watcher")
+    watcher.add_argument("watcher_args", nargs=argparse.REMAINDER)
 
     r_add = sub.add_parser("add")
     r_add.add_argument("--id")
@@ -2558,7 +4091,11 @@ def main() -> int:
     r_rm.add_argument("id")
 
     r_rot = sub.add_parser("rotate")
-    r_rot.add_argument("provider")
+    r_rot.add_argument("provider", nargs="?", help="provider name (optional with --if-due)")
+    r_rot.add_argument("--if-due", action="store_true",
+                       help="scheduled rotation: only rotate when the configured interval elapsed (exit 3 when not due)")
+    r_rot.add_argument("--to", default=None,
+                       help="switch to this exact exit profile instead of the ranked next one (e.g. 01-NL-FREE-140)")
     r_rot.add_argument("--reason", default=None,
                        help="mark the current profile with an upstream error/cooldown before rotating (e.g. 503, 429, timeout, 1010)")
     r_rot.add_argument("--force", action="store_true",
@@ -2566,10 +4103,52 @@ def main() -> int:
     r_rot.add_argument("--no-probe", action="store_true",
                        help="skip the post-switch egress probe")
 
+    r_event = sub.add_parser("response-event", help="handle an observed upstream response")
+    r_event.add_argument("--host", required=True, help="destination hostname observed by the proxy")
+    r_event.add_argument("--status", required=True, type=int, help="HTTP response status")
+    r_event.add_argument("--provider", default=None, help="expected route provider")
+    r_event.add_argument("--dedupe-seconds", type=int, default=5,
+                         help="suppress duplicate events for this many seconds")
+
+    w_proxy = sub.add_parser("with-proxy", help="run a command through the proxy when up, else direct (fail-open)")
+    w_proxy.add_argument("--timeout-ms", type=int, default=300, help="listener probe timeout (default 300)")
+    w_proxy_group = w_proxy.add_mutually_exclusive_group()
+    w_proxy_group.add_argument("--force-proxy", action="store_true",
+                               help="fail (exit 4) instead of running direct when the listener is down")
+    w_proxy_group.add_argument("--force-direct", action="store_true",
+                               help="skip the probe and always run direct")
+    w_proxy.add_argument("--check", action="store_true",
+                         help="print the proxy URL and exit 0 if the listener answers, else exit 1")
+    w_proxy.add_argument("cmd_tail", nargs=argparse.REMAINDER,
+                         help="-- <cmd...> (argv after a leading --)")
+
+    failover = sub.add_parser("failover", help="activate or clear a provider fallback")
+    failover.add_argument("provider")
+    failover.add_argument("action", choices=["on", "off", "status"])
+    failover.add_argument("--to", default=None, help="fallback provider (must match config)")
+    failover.add_argument("--reason", default="transport")
+    failover.add_argument("--json", action="store_true")
+
     r_count = sub.add_parser("provider-count")
     r_count.add_argument("provider")
 
+    profile = sub.add_parser("profile", help="manage local WireGuard profiles")
+    profile_sub = profile.add_subparsers(dest="profile_action")
+    profile_copy_parser = profile_sub.add_parser(
+        "copy", help="copy validated .conf file(s)/directory into a provider"
+    )
+    profile_copy_parser.add_argument("sources", nargs="+", metavar="PATH")
+    profile_copy_parser.add_argument("--provider", required=True,
+                                    help="configured destination provider (e.g. proton)")
+
+    elevate = sub.add_parser("elevate", help="one-time passwordless-sudo grant (install|uninstall|status)")
+    elevate.add_argument("action", choices=["install", "uninstall", "status"])
+
     args, passthrough = parser.parse_known_args()
+    if args.cmd == "elevate":
+        return cmd_elevate(args.action)
+    if _needs_elevation(args):
+        return _elevate()
     if args.cmd == "setup":
         import setup_tui
 
@@ -2578,8 +4157,20 @@ def main() -> int:
         import monitor
 
         return monitor.main(["monitor", *args.monitor_args, *passthrough], root=ROOT)
+    if args.cmd == "watcher":
+        import route_watcher
+
+        return route_watcher.main(["watcher", *args.watcher_args, *passthrough], root=ROOT)
     if passthrough:
         parser.error("unrecognized arguments: " + " ".join(passthrough))
+    if args.cmd == "with-proxy":
+        # Fail-open must work even with a broken/missing router.json, so it
+        # bypasses the load_config gate below (it only reads the port).
+        tail = args.cmd_tail
+        if tail and tail[0] == "--":
+            tail = tail[1:]
+        return with_proxy(tail, timeout_ms=args.timeout_ms, force_proxy=args.force_proxy,
+                          force_direct=args.force_direct, check=args.check)
     if args.cmd == "init":
         return write_default_config(force=getattr(args, "force", False))
     if args.cmd is None:
@@ -2595,8 +4186,13 @@ def main() -> int:
     if args.cmd == "up":
         if sys.platform != "darwin":
             return fail("up requires macOS (v1 scope)")
+        # `up` is the reconnect path for the tray and CLI: remove the manual
+        # disconnect marker before asking the keepalive to watch again.
+        MANUAL_OFF_FILE.unlink(missing_ok=True)
         rc = load_config()
         if rc == 0 and engine_start() == 0:
+            route_watcher_start()
+            ensure_tray_started()
             return system_proxy_on()
         return rc
     if args.cmd == "down" and sys.platform != "darwin":
@@ -2623,11 +4219,58 @@ def main() -> int:
         return rc
 
     if args.cmd == "ensure":
-        return _with_lock(engine_ensure)
+        rc = _with_lock(engine_ensure)
+        if rc == 0:
+            route_watcher_start()
+        else:
+            route_watcher_stop()
+        return rc
     if args.cmd == "start":
-        return _with_lock(engine_start)
+        # Explicit start (tray Connect / CLI) cancels any manual-off state.
+        MANUAL_OFF_FILE.unlink(missing_ok=True)
+        route_watcher_stop()
+        rc = _with_lock(engine_start)
+        if rc == 0:
+            route_watcher_start()
+            ensure_tray_started()
+            # `start` is the user-facing Connect path. In proxy mode the
+            # engine can be healthy while GUI apps still bypass it unless the
+            # macOS service proxy is enabled here too. Keep TUN mode's proxy
+            # disabled: TUN has no reason to point apps at 127.0.0.1:2080.
+            if sys.platform == "darwin":
+                proxy_rc = (system_proxy_on() if current_mode() == "proxy"
+                            else system_proxy_off())
+                if proxy_rc != 0:
+                    return proxy_rc
+        return rc
     if args.cmd == "stop":
-        return _with_lock(engine_stop)
+        # Disable the macOS-wide proxy BEFORE stopping sing-box. If
+        # networksetup cannot clear it, keep the engine alive rather than
+        # leaving every GUI app pointed at a dead 127.0.0.1:2080 listener.
+        if sys.platform == "darwin":
+            proxy_rc = system_proxy_off()
+            if proxy_rc != 0:
+                return proxy_rc
+        route_watcher_stop()
+        rc = _with_lock(engine_stop)
+        if rc == 0:
+            # Manual disconnect: tell keepalive.sh to leave the engine down.
+            # Without this marker the keepalive's next `ensure` tick
+            # resurrects the proxy within 15s and the tray's Disconnect
+            # looks broken.
+            try:
+                MANUAL_OFF_FILE.write_text(
+                    f"manual stop {datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')}\n",
+                    encoding="utf-8",
+                )
+                try:
+                    MANUAL_OFF_FILE.chmod(0o600)
+                except OSError:
+                    pass
+            except OSError as e:
+                print(f"router: warning: could not write manual-off marker: {e}",
+                      file=sys.stderr)
+        return rc
     if args.cmd == "status":
         if resolve_sing_box() is None:
             print(f"router: {_sing_box_missing_message()}", file=sys.stderr)
@@ -2638,10 +4281,35 @@ def main() -> int:
             print(line)
         return rc
     if args.cmd == "reload":
-        return _with_lock(engine_reload)
+        rc = _with_lock(engine_reload)
+        if rc == 0:
+            route_watcher_start()
+        return rc
     if args.cmd == "rotate":
+        if args.if_due:
+            return _with_lock(lambda: rotate_due(args.provider))
+        if not args.provider:
+            parser.error("rotate needs a provider (or use --if-due for scheduled rotation)")
         return _with_lock(lambda: rotate(args.provider, reason=args.reason, force=args.force,
-                                         probe=not args.no_probe))
+                                         probe=not args.no_probe, to=args.to))
+    if args.cmd == "response-event":
+        return _with_lock(lambda: response_event(
+            args.host, args.status, provider=args.provider,
+            dedupe_seconds=args.dedupe_seconds,
+        ))
+    if args.cmd == "failover":
+        if args.action == "on":
+            return _with_lock(lambda: activate_fallback(
+                args.provider, target=args.to, reason=args.reason))
+        if args.action == "off":
+            return _with_lock(lambda: deactivate_fallback(args.provider))
+        state = fallback_status(args.provider)
+        if args.json:
+            print(json.dumps(state, indent=2, sort_keys=True))
+        else:
+            print(f"fallback {args.provider}: configured={state['configured'] or 'none'} "
+                  f"active={state['active'] or 'none'}")
+        return 0
     if args.cmd == "egress":
         if args.action == "probe":
             return egress_probe(args.provider)
@@ -2653,6 +4321,10 @@ def main() -> int:
     if args.cmd == "provider-count":
         print(provider_count(args.provider))
         return 0
+    if args.cmd == "profile":
+        if args.profile_action == "copy":
+            return profile_copy(args.provider, args.sources)
+        parser.error("profile needs an action: copy")
     if args.cmd == "routes":
         return routes_list()
     if args.cmd == "routing":
@@ -2666,10 +4338,28 @@ def main() -> int:
             return routing_cli_remove(args.mode, args.domain)
         parser.error("routing needs an action: show | set | add | remove")
     if args.cmd == "vpn":
+        if args.action == "capture":
+            if args.capture is None:
+                parser.error("vpn capture needs a scope: routes | ruleset")
+            return _with_lock(lambda: vpn_capture(args.capture))
         if args.action == "on":
-            return _with_lock(vpn_on)
+            route_watcher_stop()
+            rc = _with_lock(vpn_on)
+            if rc == 0:
+                route_watcher_start()
+            return rc
+        if args.action == "restart":
+            route_watcher_stop()
+            rc = _with_lock(vpn_restart)
+            if rc == 0:
+                route_watcher_start()
+            return rc
         if args.action == "off":
-            return _with_lock(vpn_off)
+            route_watcher_stop()
+            rc = _with_lock(vpn_off)
+            if rc == 0:
+                route_watcher_start()
+            return rc
         return vpn_status()
     if args.cmd == "add":
         return _with_lock(lambda: routes_add(args))

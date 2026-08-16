@@ -22,6 +22,8 @@
     <string>en_US.UTF-8</string>
     <key>PATH</key>
     <string>@PATH@</string>
+    <key>SING_BOX</key>
+    <string>/opt/homebrew/bin/sing-box</string>
   </dict>
 
   <key>LimitLoadToSessionType</key>
@@ -34,7 +36,12 @@
   <true/>
 
   <key>KeepAlive</key>
-  <true/>
+  <dict>
+    <!-- A disabled autocheck worker exits successfully; do not respawn it in a
+         tight launchd loop. Crash/abnormal exit still gets supervised. -->
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
 
   <key>ThrottleInterval</key>
   <integer>30</integer>

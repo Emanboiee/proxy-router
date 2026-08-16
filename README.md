@@ -15,8 +15,9 @@ keeps the route table conservative; `proxy-router setup --preset` applies the
 validated Proton/WARP presets explicitly.
 
 On the current deployment, OpenCode Zen uses the Proton pool and Roblox uses
-Cloudflare WARP. Direct egress remains the fallback when all tunnel exits are
-unhealthy.
+Cloudflare WARP. Proton routes declare Cloudflare WARP as their explicit
+provider fallback; direct egress remains the final fallback only when the
+configured tunnel route is removed or the router is down.
 
 Core CLI runs on macOS, Linux, and Windows. The macOS-only bits (`up`/`down`
 and the launchd keep-alive) are guarded and print a clear message elsewhere.
@@ -65,7 +66,7 @@ proxy-router ensure
 
 `proxy-router setup` with no flags opens the custom terminal wizard. It never
 enables TUN mode or starts monitoring unless you explicitly choose those
-operations. Menu item 9 installs/verifies the Hermes OpenCode auto-rotation
+operations. Menu item 8 installs/verifies the Hermes OpenCode auto-rotation
 bridge (placed at `$OPENCODE_ZEN_VPN_ROOT/proxy-manager.sh`).
 
 ## Layout
@@ -97,7 +98,12 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py routes               # list route table
 ./router.py vpn on               # full TUN mode: route everything via the engines' rules
 ./router.py vpn off              # stop the TUN, back to proxy mode
+./router.py vpn restart          # stop + re-enter TUN in one step (single elevation prompt)
 ./router.py vpn status           # show current mode and liveness
+./router.py elevate install      # one-time macOS admin prompt; afterwards engine commands run
+                                 # without prompts (vpn on/off/restart, reload, ensure, rotate)
+./router.py elevate uninstall    # remove the passwordless-sudo grant
+./router.py elevate status       # is the grant active for this interpreter/script?
 ./router.py add --domain example.com --provider proton [--id my-route]
 ./router.py add --ip 1.2.3.0/24 --provider proton [--id my-route]
 ./router.py remove <id>
@@ -105,7 +111,14 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py rotate <provider> --reason 503|429|timeout|1010  # mark CURRENT exit failed upstream, prefer a different one
 ./router.py rotate <provider> --force   # switch anyway, ignoring cooldowns and blocked exits
 ./router.py rotate <provider> --no-probe # skip the post-switch egress probe
+./router.py rotate --if-due      # scheduled rotation: only when the interval elapsed (exit 3 = not due)
+./router.py failover proton on [--to mullvad]  # route Proton domains through its configured fallback chain (first valid entry, or the named member)
+./router.py failover proton off    # clear fallback and restore Proton routes
+./router.py failover proton status --json   # configured chain + active fallback
 ./router.py provider-count proton # rotation candidates (retry budget)
+./router.py with-proxy [--timeout-ms 300] [--force-proxy|--force-direct] -- <cmd...>
+                                 # fail-open runner: exec <cmd> through the proxy when up, else direct
+./router.py with-proxy --check   # health check: prints proxy URL + exit 0 when up, exit 1 when down
 ./router.py egress probe [provider]  # probe current exit(s) through the tunnel, persist health
 ./router.py egress show [provider]   # print persisted egress records (JSON)
 ./router.py egress check [--provider <name>] [--json]  # read-only live check: exit 1 ONLY when an active exit is DEAD
@@ -183,6 +196,20 @@ Rotation is then egress-aware instead of blind round-robin:
   means resolution through the tunnel failed, `dns_ok: true` means a later
   dial/read stage failed. Exit code is 1 only when an exit is `dead`, so
   automation never rotates on a reputation-block HTTP status.
+- A provider can declare `fallback_provider` (the deployment maps Proton to
+  Cloudflare WARP). The value may be a single provider name or an **ordered
+  list** forming a fallback chain, e.g.
+  `"fallback_provider": ["cloudflare", "mullvad"]` — entries are validated at
+  load (must name another configured provider, no self/duplicates) and the
+  chain is walked in order, so the first entry with valid profiles wins. When
+  rotation exhausts the primary pool, the wrapper, keepalive, or Hermes
+  rotation bridge writes a private runtime marker and reloads once with the
+  primary endpoint removed; matching routes and DNS then use the chosen
+  fallback. `failover <name> on [--to <provider>]` activates the first valid
+  chain entry (or a specific member); `failover <name> status --json` reports
+  both `configured` (the full chain) and `active`. `egress check`/`sweep`
+  report `fallback` instead of probing Proton through WARP. Clear it
+  explicitly with `failover proton off` after Proton has been validated again.
 - A `sing-box.json.last-good` snapshot (atomic, 0600) is written whenever a
   freshly built config validates AND the engine demonstrably comes up with it;
   if a later reload's config fails validation or the engine fails to come up,
@@ -262,13 +289,34 @@ Platform notes:
   (`sudo proxy-router vpn on`).
 - **Windows**: needs an elevated shell and `wintun.dll` next to
   `sing-box.exe` (drop it from the official Wintun release).
-- **macOS**: needs root to create the `utun` interface
-  (`sudo proxy-router vpn on`). This is NOT a System Settings VPN provider
-  entry — that would require a signed NetworkExtension app. It is a TUN
-  interface managed from the terminal.
+- **macOS**: needs root to create the `utun` interface. Running
+  `proxy-router vpn on` (or any engine command while TUN mode is active) as a
+  regular user in an interactive terminal re-executes itself through the
+  standard macOS admin-password dialog (`osascript` with administrator
+  privileges). Run `proxy-router elevate install` once (single admin prompt)
+  to grant passwordless sudo for exactly the engine commands (see below);
+  afterwards `vpn on`/`vpn off`/`vpn restart`/`reload`/`ensure`/`rotate` run
+  silently, even from background keepalive/launchd ticks. Without the grant,
+  interactive runs ask for permission every time — no manual `sudo` needed —
+  and background ticks never prompt (they have no TTY) and keep the clear
+  "run with sudo" error instead. State files are handed back to the invoking
+  user automatically. Use `vpn restart` to cycle the TUN with a single prompt
+  (`vpn off && vpn on` asks twice). This is NOT a System Settings VPN
+  provider entry — that would require a signed NetworkExtension app. It is a
+  TUN interface managed from the terminal.
 
 TUN options live under `"vpn"` in `router.json`:
 `address` (CIDR list), `mtu`, `stack` (`system`, default | `gvisor`).
+
+`mtu` must fit the path to the WireGuard endpoint: if the physical network
+itself is tunneled (e.g. a school/proxy filter with a reduced inner MTU),
+the WireGuard packets fragment or get dropped, which reads as "TUN is
+slow". Measure the endpoint path with `ping -D -s <size> <endpoint>` and
+set `mtu` to `path_mtu - 80` (WireGuard overhead); 1280 is a safe
+default. `selective`/`selective_provider` is an optional IP-CIDR capture
+list from `rulesets/<name>.json` — only use it when you want TUN to
+capture exactly one site; with it set, all other domains fall out to
+direct and are NOT tunneled.
 
 Two more knobs in `"vpn"` control address-family policy:
 
@@ -281,6 +329,36 @@ Two more knobs in `"vpn"` control address-family policy:
   drop the WARP IPv4 endpoint so the IPv6 one must be used). This is a
   separate scope from `dns_strategy`: endpoints are the tunnel servers,
   destinations are the sites you route.
+- `dns_transport` — transport for the generated `dns-<provider>` servers that
+  resolve tunneled domains. Default `udp`. Set to `https` (DoH over TCP
+  443 to 1.1.1.1) on networks that drop UDP 53 to external resolvers while
+  allowing outbound TCP 443; the same IP literal is used as the server
+  address with `server_port: 443`.
+
+## One-time elevation (macOS)
+
+`vpn` engine commands need root to create the `utun` interface. Instead of an
+admin-password dialog on every run, grant passwordless sudo once:
+
+```sh
+./router.py elevate install    # one admin prompt; installs /etc/sudoers.d/91-proxy-router
+./router.py elevate status     # exit 0 when the grant matches this interpreter/script
+./router.py elevate uninstall  # remove the grant
+```
+
+The sudoers file only authorizes router engine subcommands for this interpreter
+script path (NOPASSWD for `start`, `stop`, `vpn *`, `reload`, `ensure`,
+`rotate`, `add`, and `remove`, plus the explicit legacy rotate shapes).
+The no-argument sudoers entries allow the validated option forms for those
+subcommands; sudo execs the command directly (no shell), so shell syntax is
+not interpreted as part of the grant. State files are handed back to the invoking user via
+the `SUDO_UID`/`SUDO_GID` sudo sets automatically. With the grant in place,
+the interactive dialog path is skipped and background keepalive/launchd ticks
+can also elevate silently — `vpn on`/`vpn off`/`vpn restart` never prompt
+again. The tray's Connect/Disconnect and the CLI's proxy-mode `start`/`stop`
+also elevate automatically while the engine runs as root, so an engine
+started via `sudo vpn on` stays manageable after `vpn off` returns to proxy
+mode.
 
 ## Provider setup
 
@@ -291,7 +369,7 @@ becomes the sing-box endpoint tag.
 The easiest path is the setup wizard:
 
 ```sh
-proxy-router setup                  # interactive terminal menu (item 9: Hermes rotation bridge)
+proxy-router setup                  # interactive terminal menu (item 8: Hermes rotation bridge)
 proxy-router setup --guide proton   # print the bundled Proton guide
 proxy-router setup --guide warp     # print the bundled WARP guide
 proxy-router setup --import-proton ~/Downloads/*.conf
@@ -322,7 +400,8 @@ replaced by public DNS through the tunnel.
   "routes": [
     { "id": "opencode-zen", "domains": ["opencode.ai"], "provider": "proton" },
     { "id": "roblox", "domains": ["roblox.com", "rbxcdn.com", "robloxlabs.com", "rblx.com"], "provider": "cloudflare" }
-  ]
+  ],
+  "rotation": { "interval_seconds": 7200, "jitter_seconds": 300 }
 }
 ```
 
@@ -408,6 +487,70 @@ rotations are capped at `PROXY_KEEPALIVE_MAX_ROTATIONS` (default 2) per
 `PROXY_KEEPALIVE_STORM_WINDOW` seconds (default 600), so a genuinely broken
 pool can never rotation-storm.
 
+Fallback is part of the same self-heal loop. When a dead pool refuses to
+rotate, `rotate_dead` activates the provider's configured fallback
+(`failover <provider> on --reason timeout`) instead of giving up, so routed
+domains keep working through the fallback tunnel. While a fallback is active,
+`egress check`/`sweep` report `fallback` and never probe the primary pool.
+On the full-pool sweep cadence (`PROXY_KEEPALIVE_SWEEP_EVERY`, default 1800s)
+the keepalive therefore attempts ONE restore per fallback-parked provider:
+it clears the marker (`failover off`), probes the primary live through the
+tunnel, keeps the fallback cleared when the primary answers, and re-activates
+the fallback when the primary is still dead. The sweep cadence throttles the
+restore, so a genuinely dead primary never causes a failover off/on storm.
+
+## Scheduled rotation
+
+By default the router only rotates reactively (dead tunnel, upstream
+429/503/...). With a `rotation` block in `router.json` the keepalive loop also
+rotates proactively on a fixed cadence, so the active exit's egress IP churns
+before upstream rate limits accumulate:
+
+```json
+"rotation": { "interval_seconds": 7200, "jitter_seconds": 300 }
+```
+
+- `interval_seconds` — rotate every N seconds (0 or absent = off; default
+  config enables 7200 = 2h).
+- `jitter_seconds` — spread the next rotation by ±jitter/2 around the exact
+  interval (default 300), so the switch doesn't tick in lockstep with other
+  clients on the same provider.
+- Every healthy keepalive tick runs `router.py rotate --if-due`; it reads
+  `state/<provider>.rotation` and only acts once the interval has elapsed
+  (exit 0 = rotated, 3 = not due). It is skipped automatically while the
+  engine is down or `manual-off` is set.
+- A provider with no rotation record yet is seeded as "rotated now", so a
+  fresh install waits a full interval before the first switch.
+- Scheduled switches reuse the normal `rotate` path: verify-then-switch with
+  rollback, per-provider cooldowns, and storm-guarded by nothing extra — the
+  cadence itself is the guard. The current exit is NOT marked as an upstream
+  failure (a scheduled switch is a preference, not a failure signal).
+- `router.py status --json` reports `rotation.interval_seconds`,
+  `rotation.jitter_seconds`, and `rotation.next_at` (earliest upcoming switch).
+
+Manual rotation still works as before; scheduled rotation never forces past a
+blocked/cooldown profile.
+
+## Fail-open proxy runner
+
+Apps pointed at `127.0.0.1:<port>` (hermes, curl, a cron job, ...) break when
+the engine is down. `with-proxy` wraps any command with a health check: when
+the listener answers it runs the command with `http_proxy`/`https_proxy` (and
+uppercase variants) set, otherwise it strips those vars and runs DIRECT — the
+engine is never started, so `manual-off` stays honored:
+
+```sh
+./router.py with-proxy -- hermes model@opencode "..."   # proxy when up, direct otherwise
+./router.py with-proxy --check                          # prints http://127.0.0.1:2080, exit 0 when up
+./router.py with-proxy --force-proxy -- cmd...          # refuse (exit 4) instead of running direct
+./router.py with-proxy --force-direct -- cmd...         # always direct, skip the probe
+```
+
+Flags: `--timeout-ms` (probe timeout, default 300). The child replaces the
+wrapper via exec, so exit codes and signals pass through untouched. `--check`
+is what scripts should use for one-shot health checks (exit 0/1, prints the
+URL only when up).
+
 The dead-tunnel checks only ever probe the ACTIVE exit, so a pool could sit
 on a stale-but-alive lane forever. Every `PROXY_KEEPALIVE_SWEEP_EVERY`
 seconds (default 1800 = 30 min) the keepalive therefore runs a full-pool
@@ -423,6 +566,13 @@ on rate-limit/transient-http/transport failures it rotates the provider pool
 once per profile and retries the exact same command after 15s
 (`OPENCODE_RETRY_DELAY_SECONDS` to override, `OPENCODE_MAX_ATTEMPTS` to cap,
 `OPENCODE_PROVIDER` to change the pool).
+
+The wrapper is fail-open: it pre-flights with `router.py with-proxy --check`
+and only sets the proxy env while the listener is up. When the router is
+stopped or disabled, hermes runs DIRECT (no rotation, no engine resurrection)
+so it keeps working without the tunnel — useful when the Proton egress is
+rate-limited and you just want opencode to work. Rotation on failure resumes
+automatically once the proxy is back up.
 
 The Hermes `opencode_server_rotation` plugin expects a rotation manager at
 `tools/opencode-zen-vpn/proxy-manager.sh` (its `rotate` subcommand). That

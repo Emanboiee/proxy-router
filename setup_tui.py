@@ -38,6 +38,52 @@ from pathlib import Path
 
 _PRESET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 
+# Resource-aware keepalive profiles. Explicit CLI overrides can tune any of
+# these values without making users hand-edit JSON or environment variables.
+_AUTOCHECK_PRESETS = {
+    "off": {
+        "enabled": False,
+        "interval": 15,
+        "max_backoff": 300,
+        "probe_every": 4,
+        "dead_strikes": 2,
+        "storm_window": 600,
+        "max_rotations": 2,
+        "sweep_every": 1800,
+    },
+    "light": {
+        "enabled": True,
+        "interval": 30,
+        "max_backoff": 600,
+        "probe_every": 12,
+        "dead_strikes": 3,
+        "storm_window": 1800,
+        "max_rotations": 1,
+        "sweep_every": 7200,
+    },
+    "balanced": {
+        "enabled": True,
+        "interval": 15,
+        "max_backoff": 300,
+        "probe_every": 4,
+        "dead_strikes": 2,
+        "storm_window": 600,
+        "max_rotations": 2,
+        "sweep_every": 1800,
+    },
+    "aggressive": {
+        "enabled": True,
+        "interval": 10,
+        "max_backoff": 180,
+        "probe_every": 1,
+        "dead_strikes": 1,
+        "storm_window": 300,
+        "max_rotations": 3,
+        "sweep_every": 900,
+    },
+}
+_AUTOCHECK_NUMERIC = tuple(key for key in _AUTOCHECK_PRESETS["balanced"] if key != "enabled")
+
 try:
     import termios
     import tty
@@ -296,6 +342,49 @@ def import_profiles(source, destination, validator=None) -> dict:
     }
 
 
+def configure_autocheck(config_path, preset: str | None = None, **overrides) -> dict:
+    """Persist resource-aware keepalive settings without starting the engine.
+
+    ``preset`` is one of ``off``, ``light``, ``balanced``, or ``aggressive``.
+    Numeric overrides are validated and merged on top, making this suitable
+    for both a low-power laptop and a machine that can afford frequent pool
+    sweeps. Existing unrelated router settings are preserved.
+    """
+    config_path = Path(config_path)
+    if config_path.is_file():
+        data = json.loads(config_path.read_text())
+    else:
+        data = _default_config()
+    current = data.get("keepalive")
+    if not isinstance(current, dict):
+        current = {}
+    selected = preset or current.get("preset") or "balanced"
+    if selected not in _AUTOCHECK_PRESETS:
+        raise ValueError(f"unknown autocheck profile '{selected}'")
+    settings = dict(_AUTOCHECK_PRESETS[selected])
+    if preset is None:
+        for key, value in current.items():
+            if key in settings:
+                settings[key] = value
+    for key in _AUTOCHECK_NUMERIC:
+        value = overrides.get(key)
+        if value is None:
+            continue
+        try:
+            value = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"autocheck {key} must be an integer") from exc
+        if value < 1:
+            raise ValueError(f"autocheck {key} must be at least 1")
+        settings[key] = value
+    settings["preset"] = selected
+    data["keepalive"] = settings
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(data, indent=2) + "\n")
+    os.chmod(config_path, 0o600)
+    return settings
+
+
 # ---------------------------------------------------------------------------
 # guides
 # ---------------------------------------------------------------------------
@@ -346,7 +435,12 @@ def apply_presets(config_path, opencode=True, warp_roblox=True) -> dict:
 
     added: list[str] = []
     if opencode:
-        providers.setdefault("proton", {"directory": "providers/proton", "cooldown_seconds": 60})
+        proton_config = providers.setdefault("proton", {})
+        proton_config.setdefault("directory", "providers/proton")
+        proton_config.setdefault("cooldown_seconds", 60)
+        if warp_roblox or "cloudflare" in providers:
+            if "fallback_providers" not in proton_config and "fallback_provider" not in proton_config:
+                proton_config["fallback_providers"] = ["cloudflare"]
         if not any(r.get("id") == "opencode-zen" for r in routes):
             routes.append(dict(_PRESET_ROUTES["opencode-zen"]))
             added.append("opencode-zen")
@@ -361,6 +455,63 @@ def apply_presets(config_path, opencode=True, warp_roblox=True) -> dict:
     config_path.write_text(json.dumps(data, indent=2) + "\n")
     os.chmod(config_path, 0o600)
     return {"added": added}
+
+
+def configure_fallback(config_path, primary: str, candidates: list[str] | str) -> dict:
+    """Set an ordered fallback chain without starting or reloading the engine.
+
+    ``candidates`` may be a list or a comma-separated CLI value. The legacy
+    singular ``fallback_provider`` key is removed when a new chain is saved,
+    making the migration explicit while preserving every unrelated setting.
+    An empty candidate list clears the chain.
+    """
+    config_path = Path(config_path)
+    if config_path.is_file():
+        data = json.loads(config_path.read_text())
+    else:
+        data = _default_config()
+    providers = data.setdefault("providers", {})
+    if primary not in providers:
+        raise ValueError(f"unknown primary provider '{primary}'")
+    if isinstance(candidates, str):
+        candidates = [item.strip() for item in candidates.split(",") if item.strip()]
+    if not isinstance(candidates, list) or any(not isinstance(item, str) for item in candidates):
+        raise ValueError("fallback candidates must be a comma-separated provider list")
+    if len(set(candidates)) != len(candidates):
+        raise ValueError("fallback candidates must not contain duplicates")
+    if primary in candidates:
+        raise ValueError("a provider cannot fall back to itself")
+    unknown = [item for item in candidates if item not in providers]
+    if unknown:
+        raise ValueError(f"unknown fallback provider(s): {', '.join(unknown)}")
+    entry = providers[primary]
+    entry.pop("fallback_provider", None)
+    if candidates:
+        entry["fallback_providers"] = candidates
+    else:
+        entry.pop("fallback_providers", None)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(data, indent=2) + "\n")
+    os.chmod(config_path, 0o600)
+    return {"provider": primary, "fallback_providers": candidates}
+
+
+def configure_transparent(config_path, enabled: bool = True) -> dict:
+    """Select route-based TUN capture without starting or reloading the engine."""
+    config_path = Path(config_path)
+    if config_path.is_file():
+        data = json.loads(config_path.read_text())
+    else:
+        data = _default_config()
+    vpn = data.setdefault("vpn", {})
+    if not isinstance(vpn, dict):
+        raise ValueError("vpn configuration must be an object")
+    capture = "routes" if enabled else "ruleset"
+    vpn["capture"] = capture
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(data, indent=2) + "\n")
+    os.chmod(config_path, 0o600)
+    return {"capture": capture}
 
 
 def custom_preset_path(root: Path, name: str) -> Path:
@@ -428,8 +579,13 @@ def apply_preset_by_name(root: Path, name: str) -> dict:
     added: list[str] = []
     for route in preset.get("routes", []):
         if route.get("provider") and route["provider"] not in providers:
-            providers.setdefault(route["provider"], {
-                "directory": f"providers/{route['provider']}", "cooldown_seconds": 60})
+            provider_config = {
+                "directory": f"providers/{route['provider']}",
+                "cooldown_seconds": 60,
+            }
+            if route["provider"] == "proton" and "cloudflare" in providers:
+                provider_config["fallback_providers"] = ["cloudflare"]
+            providers.setdefault(route["provider"], provider_config)
         if not any(r.get("id") == route.get("id") for r in routes):
             routes.append(dict(route))
             added.append(str(route.get("id")))
@@ -442,6 +598,8 @@ def apply_preset_by_name(root: Path, name: str) -> dict:
         if routing.get("default_provider"):
             data["routing"]["default_provider"] = routing["default_provider"]
     config_path.parent.mkdir(parents=True, exist_ok=True)
+    # record the applied preset so `status` (and the tray) can show it
+    data["preset"] = name
     config_path.write_text(json.dumps(data, indent=2) + "\n")
     os.chmod(config_path, 0o600)
     return {"added": added, "mode": mode, "preset": name}
@@ -578,6 +736,22 @@ def _cmd_import(root: Path, provider: str, paths) -> int:
     return 0 if merged["imported"] else 1
 
 
+def _cmd_autocheck(root: Path, preset: str | None, overrides: dict) -> int:
+    try:
+        settings = configure_autocheck(root / "router.json", preset, **overrides)
+    except (ValueError, json.JSONDecodeError, OSError) as exc:
+        print(_style(f"setup: autocheck configuration failed: {exc}", _Ansi.RED), file=sys.stderr)
+        return 1
+    state = "enabled" if settings["enabled"] else "disabled"
+    print(_style(f"setup: autocheck {state} ({settings['preset']})", _Ansi.GREEN))
+    print(
+        "setup: interval={interval}s, probe_every={probe_every}, sweep_every={sweep_every}s, "
+        "dead_strikes={dead_strikes}, max_rotations={max_rotations}".format(**settings)
+    )
+    print("setup: run `setup --keepalive-install` to load/reload the launchd supervisor.")
+    return 0
+
+
 def _cmd_preset(root: Path) -> int:
     config_path = root / "router.json"
     try:
@@ -594,15 +768,19 @@ def _cmd_preset(root: Path) -> int:
 
 
 def _cmd_preset_prompt(root: Path) -> int:
-    """Line-menu flow: pick a preset by name (built-in or custom) and apply it."""
+    """Line-menu flow: pick a preset by name (built-in or custom) and apply it,
+    or create a new custom preset interactively."""
     names = preset_names(root)
     if not names:
         print(_style("  no presets available", _Ansi.RED), file=sys.stderr)
         return 1
     print(_style("  available presets: " + ", ".join(names), _Ansi.BOLD))
-    name = input("  preset name (empty cancels): ").strip()
+    print(_style("  create a new one with:  new", _Ansi.BOLD))
+    name = input("  preset name (empty cancels, 'new' creates): ").strip().lower()
     if not name:
         return 1
+    if name == "new":
+        return _cmd_preset_create_prompt(root)
     if name not in names:
         print(_style(f"  unknown preset '{name}' — use one of: {', '.join(names)}", _Ansi.RED), file=sys.stderr)
         return 1
@@ -618,6 +796,42 @@ def _cmd_preset_prompt(root: Path) -> int:
         label += " (already present, nothing added)"
     print(_style(_tint_provider(label), _Ansi.GREEN))
     print("  run menu item 8 (`ensure`) to apply; engine untouched for now.")
+    return 0
+
+
+def _cmd_preset_create_prompt(root: Path) -> int:
+    """Line-menu create flow: name -> provider -> comma-separated domains.
+    Writes the preset file only; the engine is never started here."""
+    try:
+        name = input("  new preset name (empty cancels): ").strip().lower()
+        if not name:
+            return 1
+        try:
+            custom_preset_path(root, name)  # validates the name
+        except ValueError as exc:
+            print(_style(f"  {exc}", _Ansi.RED), file=sys.stderr)
+            return 1
+        if name in preset_names(root):
+            print(_style(f"  preset '{name}' already exists — pick another name", _Ansi.RED), file=sys.stderr)
+            return 1
+        provider = input("  provider for this preset (proton / cloudflare / other): ").strip()
+        if not provider:
+            print(_style("  provider cannot be empty", _Ansi.RED), file=sys.stderr)
+            return 1
+        domain_text = input("  domains to tunnel, comma-separated (e.g. opencode.ai,roblox.com): ").strip()
+        if not domain_text:
+            print(_style("  at least one domain is required", _Ansi.RED), file=sys.stderr)
+            return 1
+        path = add_custom_preset(root, name, provider,
+                                 [d.strip() for d in domain_text.split(",") if d.strip()])
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return 130
+    except (ValueError, OSError) as exc:
+        print(_style(f"  preset create failed: {exc}", _Ansi.RED), file=sys.stderr)
+        return 1
+    print(_style(f"  custom preset '{name}' written to {path.relative_to(root or Path('.'))} (not applied)", _Ansi.GREEN))
+    print("  apply it now with 's', or from the tray: Presets → your name")
     return 0
 
 
@@ -785,6 +999,23 @@ def _cmd_bridge_install(root: Path, force: bool = False) -> int:
     return 0
 
 
+def _cmd_keepalive_install(root: Path, remove: bool = False) -> int:
+    """Install or remove the macOS launchd supervisor for unattended support."""
+    script = root / "examples" / "install-launchd.sh"
+    if not script.is_file():
+        print(f"keepalive: installer missing: {script}", file=sys.stderr)
+        return 1
+    env = dict(os.environ)
+    env["PROXY_ROUTER_DIR"] = str(root)
+    command = ["bash", str(script)] + (["--remove"] if remove else [])
+    try:
+        result = subprocess.run(command, env=env, cwd=root)
+    except OSError as exc:
+        print(f"keepalive: installer failed: {exc}", file=sys.stderr)
+        return 1
+    return result.returncode
+
+
 def _router_command(root: Path, *args: str) -> int:
     """Run the existing router CLI against ``root`` (never enabled implicitly)."""
     script = Path(__file__).resolve().parent / "router.py"
@@ -794,6 +1025,29 @@ def _router_command(root: Path, *args: str) -> int:
     except OSError as exc:
         print(f"setup: could not run {script}: {exc}", file=sys.stderr)
         return 1
+
+
+def _read_vpn_mode(root: Path) -> str:
+    """Read the persisted TUN mode (state/mode, 'proxy' | 'tun') read-only."""
+    try:
+        mode = (Path(root) / "state" / "mode").read_text().strip()
+    except OSError:
+        mode = ""
+    return mode if mode in ("proxy", "tun") else "proxy"
+
+
+def _launch_tray(root: Path) -> None:
+    """Best-effort tray autostart; never fails the action when the tray is absent."""
+    script = Path(__file__).resolve().parent / "proxy_tray.py"
+    if not script.is_file():
+        return
+    env = dict(os.environ, PROXY_ROUTER_ROOT=str(root))
+    try:
+        subprocess.Popen([sys.executable, str(script)], env=env,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError:
+        pass
 
 
 def _read_routing_state(root: Path) -> dict:
@@ -825,6 +1079,66 @@ def _routing_lines(root: Path) -> list[str]:
         f"vpn_domains: {vpn}",
         f"default_provider: {state['default_provider'] or '(none)'}",
     ]
+
+
+def _read_rotation_state(root: Path) -> dict:
+    """Read-only view of the persisted rotation block (no mutation, no
+    subprocess): the TUI renders from this; every change goes through
+    ``_cmd_rotation_set`` below."""
+    try:
+        data = json.loads((Path(root) / "router.json").read_text())
+        rotation = data.get("rotation") or {}
+        if not isinstance(rotation, dict):
+            rotation = {}
+    except (OSError, json.JSONDecodeError):
+        rotation = {}
+    return {
+        "interval_seconds": rotation.get("interval_seconds", 0),
+        "jitter_seconds": rotation.get("jitter_seconds", 300),
+        "policy": rotation.get("policy", "latency"),
+    }
+
+
+def _rotation_lines(root: Path) -> list[str]:
+    state = _read_rotation_state(root)
+    policy_hint = ("autoroute" if state["policy"] == "least-recent" else "fastest exit wins")
+    return [
+        f"interval_seconds: {state['interval_seconds']}",
+        f"jitter_seconds: {state['jitter_seconds']}",
+        f"policy: {state['policy']} ({policy_hint})",
+    ]
+
+
+def _cmd_rotation_set(root: Path, key: str, value: str) -> None:
+    """Write one rotation setting into router.json atomically (0600)."""
+    if key not in ("interval_seconds", "jitter_seconds", "policy"):
+        raise ValueError(f"unknown rotation setting '{key}'")
+    path = Path(root) / "router.json"
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"router.json unreadable ({exc})") from exc
+    if key == "policy":
+        if value not in ("latency", "least-recent"):
+            raise ValueError("policy must be 'latency' or 'least-recent'")
+        parsed = value
+    else:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{key} must be an integer") from exc
+        if parsed < 0:
+            raise ValueError(f"{key} must be >= 0")
+    rotation = dict(data.get("rotation") or {})
+    rotation[key] = parsed
+    data["rotation"] = rotation
+    with tempfile.NamedTemporaryFile("w", dir=str(path.parent), delete=False,
+                                     encoding="utf-8") as tmp:
+        json.dump(data, tmp, indent=2, sort_keys=True)
+        tmp.write("\n")
+        tmp_path = Path(tmp.name)
+    os.replace(tmp_path, path)
+    os.chmod(path, 0o600)
 
 
 def _cmd_routing(root: Path) -> None:
@@ -877,22 +1191,21 @@ def _cmd_routing(root: Path) -> None:
 _BANNER = """
   proxy-router setup wizard
   -------------------------
-  Guides, profile imports, route presets and health checks.
-  The engine is never started unless you explicitly pick item 8.
+  Control center: engine, providers, TUN, rotation, presets and health.
+  The engine is only started when you explicitly pick item 1.
 """
 
 _MENU = [
-    ("1", "Show Proton VPN guide"),
-    ("2", "Show Cloudflare WARP guide"),
-    ("3", "Show both guides"),
-    ("4", "Import Proton VPN profiles (.conf file or directory)"),
-    ("5", "Import Cloudflare WARP profiles (.conf file or directory)"),
-    ("6", "Apply route presets (opencode.ai -> proton, roblox -> cloudflare)"),
-    ("7", "Check provider health"),
-    ("8", "Start / reload the proxy engine (explicit action)"),
-    ("9", "Install / verify OpenCode auto-rotation bridge (Hermes)"),
-    ("r", "Routing modes (safe-list / vpn-list / default)"),
-    ("s", "Presets: apply by name / browser (built-in + custom)"),
+    ("1", "Start proxy-router (engine + tray autostart)"),
+    ("2", "Stop proxy-router"),
+    ("3", "Add a VPN provider (step-by-step wizard)"),
+    ("4", "Settings: TUN mode, rotation & autoroute"),
+    ("5", "Presets: browse / apply / create (built-in + custom)"),
+    ("6", "Check provider health"),
+    ("7", "Routing modes (show / switch / add-remove domain)"),
+    ("8", "Install / verify the OpenCode bridge (Hermes rotation gateway)"),
+    ("r", "Routing modes (show / switch / add-remove domain)"),
+    ("s", "Presets: apply by name / create custom (built-in + custom)"),
     ("q", "Quit"),
 ]
 
@@ -916,6 +1229,92 @@ def _prompt_import(root: Path, provider: str) -> None:
     _cmd_import(root, provider, [answer])
 
 
+def _line_provider_wizard(root: Path) -> None:
+    """Line-mode add-a-VPN-provider flow: pick provider, show guide, import."""
+    while True:
+        print(_style("  [1] Proton VPN   [2] Cloudflare WARP   [b] back", _Ansi.BOLD))
+        try:
+            choice = input(_style("provider> ", _Ansi.BOLD)).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if choice in ("b", "back", "q"):
+            return
+        if choice == "1":
+            _cmd_guide("proton")
+            _prompt_import(root, "proton")
+            return
+        if choice == "2":
+            _cmd_guide("warp")
+            _prompt_import(root, "cloudflare")
+            return
+        print(f"  unknown choice '{choice}'")
+
+
+def _line_rotation(root: Path) -> None:
+    """Line-mode rotation & autoroute settings (writes go through the CLI)."""
+    while True:
+        state = _read_rotation_state(root)
+        print(_style(f"  interval_seconds: {state['interval_seconds']}  "
+                     f"jitter_seconds: {state['jitter_seconds']}  policy: {state['policy']}", _Ansi.DIM))
+        print(_style("  [1] interval   [2] jitter   [3] policy toggle   [b] back", _Ansi.BOLD))
+        try:
+            choice = input(_style("rotation> ", _Ansi.BOLD)).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if choice in ("b", "back", "q"):
+            return
+        if choice == "1":
+            value = input("  interval_seconds (0 = off): ").strip()
+            if value:
+                try:
+                    _cmd_rotation_set(root, "interval_seconds", value)
+                    print(_style(f"  rotation interval_seconds = {value}", _Ansi.GREEN))
+                except ValueError as exc:
+                    print(_style(f"  {exc}", _Ansi.RED))
+        elif choice == "2":
+            value = input("  jitter_seconds: ").strip()
+            if value:
+                try:
+                    _cmd_rotation_set(root, "jitter_seconds", value)
+                    print(_style(f"  rotation jitter_seconds = {value}", _Ansi.GREEN))
+                except ValueError as exc:
+                    print(_style(f"  {exc}", _Ansi.RED))
+        elif choice == "3":
+            new_policy = "least-recent" if state["policy"] == "latency" else "latency"
+            _cmd_rotation_set(root, "policy", new_policy)
+            print(_style(f"  rotation policy = {new_policy}", _Ansi.GREEN))
+        else:
+            print(f"  unknown choice '{choice}'")
+
+
+def _line_settings(root: Path) -> None:
+    """Line-mode settings: TUN mode toggle and rotation sub-flows."""
+    while True:
+        print(_style(f"  vpn mode: {_read_vpn_mode(root)}", _Ansi.DIM))
+        print(_style("  [1] TUN mode toggle   [2] rotation & autoroute   [b] back", _Ansi.BOLD))
+        try:
+            choice = input(_style("settings> ", _Ansi.BOLD)).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if choice in ("b", "back", "q"):
+            return
+        if choice == "1":
+            target = "off" if _read_vpn_mode(root) == "tun" else "on"
+            print(_style(f"  toggling TUN mode (vpn {target})...", _Ansi.YELLOW))
+            rc = _router_command(root, "vpn", target)
+            if rc == 0:
+                print(_style(f"  TUN mode {target}", _Ansi.GREEN))
+            else:
+                print(_style("  vpn toggle failed (see router output above)", _Ansi.RED))
+        elif choice == "2":
+            _line_rotation(root)
+        else:
+            print(f"  unknown choice '{choice}'")
+
+
 def _line_wizard(root: Path) -> int:
     """Line-based fallback: used whenever either stream is not a real TTY."""
     while True:
@@ -931,32 +1330,32 @@ def _line_wizard(root: Path) -> int:
         if choice in ("q", "quit"):
             return 0
         if choice == "1":
-            _cmd_guide("proton")
-        elif choice == "2":
-            _cmd_guide("warp")
-        elif choice == "3":
-            _cmd_guide("all")
-        elif choice == "4":
-            _prompt_import(root, "proton")
-        elif choice == "5":
-            _prompt_import(root, "cloudflare")
-        elif choice == "6":
-            _cmd_preset(root)
-        elif choice == "7":
-            _cmd_check(root)
-        elif choice == "8":
-            print(_style("  starting/reloading the proxy engine (router ensure)...", _Ansi.YELLOW))
+            print(_style("  starting proxy-router (ensure)...", _Ansi.YELLOW))
             rc = _router_command(root, "ensure")
             if rc == 0:
-                print(_style("  engine up", _Ansi.GREEN))
+                _launch_tray(root)
+                print(_style("  engine up (tray autostart)", _Ansi.GREEN))
             else:
                 print(_style("  engine failed to start (see router output above)", _Ansi.RED))
-        elif choice == "9":
-            _cmd_bridge_install(root)
-        elif choice == "r":
-            _cmd_routing(root)
-        elif choice == "s":
+        elif choice == "2":
+            print(_style("  stopping proxy-router...", _Ansi.YELLOW))
+            rc = _router_command(root, "stop")
+            if rc == 0:
+                print(_style("  engine stopped", _Ansi.GREEN))
+            else:
+                print(_style("  engine stop failed (see router output above)", _Ansi.RED))
+        elif choice == "3":
+            _line_provider_wizard(root)
+        elif choice == "4":
+            _line_settings(root)
+        elif choice in ("5", "s"):
             _cmd_preset_prompt(root)
+        elif choice == "6":
+            _cmd_check(root)
+        elif choice in ("7", "r"):
+            _cmd_routing(root)
+        elif choice == "8":
+            _cmd_bridge_install(root)
         else:
             print(f"  unknown choice '{choice}' (enter a number or 'q')")
 
@@ -967,17 +1366,16 @@ def _line_wizard(root: Path) -> int:
 
 # TUI menu keeps the same actions plus Quit (digit 0; q/Q/ESC also quit).
 TUI_MENU = [
-    ("1", "Show Proton guide"),
-    ("2", "Show Cloudflare guide"),
-    ("3", "Show both guides"),
-    ("4", "Import Proton profiles"),
-    ("5", "Import Cloudflare profiles"),
-    ("6", "Apply route presets (opencode.ai -> proton, roblox -> cloudflare)"),
-    ("7", "Check provider health"),
-    ("8", "Start/reload the proxy engine"),
-    ("9", "Install / verify OpenCode auto-rotation bridge (Hermes)"),
+    ("1", "Start proxy-router (engine + tray autostart)"),
+    ("2", "Stop proxy-router"),
+    ("3", "Add a VPN provider (step-by-step wizard)"),
+    ("4", "Settings: TUN mode, rotation & autoroute"),
+    ("5", "Presets: browse / apply / create (built-in + custom)"),
+    ("6", "Check provider health"),
+    ("7", "Routing modes (show / switch / add-remove domain)"),
+    ("8", "Install / verify the OpenCode bridge (Hermes rotation gateway)"),
     ("r", "Routing modes (show / switch / add-remove domain)"),
-    ("s", "Presets: apply by name / browser (built-in + custom)"),
+    ("s", "Presets: apply by name / create custom (built-in + custom)"),
     ("0", "Quit"),
 ]
 TUI_MENU_INDEX = {key: index for index, (key, _) in enumerate(TUI_MENU)}
@@ -998,8 +1396,8 @@ def _strip_ansi(text: str) -> str:
 
 @dataclasses.dataclass
 class TuiState:
-    """Pure TUI state; view is one of "menu" | "guide" | "import" |
-    "routing" | "routing_prompt"."""
+    """Pure TUI state; view is one of "menu" | "settings" | "guide" |
+    "import" | "routing" | "routing_prompt" | "provider" | "rotation". """
 
     view: str = "menu"
     cursor: int = 0
@@ -1012,6 +1410,12 @@ class TuiState:
     routing_prompt_label: str = ""
     routing_prompt_text: str = ""
     routing_prompt_args: tuple = ()
+    preset_browser: bool = False          # routing view showing presets (s), not routing actions
+    preset_step: int = 0                  # 0=name, 1=provider, 2=domains
+    preset_name: str = ""
+    preset_provider: str = ""
+    prompt_return_view: str = ""          # routing_prompt ESC/Enter lands here when set
+    provider_wizard_import: bool = False  # guide view came from the provider wizard (offers i=import)
     status: str = ""
     status_ok: bool = True
     action: tuple | None = None  # recorded machine action for the wizard loop
@@ -1057,13 +1461,21 @@ def _render_menu(state: TuiState) -> list[str]:
     lines.append("\u2502" + header + "\u2502")
     lines.append("\u2502" + _fit(" Guides \u00b7 imports \u00b7 presets \u00b7 health checks ", inner) + "\u2502")
     lines.append("\u251c" + "\u2500" * inner + "\u2524")
-    for index, (key, label) in enumerate(TUI_MENU):
+    # Scroll window keeps the cursor row visible; fixed overhead is 9 rows.
+    total = len(TUI_MENU)
+    visible = max(state.rows - 9, 1)
+    scroll = min(max(state.cursor - visible + 1, 0), max(total - visible, 0))
+    for index in range(visible):
+        item_index = scroll + index
+        if item_index >= total:
+            break
+        key, label = TUI_MENU[item_index]
         right = f" {key} "
         prefix = f"  {key}  "
         fitted = _fit(prefix + label, inner - len(right))
         label_plain = fitted[len(prefix):]
         label_tint = _tint_provider(label_plain)
-        if index == state.cursor:
+        if item_index == state.cursor:
             row = "\u2502" + prefix + label_tint + right + "\u2502"
             lines.append(_style(row, _Ansi.REVERSE))
         else:
@@ -1079,7 +1491,12 @@ def _render_menu(state: TuiState) -> list[str]:
         else:
             styled = _style(_fit(" " + plain, inner), _Ansi.RED)
         lines.append("\u2502" + styled + "\u2502")
-    lines.append("\u2502" + _style(_fit(" \u2191\u2193 navigate \u00b7 Enter select \u00b7 q/ESC quit ", inner), _Ansi.DIM) + "\u2502")
+    if total > visible:
+        hint = " \u2191\u2193 navigate \u00b7 Enter select \u00b7 q/ESC quit \u00b7 item {}-{}/{} ".format(
+            scroll + 1, min(scroll + visible, total), total)
+    else:
+        hint = " \u2191\u2193 navigate \u00b7 Enter select \u00b7 q/ESC quit "
+    lines.append("\u2502" + _style(_fit(hint, inner), _Ansi.DIM) + "\u2502")
     lines.append("\u2514" + "\u2500" * inner + "\u2518")
     return lines
 
@@ -1104,7 +1521,9 @@ def _render_guide(state: TuiState) -> list[str]:
     lines.append("\u251c" + "\u2500" * inner + "\u2524")
     total = len(state.guide_lines)
     shown = min(scroll + 1, total) if total else 0
-    lines.append("\u2502" + _style(_fit(f" line {shown}/{total} \u00b7 \u2191\u2193 scroll \u00b7 q back ", inner), _Ansi.DIM) + "\u2502")
+    hint = " line {}/{} \u00b7 \u2191\u2193 scroll \u00b7 i import \u00b7 q back ".format(shown, total) \
+        if state.provider_wizard_import else " line {}/{} \u00b7 \u2191\u2193 scroll \u00b7 q back ".format(shown, total)
+    lines.append("\u2502" + _style(_fit(hint, inner), _Ansi.DIM) + "\u2502")
     lines.append("\u2514" + "\u2500" * inner + "\u2518")
     return lines
 
@@ -1136,13 +1555,50 @@ _ROUTING_ACTIONS = [
     ("6", "remove domain from the vpn list"),
     ("7", "apply a preset by name (built-in or custom)"),
 ]
+_PRESET_ACTIONS = [
+    ("1", "apply a preset by name (built-in or custom)"),
+    ("2", "create a new preset (name, provider, domain)"),
+]
 _PRESET_PROMPT_LABEL = "preset name to apply (built-in or custom):"
+_ROTATION_ACTIONS = [
+    ("1", "interval_seconds (0 = off)"),
+    ("2", "jitter_seconds (default 300)"),
+    ("3", "policy: latency <-> least-recent (autoroute)"),
+]
+_SETTINGS_ACTIONS = [
+    ("1", "TUN mode toggle (proxy <-> full tunnel)"),
+    ("2", "rotation & autoroute settings"),
+]
+_PROVIDER_WIZARD_STEPS = [
+    ("1", "Proton VPN (step-by-step guide)"),
+    ("2", "Cloudflare WARP (step-by-step guide)"),
+]
+_PRESET_CREATE_LABELS = [
+    "new preset name (e.g. banana):",
+    "provider for the preset (proton / cloudflare):",
+    "domain(s) to route (comma-separated, e.g. opencode.ai):",
+]
 
 
 def _render_routing(state: TuiState) -> list[str]:
-    """Routing-modes view. Rendered read-only from router.json; every change
-    is executed by the wizard loop through the ``router.py routing`` CLI."""
+    """Routing-modes view (r) or presets browser (s). Rendered read-only;
+    every change is executed by the wizard loop through the router CLI
+    (routing) or add_custom_preset (preset create)."""
     inner = max(state.cols - 2, 30)
+    if state.preset_browser:
+        title = " presets "
+        lines = ["\u250c" + "\u2500" * inner + "\u2510"]
+        lines.append("\u2502" + _style(_fit(title, inner), _Ansi.BOLD, _Ansi.CYAN) + "\u2502")
+        lines.append("\u251c" + "\u2500" * inner + "\u2524")
+        for ln in state.routing_lines:
+            lines.append("\u2502" + _fit(" " + ln, inner) + "\u2502")
+        lines.append("\u251c" + "\u2500" * inner + "\u2524")
+        for key, label in _PRESET_ACTIONS:
+            lines.append("\u2502" + _style(_fit(f"  {key}  {label}", inner), _Ansi.CYAN) + "\u2502")
+        lines.append("\u251c" + "\u2500" * inner + "\u2524")
+        lines.append("\u2502" + _style(_fit(" 1-2 change \u00b7 ESC back ", inner), _Ansi.DIM) + "\u2502")
+        lines.append("\u2514" + "\u2500" * inner + "\u2518")
+        return lines
     lines = ["\u250c" + "\u2500" * inner + "\u2510"]
     lines.append("\u2502" + _style(_fit(" routing modes ", inner), _Ansi.BOLD, _Ansi.CYAN) + "\u2502")
     lines.append("\u251c" + "\u2500" * inner + "\u2524")
@@ -1171,6 +1627,58 @@ def _render_routing_prompt(state: TuiState) -> list[str]:
     return lines
 
 
+def _render_provider(state: TuiState) -> list[str]:
+    """Add-a-VPN-provider wizard step: pick which provider to set up."""
+    inner = max(state.cols - 2, 30)
+    lines = ["\u250c" + "\u2500" * inner + "\u2510"]
+    lines.append("\u2502" + _style(_fit(" add a vpn provider ", inner), _Ansi.BOLD, _Ansi.CYAN) + "\u2502")
+    lines.append("\u251c" + "\u2500" * inner + "\u2524")
+    for key, label in _PROVIDER_WIZARD_STEPS:
+        lines.append("\u2502" + _style(_fit(f"  {key}  {label}", inner), _Ansi.CYAN) + "\u2502")
+    lines.append("\u251c" + "\u2500" * inner + "\u2524")
+    lines.append("\u2502" + _style(_fit(" 1-2 pick a provider \u00b7 ESC back ", inner), _Ansi.DIM) + "\u2502")
+    lines.append("\u2514" + "\u2500" * inner + "\u2518")
+    return lines
+
+
+def _render_rotation(state: TuiState) -> list[str]:
+    """Rotation & autoroute settings view: read-only lines, every change
+    flows through the ``('rotation_set', ...)`` action to ``_cmd_rotation_set``."""
+    inner = max(state.cols - 2, 30)
+    lines = ["\u250c" + "\u2500" * inner + "\u2510"]
+    lines.append("\u2502" + _style(_fit(" rotation & autoroute ", inner), _Ansi.BOLD, _Ansi.CYAN) + "\u2502")
+    lines.append("\u251c" + "\u2500" * inner + "\u2524")
+    for ln in _rotation_lines(state.root):
+        lines.append("\u2502" + _fit(" " + ln, inner) + "\u2502")
+    lines.append("\u251c" + "\u2500" * inner + "\u2524")
+    for key, label in _ROTATION_ACTIONS:
+        lines.append("\u2502" + _style(_fit(f"  {key}  {label}", inner), _Ansi.CYAN) + "\u2502")
+    lines.append("\u251c" + "\u2500" * inner + "\u2524")
+    lines.append("\u2502" + _style(_fit(" 1-3 change \u00b7 writes router.json \u00b7 ESC back ", inner), _Ansi.DIM) + "\u2502")
+    lines.append("\u2514" + "\u2500" * inner + "\u2518")
+    return lines
+
+
+def _render_settings(state: TuiState) -> list[str]:
+    """Settings view: one entry point for TUN mode and rotation settings."""
+    inner = max(state.cols - 2, 30)
+    lines = ["\u250c" + "\u2500" * inner + "\u2510"]
+    lines.append("\u2502" + _style(_fit(" settings ", inner), _Ansi.BOLD, _Ansi.CYAN) + "\u2502")
+    lines.append("\u251c" + "\u2500" * inner + "\u2524")
+    vpn = _read_vpn_mode(state.root)
+    lines.append("\u2502" + _fit(f" vpn mode: {vpn} (proxy mode or full TUN capture)", inner) + "\u2502")
+    rot = _read_rotation_state(state.root)
+    lines.append("\u2502" + _fit(f" rotation: interval {rot['interval_seconds']}s \u00b7 "
+                                 f"jitter {rot['jitter_seconds']}s \u00b7 policy {rot['policy']}", inner) + "\u2502")
+    lines.append("\u251c" + "\u2500" * inner + "\u2524")
+    for key, label in _SETTINGS_ACTIONS:
+        lines.append("\u2502" + _style(_fit(f"  {key}  {label}", inner), _Ansi.CYAN) + "\u2502")
+    lines.append("\u251c" + "\u2500" * inner + "\u2524")
+    lines.append("\u2502" + _style(_fit(" 1-2 change \u00b7 ESC back ", inner), _Ansi.DIM) + "\u2502")
+    lines.append("\u2514" + "\u2500" * inner + "\u2518")
+    return lines
+
+
 def render_frame(state: TuiState) -> list[str]:
     """Build the full frame (header, body, footer) as a list of screen lines."""
     if state.view == "guide":
@@ -1181,6 +1689,12 @@ def render_frame(state: TuiState) -> list[str]:
         return _render_routing(state)
     if state.view == "routing_prompt":
         return _render_routing_prompt(state)
+    if state.view == "provider":
+        return _render_provider(state)
+    if state.view == "rotation":
+        return _render_rotation(state)
+    if state.view == "settings":
+        return _render_settings(state)
     return _render_menu(state)
 
 
@@ -1202,39 +1716,35 @@ def _select_item(state: TuiState, index: int) -> TuiState:
     if key == "0":
         state.quit = True
     elif key == "1":
-        _open_guide(state, "proton")
+        state.action = ("engine_start",)
     elif key == "2":
-        _open_guide(state, "warp")
+        state.action = ("engine_stop",)
     elif key == "3":
-        _open_guide(state, "all")
+        state.view = "provider"
     elif key == "4":
-        state.view, state.import_provider, state.import_text = "import", "proton", ""
-    elif key == "5":
-        state.view, state.import_provider, state.import_text = "import", "cloudflare", ""
-    elif key == "6":
-        state.action = ("preset",)
-    elif key == "7":
-        state.action = ("check",)
-    elif key == "8":
-        state.action = ("engine",)
-    elif key == "9":
-        state.action = ("bridge_install",)
-    elif key == "r":
-        # Read-only rendering; mutations flow through the router CLI via
-        # state.action, exactly like every other TUI action.
-        state.view = "routing"
-        state.routing_lines = _routing_lines(state.root) or ["routing modes"]
-        state.routing_prompt_text = ""
-    elif key == "s":
+        state.view = "settings"
+    elif key in ("5", "s"):
         # Preset browser: renders read-only, mutation flows through
         # state.action like routing changes.
         state.view = "routing"
+        state.preset_browser = True
         try:
             names = preset_names(state.root)
             state.routing_lines = ["presets: " + (", ".join(names) if names else "(none)")]
         except OSError:
             state.routing_lines = ["presets: (unreadable)"]
         state.routing_prompt_text = ""
+    elif key == "6":
+        state.action = ("check",)
+    elif key in ("7", "r"):
+        # Read-only rendering; mutations flow through the router CLI via
+        # state.action, exactly like every other TUI action.
+        state.view = "routing"
+        state.preset_browser = False
+        state.routing_lines = _routing_lines(state.root) or ["routing modes"]
+        state.routing_prompt_text = ""
+    elif key == "8":
+        state.action = ("bridge_install",)
     return state
 
 
@@ -1251,7 +1761,12 @@ def apply_key(state: TuiState, key: str) -> TuiState:
 
     if state.view == "guide":
         if key in ("q", "Q", ESC, ENTER, "\n"):
-            state.view = "menu"
+            state.view = "provider" if state.provider_wizard_import else "menu"
+        elif key in ("i", "I") and state.provider_wizard_import:
+            # Offer one-click jump to profile import for the wizard's provider.
+            state.view = "import"
+            state.import_provider = "cloudflare" if state.guide_provider == "warp" else "proton"
+            state.import_text = ""
         elif key in (UP, "k", "K"):
             state.guide_scroll = max(0, state.guide_scroll - 1)
         elif key in (DOWN, "j", "J"):
@@ -1260,9 +1775,45 @@ def apply_key(state: TuiState, key: str) -> TuiState:
             state.guide_scroll = min(state.guide_scroll + 1, max_scroll)
         return state
 
+    if state.view == "provider":
+        if key in (ESC, "q", "Q"):
+            state.view = "menu"
+        elif key == "1":
+            _open_guide(state, "proton")
+            state.provider_wizard_import = True
+        elif key == "2":
+            _open_guide(state, "warp")
+            state.provider_wizard_import = True
+        return state
+
+    if state.view == "settings":
+        if key in (ESC, "q", "Q"):
+            state.view = "menu"
+        elif key == "1":
+            state.action = ("vpn_toggle",)
+        elif key == "2":
+            state.view = "rotation"
+        return state
+
+    if state.view == "rotation":
+        if key in (ESC, "q", "Q"):
+            state.view = "settings"
+        elif key in ("1", "2"):
+            setting = "interval_seconds" if key == "1" else "jitter_seconds"
+            state.view = "routing_prompt"
+            state.prompt_return_view = "rotation"
+            state.routing_prompt_label = f"{setting} (0 = off for interval):"
+            state.routing_prompt_args = ("rotation_set", setting, "{TEXT}")
+        elif key == "3":
+            # policy toggle: latency <-> least-recent (autoroute)
+            current = _read_rotation_state(state.root)["policy"]
+            state.action = ("rotation_set", "policy",
+                            "least-recent" if current == "latency" else "latency")
+        return state
+
     if state.view == "import":
         if key == ESC:
-            state.view = "menu"
+            state.view = "provider" if state.provider_wizard_import else "menu"
         elif key in (ENTER, "\n"):
             path = state.import_text.strip()
             state.view = "menu"
@@ -1281,6 +1832,17 @@ def apply_key(state: TuiState, key: str) -> TuiState:
     if state.view == "routing":
         if key in (ESC, "q", "Q"):
             state.view = "menu"
+        elif state.preset_browser:
+            if key == "1":
+                state.view = "routing_prompt"
+                state.routing_prompt_label = _PRESET_PROMPT_LABEL
+                state.routing_prompt_args = ("preset_by_name", "{TEXT}")
+            elif key == "2":
+                state.view = "routing_prompt"
+                state.preset_step = 0
+                state.preset_name = state.preset_provider = ""
+                state.routing_prompt_label = _PRESET_CREATE_LABELS[0]
+            return state
         elif key == "1":
             state.action = ("routing", "set", "--mode", "vpn-list")
         elif key == "2":
@@ -1315,15 +1877,43 @@ def apply_key(state: TuiState, key: str) -> TuiState:
 
     if state.view == "routing_prompt":
         if key == ESC:
-            state.view = "routing"
+            state.view = state.prompt_return_view or ("routing" if state.preset_browser else "menu")
+            state.preset_step = 0
+            state.prompt_return_view = ""
         elif key in (ENTER, "\n"):
             text = state.routing_prompt_text.strip()
-            state.view = "routing"
-            if not text:
-                state.status = "routing change cancelled: empty input"
-                state.status_ok = False
+            if state.preset_browser and state.preset_step < 2:
+                # create-preset flow: name (0) -> provider (1) -> domains (2)
+                if not text:
+                    state.status = "preset create cancelled: empty input"
+                    state.status_ok = False
+                elif state.preset_step == 0:
+                    state.preset_name = text
+                    state.preset_step = 1
+                    state.routing_prompt_label = _PRESET_CREATE_LABELS[1]
+                elif state.preset_step == 1:
+                    state.preset_provider = text
+                    state.preset_step = 2
+                    state.routing_prompt_label = _PRESET_CREATE_LABELS[2]
+                state.routing_prompt_text = ""
+            elif state.preset_browser and state.preset_step == 2:
+                # final create-flow step: domains -> fire preset_create action
+                state.view = "routing"
+                state.preset_step = 0
+                if not text:
+                    state.status = "preset create cancelled: empty domain"
+                    state.status_ok = False
+                else:
+                    state.action = ("preset_create", state.preset_name,
+                                    state.preset_provider, text)
             else:
-                state.action = tuple(text if part == "{TEXT}" else part for part in state.routing_prompt_args)
+                state.view = state.prompt_return_view or ("routing" if state.preset_browser else "menu")
+                state.prompt_return_view = ""
+                if not text:
+                    state.status = "routing change cancelled: empty input"
+                    state.status_ok = False
+                else:
+                    state.action = tuple(text if part == "{TEXT}" else part for part in state.routing_prompt_args)
         elif key in (BACKSPACE, "\x08"):
             state.routing_prompt_text = state.routing_prompt_text[:-1]
         elif key and len(key) == 1 and ord(key) >= 32:
@@ -1393,14 +1983,48 @@ def _execute_action(action: tuple, root: Path) -> tuple[str, int]:
             except (ValueError, json.JSONDecodeError, OSError) as exc:
                 buf.write(f"preset apply failed: {exc}")
                 rc = 1
+        elif kind == "preset_create":
+            # write the preset file only; the engine is never started here
+            try:
+                _, name, provider, domain_text = action
+                domains = [d.strip() for d in domain_text.split(",") if d.strip()]
+                path = add_custom_preset(root, name, provider, domains)
+                buf.write(f"custom preset '{name}' written to {path.relative_to(root or Path('.'))} (not applied)")
+                rc = 0
+            except (ValueError, OSError) as exc:
+                buf.write(f"preset create failed: {exc}")
+                rc = 1
         elif kind == "check":
             rc = _cmd_check(root)
-        elif kind == "engine":
+        elif kind == "engine_start":
             rc = _router_command(root, "ensure")
             if rc == 0:
-                buf.write("engine up")
+                _launch_tray(root)
+                buf.write("engine up (tray autostart)")
             else:
                 buf.write("engine failed to start (see output above)")
+        elif kind == "engine_stop":
+            rc = _router_command(root, "stop")
+            if rc == 0:
+                buf.write("engine stopped")
+            else:
+                buf.write("engine stop failed (see output above)")
+        elif kind == "vpn_toggle":
+            target = "off" if _read_vpn_mode(root) == "tun" else "on"
+            rc = _router_command(root, "vpn", target)
+            if rc == 0:
+                buf.write("TUN mode on (all traffic via engine rules)" if target == "on"
+                          else "TUN mode off (proxy mode)")
+            else:
+                buf.write("vpn toggle failed (see output above)")
+        elif kind == "rotation_set":
+            try:
+                _cmd_rotation_set(root, action[1], action[2])
+                buf.write(f"rotation {action[1]} = {action[2]}")
+                rc = 0
+            except ValueError as exc:
+                buf.write(str(exc))
+                rc = 1
         elif kind == "bridge_install":
             rc = _cmd_bridge_install(root)
         elif kind == "routing":
@@ -1549,6 +2173,25 @@ def main(argv=None, root=None) -> int:
                         help="import WireGuard .conf file(s)/directory into providers/proton")
     parser.add_argument("--import-warp", nargs="+", metavar="PATH",
                         help="import WireGuard .conf file(s)/directory into providers/cloudflare")
+    parser.add_argument("--autocheck", choices=sorted(_AUTOCHECK_PRESETS), metavar="PROFILE",
+                        help="configure automatic health checks (off, light, balanced, aggressive)")
+    for key in _AUTOCHECK_NUMERIC:
+        parser.add_argument(f"--autocheck-{key.replace('_', '-')}", type=int, metavar="N",
+                            help=f"override autocheck {key}")
+    parser.add_argument("--fallback", metavar="PRIMARY",
+                        help="set a primary provider's ordered fallback chain")
+    parser.add_argument("--fallback-to", metavar="PROVIDER,...",
+                        help="comma-separated fallback providers for --fallback; empty clears it")
+    parser.add_argument("--fallback-clear", metavar="PRIMARY",
+                        help="clear a provider's fallback chain")
+    parser.add_argument("--transparent", action="store_true",
+                        help="configure route-based TUN capture for configured domains")
+    parser.add_argument("--transparent-off", action="store_true",
+                        help="restore the existing selective ruleset TUN capture")
+    parser.add_argument("--keepalive-install", action="store_true",
+                        help="install the macOS launchd 24/7 supervisor")
+    parser.add_argument("--keepalive-remove", action="store_true",
+                        help="remove the macOS launchd 24/7 supervisor")
     parser.add_argument("--preset", metavar="NAME", nargs="?",
                         const="default",
                         help="apply a preset by name (built-in or custom; bare --preset applies 'default')")
@@ -1582,6 +2225,46 @@ def main(argv=None, root=None) -> int:
         rc = max(rc, _cmd_import(ROOT, "proton", args.import_proton))
     if args.import_warp:
         rc = max(rc, _cmd_import(ROOT, "cloudflare", args.import_warp))
+    autocheck_overrides = {
+        key: getattr(args, f"autocheck_{key}")
+        for key in _AUTOCHECK_NUMERIC
+        if getattr(args, f"autocheck_{key}") is not None
+    }
+    if args.autocheck or autocheck_overrides:
+        rc = max(rc, _cmd_autocheck(ROOT, args.autocheck, autocheck_overrides))
+    if args.fallback or args.fallback_clear:
+        try:
+            if args.fallback and args.fallback_clear:
+                raise ValueError("choose --fallback or --fallback-clear, not both")
+            if args.fallback_clear and args.fallback_to is not None:
+                raise ValueError("--fallback-clear cannot be combined with --fallback-to")
+            primary = args.fallback or args.fallback_clear
+            candidates = [] if args.fallback_clear else args.fallback_to
+            if args.fallback and args.fallback_to is None:
+                raise ValueError("--fallback needs --fallback-to PROVIDER,... (empty clears it)")
+            result = configure_fallback(ROOT / "router.json", primary, candidates or [])
+            chain = " -> ".join(result["fallback_providers"]) or "(none)"
+            print(_style(f"setup: fallback chain {primary} -> {chain}", _Ansi.GREEN))
+            print("setup: run `proxy-router reload` to apply (or `ensure` if stopped); the engine was not restarted.")
+        except (ValueError, json.JSONDecodeError, OSError) as exc:
+            print(_style(f"setup: fallback configuration failed: {exc}", _Ansi.RED), file=sys.stderr)
+            rc = max(rc, 1)
+    if args.transparent or args.transparent_off:
+        try:
+            if args.transparent and args.transparent_off:
+                raise ValueError("choose --transparent or --transparent-off, not both")
+            result = configure_transparent(ROOT / "router.json", enabled=args.transparent)
+            print(_style(f"setup: TUN capture = {result['capture']}", _Ansi.GREEN))
+            print("setup: run `proxy-router vpn on` (or `reload` if TUN is already active); the engine was not restarted.")
+        except (ValueError, json.JSONDecodeError, OSError) as exc:
+            print(_style(f"setup: transparent mode configuration failed: {exc}", _Ansi.RED), file=sys.stderr)
+            rc = max(rc, 1)
+    if args.keepalive_install or args.keepalive_remove:
+        if args.keepalive_install and args.keepalive_remove:
+            print("setup: choose --keepalive-install or --keepalive-remove, not both", file=sys.stderr)
+            rc = max(rc, 1)
+        else:
+            rc = max(rc, _cmd_keepalive_install(ROOT, remove=args.keepalive_remove))
     if args.preset:
         try:
             result = apply_preset_by_name(ROOT, args.preset)
@@ -1591,7 +2274,7 @@ def main(argv=None, root=None) -> int:
             else:
                 label += " (already present, nothing added)"
             print(_style(_tint_provider(label), _Ansi.GREEN))
-            print("setup: run `proxy-router ensure` (or reload) to apply; the engine is untouched.")
+            print("setup: run `proxy-router reload` to apply (or `ensure` if stopped); the engine was not restarted.")
         except (ValueError, json.JSONDecodeError, OSError) as exc:
             print(_style(f"setup: preset apply failed: {exc}", _Ansi.RED), file=sys.stderr)
             rc = max(rc, 1)
@@ -1618,8 +2301,12 @@ def main(argv=None, root=None) -> int:
         rc = max(rc, _cmd_bridge_install(ROOT, force=True))
     if args.bridge_check:
         rc = max(rc, _cmd_bridge_check(ROOT))
-    if not (args.guide or args.check or args.import_proton or args.import_warp or args.preset
-            or args.bridge_install or args.bridge_force_install or args.bridge_check):
+    if not (args.guide or args.check or args.import_proton or args.import_warp
+            or args.autocheck or autocheck_overrides or args.fallback
+            or args.fallback_clear or args.transparent or args.transparent_off
+            or args.keepalive_install or args.keepalive_remove
+            or args.preset or args.bridge_install
+            or args.bridge_force_install or args.bridge_check):
         rc = wizard(ROOT)
     return rc
 
