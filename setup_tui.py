@@ -583,12 +583,17 @@ def apply_preset_by_name(root: Path, name: str) -> dict:
                 "directory": f"providers/{route['provider']}",
                 "cooldown_seconds": 60,
             }
-            if route["provider"] == "proton" and "cloudflare" in providers:
-                provider_config["fallback_providers"] = ["cloudflare"]
             providers.setdefault(route["provider"], provider_config)
         if not any(r.get("id") == route.get("id") for r in routes):
             routes.append(dict(route))
             added.append(str(route.get("id")))
+    # Same normalization apply_presets uses: a Proton pool paired with a
+    # Cloudflare pool declares it as the fallback chain (first application
+    # only; an explicitly configured chain is never overwritten).
+    proton_config = providers.get("proton")
+    if isinstance(proton_config, dict) and "cloudflare" in providers:
+        if "fallback_providers" not in proton_config and "fallback_provider" not in proton_config:
+            proton_config["fallback_providers"] = ["cloudflare"]
     routing = preset.get("routing") or {}
     mode = routing.get("mode", "default")
     if mode != "default":

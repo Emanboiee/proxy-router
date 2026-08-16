@@ -208,7 +208,13 @@ class RouterStatus:
                     "ok": bool(rec.get("ok")),
                     "latency_ms": rec.get("latency_ms"),
                     "status": rec.get("status"),
-                    "error": rec.get("error") or rec.get("upstream_error"),
+                    # Keep transport probe failures separate from explicit
+                    # upstream failures. The former are often transient and
+                    # should not turn the menu into a wall of red warnings.
+                    "error": rec.get("error"),
+                    "upstream_error": rec.get("upstream_error"),
+                    "blocked": bool(rec.get("blocked")),
+                    "exhausted": bool(rec.get("exhausted")),
                 }
             provider_map[name] = {
                 "active": active,
@@ -247,7 +253,10 @@ class RouterStatus:
         ok = egress.get("ok")
         # A lane can probe ok while the exit is actually rate-limited or
         # exhausted upstream (record keeps `upstream_error` across probes).
-        warn = bool(egress.get("upstream_error") or egress.get("error")
+        # Transport-level probe failures (SSL EOF/timeout) are deliberately
+        # quiet in the tray. Keep explicit upstream failures and hard markers
+        # visible because they affect real traffic.
+        warn = bool(egress.get("upstream_error") or egress.get("blocked")
                     or egress.get("exhausted"))
         if warn:
             mark = "▲"
@@ -268,9 +277,18 @@ class RouterStatus:
         rec = (self.providers.get(name, {}).get("egress") or {}).get(profile)
         if not rec:
             return ""
-        err = rec.get("error") or rec.get("upstream_error")
-        if err:
-            return " ! " + _friendly_egress_error(err)
+        upstream_error = rec.get("upstream_error")
+        if upstream_error:
+            return " ! " + _friendly_egress_error(upstream_error)
+        if rec.get("blocked"):
+            return " ! blocked"
+        if rec.get("exhausted"):
+            return " ! rate-limited"
+        # An HTTP response is meaningful degradation; a transport-only probe
+        # failure is not. The latter is retained internally for rotation but
+        # omitted from the user-facing menu because it is commonly transient.
+        if rec.get("error") and rec.get("status") is not None:
+            return " ! " + _friendly_egress_error(rec["error"])
         lat = rec.get("latency_ms")
         if isinstance(lat, (int, float)):
             return f" · {lat:.0f}ms"
@@ -861,16 +879,14 @@ class TrayApp:
 
             def pick_exit_items():
                 sub = []
-                # Clickable exits first (healthy, then offline/SSL "try
-                # anyway" picks); hard-disabled (blocked/exhausted) last.
+                # Clickable exits first; hard-disabled (blocked/exhausted)
+                # last. Transport probe failures stay clickable but quiet.
                 def sort_key(p):
                     return (self._exit_disabled(st, name, p),
                             self._exit_try_anyway(st, name, p), p)
                 for p in sorted(profiles, key=sort_key):
                     try_anyway = self._exit_try_anyway(st, name, p)
                     label = f"{p}{st.profile_health(name, p)}"
-                    if try_anyway:
-                        label += " · try anyway"
                     sub.append(pystray.MenuItem(
                         label,
                         make_exit_action(provider=name, profile=p, force=try_anyway),

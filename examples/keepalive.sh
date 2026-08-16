@@ -163,6 +163,27 @@ rotate_dead() {
   fi
 }
 
+# One bounded restore attempt per fallback-parked provider, run on the sweep
+# cadence: clear the marker, probe the primary live through the tunnel, keep
+# the fallback cleared when the primary answers, re-activate it when the
+# primary is still dead. The sweep cadence throttles the restore, so a
+# genuinely dead primary never causes a failover off/on storm.
+restore_fallbacks() {
+  out=$("$ROOT/router.py" egress check 2>&1 || true)
+  printf '%s\n' "$out" | sed -n 's/^\([A-Za-z0-9._-]*\): fallback (.*)$/\1/p' | while IFS= read -r provider; do
+    [ -n "$provider" ] || continue
+    if ! "$ROOT/router.py" failover "$provider" off >/dev/null 2>&1; then
+      continue
+    fi
+    if "$ROOT/router.py" egress check --provider "$provider" >/dev/null 2>&1; then
+      echo "router: '$provider' primary is alive again; fallback cleared" >&2
+    else
+      echo "router: '$provider' primary still dead; re-activating fallback" >&2
+      "$ROOT/router.py" failover "$provider" on --reason timeout >/dev/null 2>&1 || true
+    fi
+  done
+}
+
 while true; do
   if "$ROOT/router.py" ensure >/dev/null 2>&1; then
     backoff="$INTERVAL"
@@ -208,6 +229,8 @@ while true; do
       else
         echo "router: sweep: some provider has no alive exits" >&2
       fi
+      # fallback restore rides the sweep cadence (see restore_fallbacks)
+      restore_fallbacks
       last_sweep="$sweep_now"
     fi
   else

@@ -307,20 +307,21 @@ def load_config() -> int:
             return fail(
                 f"bad {CONFIG_FILE.name}: provider '{name}' cannot define both fallback_provider and fallback_providers"
             )
-        if fallback_list is not None and (
-            not isinstance(fallback_list, list)
-            or any(not isinstance(target, str) for target in fallback_list)
-        ):
+        raw_fallbacks = fallback_list if fallback_list is not None else legacy_fallback
+        if raw_fallbacks is None:
+            fallbacks: list[str] = []
+        elif isinstance(raw_fallbacks, str):
+            fallbacks = [raw_fallbacks]
+        elif isinstance(raw_fallbacks, list) and all(isinstance(t, str) for t in raw_fallbacks):
+            fallbacks = list(raw_fallbacks)
+        else:
             return fail(
-                f"bad {CONFIG_FILE.name}: provider '{name}' fallback_providers must be a string list"
+                f"bad {CONFIG_FILE.name}: provider '{name}' fallback_providers must be a provider name or a string list"
             )
-        if isinstance(fallback_list, list) and len(set(fallback_list)) != len(fallback_list):
+        if len(set(fallbacks)) != len(fallbacks):
             return fail(
                 f"bad {CONFIG_FILE.name}: provider '{name}' fallback_providers must not contain duplicates"
             )
-        fallbacks = fallback_list if fallback_list is not None else (
-            [legacy_fallback] if legacy_fallback is not None else []
-        )
         if any(target == name or target not in providers for target in fallbacks):
             field = "fallback_providers" if fallback_list is not None else "fallback_provider"
             return fail(
@@ -808,20 +809,39 @@ def _fallback_state_path(name: str) -> Path:
     return ROOT / "state" / "fallback" / f"{name}.json"
 
 
+def fallback_chain(name: str) -> list[str]:
+    """Return the normalized ordered fallback chain for ``name``.
+
+    Accepts the legacy ``fallback_provider`` (a single name or an ordered
+    list) and the ``fallback_providers`` list, drops self-references,
+    unknown providers, and duplicate names (first occurrence wins).
+    """
+    entry = _providers.get(name)
+    if not isinstance(entry, dict):
+        return []
+    raw = entry.get("fallback_providers")
+    if raw is None:
+        raw = entry.get("fallback_provider")
+    if raw is None:
+        return []
+    items = raw if isinstance(raw, list) else [raw]
+    seen: set[str] = set()
+    chain: list[str] = []
+    for target in items:
+        if not isinstance(target, str) or target == name or target not in _providers or target in seen:
+            continue
+        seen.add(target)
+        chain.append(target)
+    return chain
+
+
 def configured_fallbacks(name: str) -> list[str]:
     """Return the ordered configured fallback providers for ``name``.
 
     ``fallback_provider`` is retained as a compatibility alias for existing
     router.json files; new configurations should use ``fallback_providers``.
     """
-    entry = _providers.get(name)
-    if not isinstance(entry, dict):
-        return []
-    targets = entry.get("fallback_providers")
-    if targets is None:
-        target = entry.get("fallback_provider")
-        targets = [target] if isinstance(target, str) else []
-    return [target for target in targets if target != name and target in _providers]
+    return fallback_chain(name)
 
 
 def configured_fallback(name: str) -> str | None:
@@ -3897,8 +3917,11 @@ SUDOERS_COMMANDS = (
     ("stop",),
     ("reload",),
     ("ensure",),
+    ("rotate",),
     ("rotate", "*"),
     ("rotate", "*", "--reason", "*"),
+    ("add",),
+    ("remove",),
 )
 
 # stderr markers that prove `sudo -n` DENIED (vs the command itself
