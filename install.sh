@@ -36,8 +36,6 @@ for runtime_file in router.py setup_tui.py monitor.py route_watcher.py proxy_tra
   cp "$SCRIPT_DIR/$runtime_file" "$PREFIX/$runtime_file"
   chmod 755 "$PREFIX/$runtime_file"
 done
-cp "$SCRIPT_DIR/keepalive.sh" "$PREFIX/keepalive.sh"
-chmod 755 "$PREFIX/keepalive.sh"
 
 if [ -f "$BIN_SOURCE" ] && [ -x "$BIN_SOURCE" ]; then
   cp "$BIN_SOURCE" "$PREFIX/bin/sing-box"

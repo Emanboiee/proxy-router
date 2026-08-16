@@ -22,14 +22,13 @@ $Bin = Join-Path $Dest 'bin'
 New-Item -ItemType Directory -Force -Path $Dest | Out-Null
 New-Item -ItemType Directory -Force -Path $Bin | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $Dest 'providers') | Out-Null
-foreach ($Name in @('examples', 'guides', 'presets', 'rulesets')) {
+foreach ($Name in @('examples', 'guides', 'rulesets')) {
   New-Item -ItemType Directory -Force -Path (Join-Path $Dest $Name) | Out-Null
 }
 
 foreach ($Name in @('router.py', 'setup_tui.py', 'monitor.py', 'route_watcher.py', 'proxy_tray.py')) {
   Copy-Item (Join-Path $ScriptDir $Name) -Destination $Dest -Force
 }
-Copy-Item (Join-Path $ScriptDir 'keepalive.sh') -Destination $Dest -Force
 Copy-Item (Join-Path $ScriptDir 'router.example.json') -Destination $Dest -Force
 Copy-Item (Join-Path $ScriptDir 'README.md') -Destination $Dest -Force
 Copy-Item (Join-Path $ScriptDir 'LICENSE') -Destination $Dest -Force

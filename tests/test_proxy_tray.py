@@ -1,4 +1,4 @@
-"""Unit tests for examples/proxy_tray.py (stdlib only, no GUI deps — the
+"""Unit tests for proxy_tray.py (stdlib only, no GUI deps — the
 module's pystray/PIL imports are guarded)."""
 import importlib.util
 import os
@@ -15,7 +15,7 @@ def _load_tray():
     if "proxy_tray" in sys.modules:
         return sys.modules["proxy_tray"]
     spec = importlib.util.spec_from_file_location(
-        "proxy_tray", ROOT / "examples" / "proxy_tray.py")
+        "proxy_tray", ROOT / "proxy_tray.py")
     mod = importlib.util.module_from_spec(spec)
     sys.modules["proxy_tray"] = mod
     spec.loader.exec_module(mod)

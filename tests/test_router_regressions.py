@@ -454,7 +454,7 @@ def test_rotate_to_current_profile_is_noop_does_not_cooldown(tmp_path, monkeypat
 
 
 # ---------------------------------------------------------------------------
-# tray UX regressions (examples/proxy_tray.py)
+# tray UX regressions (proxy_tray.py)
 # ---------------------------------------------------------------------------
 
 import types  # noqa: E402
@@ -509,7 +509,7 @@ def load_tray(tmp_path):
         sys.modules[name] = {"pystray": stub_pystray, "PIL": stub_pil}[name]
     try:
         spec = importlib.util.spec_from_file_location(
-            "proxy_tray_under_test", ROOT / "examples" / "proxy_tray.py")
+            "proxy_tray_under_test", ROOT / "proxy_tray.py")
         module = importlib.util.module_from_spec(spec)
         assert spec.loader is not None
         # Register before exec: the module uses `from __future__ import

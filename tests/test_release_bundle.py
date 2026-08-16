@@ -15,25 +15,19 @@ class ReleaseBundleSourceTests(unittest.TestCase):
             "monitor.py",
             "route_watcher.py",
             "proxy_tray.py",
-            "keepalive.sh",
             "guides/proton-vpn-free.md",
             "guides/cloudflare-warp.md",
-            "presets/banana.json",
             "rulesets/roblox.json",
             "examples/proxy-manager.sh",
             "examples/keepalive.sh",
         ):
             self.assertTrue((ROOT / relative).is_file(), relative)
-        self.assertEqual(
-            (ROOT / "proxy_tray.py").read_bytes(),
-            (ROOT / "examples/proxy_tray.py").read_bytes(),
-        )
 
     def test_release_workflow_copies_runtime_modules_and_data(self):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
         for name in ("setup_tui.py", "monitor.py", "route_watcher.py", "proxy_tray.py"):
             self.assertIn(name, workflow)
-        self.assertIn("cp -R guides presets rulesets dist/proxy-router/", workflow)
+        self.assertIn("cp -R guides rulesets dist/proxy-router/", workflow)
         self.assertIn("cp -R examples/. dist/proxy-router/examples/", workflow)
 
     def test_installers_copy_runtime_modules(self):
@@ -42,7 +36,7 @@ class ReleaseBundleSourceTests(unittest.TestCase):
         for name in ("setup_tui.py", "monitor.py", "route_watcher.py", "proxy_tray.py"):
             self.assertIn(name, shell)
             self.assertIn(name, powershell)
-        for name in ("guides", "presets", "rulesets"):
+        for name in ("guides", "rulesets"):
             self.assertIn(name, shell)
             self.assertIn(name, powershell)
 
