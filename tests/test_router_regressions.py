@@ -99,19 +99,19 @@ def test_activate_fallback_writes_marker_and_reloads_once(tmp_path, monkeypatch)
         "proton": {"directory": "providers/proton", "fallback_provider": "cloudflare"},
         "cloudflare": {"directory": "providers/cloudflare"},
     }
-    switches = []
+    reloads = []
     monkeypatch.setattr(router, "_profile_error", lambda profile: None)
-    monkeypatch.setattr(router, "engine_switch", lambda: switches.append(True) or 0)
+    monkeypatch.setattr(router, "engine_reload", lambda *a, **k: reloads.append(True) or 0)
 
     assert router.activate_fallback("proton", reason="tls") == 0
     marker = json.loads((tmp_path / "state" / "fallback" / "proton.json").read_text())
     assert marker["provider"] == "cloudflare"
     assert marker["reason"] == "tls"
-    assert switches == [True]
+    assert reloads == [True]
 
     assert router.deactivate_fallback("proton") == 0
     assert not (tmp_path / "state" / "fallback" / "proton.json").exists()
-    assert switches == [True, True]
+    assert reloads == [True, True]
 
 
 def test_activate_fallback_restores_marker_when_reload_fails(tmp_path, monkeypatch):
@@ -124,7 +124,7 @@ def test_activate_fallback_restores_marker_when_reload_fails(tmp_path, monkeypat
         "proton": {"directory": "providers/proton", "fallback_provider": "cloudflare"},
         "cloudflare": {"directory": "providers/cloudflare"},
     }
-    monkeypatch.setattr(router, "engine_switch", lambda: 1)
+    monkeypatch.setattr(router, "engine_reload", lambda *a, **k: 1)
 
     assert router.activate_fallback("proton", reason="tls") == 1
     assert not (tmp_path / "state" / "fallback" / "proton.json").exists()
@@ -237,13 +237,13 @@ def test_activate_fallback_walks_chain_to_first_valid_provider(tmp_path, monkeyp
     }
     monkeypatch.setattr(router, "_profile_error",
                         lambda profile: None if "mullvad" in str(profile) else "bad")
-    switches = []
-    monkeypatch.setattr(router, "engine_switch", lambda: switches.append(True) or 0)
+    reloads = []
+    monkeypatch.setattr(router, "engine_reload", lambda *a, **k: reloads.append(True) or 0)
 
     assert router.activate_fallback("proton", reason="tls") == 0
     marker = json.loads((tmp_path / "state" / "fallback" / "proton.json").read_text())
     assert marker["provider"] == "mullvad"
-    assert switches == [True]
+    assert reloads == [True]
 
 
 def test_activate_fallback_rejects_target_outside_chain(tmp_path, monkeypatch):
@@ -259,7 +259,7 @@ def test_activate_fallback_rejects_target_outside_chain(tmp_path, monkeypatch):
         "mullvad": {"directory": "providers/mullvad"},
     }
     monkeypatch.setattr(router, "_profile_error", lambda profile: None)
-    monkeypatch.setattr(router, "engine_switch", lambda: 0)
+    monkeypatch.setattr(router, "engine_reload", lambda *a, **k: 0)
 
     assert router.activate_fallback("proton", target="mullvad") == 0
     marker = json.loads((tmp_path / "state" / "fallback" / "proton.json").read_text())
@@ -322,6 +322,35 @@ def test_egress_sweep_skips_primary_when_fallback_is_active(tmp_path, monkeypatc
         "status": "fallback", "fallback_provider": "cloudflare",
         "fallback_profile": None, "ok": True,
     }
+
+
+def test_tun_exclude_cidr_pins_destinations_outside_engine(tmp_path):
+    # route_exclude_address keeps these CIDRs on the physical path so they
+    # never transit (or blip on) the engine (#38 escape hatch)
+    router = load_router(tmp_path)
+    profile = tmp_path / "proton.conf"
+    router._providers = {"proton": {}}
+    router._routes = [{"id": "zen", "domains": ["opencode.ai"], "provider": "proton"}]
+    router._vpn = {"capture": "routes", "exclude_cidr": ["203.0.113.0/24"]}
+    router._routing = {}
+    router._port = 2080
+    router.current_mode = lambda: "tun"
+    router._usable_profile = lambda name, preferred=None: profile
+    router.parse_wireguard = lambda path: {}
+    config, _ = router.build_singbox_config()
+    tun = next(i for i in config["inbounds"] if i.get("type") == "tun")
+    assert tun["route_exclude_address"] == ["203.0.113.0/24"]
+
+
+def test_load_config_rejects_malformed_exclude_cidr(tmp_path):
+    router = load_router(tmp_path)
+    router.CONFIG_FILE.write_text(json.dumps({
+        "port": 2080,
+        "providers": {"proton": {"directory": "providers/proton"}},
+        "routes": [],
+        "vpn": {"exclude_cidr": "203.0.113.0/24"},
+    }))
+    assert router.load_config() == 1
 
 
 def test_selective_tun_uses_address_set_and_keeps_auto_route(tmp_path):

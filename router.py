@@ -299,6 +299,12 @@ def load_config() -> int:
     capture = vpn.get("capture")
     if capture is not None and capture not in ("ruleset", "routes"):
         return fail(f"bad {CONFIG_FILE.name}: vpn.capture must be 'ruleset' or 'routes'")
+    exclude_cidr = vpn.get("exclude_cidr")
+    if exclude_cidr is not None and (
+        not isinstance(exclude_cidr, list)
+        or any(not isinstance(cidr, str) or not cidr.strip() for cidr in exclude_cidr)
+    ):
+        return fail(f"bad {CONFIG_FILE.name}: vpn.exclude_cidr must be a list of CIDR strings")
     if not all(isinstance(name, str) and _PROVIDER_NAME.fullmatch(name) and isinstance(entry, dict)
                for name, entry in providers.items()):
         return fail(f"bad {CONFIG_FILE.name}: provider names/entries are invalid")
@@ -915,7 +921,7 @@ def activate_fallback(name: str, *, target: str | None = None, reason: str = "tr
             "reason": str(reason),
             "activated_at": int(time.time()),
         }, sort_keys=True) + "\n", 0o600)
-        rc = engine_switch()
+        rc = engine_reload()
         if rc == 0:
             print(f"fallback active: {name} -> {candidate} ({reason})")
             return 0
@@ -928,7 +934,7 @@ def activate_fallback(name: str, *, target: str | None = None, reason: str = "tr
 
 
 def deactivate_fallback(name: str) -> int:
-    """Restore primary routing for ``name`` with one hard server switch."""
+    """Restore primary routing for ``name`` with one in-place reload."""
     if name not in _providers:
         return fail(f"unknown provider '{name}'")
     path = _fallback_state_path(name)
@@ -937,7 +943,7 @@ def deactivate_fallback(name: str) -> int:
         return 0
     previous = path.read_text()
     path.unlink(missing_ok=True)
-    rc = engine_switch()
+    rc = engine_reload()
     if rc != 0:
         _atomic_write(path, previous, 0o600)
         return rc
@@ -2017,6 +2023,13 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
             # keeps the transparent listener app-independent while preserving
             # direct fallback for unmatched traffic.
             rules.insert(0, {"action": "sniff"})
+        exclude_cidr = _vpn.get("exclude_cidr") or []
+        if exclude_cidr:
+            # Destinations pinned outside the engine entirely: sing-box
+            # excludes these routes from the TUN, so they always ride the
+            # physical path and never see a reload/switch blip (agent
+            # backends, work VPNs, anything that must stay up 24/7).
+            tun["route_exclude_address"] = list(exclude_cidr)
         # Keep the mixed proxy listener ALONGSIDE the TUN: apps pinned to
         # 127.0.0.1:PORT (hermes gateway, with-proxy, keepalive egress
         # probes) must keep working while TUN captures everything else at
@@ -2858,16 +2871,11 @@ def rotate(name: str, *, reason: str | None = None, force: bool = False, probe: 
     set_active(name, chosen)
     record_rotation(name, chosen)
     print(f"switched {name} -> {chosen.stem}")
-    rc = engine_switch()
-    if rc != 0:
-        # The new process never became healthy. Restore the previous active
-        # marker so future starts and route attribution match the config that
-        # was restored by engine_switch().
-        if previous is None:
-            (ROOT / "state" / f"{name}.active").unlink(missing_ok=True)
-        else:
-            set_active(name, previous)
-        return rc
+    # The reload applied the new exit in place: SIGHUP regenerates the
+    # endpoint set without restarting the process, so the TUN interface,
+    # routes, and listener sockets survive the switch (in-flight flows
+    # still reset; nothing else does). If SIGHUP could not come up,
+    # engine_reload already fell back to a full start internally.
     if probe and not listener_up():
         # Transparent TUN keeps the mixed listener alongside the TUN inbound,
         # so rotation can still validate the new profile through 127.0.0.1.
@@ -2897,7 +2905,7 @@ def rotate(name: str, *, reason: str | None = None, force: bool = False, probe: 
     set_active(name, previous)
     record_rotation(name, previous)
     print(f"switched {name} -> {previous.stem} (rollback)")
-    rollback_rc = engine_switch()
+    rollback_rc = engine_reload({name: previous})
     # The rollback restored service, but the requested rotation failed. A
     # non-zero result is required so callers can activate the configured
     # provider fallback instead of treating the rollback as success.
@@ -3543,9 +3551,11 @@ def egress_check(name: str | None = None, as_json: bool = False) -> int:
 def egress_sweep(name: str | None = None, as_json: bool = False) -> int:
     """Probe every profile once and leave the engine on the best alive one.
 
-    Every profile change is a hard engine switch. If no profile is alive, the
-    original active profile is restored when possible, so a diagnostic sweep
-    cannot strand the tunnel on the last dead profile it tested.
+    Every profile change is an in-place SIGHUP reload: the process, TUN
+    interface, and listener sockets survive each hop. If no profile is
+    alive, the original active profile is restored when possible, so a
+    diagnostic sweep cannot strand the tunnel on the last dead profile it
+    tested.
     """
     # The tun config keeps the mixed listener (see egress_probe), so the
     # full-pool sweep probes through 127.0.0.1:<port> in either mode.
@@ -3601,16 +3611,13 @@ def egress_sweep(name: str | None = None, as_json: bool = False) -> int:
             nonlocal actual
             if actual == profile:
                 return 0
-            previous = actual
-            set_active(provider, profile)
-            rc = engine_switch()
+            # Graceful hop: apply the candidate through the SIGHUP reload
+            # BEFORE committing the active marker, so a failed switch leaves
+            # both the marker and the running exit untouched.
+            rc = engine_reload({provider: profile})
             if rc != 0:
-                if previous is None:
-                    (ROOT / "state" / f"{provider}.active").unlink(missing_ok=True)
-                else:
-                    set_active(provider, previous)
-                actual = previous
                 return rc
+            set_active(provider, profile)
             actual = profile
             record_rotation(provider, profile)
             print(f"switched {provider} -> {profile.stem} (sweep)")

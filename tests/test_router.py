@@ -1040,8 +1040,8 @@ class RotationEgressTests(unittest.TestCase):
         self.assertEqual(self._active(), "a")
         self.assertTrue(router.is_cooled_down("proton", self._profile("b")))
         probe.assert_called_once()
-        # first hard switch for the rotation, second for the rollback
-        self.assertEqual(self.engine_switch.call_count, 2)
+        # first in-place reload for the rotation, second for the rollback
+        self.assertEqual(self.engine_reload.call_count, 2)
 
     def test_rotate_reason_probe_failure_keeps_reason_cooldown(self):
         # A --reason rotation marks the current profile FAILED upstream; the
@@ -1757,10 +1757,10 @@ class EgressSweepTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         stems = [call.args[1].stem for call in self.probe.call_args_list]
         self.assertEqual(stems, ["a", "b", "c"])
-        # hops are direct hard switches (a->b, b->c, then back to the best);
+        # hops are in-place reloads (a->b, b->c, then back to the best);
         # sweep never routes through rotate()
         self.rotate.assert_not_called()
-        self.assertEqual(self.engine_switch.call_count, 3)
+        self.assertEqual(self.engine_reload.call_count, 3)
 
     def test_sweep_retries_failed_probe_after_settle(self):
         router._egress_settings = {**router.DEFAULT_EGRESS_SETTINGS, "probe_settle_seconds": 20}
@@ -1779,7 +1779,7 @@ class EgressSweepTests(unittest.TestCase):
     def test_does_not_probe_unactivated_profiles_after_hop_failure(self):
         router.set_active("proton", self._profile("a"))
         # hop a->b succeeds, hop b->c fails, restore-to-original is a third switch
-        self.engine_switch.side_effect = [0, 1, 0]
+        self.engine_reload.side_effect = [0, 1, 0]
         self._probe(
             (True, {"ok": True, "latency_ms": 10.0, "status": 200}),
             (True, {"ok": True, "latency_ms": 20.0, "status": 200}),
@@ -1804,7 +1804,7 @@ class EgressSweepTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(router.persisted_active("proton").stem, "b")
         # a->b, b->c, then back to the best (b)
-        self.assertEqual(self.engine_switch.call_count, 3)
+        self.assertEqual(self.engine_reload.call_count, 3)
         joined = "".join(c.args[0] for c in write.call_args_list)
         self.assertIn("switched proton -> b (sweep)", joined)
 
@@ -1814,8 +1814,10 @@ class EgressSweepTests(unittest.TestCase):
         router.set_active("proton", self._profile("a"))
         rc = router.egress_sweep("proton")
         self.assertEqual(rc, 0)
+        # hops are in-place reloads, but the sweep must still END on the
+        # current exit when it is already the best
         self.assertEqual(router.persisted_active("proton").stem, "a")
-        self.engine_reload.assert_not_called()
+        self.assertEqual(self.engine_reload.call_count, 3)
 
     def test_all_profiles_dead_exit_one_no_switch(self):
         router.set_active("proton", self._profile("a"))
@@ -1827,8 +1829,8 @@ class EgressSweepTests(unittest.TestCase):
         with mock.patch("sys.stdout.write") as write:
             rc = router.egress_sweep("proton")
         self.assertEqual(rc, 1)
-        # every exit is probed via a hard switch, then the original restored
-        self.assertEqual(self.engine_switch.call_count, 3)
+        # every exit is probed via an in-place reload, then the original restored
+        self.assertEqual(self.engine_reload.call_count, 3)
         self.assertEqual(router.persisted_active("proton").stem, "a")  # restored
         joined = "".join(c.args[0] for c in write.call_args_list)
         self.assertIn("0/3 alive", joined)
