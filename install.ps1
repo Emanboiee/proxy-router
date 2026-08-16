@@ -22,12 +22,30 @@ $Bin = Join-Path $Dest 'bin'
 New-Item -ItemType Directory -Force -Path $Dest | Out-Null
 New-Item -ItemType Directory -Force -Path $Bin | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $Dest 'providers') | Out-Null
+foreach ($Name in @('examples', 'guides', 'rulesets')) {
+  New-Item -ItemType Directory -Force -Path (Join-Path $Dest $Name) | Out-Null
+}
 
-Copy-Item (Join-Path $ScriptDir 'router.py') -Destination $Dest -Force
+foreach ($Name in @('router.py', 'setup_tui.py', 'monitor.py', 'route_watcher.py', 'proxy_tray.py')) {
+  Copy-Item (Join-Path $ScriptDir $Name) -Destination $Dest -Force
+}
 Copy-Item (Join-Path $ScriptDir 'router.example.json') -Destination $Dest -Force
 Copy-Item (Join-Path $ScriptDir 'README.md') -Destination $Dest -Force
 Copy-Item (Join-Path $ScriptDir 'LICENSE') -Destination $Dest -Force
 Copy-Item (Join-Path $ScriptDir 'install.ps1') -Destination $Dest -Force
+
+# Examples and bundled data are defaults. Preserve any user-customized file
+# already present in the destination on an installer rerun.
+foreach ($Directory in @('examples', 'guides', 'presets', 'rulesets')) {
+  $SourceDirectory = Join-Path $ScriptDir $Directory
+  $DestinationDirectory = Join-Path $Dest $Directory
+  Get-ChildItem -LiteralPath $SourceDirectory -Force | ForEach-Object {
+    $Target = Join-Path $DestinationDirectory $_.Name
+    if (-not (Test-Path -LiteralPath $Target)) {
+      Copy-Item $_.FullName -Destination $Target -Recurse
+    }
+  }
+}
 
 $SingBox = Join-Path $ScriptDir 'bin\sing-box.exe'
 if (Test-Path $SingBox) {

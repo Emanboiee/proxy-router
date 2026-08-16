@@ -55,7 +55,7 @@ class SudoersRulesTests(unittest.TestCase):
         self.assertIn("/usr/bin/python3 /opt/pr/router.py start", cmds)
         self.assertIn("/usr/bin/python3 /opt/pr/router.py stop", cmds)
         # Exact grant surface: tray Connect/Disconnect + engine commands only.
-        self.assertEqual(len(cmds), 7)
+        self.assertEqual(len(cmds), 10)
         self.assertTrue(all(" ALL=(root) NOPASSWD: " in l for l in lines[1:]))
 
 

@@ -38,6 +38,52 @@ from pathlib import Path
 
 _PRESET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 
+# Resource-aware keepalive profiles. Explicit CLI overrides can tune any of
+# these values without making users hand-edit JSON or environment variables.
+_AUTOCHECK_PRESETS = {
+    "off": {
+        "enabled": False,
+        "interval": 15,
+        "max_backoff": 300,
+        "probe_every": 4,
+        "dead_strikes": 2,
+        "storm_window": 600,
+        "max_rotations": 2,
+        "sweep_every": 1800,
+    },
+    "light": {
+        "enabled": True,
+        "interval": 30,
+        "max_backoff": 600,
+        "probe_every": 12,
+        "dead_strikes": 3,
+        "storm_window": 1800,
+        "max_rotations": 1,
+        "sweep_every": 7200,
+    },
+    "balanced": {
+        "enabled": True,
+        "interval": 15,
+        "max_backoff": 300,
+        "probe_every": 4,
+        "dead_strikes": 2,
+        "storm_window": 600,
+        "max_rotations": 2,
+        "sweep_every": 1800,
+    },
+    "aggressive": {
+        "enabled": True,
+        "interval": 10,
+        "max_backoff": 180,
+        "probe_every": 1,
+        "dead_strikes": 1,
+        "storm_window": 300,
+        "max_rotations": 3,
+        "sweep_every": 900,
+    },
+}
+_AUTOCHECK_NUMERIC = tuple(key for key in _AUTOCHECK_PRESETS["balanced"] if key != "enabled")
+
 try:
     import termios
     import tty
@@ -296,6 +342,49 @@ def import_profiles(source, destination, validator=None) -> dict:
     }
 
 
+def configure_autocheck(config_path, preset: str | None = None, **overrides) -> dict:
+    """Persist resource-aware keepalive settings without starting the engine.
+
+    ``preset`` is one of ``off``, ``light``, ``balanced``, or ``aggressive``.
+    Numeric overrides are validated and merged on top, making this suitable
+    for both a low-power laptop and a machine that can afford frequent pool
+    sweeps. Existing unrelated router settings are preserved.
+    """
+    config_path = Path(config_path)
+    if config_path.is_file():
+        data = json.loads(config_path.read_text())
+    else:
+        data = _default_config()
+    current = data.get("keepalive")
+    if not isinstance(current, dict):
+        current = {}
+    selected = preset or current.get("preset") or "balanced"
+    if selected not in _AUTOCHECK_PRESETS:
+        raise ValueError(f"unknown autocheck profile '{selected}'")
+    settings = dict(_AUTOCHECK_PRESETS[selected])
+    if preset is None:
+        for key, value in current.items():
+            if key in settings:
+                settings[key] = value
+    for key in _AUTOCHECK_NUMERIC:
+        value = overrides.get(key)
+        if value is None:
+            continue
+        try:
+            value = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"autocheck {key} must be an integer") from exc
+        if value < 1:
+            raise ValueError(f"autocheck {key} must be at least 1")
+        settings[key] = value
+    settings["preset"] = selected
+    data["keepalive"] = settings
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(data, indent=2) + "\n")
+    os.chmod(config_path, 0o600)
+    return settings
+
+
 # ---------------------------------------------------------------------------
 # guides
 # ---------------------------------------------------------------------------
@@ -346,7 +435,12 @@ def apply_presets(config_path, opencode=True, warp_roblox=True) -> dict:
 
     added: list[str] = []
     if opencode:
-        providers.setdefault("proton", {"directory": "providers/proton", "cooldown_seconds": 60})
+        proton_config = providers.setdefault("proton", {})
+        proton_config.setdefault("directory", "providers/proton")
+        proton_config.setdefault("cooldown_seconds", 60)
+        if warp_roblox or "cloudflare" in providers:
+            if "fallback_providers" not in proton_config and "fallback_provider" not in proton_config:
+                proton_config["fallback_providers"] = ["cloudflare"]
         if not any(r.get("id") == "opencode-zen" for r in routes):
             routes.append(dict(_PRESET_ROUTES["opencode-zen"]))
             added.append("opencode-zen")
@@ -361,6 +455,63 @@ def apply_presets(config_path, opencode=True, warp_roblox=True) -> dict:
     config_path.write_text(json.dumps(data, indent=2) + "\n")
     os.chmod(config_path, 0o600)
     return {"added": added}
+
+
+def configure_fallback(config_path, primary: str, candidates: list[str] | str) -> dict:
+    """Set an ordered fallback chain without starting or reloading the engine.
+
+    ``candidates`` may be a list or a comma-separated CLI value. The legacy
+    singular ``fallback_provider`` key is removed when a new chain is saved,
+    making the migration explicit while preserving every unrelated setting.
+    An empty candidate list clears the chain.
+    """
+    config_path = Path(config_path)
+    if config_path.is_file():
+        data = json.loads(config_path.read_text())
+    else:
+        data = _default_config()
+    providers = data.setdefault("providers", {})
+    if primary not in providers:
+        raise ValueError(f"unknown primary provider '{primary}'")
+    if isinstance(candidates, str):
+        candidates = [item.strip() for item in candidates.split(",") if item.strip()]
+    if not isinstance(candidates, list) or any(not isinstance(item, str) for item in candidates):
+        raise ValueError("fallback candidates must be a comma-separated provider list")
+    if len(set(candidates)) != len(candidates):
+        raise ValueError("fallback candidates must not contain duplicates")
+    if primary in candidates:
+        raise ValueError("a provider cannot fall back to itself")
+    unknown = [item for item in candidates if item not in providers]
+    if unknown:
+        raise ValueError(f"unknown fallback provider(s): {', '.join(unknown)}")
+    entry = providers[primary]
+    entry.pop("fallback_provider", None)
+    if candidates:
+        entry["fallback_providers"] = candidates
+    else:
+        entry.pop("fallback_providers", None)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(data, indent=2) + "\n")
+    os.chmod(config_path, 0o600)
+    return {"provider": primary, "fallback_providers": candidates}
+
+
+def configure_transparent(config_path, enabled: bool = True) -> dict:
+    """Select route-based TUN capture without starting or reloading the engine."""
+    config_path = Path(config_path)
+    if config_path.is_file():
+        data = json.loads(config_path.read_text())
+    else:
+        data = _default_config()
+    vpn = data.setdefault("vpn", {})
+    if not isinstance(vpn, dict):
+        raise ValueError("vpn configuration must be an object")
+    capture = "routes" if enabled else "ruleset"
+    vpn["capture"] = capture
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(data, indent=2) + "\n")
+    os.chmod(config_path, 0o600)
+    return {"capture": capture}
 
 
 def custom_preset_path(root: Path, name: str) -> Path:
@@ -428,11 +579,21 @@ def apply_preset_by_name(root: Path, name: str) -> dict:
     added: list[str] = []
     for route in preset.get("routes", []):
         if route.get("provider") and route["provider"] not in providers:
-            providers.setdefault(route["provider"], {
-                "directory": f"providers/{route['provider']}", "cooldown_seconds": 60})
+            provider_config = {
+                "directory": f"providers/{route['provider']}",
+                "cooldown_seconds": 60,
+            }
+            providers.setdefault(route["provider"], provider_config)
         if not any(r.get("id") == route.get("id") for r in routes):
             routes.append(dict(route))
             added.append(str(route.get("id")))
+    # Same normalization apply_presets uses: a Proton pool paired with a
+    # Cloudflare pool declares it as the fallback chain (first application
+    # only; an explicitly configured chain is never overwritten).
+    proton_config = providers.get("proton")
+    if isinstance(proton_config, dict) and "cloudflare" in providers:
+        if "fallback_providers" not in proton_config and "fallback_provider" not in proton_config:
+            proton_config["fallback_providers"] = ["cloudflare"]
     routing = preset.get("routing") or {}
     mode = routing.get("mode", "default")
     if mode != "default":
@@ -578,6 +739,22 @@ def _cmd_import(root: Path, provider: str, paths) -> int:
     if merged["rejected"]:
         print(_style(f"setup: rejected {merged['rejected']} file(s)", _Ansi.YELLOW))
     return 0 if merged["imported"] else 1
+
+
+def _cmd_autocheck(root: Path, preset: str | None, overrides: dict) -> int:
+    try:
+        settings = configure_autocheck(root / "router.json", preset, **overrides)
+    except (ValueError, json.JSONDecodeError, OSError) as exc:
+        print(_style(f"setup: autocheck configuration failed: {exc}", _Ansi.RED), file=sys.stderr)
+        return 1
+    state = "enabled" if settings["enabled"] else "disabled"
+    print(_style(f"setup: autocheck {state} ({settings['preset']})", _Ansi.GREEN))
+    print(
+        "setup: interval={interval}s, probe_every={probe_every}, sweep_every={sweep_every}s, "
+        "dead_strikes={dead_strikes}, max_rotations={max_rotations}".format(**settings)
+    )
+    print("setup: run `setup --keepalive-install` to load/reload the launchd supervisor.")
+    return 0
 
 
 def _cmd_preset(root: Path) -> int:
@@ -828,6 +1005,23 @@ def _cmd_bridge_install(root: Path, force: bool = False) -> int:
         return 1
     print(_style(f"bridge: installed -> {target}", _Ansi.GREEN))
     return 0
+
+
+def _cmd_keepalive_install(root: Path, remove: bool = False) -> int:
+    """Install or remove the macOS launchd supervisor for unattended support."""
+    script = root / "examples" / "install-launchd.sh"
+    if not script.is_file():
+        print(f"keepalive: installer missing: {script}", file=sys.stderr)
+        return 1
+    env = dict(os.environ)
+    env["PROXY_ROUTER_DIR"] = str(root)
+    command = ["bash", str(script)] + (["--remove"] if remove else [])
+    try:
+        result = subprocess.run(command, env=env, cwd=root)
+    except OSError as exc:
+        print(f"keepalive: installer failed: {exc}", file=sys.stderr)
+        return 1
+    return result.returncode
 
 
 def _router_command(root: Path, *args: str) -> int:
@@ -1987,6 +2181,25 @@ def main(argv=None, root=None) -> int:
                         help="import WireGuard .conf file(s)/directory into providers/proton")
     parser.add_argument("--import-warp", nargs="+", metavar="PATH",
                         help="import WireGuard .conf file(s)/directory into providers/cloudflare")
+    parser.add_argument("--autocheck", choices=sorted(_AUTOCHECK_PRESETS), metavar="PROFILE",
+                        help="configure automatic health checks (off, light, balanced, aggressive)")
+    for key in _AUTOCHECK_NUMERIC:
+        parser.add_argument(f"--autocheck-{key.replace('_', '-')}", type=int, metavar="N",
+                            help=f"override autocheck {key}")
+    parser.add_argument("--fallback", metavar="PRIMARY",
+                        help="set a primary provider's ordered fallback chain")
+    parser.add_argument("--fallback-to", metavar="PROVIDER,...",
+                        help="comma-separated fallback providers for --fallback; empty clears it")
+    parser.add_argument("--fallback-clear", metavar="PRIMARY",
+                        help="clear a provider's fallback chain")
+    parser.add_argument("--transparent", action="store_true",
+                        help="configure route-based TUN capture for configured domains")
+    parser.add_argument("--transparent-off", action="store_true",
+                        help="restore the existing selective ruleset TUN capture")
+    parser.add_argument("--keepalive-install", action="store_true",
+                        help="install the macOS launchd 24/7 supervisor")
+    parser.add_argument("--keepalive-remove", action="store_true",
+                        help="remove the macOS launchd 24/7 supervisor")
     parser.add_argument("--preset", metavar="NAME", nargs="?",
                         const="default",
                         help="apply a preset by name (built-in or custom; bare --preset applies 'default')")
@@ -2020,6 +2233,46 @@ def main(argv=None, root=None) -> int:
         rc = max(rc, _cmd_import(ROOT, "proton", args.import_proton))
     if args.import_warp:
         rc = max(rc, _cmd_import(ROOT, "cloudflare", args.import_warp))
+    autocheck_overrides = {
+        key: getattr(args, f"autocheck_{key}")
+        for key in _AUTOCHECK_NUMERIC
+        if getattr(args, f"autocheck_{key}") is not None
+    }
+    if args.autocheck or autocheck_overrides:
+        rc = max(rc, _cmd_autocheck(ROOT, args.autocheck, autocheck_overrides))
+    if args.fallback or args.fallback_clear:
+        try:
+            if args.fallback and args.fallback_clear:
+                raise ValueError("choose --fallback or --fallback-clear, not both")
+            if args.fallback_clear and args.fallback_to is not None:
+                raise ValueError("--fallback-clear cannot be combined with --fallback-to")
+            primary = args.fallback or args.fallback_clear
+            candidates = [] if args.fallback_clear else args.fallback_to
+            if args.fallback and args.fallback_to is None:
+                raise ValueError("--fallback needs --fallback-to PROVIDER,... (empty clears it)")
+            result = configure_fallback(ROOT / "router.json", primary, candidates or [])
+            chain = " -> ".join(result["fallback_providers"]) or "(none)"
+            print(_style(f"setup: fallback chain {primary} -> {chain}", _Ansi.GREEN))
+            print("setup: run `proxy-router reload` to apply (or `ensure` if stopped); the engine was not restarted.")
+        except (ValueError, json.JSONDecodeError, OSError) as exc:
+            print(_style(f"setup: fallback configuration failed: {exc}", _Ansi.RED), file=sys.stderr)
+            rc = max(rc, 1)
+    if args.transparent or args.transparent_off:
+        try:
+            if args.transparent and args.transparent_off:
+                raise ValueError("choose --transparent or --transparent-off, not both")
+            result = configure_transparent(ROOT / "router.json", enabled=args.transparent)
+            print(_style(f"setup: TUN capture = {result['capture']}", _Ansi.GREEN))
+            print("setup: run `proxy-router vpn on` (or `reload` if TUN is already active); the engine was not restarted.")
+        except (ValueError, json.JSONDecodeError, OSError) as exc:
+            print(_style(f"setup: transparent mode configuration failed: {exc}", _Ansi.RED), file=sys.stderr)
+            rc = max(rc, 1)
+    if args.keepalive_install or args.keepalive_remove:
+        if args.keepalive_install and args.keepalive_remove:
+            print("setup: choose --keepalive-install or --keepalive-remove, not both", file=sys.stderr)
+            rc = max(rc, 1)
+        else:
+            rc = max(rc, _cmd_keepalive_install(ROOT, remove=args.keepalive_remove))
     if args.preset:
         try:
             result = apply_preset_by_name(ROOT, args.preset)
@@ -2029,7 +2282,7 @@ def main(argv=None, root=None) -> int:
             else:
                 label += " (already present, nothing added)"
             print(_style(_tint_provider(label), _Ansi.GREEN))
-            print("setup: run `proxy-router ensure` (or reload) to apply; the engine is untouched.")
+            print("setup: run `proxy-router reload` to apply (or `ensure` if stopped); the engine was not restarted.")
         except (ValueError, json.JSONDecodeError, OSError) as exc:
             print(_style(f"setup: preset apply failed: {exc}", _Ansi.RED), file=sys.stderr)
             rc = max(rc, 1)
@@ -2056,8 +2309,12 @@ def main(argv=None, root=None) -> int:
         rc = max(rc, _cmd_bridge_install(ROOT, force=True))
     if args.bridge_check:
         rc = max(rc, _cmd_bridge_check(ROOT))
-    if not (args.guide or args.check or args.import_proton or args.import_warp or args.preset
-            or args.bridge_install or args.bridge_force_install or args.bridge_check):
+    if not (args.guide or args.check or args.import_proton or args.import_warp
+            or args.autocheck or autocheck_overrides or args.fallback
+            or args.fallback_clear or args.transparent or args.transparent_off
+            or args.keepalive_install or args.keepalive_remove
+            or args.preset or args.bridge_install
+            or args.bridge_force_install or args.bridge_check):
         rc = wizard(ROOT)
     return rc
 

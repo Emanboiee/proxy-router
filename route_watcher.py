@@ -7,9 +7,9 @@ localhost:2080 clients when macOS exposes them through ``lsof``, and probes a
 critical routed domain after it is observed. It rotates the provider only for
 persistent destination-specific transport failures.
 
-Scope is intentionally honest: HTTP-proxy mode can observe traffic that uses
-127.0.0.1:2080, not applications that bypass the proxy. Full-device coverage
-requires sing-box TUN or a macOS Network Extension and is a separate mode.
+In proxy mode it can only observe traffic that uses 127.0.0.1:2080. In route-
+based TUN mode it can observe routed destinations from sing-box logs even when
+applications bypass the proxy; client attribution remains unavailable.
 """
 from __future__ import annotations
 
@@ -99,15 +99,21 @@ def parse_line(line: str) -> dict | None:
 
 
 def critical_domains(root: Path) -> tuple[str, ...]:
-    """Read target domains from routes; opencode.ai is the default critical lane."""
+    """Read all configured routed domains for transparent-mode observation.
+
+    The watcher started as an OpenCode-only guard, but route-based TUN mode
+    exists specifically so the router can observe and selectively divert any
+    configured target without requiring an app-level proxy setting. Keep the
+    fallback for a fresh/partial config so OpenCode remains observable by
+    default.
+    """
     domains: list[str] = []
     try:
         config = json.loads((Path(root) / "router.json").read_text())
         for route in config.get("routes", []):
-            route_id = str(route.get("id", "")).lower()
             for domain in route.get("domains", []):
                 domain = normalize_host(str(domain))
-                if domain and ("opencode" in route_id or domain_matches(domain, "opencode.ai")):
+                if domain:
                     domains.append(domain)
     except (OSError, ValueError, TypeError):
         pass
@@ -119,6 +125,25 @@ def _owned_pid(root: Path) -> int | None:
         return int((Path(root) / "sing-box.pid").read_text().strip())
     except (OSError, ValueError):
         return None
+
+
+def _hand_back_ownership(*paths: Path) -> None:
+    """Make root-created watcher markers readable by the invoking user."""
+    if os.geteuid() != 0:
+        return
+    uid = os.environ.get("SUDO_UID")
+    gid = os.environ.get("SUDO_GID")
+    if not uid or not gid:
+        return
+    try:
+        owner = (int(uid), int(gid))
+    except ValueError:
+        return
+    for path in paths:
+        try:
+            os.chown(path, *owner)
+        except OSError:
+            pass
 
 
 def client_snapshot(root: Path, runner: Callable = subprocess.run) -> list[dict]:
@@ -186,20 +211,23 @@ class RotationGuard:
     """Persistent-failure guard used by the standalone worker."""
 
     def __init__(self) -> None:
-        self.failure_times: collections.deque[float] = collections.deque()
-        self.last_rotate = 0.0
+        self.failure_times: dict[str, collections.deque[float]] = {}
+        self.last_rotate: dict[str, float] = {}
 
-    def record_transport_failure(self, now: float) -> bool:
-        while self.failure_times and now - self.failure_times[0] > FAILURE_WINDOW_SECONDS:
-            self.failure_times.popleft()
-        self.failure_times.append(now)
-        if len(self.failure_times) < MIN_TRANSPORT_FAILURES:
+    def record_transport_failure(self, now: float, target: str = "*") -> bool:
+        target = normalize_host(target) or "*"
+        failures = self.failure_times.setdefault(target, collections.deque())
+        while failures and now - failures[0] > FAILURE_WINDOW_SECONDS:
+            failures.popleft()
+        failures.append(now)
+        if len(failures) < MIN_TRANSPORT_FAILURES:
             return False
-        if self.last_rotate and now - self.last_rotate < ROTATE_COOLDOWN_SECONDS:
-            self.failure_times.clear()
+        last_rotate = self.last_rotate.get(target, 0.0)
+        if last_rotate and now - last_rotate < ROTATE_COOLDOWN_SECONDS:
+            failures.clear()
             return False
-        self.last_rotate = now
-        self.failure_times.clear()
+        self.last_rotate[target] = now
+        failures.clear()
         return True
 
 
@@ -273,6 +301,7 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
     enabled_file(root).write_text("enabled\n", encoding="ascii")
     os.chmod(pid_file(root), 0o600)
     os.chmod(enabled_file(root), 0o600)
+    _hand_back_ownership(pid_file(root), enabled_file(root))
     log_path = root / LOG_FILE_NAME
     offset = log_path.stat().st_size if log_path.exists() else 0
     domains = critical_domains(root)
@@ -283,6 +312,10 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
     guard = RotationGuard()
     try:
         while enabled_file(root).is_file():
+            # Routes can be added while the watcher is running. Refresh the
+            # target set each tick so transparent capture starts observing a
+            # newly configured domain without requiring a router restart.
+            domains = critical_domains(root)
             offset, lines = _read_new_lines(log_path, offset)
             for line in lines:
                 event = parse_line(line)
@@ -303,7 +336,7 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
                     append_event(root, event)
                     if is_critical:
                         last_target[host] = now
-                        if event.get("failure") and guard.record_transport_failure(now):
+                        if event.get("failure") and guard.record_transport_failure(now, host):
                             result = rotate_provider(root)
                             append_event(root, {"kind": "rotation", "observed_at": time.time(), **result})
                 elif event["kind"] == "client":
@@ -317,13 +350,12 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
                 last_probe[host] = now
                 result = probe_target(root, host)
                 append_event(root, {"kind": "probe", "observed_at": time.time(), **result})
-                if result.get("transport_failure") and guard.record_transport_failure(now):
+                if result.get("transport_failure") and guard.record_transport_failure(now, host):
                     rotation = rotate_provider(root)
                     append_event(root, {"kind": "rotation", "observed_at": time.time(), **rotation})
             sleep(max(0.5, float(interval)))
     finally:
-        pid_file(root).unlink(missing_ok=True)
-        enabled_file(root).unlink(missing_ok=True)
+        _cleanup_worker_state(root, os.getpid())
     return 0
 
 
@@ -351,14 +383,30 @@ def _pid_running(pid: int, root: Path | None = None) -> bool:
     return True
 
 
+def _cleanup_worker_state(root: Path, owner_pid: int) -> None:
+    """Remove watcher markers only when they still belong to this worker."""
+    try:
+        if pid_file(root).read_text().strip() != str(owner_pid):
+            return
+    except (OSError, ValueError):
+        return
+    pid_file(root).unlink(missing_ok=True)
+    enabled_file(root).unlink(missing_ok=True)
+
+
 def status(root: Path | None = None) -> dict:
     root = Path(root) if root is not None else ROOT
     try:
         pid = int(pid_file(root).read_text().strip())
     except (OSError, ValueError):
         pid = None
+    try:
+        mode = (root / "state" / "mode").read_text().strip()
+    except OSError:
+        mode = "proxy"
+    scope = "tun + proxy-observable" if mode == "tun" else "proxy-observable only"
     return {"enabled": enabled_file(root).is_file(), "running": bool(pid and _pid_running(pid, root)), "pid": pid,
-            "events": events_file(root).is_file(), "scope": "proxy-observable only", "targets": list(critical_domains(root))}
+            "events": events_file(root).is_file(), "scope": scope, "targets": list(critical_domains(root))}
 
 
 def start(root: Path | None = None, *, interval: float = DEFAULT_INTERVAL) -> dict:
@@ -367,16 +415,21 @@ def start(root: Path | None = None, *, interval: float = DEFAULT_INTERVAL) -> di
     if current["running"]:
         return {"started": False, "already_running": True, "pid": current["pid"]}
     state_dir(root).mkdir(parents=True, exist_ok=True)
+    # Publish the start intent before spawning so the child cannot observe a
+    # missing enable marker and exit during the tiny parent/child race.
+    enabled_file(root).write_text("enabled\n", encoding="ascii")
+    os.chmod(enabled_file(root), 0o600)
     command = [sys.executable, str(Path(__file__).resolve()), "--worker", "--root", str(root), "--interval", str(interval)]
     try:
         proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL, start_new_session=True)
     except OSError as exc:
+        enabled_file(root).unlink(missing_ok=True)
         return {"started": False, "error": f"{type(exc).__name__}: {exc}"}
     pid_file(root).write_text(str(proc.pid), encoding="ascii")
-    enabled_file(root).write_text("enabled\n", encoding="ascii")
     os.chmod(pid_file(root), 0o600)
     os.chmod(enabled_file(root), 0o600)
+    _hand_back_ownership(pid_file(root), enabled_file(root))
     return {"started": True, "pid": proc.pid, "interval": interval}
 
 

@@ -53,6 +53,277 @@ def test_vpn_list_filters_provider_routes_to_vpn_domains(tmp_path):
     assert config["route"]["final"] == "direct"
 
 
+def test_primary_routes_use_runtime_fallback_provider(tmp_path):
+    router = load_router(tmp_path)
+    proton = tmp_path / "proton.conf"
+    cloudflare = tmp_path / "cloudflare.conf"
+    router._providers = {
+        "proton": {"fallback_provider": "cloudflare"},
+        "cloudflare": {},
+    }
+    router._routes = [{
+        "id": "opencode", "domains": ["opencode.ai"], "provider": "proton",
+    }]
+    router._routing = {}
+    router._port = 2081
+    router.current_mode = lambda: "proxy"
+    router._usable_profile = lambda name, preferred=None: {
+        "proton": proton, "cloudflare": cloudflare,
+    }.get(name)
+    router.parse_wireguard = lambda path: {
+        "type": "wireguard", "tag": "", "address": ["10.0.0.2/32"],
+        "private_key": "secret", "peers": [{"address": "192.0.2.1", "port": 1,
+        "public_key": "public", "allowed_ips": ["0.0.0.0/0"]}],
+    }
+    router.dns_server_for = lambda path: "1.1.1.1"
+    fallback_dir = tmp_path / "state" / "fallback"
+    fallback_dir.mkdir(parents=True)
+    (fallback_dir / "proton.json").write_text(json.dumps({"provider": "cloudflare"}))
+
+    config, _active = router.build_singbox_config()
+
+    assert {endpoint["tag"] for endpoint in config["endpoints"]} == {"cloudflare"}
+    assert {rule["outbound"] for rule in config["route"]["rules"] if rule.get("domain_suffix")} == {"cloudflare"}
+    assert config["dns"]["rules"] == [{
+        "domain_suffix": ["opencode.ai"], "server": "dns-cloudflare",
+    }]
+
+
+def test_activate_fallback_writes_marker_and_reloads_once(tmp_path, monkeypatch):
+    router = load_router(tmp_path)
+    for provider in ("proton", "cloudflare"):
+        directory = tmp_path / "providers" / provider
+        directory.mkdir(parents=True)
+        (directory / "active.conf").write_text("profile")
+    router._providers = {
+        "proton": {"directory": "providers/proton", "fallback_provider": "cloudflare"},
+        "cloudflare": {"directory": "providers/cloudflare"},
+    }
+    switches = []
+    monkeypatch.setattr(router, "_profile_error", lambda profile: None)
+    monkeypatch.setattr(router, "engine_switch", lambda: switches.append(True) or 0)
+
+    assert router.activate_fallback("proton", reason="tls") == 0
+    marker = json.loads((tmp_path / "state" / "fallback" / "proton.json").read_text())
+    assert marker["provider"] == "cloudflare"
+    assert marker["reason"] == "tls"
+    assert switches == [True]
+
+    assert router.deactivate_fallback("proton") == 0
+    assert not (tmp_path / "state" / "fallback" / "proton.json").exists()
+    assert switches == [True, True]
+
+
+def test_activate_fallback_restores_marker_when_reload_fails(tmp_path, monkeypatch):
+    router = load_router(tmp_path)
+    for provider in ("proton", "cloudflare"):
+        directory = tmp_path / "providers" / provider
+        directory.mkdir(parents=True)
+        (directory / "active.conf").write_text("profile")
+    router._providers = {
+        "proton": {"directory": "providers/proton", "fallback_provider": "cloudflare"},
+        "cloudflare": {"directory": "providers/cloudflare"},
+    }
+    monkeypatch.setattr(router, "engine_switch", lambda: 1)
+
+    assert router.activate_fallback("proton", reason="tls") == 1
+    assert not (tmp_path / "state" / "fallback" / "proton.json").exists()
+
+
+def test_rotate_refuses_primary_while_fallback_is_active(tmp_path, monkeypatch, capsys):
+    router = load_router(tmp_path)
+    for provider in ("proton", "cloudflare"):
+        directory = tmp_path / "providers" / provider
+        directory.mkdir(parents=True)
+        (directory / "active.conf").write_text("profile")
+    router._providers = {
+        "proton": {"directory": "providers/proton", "fallback_provider": "cloudflare"},
+        "cloudflare": {"directory": "providers/cloudflare"},
+    }
+    monkeypatch.setattr(router, "_profile_error", lambda profile: None)
+    marker = tmp_path / "state" / "fallback"
+    marker.mkdir(parents=True)
+    (marker / "proton.json").write_text(json.dumps({"provider": "cloudflare"}))
+
+    assert router.rotate("proton") == 1
+    assert "fallback active" in capsys.readouterr().err
+
+
+def test_load_config_rejects_unknown_fallback_provider(tmp_path):
+    router = load_router(tmp_path)
+    router.CONFIG_FILE.write_text(json.dumps({
+        "port": 2081,
+        "providers": {
+            "proton": {
+                "directory": "providers/proton",
+                "fallback_provider": "warp",
+            },
+        },
+        "routes": [],
+    }))
+
+    assert router.load_config() == 1
+
+
+def test_load_config_accepts_fallback_chain_list(tmp_path):
+    router = load_router(tmp_path)
+    router.CONFIG_FILE.write_text(json.dumps({
+        "port": 2081,
+        "providers": {
+            "proton": {"directory": "providers/proton",
+                       "fallback_provider": ["cloudflare", "mullvad"]},
+            "cloudflare": {"directory": "providers/cloudflare"},
+            "mullvad": {"directory": "providers/mullvad"},
+        },
+        "routes": [],
+    }))
+
+    assert router.load_config() == 0
+    assert router.fallback_chain("proton") == ["cloudflare", "mullvad"]
+
+
+def test_load_config_rejects_self_in_fallback_chain(tmp_path):
+    router = load_router(tmp_path)
+    router.CONFIG_FILE.write_text(json.dumps({
+        "port": 2081,
+        "providers": {
+            "proton": {"directory": "providers/proton",
+                       "fallback_provider": ["proton", "cloudflare"]},
+            "cloudflare": {"directory": "providers/cloudflare"},
+        },
+        "routes": [],
+    }))
+
+    assert router.load_config() == 1
+
+
+def test_load_config_rejects_duplicate_fallback_chain_entries(tmp_path):
+    router = load_router(tmp_path)
+    router.CONFIG_FILE.write_text(json.dumps({
+        "port": 2081,
+        "providers": {
+            "proton": {"directory": "providers/proton",
+                       "fallback_provider": ["cloudflare", "cloudflare"]},
+            "cloudflare": {"directory": "providers/cloudflare"},
+        },
+        "routes": [],
+    }))
+
+    assert router.load_config() == 1
+
+
+def test_fallback_chain_drops_invalid_entries(tmp_path):
+    router = load_router(tmp_path)
+    router._providers = {
+        "proton": {"fallback_provider": ["cloudflare", "proton", "warp", "cloudflare"]},
+        "cloudflare": {},
+    }
+
+    assert router.fallback_chain("proton") == ["cloudflare"]
+    assert router.configured_fallback("proton") == "cloudflare"
+
+
+def test_activate_fallback_walks_chain_to_first_valid_provider(tmp_path, monkeypatch):
+    router = load_router(tmp_path)
+    for provider in ("proton", "cloudflare", "mullvad"):
+        directory = tmp_path / "providers" / provider
+        directory.mkdir(parents=True)
+        (directory / "active.conf").write_text("profile")
+    router._providers = {
+        "proton": {"directory": "providers/proton",
+                   "fallback_provider": ["cloudflare", "mullvad"]},
+        "cloudflare": {"directory": "providers/cloudflare"},
+        "mullvad": {"directory": "providers/mullvad"},
+    }
+    monkeypatch.setattr(router, "_profile_error",
+                        lambda profile: None if "mullvad" in str(profile) else "bad")
+    switches = []
+    monkeypatch.setattr(router, "engine_switch", lambda: switches.append(True) or 0)
+
+    assert router.activate_fallback("proton", reason="tls") == 0
+    marker = json.loads((tmp_path / "state" / "fallback" / "proton.json").read_text())
+    assert marker["provider"] == "mullvad"
+    assert switches == [True]
+
+
+def test_activate_fallback_rejects_target_outside_chain(tmp_path, monkeypatch):
+    router = load_router(tmp_path)
+    for provider in ("proton", "cloudflare", "mullvad"):
+        directory = tmp_path / "providers" / provider
+        directory.mkdir(parents=True)
+        (directory / "active.conf").write_text("profile")
+    router._providers = {
+        "proton": {"directory": "providers/proton",
+                   "fallback_provider": ["cloudflare", "mullvad"]},
+        "cloudflare": {"directory": "providers/cloudflare"},
+        "mullvad": {"directory": "providers/mullvad"},
+    }
+    monkeypatch.setattr(router, "_profile_error", lambda profile: None)
+    monkeypatch.setattr(router, "engine_switch", lambda: 0)
+
+    assert router.activate_fallback("proton", target="mullvad") == 0
+    marker = json.loads((tmp_path / "state" / "fallback" / "proton.json").read_text())
+    assert marker["provider"] == "mullvad"
+    assert router.activate_fallback("proton", target="warp") == 1
+
+
+def test_active_fallback_validates_marker_against_chain(tmp_path):
+    router = load_router(tmp_path)
+    router._providers = {
+        "proton": {"fallback_provider": ["cloudflare", "mullvad"]},
+        "cloudflare": {},
+        "mullvad": {},
+    }
+    fallback_dir = tmp_path / "state" / "fallback"
+    fallback_dir.mkdir(parents=True)
+    (fallback_dir / "proton.json").write_text(json.dumps({"provider": "mullvad"}))
+
+    assert router.active_fallback("proton") == "mullvad"
+    (fallback_dir / "proton.json").write_text(json.dumps({"provider": "warp"}))
+    assert router.active_fallback("proton") is None
+
+
+def test_fallback_status_reports_configured_chain(tmp_path):
+    router = load_router(tmp_path)
+    router._providers = {
+        "proton": {"fallback_provider": ["cloudflare", "mullvad"]},
+        "cloudflare": {},
+        "mullvad": {},
+    }
+    fallback_dir = tmp_path / "state" / "fallback"
+    fallback_dir.mkdir(parents=True)
+    (fallback_dir / "proton.json").write_text(json.dumps({"provider": "cloudflare"}))
+
+    assert router.fallback_status("proton") == {
+        "configured": ["cloudflare", "mullvad"],
+        "active": "cloudflare",
+    }
+
+
+def test_egress_sweep_skips_primary_when_fallback_is_active(tmp_path, monkeypatch, capsys):
+    router = load_router(tmp_path)
+    router._providers = {
+        "proton": {"directory": "providers/proton", "fallback_provider": "cloudflare"},
+        "cloudflare": {"directory": "providers/cloudflare"},
+    }
+    router.current_mode = lambda: "proxy"
+    router.listener_up = lambda: True
+    marker = tmp_path / "state" / "fallback"
+    marker.mkdir(parents=True)
+    (marker / "proton.json").write_text(json.dumps({"provider": "cloudflare"}))
+    # the sweep reports the parked primary via one fallback probe
+    monkeypatch.setattr(router, "_check_active_fallback",
+                        lambda provider, fallback: (None, "alive", None))
+
+    assert router.egress_sweep("proton", as_json=True) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["dead"] == []
+    assert data["results"]["proton"] == {
+        "status": "fallback", "fallback_provider": "cloudflare",
+        "fallback_profile": None, "ok": True,
+    }
+
+
 def test_selective_tun_uses_address_set_and_keeps_auto_route(tmp_path):
     router = load_router(tmp_path)
     rulesets = tmp_path / "rulesets"
@@ -187,7 +458,7 @@ def test_rotate_to_current_profile_is_noop_does_not_cooldown(tmp_path, monkeypat
 
 
 # ---------------------------------------------------------------------------
-# tray UX regressions (examples/proxy_tray.py)
+# tray UX regressions (proxy_tray.py)
 # ---------------------------------------------------------------------------
 
 import types  # noqa: E402
@@ -242,7 +513,7 @@ def load_tray(tmp_path):
         sys.modules[name] = {"pystray": stub_pystray, "PIL": stub_pil}[name]
     try:
         spec = importlib.util.spec_from_file_location(
-            "proxy_tray_under_test", ROOT / "examples" / "proxy_tray.py")
+            "proxy_tray_under_test", ROOT / "proxy_tray.py")
         module = importlib.util.module_from_spec(spec)
         assert spec.loader is not None
         # Register before exec: the module uses `from __future__ import
@@ -403,20 +674,25 @@ def test_tray_friendly_egress_error_mapping(tmp_path):
 
 
 def test_tray_exit_picker_humanizes_raw_error(tmp_path):
-    """profile_health must render a raw SSL/URLError as '! offline (SSL)',
-    not the Python error tail (the screenshot bug)."""
+    """profile_health keeps transport-only probe failures quiet (commonly
+    transient), but an HTTP-level degradation must render a friendly tag —
+    never the raw Python error tail (the screenshot bug)."""
     module = load_tray(tmp_path)
-    bad = {"ok": False, "status": None, "latency_ms": None,
-           "error": "URLError: <urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING, "
-                    "EOF occurred in violation of protocol (_ssl.c:983)]>",
-           "blocked": False, "exhausted": False}
+    transport_dead = {"ok": False, "status": None, "latency_ms": None,
+                      "error": "URLError: <urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING]>",
+                      "blocked": False, "exhausted": False}
+    http_degraded = {"ok": False, "status": 503, "latency_ms": None,
+                     "error": "URLError: <urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING]>",
+                     "blocked": False, "exhausted": False}
     app = _tray_app(module, tmp_path, up=True,
                     providers={"proton": {
                         "active": "01-NL-FREE-140",
-                        "profiles": ["01-NL-FREE-140"],
-                        "egress": {"01-NL-FREE-140": bad}}})
-    health = app.latest.profile_health("proton", "01-NL-FREE-140")
-    assert "offline (SSL)" in health, f"raw error tail leaked: {health!r}"
+                        "profiles": ["01-NL-FREE-140", "02-NL-FREE-149"],
+                        "egress": {"01-NL-FREE-140": transport_dead,
+                                   "02-NL-FREE-149": http_degraded}}})
+    assert app.latest.profile_health("proton", "01-NL-FREE-140") == ""
+    health = app.latest.profile_health("proton", "02-NL-FREE-149")
+    assert health.startswith(" ! "), f"HTTP degradation needs a warning: {health!r}"
     assert "urlopen" not in health.lower(), f"Python error leaked: {health!r}"
 
 
@@ -534,8 +810,8 @@ def test_tray_exit_picker_sorts_healthy_first(tmp_path):
     # blocked exit sinks last of all
     assert exit_rows[-1].startswith("03-CH-FREE-50"), \
         f"blocked exit should sink last: {exit_rows}"
-    # dead rows carry the "try anyway" affordance label
-    assert "try anyway" in exit_rows[1] and "try anyway" in exit_rows[2]
+    # transport-dead rows stay clickable and quiet (no warning text)
+    assert "!" not in exit_rows[1] and "!" not in exit_rows[2]
     # disabled flags still correct after sorting
     enabled = [e for d, t, e, _ in rows if d == 2 and "FREE" in t]
     assert enabled[0] is True and enabled[-1] is False
@@ -829,6 +1105,9 @@ def test_sudoers_rules_render_all_command_shapes():
     assert "/usr/bin/python3 /opt/pr/router.py ensure" in cmds
     assert "/usr/bin/python3 /opt/pr/router.py rotate *" in cmds
     assert "/usr/bin/python3 /opt/pr/router.py rotate * --reason *" in cmds
+    assert "/usr/bin/python3 /opt/pr/router.py rotate" in cmds
+    assert "/usr/bin/python3 /opt/pr/router.py add" in cmds
+    assert "/usr/bin/python3 /opt/pr/router.py remove" in cmds
     assert all(" ALL=(root) NOPASSWD: " in l for l in lines[1:])
 
 

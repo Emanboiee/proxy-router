@@ -51,20 +51,6 @@ class RouteWatcherTests(unittest.TestCase):
         self.assertFalse(guard.record_transport_failure(100.0))
         self.assertFalse(guard.record_transport_failure(161.0))
 
-    def test_critical_domains_are_config_driven(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "router.json").write_text(json.dumps({
-                "routes": [
-                    {"id": "opencode-ai", "domains": ["opencode.ai", "api.opencode.ai"]},
-                    {"id": "roblox", "domains": ["roblox.com"]},
-                ],
-            }))
-            self.assertEqual(
-                w.critical_domains(root),
-                ("opencode.ai", "api.opencode.ai"),
-            )
-
     def test_probe_http_failure_is_not_transport_failure(self):
         def fake_runner(*args, **kwargs):
             return SimpleNamespace(returncode=0, stdout="503", stderr="")

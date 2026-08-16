@@ -14,7 +14,14 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 if [ ! -f "$ROOT/router.py" ] && [ -f "$(dirname "$ROOT")/router.py" ]; then
   ROOT="$(dirname "$ROOT")"
 fi
-ROUTER="$ROOT/router.py"
+if [ -n "${PROXY_ROUTER_BIN:-}" ]; then
+  ROUTER="$PROXY_ROUTER_BIN"
+elif [ -n "${PROXY_ROUTER_ROOT:-}" ] && [ -x "$PROXY_ROUTER_ROOT/router.py" ]; then
+  export PROXY_ROUTER_ROOT
+  ROUTER="$PROXY_ROUTER_ROOT/router.py"
+else
+  ROUTER="$ROOT/router.py"
+fi
 HERMES_BIN="${HERMES_BIN:-hermes}"
 MAX_ATTEMPTS="${OPENCODE_MAX_ATTEMPTS:-}"
 RETRY_DELAY="${OPENCODE_RETRY_DELAY_SECONDS:-15}"
@@ -51,7 +58,7 @@ retry_kind() {
     printf '%s\n' "transient-http"
     return 0
   fi
-  if grep -Eiq 'timed[[:space:]]+out|timeout|connection[[:space:]]+(reset|refused|closed)|broken pipe|network[[:space:]]+error|temporary failure|ECONNRESET|ECONNREFUSED' "$file"; then
+  if grep -Eiq 'timed[[:space:]]+out|timeout|connection[[:space:]]+(reset|refused|closed)|broken pipe|network[[:space:]]+error|temporary failure|ECONNRESET|ECONNREFUSED|ssl|tls|unexpected[[:space:]]+eof|\beof\b' "$file"; then
     printf '%s\n' "transport"
     return 0
   fi
@@ -60,6 +67,7 @@ retry_kind() {
 
 summaries=()
 attempt=0
+fallback_used=0
 while ((attempt < MAX_ATTEMPTS)); do
   : > "$TMP_OUTPUT"
 
@@ -87,6 +95,17 @@ while ((attempt < MAX_ATTEMPTS)); do
   summaries+=("$kind")
   ((attempt += 1))
   if ((attempt >= MAX_ATTEMPTS)); then
+    if [ -n "$PROXY_URL" ] && ((fallback_used == 0)); then
+      printf '[opencode] %s; Proton pool exhausted, activating configured fallback\n' "$kind" >&2
+      if "$ROUTER" failover "$PROVIDER" on --reason "$kind" >/dev/null 2>&1; then
+        fallback_used=1
+        attempt=0
+        MAX_ATTEMPTS=1
+        printf '[opencode] waiting %ss before retrying through fallback\n' "$RETRY_DELAY" >&2
+        sleep "$RETRY_DELAY"
+        continue
+      fi
+    fi
     printf '[opencode] failover exhausted after %s attempt(s): %s\n' "$attempt" "${summaries[*]}" >&2
     ((rc != 0)) && exit "$rc"
     exit 75
@@ -102,6 +121,15 @@ while ((attempt < MAX_ATTEMPTS)); do
     # cooldown (and a blocked marker for egress-IP reputation blocks) before
     # switching.
     if ! "$ROUTER" rotate "$PROVIDER" --reason "$kind" >/dev/null 2>&1; then
+      if [ -n "$PROXY_URL" ] && ((fallback_used == 0)) && \
+         "$ROUTER" failover "$PROVIDER" on --reason "$kind" >/dev/null 2>&1; then
+        fallback_used=1
+        attempt=0
+        MAX_ATTEMPTS=1
+        printf '[opencode] fallback activated; waiting %ss before retrying\n' "$RETRY_DELAY" >&2
+        sleep "$RETRY_DELAY"
+        continue
+      fi
       printf '[opencode] failover exhausted: no eligible alternate profile\n' >&2
       ((rc != 0)) && exit "$rc"
       exit 75
@@ -109,8 +137,13 @@ while ((attempt < MAX_ATTEMPTS)); do
   fi
 
   # Wait a fixed 15s (override with OPENCODE_RETRY_DELAY_SECONDS) before
-  # retrying the exact same model command on the freshly rotated server.
-  printf '[opencode] waiting %ss before retrying %s on the rotated server\n' "$RETRY_DELAY" "$*" >&2
+  # retrying the exact same model command, through the rotated server or
+  # directly when the proxy is down.
+  if [ -n "$PROXY_URL" ]; then
+    printf '[opencode] waiting %ss before retrying %s on the rotated server\n' "$RETRY_DELAY" "$*" >&2
+  else
+    printf '[opencode] waiting %ss before retrying %s directly\n' "$RETRY_DELAY" "$*" >&2
+  fi
   sleep "$RETRY_DELAY"
 done
 

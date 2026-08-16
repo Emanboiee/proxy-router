@@ -8,7 +8,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>@PYTHON@</string>
-        <string>@ROOT@/examples/proxy_tray.py</string>
+        <string>@ROOT@/proxy_tray.py</string>
         <string>--root</string>
         <string>@ROOT@</string>
     </array>

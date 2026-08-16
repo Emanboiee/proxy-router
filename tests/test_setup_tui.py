@@ -172,6 +172,12 @@ class ApplyPresetsTests(unittest.TestCase):
         data = json.loads(self.config.read_text())
         self.assertIn("cloudflare", data["providers"])
 
+    def test_new_proton_provider_gets_warp_fallback(self):
+        self.config.write_text(json.dumps({"providers": {}, "routes": []}))
+        setup_tui.apply_presets(self.config)
+        data = json.loads(self.config.read_text())
+        self.assertEqual(data["providers"]["proton"]["fallback_providers"], ["cloudflare"])
+
     def test_preserves_existing_providers(self):
         setup_tui.apply_presets(self.config)
         data = json.loads(self.config.read_text())
@@ -225,6 +231,22 @@ class CustomPresetTests(unittest.TestCase):
         self.assertIn("game.com", data["routing"]["vpn_domains"])
         route = next(r for r in data["routes"] if r["id"] == "mygames")
         self.assertEqual(route["provider"], "cloudflare")
+
+    def test_proton_preset_provider_gets_warp_fallback(self):
+        # a user who brings both pools: applying a preset that routes through
+        # proton wires the existing cloudflare pool as its fallback chain
+        self.config.write_text(json.dumps({
+            "providers": {
+                "proton": {"directory": "providers/proton"},
+                "cloudflare": {"directory": "providers/cloudflare"},
+            },
+            "routes": [],
+        }))
+        setup_tui.add_custom_preset(
+            self.root, "work", "proton", ["gmail.com"])
+        setup_tui.apply_preset_by_name(self.root, "work")
+        data = json.loads(self.config.read_text())
+        self.assertEqual(data["providers"]["proton"]["fallback_providers"], ["cloudflare"])
 
     def test_custom_preset_safe_list_default_provider(self):
         path = setup_tui.add_custom_preset(
@@ -701,11 +723,6 @@ class RoutingTuiTests(unittest.TestCase):
             data = json.loads((root / "router.json").read_text())
             self.assertEqual(data["routing"]["direct_domains"], ["youtube.com"])
             self.assertIn("NOT reloaded", text)
-
-
-if __name__ == "__main__":
-    unittest.main()
-
 
 if __name__ == "__main__":
     unittest.main()

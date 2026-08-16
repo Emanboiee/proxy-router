@@ -45,6 +45,7 @@
 #   PROXY_KEEPALIVE_STORM_WINDOW   rotation-guard window in seconds    (600)
 #   PROXY_KEEPALIVE_MAX_ROTATIONS  max keepalive rotations per window  (2)
 #   PROXY_KEEPALIVE_SWEEP_EVERY    full-pool egress sweep every N seconds (1800)
+#   PROXY_KEEPALIVE_ENABLED        temporary on/off override               (config)
 set -uo pipefail
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -53,13 +54,45 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 if [ ! -f "$ROOT/router.py" ] && [ -f "$(dirname "$ROOT")/router.py" ]; then
   ROOT="$(dirname "$ROOT")"
 fi
-INTERVAL="${PROXY_KEEPALIVE_INTERVAL:-15}"
-MAX_BACKOFF="${PROXY_KEEPALIVE_MAX_BACKOFF:-300}"
-PROBE_EVERY="${PROXY_KEEPALIVE_PROBE_EVERY:-4}"
-DEAD_STRIKES="${PROXY_KEEPALIVE_DEAD_STRIKES:-2}"
-STORM_WINDOW="${PROXY_KEEPALIVE_STORM_WINDOW:-600}"
-MAX_ROTATIONS="${PROXY_KEEPALIVE_MAX_ROTATIONS:-2}"
-SWEEP_EVERY="${PROXY_KEEPALIVE_SWEEP_EVERY:-1800}"
+
+# Read one validated value from router.json. Environment variables below win,
+# so launchd/system operators can make temporary changes without rewriting
+# config. Missing or malformed config falls back to the safe defaults.
+config_setting() {
+  python3 - "$ROOT/router.json" "$1" "$2" <<'PY' 2>/dev/null || printf '%s\n' "$2"
+import json
+import sys
+
+path, key, default = sys.argv[1:]
+try:
+    data = json.loads(open(path, encoding="utf-8").read())
+    value = (data.get("keepalive") or {}).get(key, default)
+    if key == "enabled":
+        print("1" if value not in (False, 0, "0", "false", "off") else "0")
+    else:
+        value = int(value)
+        if value < 1:
+            raise ValueError
+        print(value)
+except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    raise SystemExit(1)
+PY
+}
+
+ENABLED="${PROXY_KEEPALIVE_ENABLED:-$(config_setting enabled 1)}"
+case "$ENABLED" in
+  0|false|False|off|OFF)
+    echo "router: autocheck disabled"
+    exit 0
+    ;;
+esac
+INTERVAL="${PROXY_KEEPALIVE_INTERVAL:-$(config_setting interval 15)}"
+MAX_BACKOFF="${PROXY_KEEPALIVE_MAX_BACKOFF:-$(config_setting max_backoff 300)}"
+PROBE_EVERY="${PROXY_KEEPALIVE_PROBE_EVERY:-$(config_setting probe_every 4)}"
+DEAD_STRIKES="${PROXY_KEEPALIVE_DEAD_STRIKES:-$(config_setting dead_strikes 2)}"
+STORM_WINDOW="${PROXY_KEEPALIVE_STORM_WINDOW:-$(config_setting storm_window 600)}"
+MAX_ROTATIONS="${PROXY_KEEPALIVE_MAX_ROTATIONS:-$(config_setting max_rotations 2)}"
+SWEEP_EVERY="${PROXY_KEEPALIVE_SWEEP_EVERY:-$(config_setting sweep_every 1800)}"
 
 backoff="$INTERVAL"
 boot=1
@@ -97,14 +130,58 @@ rotate_dead() {
     strikes=0
     return
   fi
+  # Count every recovery attempt, including a failed rotate/fallback attempt.
+  # Otherwise an exhausted provider can be retried forever every probe tick.
+  rotations=$((rotations + 1))
+  strikes=0
   echo "router: rotating '$provider' after dead tunnel checks" >&2
   if "$ROOT/router.py" rotate "$provider" --reason timeout; then
     :
   else
-    echo "router: rotate '$provider' failed; will retry after the next dead check" >&2
+    echo "router: rotate '$provider' failed; checking configured fallback" >&2
+    fallback_state=$("$ROOT/router.py" failover "$provider" status 2>/dev/null || true)
+    configured_fallback=$(printf '%s\n' "$fallback_state" | sed -n 's/.* configured=\([^ ]*\).*/\1/p')
+    active_fallback=$(printf '%s\n' "$fallback_state" | sed -n 's/.* active=\([^ ]*\).*/\1/p')
+    case "$active_fallback" in
+      ""|none|no|false|0|off|OFF)
+        ;;
+      *)
+        echo "router: fallback '$active_fallback' already active; waiting for the next dead check" >&2
+        return
+        ;;
+    esac
+    case "$configured_fallback" in
+      ""|none|no|false|0|off|OFF)
+        echo "router: no configured fallback for '$provider'; backing off" >&2
+        return
+        ;;
+    esac
+    if ! "$ROOT/router.py" failover "$provider" on --reason timeout >/dev/null 2>&1; then
+      echo "router: fallback for '$provider' failed; will retry after the next dead check" >&2
+      return
+    fi
   fi
-  rotations=$((rotations + 1))
-  strikes=0
+}
+
+# One bounded restore attempt per fallback-parked provider, run on the sweep
+# cadence: clear the marker, probe the primary live through the tunnel, keep
+# the fallback cleared when the primary answers, re-activate it when the
+# primary is still dead. The sweep cadence throttles the restore, so a
+# genuinely dead primary never causes a failover off/on storm.
+restore_fallbacks() {
+  out=$("$ROOT/router.py" egress check 2>&1 || true)
+  printf '%s\n' "$out" | sed -n 's/^\([A-Za-z0-9._-]*\): fallback (.*)$/\1/p' | while IFS= read -r provider; do
+    [ -n "$provider" ] || continue
+    if ! "$ROOT/router.py" failover "$provider" off >/dev/null 2>&1; then
+      continue
+    fi
+    if "$ROOT/router.py" egress check --provider "$provider" >/dev/null 2>&1; then
+      echo "router: '$provider' primary is alive again; fallback cleared" >&2
+    else
+      echo "router: '$provider' primary still dead; re-activating fallback" >&2
+      "$ROOT/router.py" failover "$provider" on --reason timeout >/dev/null 2>&1 || true
+    fi
+  done
 }
 
 while true; do
@@ -143,8 +220,8 @@ while true; do
     fi
     # Time-based full-pool sweep: on the first successful ensure, and every
     # SWEEP_EVERY seconds after, probe EVERY profile of every provider and
-    # end on the best alive exit (the sweep only reloads when a better exit
-    # is found; exit 1 means some provider has no alive profile at all).
+    # end on the best alive exit (each profile hop is a hard server switch;
+    # a failed/empty sweep restores the original active profile when possible).
     sweep_now=$(date +%s)
     if [ "$last_sweep" -eq 0 ] || [ $((sweep_now - last_sweep)) -ge "$SWEEP_EVERY" ]; then
       if "$ROOT/router.py" egress sweep --json >/dev/null 2>&1; then
@@ -152,6 +229,8 @@ while true; do
       else
         echo "router: sweep: some provider has no alive exits" >&2
       fi
+      # fallback restore rides the sweep cadence (see restore_fallbacks)
+      restore_fallbacks
       last_sweep="$sweep_now"
     fi
   else

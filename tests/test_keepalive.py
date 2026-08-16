@@ -39,6 +39,30 @@ case "$cmd" in
     exit 0
     ;;
   egress)
+    if [ "$3" = "--provider" ]; then
+      # per-provider probe used by restore_fallbacks after `failover off`
+      if [ -n "${FAKE_ROUTER_EGRESS_FILE:-}" ] && [ -f "$FAKE_ROUTER_EGRESS_FILE" ]; then
+        state=$(cat "$FAKE_ROUTER_EGRESS_FILE")
+      else
+        state="${FAKE_ROUTER_EGRESS:-alive}"
+      fi
+      case "$state" in
+        dead)
+          echo "proton: dead (a; probe connection)"
+          exit 1
+          ;;
+        *)
+          echo "proton: alive (a)"
+          exit 0
+          ;;
+      esac
+    fi
+    # While a fallback marker exists the router reports `fallback` instead of
+    # probing the primary, so the keepalive never sees a dead primary.
+    if [ -n "${FAKE_ROUTER_FALLBACK_FILE:-}" ] && [ -f "$FAKE_ROUTER_FALLBACK_FILE" ]; then
+      echo "proton: fallback (cloudflare)"
+      exit 0
+    fi
     if [ -n "${FAKE_ROUTER_EGRESS_FILE:-}" ] && [ -f "$FAKE_ROUTER_EGRESS_FILE" ]; then
       state=$(cat "$FAKE_ROUTER_EGRESS_FILE")
     else
@@ -55,6 +79,14 @@ case "$cmd" in
         exit 0
         ;;
     esac
+    ;;
+  failover)
+    if [ "$3" = "off" ]; then
+      rm -f "${FAKE_ROUTER_FALLBACK_FILE:-/dev/null}"
+    elif [ "$3" = "on" ] && [ -n "${FAKE_ROUTER_FALLBACK_FILE:-}" ]; then
+      printf '%s\n' "$2" > "$FAKE_ROUTER_FALLBACK_FILE"
+    fi
+    exit 0
     ;;
   rotate)
     exit 0
@@ -73,7 +105,7 @@ class KeepaliveHarness:
 
     def __init__(self, *, interval="1", fail_ensures="", egress="alive",
                  probe_every="4", dead_strikes="2", storm_window="600",
-                 max_rotations="2"):
+                 max_rotations="2", fallback=""):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
         (self.root / "bin").mkdir()
@@ -91,6 +123,9 @@ class KeepaliveHarness:
         self.sleep_log = self.root / "sleeps.log"
         self.egress_file = self.root / "egress.state"
         self.egress_file.write_text(egress)
+        self.fallback_file = self.root / "fallback.state"
+        if fallback:
+            self.fallback_file.write_text(fallback)
         env = dict(os.environ)
         env["PATH"] = f"{self.root / 'bin'}:" + env["PATH"]
         env["PROXY_KEEPALIVE_INTERVAL"] = interval
@@ -103,13 +138,13 @@ class KeepaliveHarness:
         env["FAKE_ROUTER_LOG"] = str(self.log)
         env["FAKE_ROUTER_ENSURE_COUNT"] = str(self.count)
         env["FAKE_ROUTER_EGRESS_FILE"] = str(self.egress_file)
+        env["FAKE_ROUTER_FALLBACK_FILE"] = str(self.fallback_file)
         if fail_ensures:
             env["FAKE_ROUTER_FAIL_ENSURES"] = fail_ensures
         self.env = env
         self.proc = subprocess.Popen([str(target)], env=env,
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                     text=True,
-                                     start_new_session=(os.name == "posix"))
+                                     text=True, start_new_session=(os.name == "posix"))
 
     def lines(self) -> list[str]:
         if not self.log.is_file():
@@ -189,11 +224,20 @@ class KeepaliveEgressCheckTests(unittest.TestCase):
             rotates = [l for l in lines if l.startswith("rotate proton")]
             self.assertEqual(rotates, [])
             # cadence: periodic checks every PROBE_EVERY(2) ensures after boot.
-            # `rotate --if-due` and `egress sweep` entries are tick noise, so
-            # measure gaps on the filtered list.
+            # `rotate --if-due` entries are tick noise, so measure gaps on the
+            # filtered list. restore_fallbacks() probes once right after the
+            # sweep, so drop the `egress check` that directly follows a sweep
+            # line too (the sweep cadence is measured separately).
             checks = [l for l in lines if l == "egress check"]
             self.assertGreaterEqual(len(checks), 4, f"too few checks: {lines}")
-            ticks = [l for l in lines if l not in {"rotate --if-due", "egress sweep --json"}]
+            restore_probes = {
+                i + 1 for i, l in enumerate(lines)
+                if l == "egress sweep --json" and i + 1 < len(lines)
+                and lines[i + 1] == "egress check"
+            }
+            ticks = [l for i, l in enumerate(lines)
+                     if i not in restore_probes
+                     and l not in {"rotate --if-due", "egress sweep --json"}]
             check_lines = [i for i, l in enumerate(ticks) if l == "egress check"]
             gaps = [b - a for a, b in zip(check_lines, check_lines[1:])]
             # every PROBE_EVERY ensures triggers a check; log distance is
@@ -262,6 +306,43 @@ class KeepaliveEgressCheckTests(unittest.TestCase):
             h.wait_lines(20)
             rotates = [l for l in h.lines() if l.startswith("rotate proton")]
             self.assertGreaterEqual(len(rotates), 4, f"expected rotation churn: {rotates}")
+        finally:
+            h.close()
+
+
+class KeepaliveFallbackRestoreTests(unittest.TestCase):
+    """restore_fallbacks(): on the sweep cadence, clear the runtime fallback
+    marker and probe the primary; keep it cleared when alive, re-activate it
+    when the primary is still dead. The sweep runs on the FIRST successful
+    ensure (last_sweep=0), so both tests observe the restore immediately."""
+
+    def test_restore_clears_fallback_when_primary_alive(self):
+        h = KeepaliveHarness(egress="alive", fallback="proton")
+        try:
+            h.wait_lines(7)
+            lines = h.lines()
+            self.assertIn("failover proton off", lines,
+                          f"expected failover off: {lines}")
+            self.assertNotIn("failover proton on --reason timeout", lines,
+                             f"re-activated a live primary: {lines}")
+            h.close()
+            self.assertIn("'proton' primary is alive again; fallback cleared", h.err,
+                          f"restore message missing: {h.err!r}")
+        finally:
+            h.close()
+
+    def test_restore_reactivates_fallback_when_primary_still_dead(self):
+        h = KeepaliveHarness(egress="dead", fallback="proton")
+        try:
+            h.wait_lines(9)
+            lines = h.lines()
+            self.assertIn("failover proton off", lines,
+                          f"expected failover off: {lines}")
+            self.assertIn("failover proton on --reason timeout", lines,
+                          f"expected fallback re-activation: {lines}")
+            h.close()
+            self.assertIn("'proton' primary still dead; re-activating fallback", h.err,
+                          f"re-activation message missing: {h.err!r}")
         finally:
             h.close()
 
