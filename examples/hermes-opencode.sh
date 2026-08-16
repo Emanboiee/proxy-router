@@ -18,7 +18,13 @@ ROUTER="$ROOT/router.py"
 HERMES_BIN="${HERMES_BIN:-hermes}"
 MAX_ATTEMPTS="${OPENCODE_MAX_ATTEMPTS:-}"
 RETRY_DELAY="${OPENCODE_RETRY_DELAY_SECONDS:-15}"
-PROVIDER="${OPENCODE_PROVIDER:-proton}"
+PROVIDER="${OPENCODE_PROVIDER:-}"
+if [ -z "$PROVIDER" ]; then
+  echo "hermes-opencode: OPENCODE_PROVIDER is not set." >&2
+  echo "  Set it to the provider whose pool should back the retries," >&2
+  echo "  e.g. OPENCODE_PROVIDER=proton (see 'router.py status' for names)." >&2
+  exit 2
+fi
 TMP_OUTPUT=$(mktemp "${TMPDIR:-/tmp}/hermes-opencode.XXXXXX")
 trap 'rm -f "$TMP_OUTPUT"' EXIT
 

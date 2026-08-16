@@ -11,6 +11,9 @@ configs/
 providers/
 wgcf-account.toml
 
+# User-local named presets (created via `setup --preset-add` / the TUI)
+presets/
+
 # Python
 __pycache__/
 *.py[cod]

@@ -670,12 +670,15 @@ def _cmd_preset_create_prompt(root: Path) -> int:
 def bridge_root() -> Path:
     """Machine-level VPN root that the Hermes rotation plugin expects.
 
-    Mirrors the plugin's lookup exactly: ``OPENCODE_ZEN_VPN_ROOT`` env
-    override, else the plugin's compiled-in default (hardcoded here only).
-    ``expanduser`` so ``~`` prefixes work in the env value.
+    ``OPENCODE_ZEN_VPN_ROOT`` env override, else a generic per-user default
+    (the installer prefix convention). ``expanduser`` so ``~`` prefixes work
+    in the env value.
     """
     return Path(
-        os.environ.get("OPENCODE_ZEN_VPN_ROOT", "/Users/kyson/airi/tools/opencode-zen-vpn")
+        os.environ.get(
+            "OPENCODE_ZEN_VPN_ROOT",
+            os.path.join(os.path.expanduser("~"), ".local", "share", "opencode-zen-vpn"),
+        )
     ).expanduser()
 
 

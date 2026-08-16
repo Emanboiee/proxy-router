@@ -33,7 +33,11 @@ router_py() {
 case "${1:-}" in
   rotate)
     ROUTER=$(router_py)
-    PROVIDER="${OPENCODE_PROVIDER:-proton}"
+    PROVIDER="${OPENCODE_PROVIDER:-}"
+    if [ -z "$PROVIDER" ]; then
+      printf 'proxy-manager: OPENCODE_PROVIDER is not set (provider to rotate, see router.py status)\n' >&2
+      exit 2
+    fi
     REASON="${2:-}"
     case "$REASON" in
       ""|408|425|429|500|502|503|504|1010|403|timeout|tls|connection|rate_limit|upstream_rate_limit|server_error) ;;
@@ -49,7 +53,7 @@ case "${1:-}" in
     fi
     ;;
   help|-h|--help|"")
-    printf 'usage: %s rotate [REASON] [OPENCODE_PROVIDER=proton]\n' "$0" >&2
+    printf 'usage: %s rotate [REASON] [OPENCODE_PROVIDER=<name>]\n' "$0" >&2
     exit 0
     ;;
   *)
