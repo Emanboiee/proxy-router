@@ -512,12 +512,14 @@ def load_tray(tmp_path):
             self._items = items
 
     class _StubMenuItem:
-        def __init__(self, text, action=None, enabled=True, checked=None, submenu=None):
+        def __init__(self, text, action=None, enabled=True, checked=None, submenu=None,
+                     default=False):
             if isinstance(action, _StubMenu):
                 submenu, action = action, None
             self.text = text
             self.action = action
             self.enabled = enabled
+            self.default = default
             self._checked = checked
             self._submenu = submenu
 
@@ -808,6 +810,24 @@ def test_tray_transport_dead_exit_is_clickable_try_anyway(tmp_path):
     # hard block marker: disabled, not try-anyway
     assert app._exit_disabled(app.latest, "proton", "02-NL-FREE-149")
     assert not app._exit_try_anyway(app.latest, "proton", "02-NL-FREE-149")
+
+
+def test_tray_menu_offers_dashboard_default_action(tmp_path):
+    """One click on the tray opens the full dashboard TUI: the bold default
+    menu entry spawns setup_tui in a terminal window."""
+    module = load_tray(tmp_path)
+    app = _tray_app(module, tmp_path, up=True)
+    items = app.build_menu()
+    rows = _flatten(items.items)
+    texts = [t for _d, t, _e, _extra in rows]
+    assert any("Open Dashboard" in t for t in texts)
+    # the bold default action is the first actionable top-level entry:
+    # before Connect/Reconnect in the raw item order
+    raw = [getattr(i, "text", None) for i in items.items]
+    actionable = [t for t in raw if t and not t.startswith(("●", "○", "!"))]
+    first_action = actionable[0] if actionable else None
+    assert first_action and "Open Dashboard" in first_action, f"first action: {first_action!r}"
+    assert "onnect" in actionable[1], actionable[:4]  # Reconnect when up
 
 
 def test_tray_exit_picker_sorts_healthy_first(tmp_path):

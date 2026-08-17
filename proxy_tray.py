@@ -27,6 +27,7 @@ import json
 import os
 import shlex
 import shutil
+from pathlib import Path
 import subprocess
 import sys
 import threading
@@ -304,6 +305,52 @@ class RouterStatus:
             detail = f"proxy :{self.port}"
         watcher = "watcher on" if self.watcher else "watcher off"
         return f"proxy {state} · {detail} · {watcher}"
+
+
+def open_dashboard(root) -> bool:
+    """Open the full dashboard TUI in a terminal window (tray one-click).
+
+    The tray menu is compact by design; the dashboard is where profiles,
+    exits, fallbacks, routing, and presets get managed. macOS: Terminal runs
+    setup_tui.py in the router root. Elsewhere: the first common terminal
+    emulator that exists wins. Never raises — the tray must survive a
+    broken terminal setup."""
+    root = Path(root)
+    tui = root / "setup_tui.py"
+    if not tui.is_file():
+        print(f"dashboard: missing {tui}", file=sys.stderr)
+        return False
+    python = sys.executable or "python3"
+    if sys.platform == "darwin":
+        script = f"cd {shlex.quote(str(root))} && {shlex.quote(python)} setup_tui.py"
+        content = script.replace("\\", "\\\\").replace('"', '\\"')
+        try:
+            proc = subprocess.run(
+                ["osascript", "-e",
+                 f'tell application "Terminal" to do script "{content}"'],
+                capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(f"dashboard: could not open Terminal: {exc}", file=sys.stderr)
+            return False
+        return proc.returncode == 0
+    launchers = [
+        ["x-terminal-emulator", "-e", f"{python} setup_tui.py"],
+        ["gnome-terminal", "--", f"{python} setup_tui.py"],
+        ["konsole", "-e", f"{python} setup_tui.py"],
+        ["xterm", "-e", f"{python} setup_tui.py"],
+    ]
+    for launcher in launchers:
+        if shutil.which(launcher[0]) is None:
+            continue
+        try:
+            subprocess.Popen(launcher, cwd=str(root),
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except OSError:
+            continue
+    print("dashboard: no terminal emulator found (xterm/gnome-terminal/konsole)",
+          file=sys.stderr)
+    return False
 
 
 class RouterClient:
@@ -599,6 +646,12 @@ class TrayApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def action_dashboard(self):
+        ok = open_dashboard(self.root)
+        with self.lock:
+            self.last_action_result = "dashboard opened" if ok else "dashboard: no terminal"
+        self.refresh()
+
     def action_connect(self):
         # start (not ensure): also clears the manual-off marker written by
         # Disconnect, so keepalive resumes watching afterwards.
@@ -727,6 +780,12 @@ class TrayApp:
             items.append(pystray.MenuItem(last_action_result, None))
 
         items.append(pystray.Menu.SEPARATOR)
+
+        # The dashboard is the tray's default action: the bold first menu
+        # entry (macOS trays open their menu on click; the bold item is the
+        # one-click path) opens the full TUI in a Terminal window.
+        items.append(pystray.MenuItem(
+            "Open Dashboard", self.action_dashboard, default=True))
 
         # Actions — terse, no CLI flags. Connect is only offered once at
         # least one provider exists; on a fresh install the banner above
