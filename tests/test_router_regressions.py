@@ -1233,7 +1233,11 @@ def test_elevate_prefers_sudo_n_when_granted(tmp_path, monkeypatch):
 
 
 def test_elevate_falls_back_to_admin_dialog(tmp_path, monkeypatch):
+    """Without the sudoers grant, an interactive (TTY) macOS run falls back
+    to the admin dialog; a TTY-less run refuses up front (TTY gate)."""
     router = load_router(tmp_path)
+    monkeypatch.setattr(router.sys, "platform", "darwin")
+    monkeypatch.setattr(router.sys, "stdin", _TTY(True))
     monkeypatch.setattr(router, "_sudoers_installed", lambda: False)
     monkeypatch.setattr(router, "_elevate_macos", lambda: 99)
     assert router._elevate() == 99
