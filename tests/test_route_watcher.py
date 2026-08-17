@@ -1,6 +1,7 @@
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import route_watcher as w
 
@@ -65,6 +66,29 @@ class RouteWatcherTests(unittest.TestCase):
         result = w.probe_target(Path("/tmp"), "opencode.ai", runner=fake_runner)
         self.assertTrue(result["transport_failure"])
         self.assertFalse(result["ok"])
+
+    def test_worker_exits_when_orphaned(self):
+        """A worker reparented to launchd (ppid == 1) must stop instead of
+        leaking forever. Regression: 259 orphaned workers from killed test
+        runs/harnesses, ~1.2GB RSS."""
+        root = Path(self._tmp_worker_root())
+        state_root = w.state_dir(root)
+        state_root.mkdir(parents=True, exist_ok=True)
+        w.enabled_file(root).write_text("enabled\n", encoding="ascii")
+
+        with mock.patch.object(w.os, "getppid", return_value=1), \
+             mock.patch.object(w.time, "sleep") as sleep:
+            rc = w.worker(root, interval=0.5)
+            sleep.assert_not_called()
+
+        self.assertEqual(rc, 0)
+        # Cleanup ran: markers removed.
+        self.assertFalse(w.enabled_file(root).exists())
+        self.assertFalse(w.pid_file(root).exists())
+
+    def _tmp_worker_root(self):
+        import tempfile
+        return tempfile.mkdtemp(prefix="route-watcher-orphan-test-")
 
 
 if __name__ == "__main__":

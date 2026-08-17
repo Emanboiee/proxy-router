@@ -312,6 +312,13 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
     guard = RotationGuard()
     try:
         while enabled_file(root).is_file():
+            # Parent-liveness guard: a worker whose parent died (test run
+            # killed, harness aborted, crash) is reparented to launchd
+            # (pid 1). Without this check it would keep its temp root,
+            # markers and probes alive forever, leaking one process per
+            # dead parent. Exit and clean up our own state.
+            if os.getppid() == 1:
+                break
             # Routes can be added while the watcher is running. Refresh the
             # target set each tick so transparent capture starts observing a
             # newly configured domain without requiring a router restart.
