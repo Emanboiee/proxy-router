@@ -1,8 +1,10 @@
 """Unit tests for proxy_tray.py (stdlib only, no GUI deps — the
 module's pystray/PIL imports are guarded)."""
 import importlib.util
+import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -228,3 +230,32 @@ class TransientProbePresentationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DashboardOpenerTests(unittest.TestCase):
+    """Tray one-click: open the full TUI in a terminal window."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        (self.root / "setup_tui.py").write_text("# tui")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_missing_tui_fails_quietly(self):
+        (self.root / "setup_tui.py").unlink()
+        self.assertFalse(tray.open_dashboard(self.root))
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS Terminal path")
+    def test_macos_opens_terminal_with_tui(self):
+        calls = []
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0)
+        with mock.patch.object(tray.subprocess, "run", side_effect=fake_run):
+            self.assertTrue(tray.open_dashboard(self.root))
+        self.assertEqual(calls[0][0], "osascript")
+        self.assertIn("setup_tui.py", " ".join(calls[0]))
+
+
