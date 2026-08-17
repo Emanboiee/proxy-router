@@ -45,6 +45,9 @@ MODE_FILE = ROOT / "state" / "mode"
 # keepalive.sh so a manual disconnect is NOT resurrected on the next
 # ensure tick. Removed by `router.py start` / tray Connect.
 MANUAL_OFF_FILE = ROOT / "state" / "manual-off"
+# Pending per-provider overrides handed to an elevated `reload` when the
+# engine runs as root and the invoking process cannot SIGHUP it directly.
+RELOAD_OVERRIDE_FILE = ROOT / "state" / "reload-override.json"
 DEFAULT_PORT = 2080
 DEFAULT_TUN_ADDRESS = ["172.19.0.1/30"]
 DEFAULT_TUN_MTU = 1500
@@ -1394,20 +1397,28 @@ def check_egress_live(name: str, profile: Path, *, port: int | None = None,
 def _egress_rank(record: dict, now: int | None = None) -> tuple[int, float]:
     """Rotation preference: lower is better. Recently-OK profiles rank by
     latency (fastest first); known-slow-but-OK and unknown profiles rank
-    second; profiles with repeated failures rank last."""
+    second; profiles with RECENT repeated failures rank last.
+
+    Failure streaks expire with the ok window: a record whose last probe is
+    older than that window carries no signal (it was typically written by
+    an era of dishonest probes or long-gone network conditions), so it
+    ranks as unknown instead of poisoning the exit forever."""
     if not record:
         return (1, float("inf"))
     now = int(now if now is not None else time.time())
     ok = record.get("ok")
     last_ok = record.get("last_ok_at") or record.get("checked_at")
+    checked_at = record.get("checked_at")
     fails = int(record.get("fails") or 0)
     settings = egress_settings()
-    if ok and last_ok and now - int(last_ok) < int(settings["ok_window"]):
+    window = int(settings["ok_window"])
+    fresh = checked_at is not None and now - int(checked_at) < window
+    if ok and last_ok and now - int(last_ok) < window:
         latency = float(record.get("latency_ms") or float("inf"))
         if latency < float(settings["slow_latency_ms"]):
             return (0, latency)
         return (2, latency)
-    if fails >= int(settings["fail_threshold"]):
+    if fails >= int(settings["fail_threshold"]) and fresh:
         return (3, float("inf"))
     return (1, float("inf"))
 
@@ -2723,7 +2734,34 @@ def engine_stop() -> int:
     return 0
 
 
+def _elevated_reload() -> int:
+    """Re-run the granted `reload` shape as root.
+
+    `sudo vpn on` starts the engine as root (TUN needs it), so a user-level
+    keepalive sweep or rotation cannot SIGHUP the process. `reload` is a
+    granted sudoers shape, so re-run exactly that; pending per-provider
+    overrides ride in RELOAD_OVERRIDE_FILE so sweep hops keep their
+    candidate-without-commit semantics across the privilege boundary."""
+    command = [sys.executable, os.path.abspath(__file__), "reload"]
+    probe = subprocess.run(["sudo", "-n", *command])
+    if probe.returncode != 0:
+        print("router: elevated reload denied; run `sudo python3 router.py reload` manually",
+              file=sys.stderr)
+    return probe.returncode
+
+
 def engine_reload(active_overrides: dict[str, Path] | None = None) -> int:
+    overrides = dict(active_overrides or {})
+    if RELOAD_OVERRIDE_FILE.is_file():
+        # an elevated rerun picks up the invoking user's pending candidates
+        try:
+            pending = json.loads(RELOAD_OVERRIDE_FILE.read_text())
+            if isinstance(pending, dict):
+                overrides.update({name: Path(path) for name, path in pending.items()})
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
+        RELOAD_OVERRIDE_FILE.unlink(missing_ok=True)
+    active_overrides = overrides or None
     sing_box = resolve_sing_box()
     if sing_box is None:
         return fail(_sing_box_missing_message())
@@ -2775,6 +2813,14 @@ def engine_reload(active_overrides: dict[str, Path] | None = None) -> int:
     try:
         os.kill(pid, signal.SIGHUP)  # SIGHUP: sing-box hot-reloads the config in place
     except PermissionError:
+        if os.geteuid() != 0:
+            if overrides:
+                RELOAD_OVERRIDE_FILE.parent.mkdir(parents=True, exist_ok=True)
+                _atomic_write(RELOAD_OVERRIDE_FILE,
+                              json.dumps({name: str(path) for name, path in overrides.items()}), 0o600)
+            print("router: engine runs as root; reloading through the granted sudo shape",
+                  file=sys.stderr)
+            return _elevated_reload()
         return fail("engine runs as root (started via sudo); run `router.py elevate install` once, "
                     "or reload it now with `sudo python3 router.py reload`")
     except ProcessLookupError:
