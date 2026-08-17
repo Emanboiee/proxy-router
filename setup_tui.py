@@ -1594,13 +1594,22 @@ def _tui_profiles(root: Path, provider: str) -> list[tuple[str, str]]:
             cooling = until > now
         except (OSError, ValueError):
             pass
+        # Records carry no signal forever: a probe verdict older than the
+        # egress ok-window was typically written under long-gone network
+        # conditions (or an era of dishonest probes) — render it as unprobed.
+        try:
+            window = int((config.get("egress") or {}).get("ok_window", 86400))
+        except (TypeError, ValueError):
+            window = 86400
+        checked_at = record.get("checked_at")
+        fresh = isinstance(checked_at, (int, float)) and now - float(checked_at) < window
         if record.get("blocked"):
             marker = "blocked"
         elif cooling:
             marker = "cooling"
-        elif record.get("ok") is True:
+        elif fresh and record.get("ok") is True:
             marker = "ok"
-        elif record.get("ok") is False:
+        elif fresh and record.get("ok") is False:
             marker = "dead"
         else:
             marker = ""

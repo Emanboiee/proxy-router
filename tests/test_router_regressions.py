@@ -4,6 +4,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1415,9 +1416,16 @@ def test_engine_reload_permission_error_on_sighup_only(tmp_path, monkeypatch):
         raise PermissionError(1, "operation not permitted")
 
     monkeypatch.setattr(router.os, "kill", deny_sighup)
-    assert router.engine_reload() == 1
+    monkeypatch.setattr(router.os, "geteuid", lambda: 501)
+    reloads = []
+    monkeypatch.setattr(router.subprocess, "run",
+                        lambda *a, **k: reloads.append(a) or SimpleNamespace(returncode=0))
+    # a regular user now hands the reload to the granted sudo shape
+    # instead of failing; the pid file is untouched either way
+    assert router.engine_reload() == 0
     assert start_calls == []
     assert router.PID_FILE.read_text() == "4242"
+    assert reloads and reloads[0][0][0] == "sudo"
 
 
 def test_restore_last_good_permission_error_on_sighup_only(tmp_path, monkeypatch):

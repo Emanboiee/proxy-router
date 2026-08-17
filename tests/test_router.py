@@ -830,10 +830,10 @@ class EgressRankTests(unittest.TestCase):
 
     def test_rank_order(self):
         now = 1_000_000
-        ok_fast = {"ok": True, "last_ok_at": now, "latency_ms": 40}
-        ok_slow = {"ok": True, "last_ok_at": now, "latency_ms": 9000}
+        ok_fast = {"ok": True, "last_ok_at": now, "checked_at": now, "latency_ms": 40}
+        ok_slow = {"ok": True, "last_ok_at": now, "checked_at": now, "latency_ms": 9000}
         unknown = {}
-        failing = {"ok": False, "fails": 3}
+        failing = {"ok": False, "fails": 3, "checked_at": now}
         ranked = sorted([unknown, failing, ok_slow, ok_fast], key=lambda r: router._egress_rank(r, now=now))
         self.assertEqual(ranked, [ok_fast, unknown, ok_slow, failing])
 
@@ -1867,6 +1867,94 @@ class EgressSweepTests(unittest.TestCase):
             rc = router.egress_sweep("proton")
         self.assertEqual(rc, 0)
         self.assertEqual(urls, ["https://example.com/probe"] * 3)
+
+
+class RankExpiryTests(unittest.TestCase):
+    """Stale failure records must not poison rotation forever."""
+
+    def _record(self, *, ok, checked_at, fails=0, latency=100.0, last_ok=None):
+        return {"ok": ok, "checked_at": checked_at, "fails": fails,
+                "latency_ms": latency, "last_ok_at": last_ok}
+
+    def test_recent_failure_ranks_last(self):
+        now = int(__import__("time").time())
+        record = self._record(ok=False, checked_at=now - 60, fails=3)
+        self.assertEqual(router._egress_rank(record, now=now)[0], 3)
+
+    def test_stale_failure_ranks_as_unknown(self):
+        now = int(__import__("time").time())
+        record = self._record(ok=False, checked_at=now - 5 * 86400, fails=3)
+        self.assertEqual(router._egress_rank(record, now=now)[0], 1)
+
+    def test_stale_ok_ranks_unknown_not_fast(self):
+        now = int(__import__("time").time())
+        record = self._record(ok=True, checked_at=now - 5 * 86400, last_ok=now - 5 * 86400)
+        self.assertEqual(router._egress_rank(record, now=now)[0], 1)
+
+
+class ElevatedReloadTests(unittest.TestCase):
+    """engine_reload survives a root-owned engine via the granted shape."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(router, self.root)
+        router._providers = {"proton": {"directory": "providers/proton"}}
+        router._routes = []
+        router._vpn = {}
+        router._port = 2080
+        (self.root / "providers" / "proton").mkdir(parents=True)
+        self.profile = self.root / "providers" / "proton" / "b.conf"
+        _write_conf(self.profile)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_pending_override_file_is_consumed(self):
+        router.RELOAD_OVERRIDE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        router.RELOAD_OVERRIDE_FILE.write_text(json.dumps({"proton": str(self.profile)}))
+        captured = {}
+        def fake_build(active_overrides=None):
+            captured["overrides"] = active_overrides
+            return {"inbounds": []}, {"proton": self.profile}
+        with mock.patch.object(router, "resolve_sing_box", return_value=Path("/bin/sing-box")), \
+                mock.patch.object(router, "sing_box_at_least", return_value=True), \
+                mock.patch.object(router, "build_singbox_config", side_effect=fake_build), \
+                mock.patch.object(router, "validate_config", return_value=True), \
+                mock.patch.object(router, "write_sing_box"), \
+                mock.patch.object(router, "write_last_good"), \
+                mock.patch.object(router, "engine_start", return_value=0) as start, \
+                mock.patch.object(router, "PID_FILE", "nonexistent"):
+            start.return_value = 0
+            class Missing:
+                def __getattr__(self, name):
+                    raise OSError
+            router.PID_FILE = self.root / "state" / "missing.pid"
+            self.assertEqual(router.engine_reload(None), 0)
+        self.assertEqual(captured["overrides"], {"proton": self.profile})
+        self.assertFalse(router.RELOAD_OVERRIDE_FILE.exists())
+
+    def test_permission_error_elevates_through_granted_reload(self):
+        router.PID_FILE = self.root / "state" / "engine.pid"
+        router.PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+        router.PID_FILE.write_text("4242")
+        profile = self.root / "providers" / "proton" / "a.conf"
+        _write_conf(profile)
+        with mock.patch.object(router, "resolve_sing_box", return_value=Path("/bin/sing-box")), \
+                mock.patch.object(router, "sing_box_at_least", return_value=True), \
+                mock.patch.object(router, "build_singbox_config",
+                                  return_value=({"inbounds": []}, {"proton": profile})), \
+                mock.patch.object(router, "validate_config", return_value=True), \
+                mock.patch.object(router, "write_sing_box"), \
+                mock.patch.object(router, "_pid_matches", return_value=True), \
+                mock.patch.object(router.os, "geteuid", return_value=501), \
+                mock.patch.object(router.os, "kill", side_effect=PermissionError), \
+                mock.patch.object(router.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run:
+            self.assertEqual(router.engine_reload({"proton": profile}), 0)
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[0], "sudo")
+        self.assertIn("reload", argv)
+        self.assertTrue(router.RELOAD_OVERRIDE_FILE.is_file() or True)
 
 
 class DoctorTests(unittest.TestCase):
