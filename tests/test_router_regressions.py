@@ -295,6 +295,30 @@ def test_load_config_rejects_duplicate_fallback_chain_entries(tmp_path):
     assert router.load_config() == 1
 
 
+def test_load_config_rejects_bad_default_mode(tmp_path):
+    router = load_router(tmp_path)
+    router.CONFIG_FILE.write_text(json.dumps({
+        "port": 2081,
+        "providers": {"proton": {"directory": "providers/proton"}},
+        "routes": [],
+        "vpn": {"default_mode": "banana"},
+    }))
+
+    assert router.load_config() == 1
+
+
+def test_load_config_accepts_default_mode_tun(tmp_path):
+    router = load_router(tmp_path)
+    router.CONFIG_FILE.write_text(json.dumps({
+        "port": 2081,
+        "providers": {"proton": {"directory": "providers/proton"}},
+        "routes": [],
+        "vpn": {"default_mode": "tun"},
+    }))
+
+    assert router.load_config() == 0
+
+
 def test_fallback_chain_drops_invalid_entries(tmp_path):
     router = load_router(tmp_path)
     router._providers = {
@@ -777,7 +801,7 @@ def test_tray_friendly_egress_error_mapping(tmp_path):
     module = load_tray(tmp_path)
     f = module._friendly_egress_error
     assert f("URLError: <urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING, "
-             "EOF occurred in violation of protocol (_ssl.c:983)]>") == "offline (SSL)"
+             "EOF occurred in violation of protocol (_ssl.c:983)]>") == "throttled (SSL)"
     assert f("URLError: timed out") == "timed out"
     assert f("URLError: connection refused") == "offline"
     assert f("URLError: [Errno -5] No address associated with hostname") == "no route (DNS)"
@@ -989,6 +1013,31 @@ def test_record_egress_heals_stale_upstream_error(tmp_path):
     assert rec["error"] is None
 
 
+def test_probe_429_does_not_heal_exhausted_marker(tmp_path, monkeypatch):
+    """ROOT CAUSE: a probe that gets HTTP 429 from the probe target was
+    classified as healthy (ok=True), so the sweep would CLEAR the exhausted
+    marker on an exit that is still rate-limited, letting rotation switch
+    back into a 429'd server. A 429 probe must be a failure and must leave
+    the marker intact."""
+    router = load_router(tmp_path)
+    (tmp_path / "state" / "egress" / "proton").mkdir(parents=True)
+    profile = Path("01-NL-FREE-140.conf")
+    router._apply_upstream_failure("proton", profile, "429", 60)
+    rec = router.read_egress("proton", profile)
+    assert rec["exhausted"] is True
+
+    monkeypatch.setattr(router, "probe_egress", lambda **k: {
+        "ok": False, "latency_ms": None, "status": 429,
+        "error": "rate-limit-429", "block_reason": None})
+    ok, _ = router.probe_profile("proton", profile)
+    rec = router.read_egress("proton", profile)
+
+    assert ok is False
+    assert rec["exhausted"] is True
+    assert rec["upstream_error"] == "429"
+    assert router.is_cooled_down("proton", profile)
+
+
 class _UnreadableModeFile:
     def is_file(self):
         return True
@@ -1095,6 +1144,24 @@ def test_current_mode_unreadable_mode_file_defaults_to_proxy(tmp_path, monkeypat
     router = load_router(tmp_path)
     router.MODE_FILE = _UnreadableModeFile()
     assert router.current_mode() == "proxy"
+
+
+def test_current_mode_missing_file_falls_back_to_default_mode(tmp_path):
+    """Fresh installs have no state/mode; the configured vpn.default_mode
+    decides which mode ensure boots (tun for a WARP-style always-on box)."""
+    router = load_router(tmp_path)
+    router._vpn = {"default_mode": "tun"}
+    assert not router.MODE_FILE.exists()
+    assert router.current_mode() == "tun"
+
+
+def test_current_mode_unreadable_file_falls_back_to_default_mode(tmp_path):
+    """An unreadable mode file falls back to the configured default_mode
+    too, so a sudo-run mode file never silently flips a TUN box to proxy."""
+    router = load_router(tmp_path)
+    router._vpn = {"default_mode": "tun"}
+    router.MODE_FILE = _UnreadableModeFile()
+    assert router.current_mode() == "tun"
 
 
 def test_hand_back_ownership_chowns_when_sudo_invoked(tmp_path, monkeypatch):

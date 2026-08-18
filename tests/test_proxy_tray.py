@@ -133,6 +133,19 @@ class HumanizeTests(unittest.TestCase):
         self.assertIn("install sing-box 1.12+", detail)
         self.assertIn("github.com/SagerNet/sing-box/releases", detail)
 
+    def test_system_proxy_echo_line_is_stripped(self):
+        # macOS start/stop end with "system proxy disabled on 1 network
+        # service(s)"; showing that after "Connect: done" reads like a
+        # failure (issue #50).
+        detail = tray._humanize(
+            "router: engine started\nsystem proxy disabled on 1 network service(s)")
+        self.assertEqual(detail, "")
+
+    def test_system_proxy_enabled_echo_line_is_stripped(self):
+        detail = tray._humanize(
+            "system proxy enabled on 2 network service(s) -> 127.0.0.1:2080")
+        self.assertEqual(detail, "")
+
 
 class RunElevatedFallbackTests(unittest.TestCase):
     """`_run_elevated` falls back to the admin dialog when `sudo -n`
@@ -227,6 +240,49 @@ class TransientProbePresentationTests(unittest.TestCase):
         })
         self.assertIn("▲", status.provider_label("proton"))
         self.assertIn("rate-limited", status.profile_health("proton", "06-SG-FREE-4"))
+
+
+class QuitActionTests(unittest.TestCase):
+    """Quit must stop the engine BEFORE leaving the tray (issue #52):
+    a quitting tray that leaves the proxy-router engine running strands
+    the user with a live tunnel they can no longer control."""
+
+    def test_quit_stops_engine_then_tray(self):
+        calls = []
+        tray_stopped = threading.Event()
+
+        class FakeClient:
+            def stop(self):
+                calls.append("engine")
+                return 0, "stopped"
+
+        class FakeTray:
+            def stop(self):
+                calls.append("tray")
+                tray_stopped.set()
+
+        app = tray.TrayApp(FakeClient(), None)
+        app.tray = FakeTray()
+        app.action_quit()
+        self.assertTrue(tray_stopped.wait(2))
+        self.assertEqual(calls, ["engine", "tray"])
+        self.assertTrue(app.quit_flag.is_set())
+
+    def test_quit_stops_tray_even_when_engine_stop_fails(self):
+        tray_stopped = threading.Event()
+
+        class FakeClient:
+            def stop(self):
+                return 1, "engine not running"
+
+        class FakeTray:
+            def stop(self):
+                tray_stopped.set()
+
+        app = tray.TrayApp(FakeClient(), None)
+        app.tray = FakeTray()
+        app.action_quit()
+        self.assertTrue(tray_stopped.wait(2))
 
 
 if __name__ == "__main__":
