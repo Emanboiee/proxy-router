@@ -647,10 +647,12 @@ class TrayApp:
         threading.Thread(target=worker, daemon=True).start()
 
     def action_dashboard(self):
-        ok = open_dashboard(self.root)
+        ok = open_dashboard(self.client.root)
         with self.lock:
             self.last_action_result = "dashboard opened" if ok else "dashboard: no terminal"
-        self.refresh()
+        if self.tray is not None:
+            self._menu_sig = None
+            self.tray.menu = self.build_menu()
 
     def action_connect(self):
         # start (not ensure): also clears the manual-off marker written by

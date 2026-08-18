@@ -7,6 +7,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -257,5 +258,48 @@ class DashboardOpenerTests(unittest.TestCase):
             self.assertTrue(tray.open_dashboard(self.root))
         self.assertEqual(calls[0][0], "osascript")
         self.assertIn("setup_tui.py", " ".join(calls[0]))
+
+    def test_macos_terminal_failure_fails_quietly(self):
+        failed = subprocess.CompletedProcess(["osascript"], 1)
+        with mock.patch.object(tray.sys, "platform", "darwin"), \
+             mock.patch.object(tray.subprocess, "run", return_value=failed):
+            self.assertFalse(tray.open_dashboard(self.root))
+
+
+class DashboardActionTests(unittest.TestCase):
+    """The tray callback owns root forwarding and visible outcome state."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.app = tray.TrayApp(tray.RouterClient(str(self.root)), None)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_callback_passes_client_root_and_records_success(self):
+        roots = []
+        with mock.patch.object(
+            tray, "open_dashboard", side_effect=lambda root: roots.append(root) or True
+        ):
+            self.app.action_dashboard()
+        self.assertEqual(roots, [str(self.root)])
+        self.assertEqual(self.app.last_action_result, "dashboard opened")
+
+    def test_callback_records_visible_failure_without_raising(self):
+        with mock.patch.object(tray, "open_dashboard", return_value=False):
+            self.app.action_dashboard()
+        self.assertEqual(self.app.last_action_result, "dashboard: no terminal")
+
+    def test_callback_rebuilds_attached_tray_menu(self):
+        sentinel = object()
+        self.app.tray = SimpleNamespace(menu=None)
+        self.app._menu_sig = "old"
+        with mock.patch.object(tray, "open_dashboard", return_value=True), \
+             mock.patch.object(self.app, "build_menu", return_value=sentinel) as build:
+            self.app.action_dashboard()
+        self.assertIsNone(self.app._menu_sig)
+        self.assertIs(self.app.tray.menu, sentinel)
+        build.assert_called_once_with()
 
 
