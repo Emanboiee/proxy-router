@@ -2109,7 +2109,9 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
         "inbounds": inbounds,
         "endpoints": list(active.values()),
         "outbounds": [{"type": "direct", "tag": "direct"}],
-        "dns": {"servers": dns_servers, "rules": dns_rules, "strategy": dns_strategy()},
+        # Without dns.final, unmatched queries hit the FIRST server (tunnel-riding
+        # provider DNS); pin them to the always-present local resolver instead.
+        "dns": {"servers": dns_servers, "rules": dns_rules, "strategy": dns_strategy(), "final": "dns-local"},
         "route": {
             "auto_detect_interface": True,
             "default_domain_resolver": "dns-local",
@@ -2359,6 +2361,29 @@ def log_has_fatal(after: int) -> bool:
     return "FATAL" in tail or "fatal" in tail
 
 
+def _tun_egress_probe(timeout: float) -> bool:
+    """Tun-mode egress proof: at least one routed target must answer through
+    the local proxy listener (which coexists with the TUN and rides the same
+    rules). A TLS-classed failure still counts as the path working (CONNECT
+    rode the tunnel); a connection-level failure means the tunnel is
+    up-but-dead. Returns True when nothing routed exists to prove."""
+    for name in _providers:
+        if active_fallback(name):
+            continue
+        if _usable_profile(name) is None:
+            continue
+        url = probe_url_for(name)
+        if url is None:
+            continue
+        result = probe_egress(url=url, timeout=timeout)
+        if result.get("ok") or result.get("status") is not None:
+            return True
+        if _transport_reason(result.get("error") or "") == "tls":
+            return True
+        return False
+    return True
+
+
 def wait_engine(timeout: float = 8.0, log_from: int = 0) -> bool:
     """Mode-aware readiness: the engine must come up AND survive a settle
     window without a FATAL in the log.
@@ -2389,7 +2414,15 @@ def wait_engine(timeout: float = 8.0, log_from: int = 0) -> bool:
                 time.sleep(0.5)
                 continue
             if not log_has_fatal(log_from):
-                return True
+                if current_mode() != "tun":
+                    return True
+                now = time.time()
+                if now >= probe_at:
+                    probe_at = now + 1.0  # re-probe cadence, bounded by deadline
+                    probe_timeout = min(max(0.5, deadline - now),
+                                        float(egress_settings()["probe_timeout"]))
+                    if _tun_egress_probe(probe_timeout):
+                        return True
         time.sleep(0.2)
     return False
 
@@ -2569,6 +2602,10 @@ def engine_start(use_existing_config: bool = False, *, recover: bool = True) -> 
     PID_FILE.write_text(str(process.pid))
     os.chmod(PID_FILE, 0o600)
     _hand_back_ownership(PID_FILE)
+    # The elevated start opened LOG_FILE as root (log_handle above); hand it
+    # back so non-root readers (log_has_fatal, keepalive rotation, status)
+    # can still open it. The engine keeps writing through its inherited fd.
+    _hand_back_ownership(LOG_FILE)
     if not wait_engine(log_from=log_offset()):
         engine_stop()
         if recover and not use_existing_config and LAST_GOOD_FILE.is_file():

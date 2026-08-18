@@ -1,6 +1,8 @@
 import contextlib
 import io
 import json
+import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -182,6 +184,48 @@ class RouteWatcherTests(unittest.TestCase):
             payload = json.loads(output.getvalue())
         self.assertEqual(rc, 1)
         self.assertFalse(payload["stopped"])
+
+    def test_start_redirects_worker_stderr_to_worker_log(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        captured: dict = {}
+
+        def fake_popen(command, **kwargs):
+            captured["stderr"] = kwargs.get("stderr")
+            return SimpleNamespace(pid=4242)
+
+        with mock.patch.object(w.subprocess, "Popen", side_effect=fake_popen):
+            result = w.start(root)
+        self.assertTrue(result["started"])
+        log = w.worker_log_file(root)
+        self.assertTrue(log.is_file())
+        self.assertEqual(result["log"], str(log))
+        self.assertEqual(captured["stderr"].name, str(log), "worker stderr must ride worker.log")
+
+    def test_worker_exits_after_engine_down_grace(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        with mock.patch.object(w, "engine_pid_alive", return_value=False):
+            rc = w.worker(root, interval=0.05, sleep=lambda _: None)
+        self.assertEqual(rc, 0)
+        self.assertFalse(w.enabled_file(root).exists(), "worker must clean up its markers")
+        self.assertFalse(w.pid_file(root).exists())
+
+    def test_worker_keeps_running_while_engine_alive(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        ticks = 0
+
+        def fake_sleep(_):
+            nonlocal ticks
+            ticks += 1
+            if ticks >= 3:
+                w.enabled_file(root).unlink(missing_ok=True)
+
+        with mock.patch.object(w, "engine_pid_alive", return_value=True):
+            rc = w.worker(root, interval=0.05, sleep=fake_sleep)
+        self.assertEqual(rc, 0)
+        self.assertGreaterEqual(ticks, 3)
 
 
 if __name__ == "__main__":

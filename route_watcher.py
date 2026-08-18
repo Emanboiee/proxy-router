@@ -32,7 +32,10 @@ STATE_DIR_NAME = "state/route-watcher"
 PID_NAME = "pid"
 ENABLED_NAME = "enabled"
 EVENTS_NAME = "events.jsonl"
+WORKER_LOG_NAME = "worker.log"
+ENGINE_PID_NAME = "sing-box.pid"
 DEFAULT_INTERVAL = 2.0
+ENGINE_DOWN_GRACE_TICKS = 3
 TARGET_IDLE_SECONDS = 60.0
 PROBE_EVERY_SECONDS = 10.0
 CLIENT_SNAPSHOT_EVERY_SECONDS = 5.0
@@ -69,6 +72,14 @@ def enabled_file(root: Path | None = None) -> Path:
 
 def events_file(root: Path | None = None) -> Path:
     return state_dir(root) / EVENTS_NAME
+
+
+def worker_log_file(root: Path | None = None) -> Path:
+    return state_dir(root) / WORKER_LOG_NAME
+
+
+def engine_pid_file(root: Path | None = None) -> Path:
+    return (Path(root) if root is not None else ROOT) / ENGINE_PID_NAME
 
 
 def normalize_host(host: str) -> str:
@@ -311,8 +322,17 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
     clients: list[dict] = []
     clients_at = 0.0
     guard = RotationGuard()
+    engine_down_ticks = 0
     try:
         while enabled_file(root).is_file():
+            # Grace before exit covers engine_switch's stop/start gap.
+            if not engine_pid_alive(root):
+                engine_down_ticks += 1
+                if engine_down_ticks >= ENGINE_DOWN_GRACE_TICKS:
+                    print(f"route-watcher: engine dead for {engine_down_ticks} ticks; exiting", file=sys.stderr)
+                    break
+            else:
+                engine_down_ticks = 0
             # Routes can be added while the watcher is running. Refresh the
             # target set each tick so transparent capture starts observing a
             # newly configured domain without requiring a router restart.
@@ -422,6 +442,28 @@ def _pid_running(pid: int, root: Path | None = None) -> bool:
     return True
 
 
+def engine_pid_alive(root: Path | None = None) -> bool:
+    """True when root/sing-box.pid names a live process.
+
+    The engine may be root-owned (tun mode) while the watcher runs as the
+    regular user; PermissionError from kill(0) still means it is alive.
+    """
+    root = Path(root) if root is not None else ROOT
+    try:
+        pid = int(engine_pid_file(root).read_text().strip())
+    except (OSError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except (ProcessLookupError, OSError):
+        return False
+
+
 def _cleanup_worker_state(root: Path, owner_pid: int) -> None:
     """Remove watcher markers only when they still belong to this worker."""
     try:
@@ -459,17 +501,31 @@ def start(root: Path | None = None, *, interval: float = DEFAULT_INTERVAL) -> di
     enabled_file(root).write_text("enabled\n", encoding="ascii")
     os.chmod(enabled_file(root), 0o600)
     command = [sys.executable, str(Path(__file__).resolve()), "--worker", "--root", str(root), "--interval", str(interval)]
+    worker_log = worker_log_file(root)
+    try:
+        log_handle = worker_log.open("ab")
+    except OSError:
+        log_handle = subprocess.DEVNULL
     try:
         proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL, start_new_session=True)
+                                stderr=log_handle, start_new_session=True)
     except OSError as exc:
         enabled_file(root).unlink(missing_ok=True)
+        if log_handle is not subprocess.DEVNULL:
+            log_handle.close()
         return {"started": False, "error": f"{type(exc).__name__}: {exc}"}
+    if log_handle is not subprocess.DEVNULL:
+        log_handle.close()  # child inherited the fd; the parent must not hold it
     pid_file(root).write_text(str(proc.pid), encoding="ascii")
     os.chmod(pid_file(root), 0o600)
     os.chmod(enabled_file(root), 0o600)
+    try:
+        os.chmod(worker_log, 0o600)
+        _hand_back_ownership(worker_log)
+    except OSError:
+        pass
     _hand_back_ownership(pid_file(root), enabled_file(root))
-    return {"started": True, "pid": proc.pid, "interval": interval}
+    return {"started": True, "pid": proc.pid, "interval": interval, "log": str(worker_log)}
 
 
 def _wait_until_stopped(pid: int, root: Path, *, timeout: float = 3.0,
