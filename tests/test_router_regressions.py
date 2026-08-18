@@ -5,6 +5,7 @@ import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1061,7 +1062,7 @@ def test_needs_elevation_vpn_on_interactive_darwin_nonroot(tmp_path, monkeypatch
     monkeypatch.setattr(router.sys, "stdin", _TTY(True))
     monkeypatch.delenv("PROXY_ROUTER_ELEVATED", raising=False)
     args = type("A", (), {"cmd": "vpn", "action": "on"})()
-    assert router._needs_elevation(args) is True
+    assert router._needs_elevation(args) is False
 
 
 def test_needs_elevation_vpn_off_only_in_tun_mode(tmp_path, monkeypatch):
@@ -1075,7 +1076,7 @@ def test_needs_elevation_vpn_off_only_in_tun_mode(tmp_path, monkeypatch):
     args = type("A", (), {"cmd": "vpn", "action": "off"})()
     router.MODE_FILE.parent.mkdir(parents=True, exist_ok=True)
     router.MODE_FILE.write_text("tun")
-    assert router._needs_elevation(args) is True
+    assert router._needs_elevation(args) is False
     router.MODE_FILE.write_text("proxy")
     assert router._needs_elevation(args) is False
 
@@ -1092,7 +1093,7 @@ def test_needs_elevation_engine_commands_only_in_tun_mode(tmp_path, monkeypatch)
     router.MODE_FILE.write_text("tun")
     for cmd in ("start", "stop", "ensure", "reload", "rotate", "add", "remove"):
         args = type("A", (), {"cmd": cmd})()
-        assert router._needs_elevation(args) is True, cmd
+        assert router._needs_elevation(args) is False, cmd
     router.MODE_FILE.write_text("proxy")
     for cmd in ("start", "stop", "ensure", "reload", "rotate", "add", "remove"):
         args = type("A", (), {"cmd": cmd})()
@@ -1141,66 +1142,50 @@ def test_needs_elevation_noninteractive_lifts_when_sudoers_installed(tmp_path, m
     router.MODE_FILE.parent.mkdir(parents=True, exist_ok=True)
     router.MODE_FILE.write_text("tun")
     args = type("A", (), {"cmd": "vpn", "action": "on"})()
-    assert router._needs_elevation(args) is True
+    assert router._needs_elevation(args) is False
 
 
 def test_sudoers_rules_render_all_command_shapes():
     router = load_router(Path("/tmp/pr-test"))
-    rules = router._sudoers_rules("alice", "/usr/bin/python3", "/opt/pr/router.py")
+    rules = router._sudoers_rules("alice", 501)
     lines = rules.strip().splitlines()
-    assert lines[0].startswith("# Managed by `proxy-router elevate install`")
-    cmds = [line.split("NOPASSWD: ", 1)[1] for line in lines[1:]]
-    assert "/usr/bin/python3 /opt/pr/router.py vpn *" in cmds
-    assert "/usr/bin/python3 /opt/pr/router.py reload" in cmds
-    assert "/usr/bin/python3 /opt/pr/router.py ensure" in cmds
-    assert "/usr/bin/python3 /opt/pr/router.py rotate *" in cmds
-    assert "/usr/bin/python3 /opt/pr/router.py rotate * --reason *" in cmds
-    assert "/usr/bin/python3 /opt/pr/router.py rotate" in cmds
-    assert "/usr/bin/python3 /opt/pr/router.py add" in cmds
-    assert "/usr/bin/python3 /opt/pr/router.py remove" in cmds
-    assert all(" ALL=(root) NOPASSWD: " in line for line in lines[1:])
+    assert lines[0].startswith("# Managed by proxy-router privileged helper v2")
+    cmds = [line.split("NOPASSWD: ", 1)[1] for line in lines if "NOPASSWD:" in line]
+    assert len(cmds) == 5
+    assert {command.rsplit(" ", 2)[-2] for command in cmds} == {
+        "status", "start", "stop", "reload", "uninstall",
+    }
+    assert all(str(router.PRIVILEGED_HELPER) in command for command in cmds)
+    assert all("router.py" not in command and "*" not in command for command in cmds)
 
 
-def test_sudoers_installed_probes_by_executing_not_listing(tmp_path, monkeypatch):
-    """ROOT CAUSE:
-    If sudoers grants the user `ALL=(ALL) ALL` (password required, no
-    NOPASSWD marker), `sudo -n -line <cmd>` exits 0 and prints the rule, but
-    `sudo -n <cmd>` fails with "a password is required" — the old list-based
-    probe reported "passwordless sudo active" when running engine commands
-    still prompts/fails. We fixed this by EXECUTING the read-only
-    `vpn status` command with `-n`: it exits 0 only when the NOPASSWD rule
-    actually fires, which is exactly the property `_elevate` relies on."""
+def test_sudoers_installed_executes_exact_helper_status(tmp_path, monkeypatch):
     router = load_router(tmp_path)
     calls = []
-    monkeypatch.setattr(router.shutil, "which", lambda name: "/usr/bin/sudo")
 
     class _R:
         returncode = 0
+        stdout = json.dumps({
+            "installed": True, "running": False, "pid": None,
+            "mode": "tun", "schema_version": 1,
+        })
+        stderr = ""
 
     monkeypatch.setattr(router.subprocess, "run",
                         lambda *a, **k: calls.append(a) or _R())
     assert router._sudoers_installed() is True
-    assert calls[0][0][:2] == ["sudo", "-n"]
-    assert calls[0][0][2:] == [sys.executable, str(Path(router.__file__).resolve()), "vpn", "status"]
+    assert calls[0][0] == router._helper_command("status")
 
 
-def test_sudoers_installed_survives_engine_down_exit_1(tmp_path, monkeypatch):
-    """ROOT CAUSE:
-    If the engine is down, `vpn status` exits 1 by design (rc 0 only when
-    the engine is up and matches the persisted mode), so the old
-    `returncode == 0` probe reported "grant missing" whenever the engine
-    was stopped — background keepalive ticks and `elevate status` then
-    refused passwordless sudo that was actually installed. We fixed this
-    by treating a nonzero exit as "grant present" unless sudo itself
-    reports a denial on stderr ("a password is required" / "not in the
-    sudoers file" / requiretty), which is the only way `sudo -n` fails
-    without running the command."""
+def test_sudoers_installed_uses_helper_install_state_not_engine_liveness(tmp_path, monkeypatch):
     router = load_router(tmp_path)
-    monkeypatch.setattr(router.shutil, "which", lambda name: "/usr/bin/sudo")
 
     class _EngineDown:
-        returncode = 1
-        stdout = "vpn: down (mode set to tun; run 'vpn on')"
+        returncode = 0
+        stdout = json.dumps({
+            "installed": True, "running": False, "pid": None,
+            "mode": "tun", "schema_version": 1,
+        })
         stderr = ""
 
     monkeypatch.setattr(router.subprocess, "run", lambda *a, **k: _EngineDown())
@@ -1215,28 +1200,20 @@ def test_sudoers_installed_survives_engine_down_exit_1(tmp_path, monkeypatch):
     assert router._sudoers_installed() is False
 
 
-def test_elevate_prefers_sudo_n_when_granted(tmp_path, monkeypatch):
+def test_elevate_never_reexecutes_checkout_through_sudo(tmp_path, monkeypatch):
     router = load_router(tmp_path)
-    monkeypatch.setattr(router, "_sudoers_installed", lambda: True)
     calls = []
-
-    class _R:
-        returncode = 0
-
-    monkeypatch.setattr(router.subprocess, "run", lambda *a, **k: calls.append(a) or _R())
-    monkeypatch.setattr(router.sys, "argv", ["router.py", "vpn", "off"])
-    assert router._elevate() == 0
-    assert calls[0][0][0] == "sudo" and calls[0][0][1] == "-n"
-    assert calls[0][0][2].endswith("python3") or calls[0][0][2].endswith("python")
-    assert calls[0][0][3].endswith("router.py")
-    assert calls[0][0][4:] == ["vpn", "off"]
+    monkeypatch.setattr(router.subprocess, "run", lambda *a, **k: calls.append(a))
+    assert router._elevate() == 1
+    assert calls == []
 
 
-def test_elevate_falls_back_to_admin_dialog(tmp_path, monkeypatch):
+def test_elevate_never_falls_back_to_admin_dialog_for_normal_operation(tmp_path, monkeypatch):
     router = load_router(tmp_path)
-    monkeypatch.setattr(router, "_sudoers_installed", lambda: False)
-    monkeypatch.setattr(router, "_elevate_macos", lambda: 99)
-    assert router._elevate() == 99
+    dialog = mock.Mock(return_value=99)
+    monkeypatch.setattr(router, "_elevate_macos", dialog)
+    assert router._elevate() == 1
+    dialog.assert_not_called()
 
 
 def test_cmd_elevate_status_reports_grant(tmp_path, monkeypatch):
@@ -1260,52 +1237,37 @@ def test_needs_elevation_skips_root_and_elevated_child(tmp_path, monkeypatch):
     assert router._needs_elevation(args) is False
 
 
-def test_elevate_macos_runs_osascript_with_admin_privileges(tmp_path, monkeypatch):
-    """The elevated child must be the same CLI, with SUDO_UID/SUDO_GID and
-    PATH injected so ownership hand-back and sing-box resolution work."""
+def test_elevate_macos_runs_hash_pinned_install_snapshot(tmp_path, monkeypatch):
     router = load_router(tmp_path)
     calls = []
     monkeypatch.setattr(router.os, "getuid", lambda: 501)
     monkeypatch.setattr(router.os, "getgid", lambda: 20)
-    monkeypatch.setattr(router.os, "environ", {"PATH": "/usr/bin:/bin"}, raising=False)
-    monkeypatch.setattr(router.sys, "argv", ["router.py", "vpn", "on"])
+    monkeypatch.setattr(router.sys, "argv", ["router.py", "elevate", "install"])
     monkeypatch.setattr(router.sys, "executable", "/usr/bin/python3")
+    monkeypatch.setattr(router, "_safe_source_bytes", lambda path, uid: b"reviewed-source")
     monkeypatch.setattr(router.subprocess, "run",
                         lambda *a, **k: calls.append((a, k)) or type("P", (), {"returncode": 0})())
 
-    router._elevate_macos()
-    assert calls, "osascript was never invoked"
-    (pos, kwargs), = calls
+    assert router._elevate_macos() == 0
+    (pos, _kwargs), = calls
     argv = pos[0]
     assert argv[:2] == ["osascript", "-e"]
     script = argv[2]
     assert "with administrator privileges" in script
-    assert "SUDO_UID=501" in script
-    assert "SUDO_GID=20" in script
-    assert "PROXY_ROUTER_ELEVATED=1" in script
-    assert "PATH=/usr/bin:/bin" in script
-    assert "vpn" in script and "on" in script
+    assert "/usr/bin/python3" in script and " -I" in script and " -S" in script
+    assert "hashlib.sha256" in script
+    assert str(tmp_path) in script
+    assert "vpn on" not in script
 
 
-def test_elevate_macos_escapes_applescript_specials(tmp_path, monkeypatch):
-    r"""Quotes/backslashes in args must survive the AppleScript string literal
-    (e.g. an --id with quotes): content `\"`/`\\` escapes, literal delimiters
-    stay unescaped (a `\` at expression position is a -2741 syntax error)."""
+def test_elevate_macos_rejects_non_install_operations(tmp_path, monkeypatch):
     router = load_router(tmp_path)
-    monkeypatch.setattr(router.os, "getuid", lambda: 501)
-    monkeypatch.setattr(router.os, "getgid", lambda: 20)
-    monkeypatch.setattr(router.os, "environ", {"PATH": "/usr/bin"}, raising=False)
-    monkeypatch.setattr(router.sys, "argv", ["router.py", "add", "--id", 'we"ird\\id', "--domain", "x.example"])
-    monkeypatch.setattr(router.sys, "executable", "/usr/bin/python3")
-    captured = []
-    monkeypatch.setattr(router.subprocess, "run",
-                        lambda *a, **k: captured.append(a[0]) or type("P", (), {"returncode": 0})())
+    monkeypatch.setattr(router.sys, "argv", ["router.py", "vpn", "on"])
+    calls = []
+    monkeypatch.setattr(router.subprocess, "run", lambda *a, **k: calls.append(a))
 
-    router._elevate_macos()
-    script = captured[0][2]
-    assert script.startswith('do shell script "')
-    assert 'we\\"ird\\\\id' in script
-    assert script.endswith('" with administrator privileges')
+    assert router._elevate_macos() == 1
+    assert calls == []
 
 
 def test_needs_elevation_vpn_restart_always(tmp_path, monkeypatch):
@@ -1319,7 +1281,7 @@ def test_needs_elevation_vpn_restart_always(tmp_path, monkeypatch):
     router.MODE_FILE.parent.mkdir(parents=True, exist_ok=True)
     router.MODE_FILE.write_text("proxy")
     args = type("A", (), {"cmd": "vpn", "action": "restart"})()
-    assert router._needs_elevation(args) is True
+    assert router._needs_elevation(args) is False
 
 
 def test_vpn_restart_stops_then_brings_tun_up(tmp_path, monkeypatch):
@@ -1366,6 +1328,7 @@ def test_engine_start_aborts_when_engine_stop_fails(tmp_path, monkeypatch):
     router.write_sing_box = lambda c: None
     router.validate_config = lambda: True
     router.engine_stop = lambda: 1
+    setattr(router, "_helper_status", lambda: None)
     popen_calls = []
     monkeypatch.setattr(router.subprocess, "Popen", lambda *a, **k: popen_calls.append(a) or object())
     assert router.engine_start() == 1
@@ -1437,15 +1400,10 @@ def test_engine_reload_permission_error_on_sighup_only(tmp_path, monkeypatch):
 
     monkeypatch.setattr(router.os, "kill", deny_sighup)
     monkeypatch.setattr(router.os, "geteuid", lambda: 501)
-    reloads = []
-    monkeypatch.setattr(router.subprocess, "run",
-                        lambda *a, **k: reloads.append(a) or SimpleNamespace(returncode=0))
-    # a regular user now hands the reload to the granted sudo shape
-    # instead of failing; the pid file is untouched either way
-    assert router.engine_reload() == 0
+    monkeypatch.setattr(router, "_helper_status", lambda: None)
+    assert router.engine_reload() == 1
     assert start_calls == []
     assert router.PID_FILE.read_text() == "4242"
-    assert reloads and reloads[0][0][0] == "sudo"
 
 
 def test_restore_last_good_permission_error_on_sighup_only(tmp_path, monkeypatch):
@@ -1510,38 +1468,22 @@ def test_tray_full_tunnel_toggle_invokes_vpn_action(tmp_path, monkeypatch):
     assert calls2 == ["on"]
 
 
-def test_tray_vpn_off_elevates_via_osascript_on_darwin(tmp_path, monkeypatch):
-    """ROOT CAUSE: the tray runs under launchd with no TTY, so router.py's
-    isatty-gated `_elevate_macos` never fires from it; a plain `vpn off`
-    subprocess would hit the new PermissionError guard and fail with the
-    "run with sudo" hint instead of doing anything useful. The tray must
-    drive the osascript admin dialog itself, with the same SUDO_UID/SUDO_GID
-    hand-back env the CLI injects."""
+def test_tray_vpn_off_uses_user_controller_on_darwin(tmp_path, monkeypatch):
     module = load_tray(tmp_path)
     monkeypatch.setattr(module.sys, "platform", "darwin")
-    monkeypatch.setattr(module.os, "getuid", lambda: 501)
-    monkeypatch.setattr(module.os, "getgid", lambda: 20)
-    monkeypatch.setattr(module.os, "environ", {"PATH": "/usr/bin:/bin"}, raising=False)
-    # No sudoers grant: the tray must fall back to the admin dialog.
-    monkeypatch.setattr(module, "_sudoers_ok", lambda *a, **k: False)
     calls = []
     monkeypatch.setattr(module.subprocess, "run",
                         lambda *a, **k: calls.append((a, k)) or type("P", (), {
                             "returncode": 0, "stdout": "", "stderr": ""})())
 
     client = module.RouterClient(str(tmp_path))
-    rc, out = client.vpn("off")
+    rc, _out = client.vpn("off")
     assert rc == 0
-    (pos, kwargs), = calls
+    (pos, _kwargs), = calls
     argv = pos[0]
-    assert argv[:2] == ["osascript", "-e"]
-    script = argv[2]
-    assert "with administrator privileges" in script
-    assert "SUDO_UID=501" in script
-    assert "SUDO_GID=20" in script
-    assert "PROXY_ROUTER_ELEVATED=1" in script
-    assert "router.py" in script and "vpn off" in script
-    assert kwargs.get("timeout") == module.ELEVATED_COMMAND_TIMEOUT
+    assert argv[-2:] == ["vpn", "off"]
+    assert argv[0] == client.python
+    assert "osascript" not in argv and "sudo" not in argv
 
 
 def test_tray_vpn_uses_plain_cli_off_macos(tmp_path, monkeypatch):
@@ -1559,31 +1501,3 @@ def test_tray_vpn_uses_plain_cli_off_macos(tmp_path, monkeypatch):
     assert rc == 0
     assert calls and calls[0][0][-2:] == ["vpn", "off"]
     assert not any(c[0][0] == "osascript" for c in calls)
-
-
-def test_tray_sudoers_ok_survives_engine_down_exit_1(tmp_path, monkeypatch):
-    """ROOT CAUSE:
-    Mirrors the router probe: `sudo -n <python> <router> vpn status` exits 1
-    while the engine is down, so the old `returncode == 0` check made the
-    tray believe the passwordless grant was missing and always fell back to
-    the admin-password dialog (which blocks under launchd with no TTY). We
-    fixed this the same way as router.py: a nonzero exit only counts as
-    "grant missing" when sudo reports a denial on stderr."""
-    module = load_tray(tmp_path)
-    monkeypatch.setattr(module.shutil, "which", lambda name: "/usr/bin/sudo")
-
-    class _EngineDown:
-        returncode = 1
-        stdout = "vpn: down (mode set to tun; run 'vpn on')"
-        stderr = ""
-
-    monkeypatch.setattr(module.subprocess, "run", lambda *a, **k: _EngineDown())
-    assert module._sudoers_ok("/usr/bin/python3", "/opt/pr/router.py") is True
-
-    class _Denied:
-        returncode = 1
-        stdout = ""
-        stderr = "sudo: a password is required"
-
-    monkeypatch.setattr(module.subprocess, "run", lambda *a, **k: _Denied())
-    assert module._sudoers_ok("/usr/bin/python3", "/opt/pr/router.py") is False

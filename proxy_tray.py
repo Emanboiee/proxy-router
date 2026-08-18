@@ -42,9 +42,6 @@ except ImportError:  # --selftest and --help must work without the GUI stack
 
 POLL_SECONDS = 5.0  # live-enough menu state without spawning 24 CLI procs/min
 COMMAND_TIMEOUT = 20
-# osascript's admin-password dialog blocks until the user answers; a regular
-# command timeout would kill the toggle mid-prompt. Generous on purpose.
-ELEVATED_COMMAND_TIMEOUT = 120
 
 # Friendly, non-jargon labels for tray menu entries. The router CLI words
 # (safe-list / vpn-list / rotate / exit) stay in the terminal; the tray
@@ -80,44 +77,9 @@ _FRIENDLY_ERRORS = (
     ("no valid profiles", "no usable profiles found — re-add your .conf under Setup"),
 )
 
-# stderr markers that prove `sudo -n` DENIED (vs the command itself
-# failing). A sudoers grant is a snapshot of the command shapes at install
-# time, so a command added later (e.g. `start`/`stop` for issue #12) can
-# hit a denial even when the probe passes; callers fall back to the admin
-# dialog on these markers instead of surfacing a raw sudo error.
-_SUDO_DENIAL_TOKENS = (
-    "a password is required",
-    "not in the sudoers",
-    "must have a tty",
-)
-
 # Longest tail line _humanize keeps: the sing-box missing-binary message
 # (darwin) is ~424 chars, so 500 keeps it fully visible (issue #11).
 _MAX_DETAIL = 500
-
-
-def _sudoers_ok(python: str, router: str) -> bool:
-    """True when `sudo -n` may run router.py without a password prompt.
-
-    Mirrors router.py's probe: executes (not lists) one engine command —
-    `sudo -n -l` is a false positive when a sudoers rule exists but still
-    requires a password (listing succeeds, executing fails). Every sudoers
-    rule shares the interpreter + script prefix, so one execution proves
-    the whole grant."""
-    if not shutil.which("sudo"):
-        return False
-    probe = subprocess.run(
-        ["sudo", "-n", python, router, "vpn", "status"],
-        capture_output=True, text=True,
-    )
-    if probe.returncode == 0:
-        return True
-    # `vpn status` exits 1 while the engine is down, so a nonzero exit is
-    # not proof the grant is missing; only a sudo-level denial on stderr
-    # ("a password is required", "not in the sudoers file", requiretty)
-    # means the NOPASSWD rule is absent. Mirrors router.py's probe.
-    stderr = (probe.stderr or "").lower()
-    return not any(token in stderr for token in _SUDO_DENIAL_TOKENS)
 
 
 def _friendly_egress_error(err: object) -> str:
@@ -469,11 +431,9 @@ class RouterClient:
     def vpn(self, action: str) -> tuple[int, str]:
         """Toggle full-tunnel (TUN) mode via the router CLI.
 
-        TUN mode needs root (utun creation, route table), so macOS elevates
-        through the standard admin-password dialog. The tray runs under
-        launchd with no TTY, which router.py's own isatty-gated elevation
-        explicitly refuses — so the tray drives osascript itself, with the
-        same SUDO_UID/SUDO_GID hand-back env the CLI injects.
+        TUN mode needs root, but the tray remains a user process. router.py
+        delegates only exact lifecycle operations to the installed root-owned
+        helper and returns an install hint when that helper is absent.
         """
         if sys.platform == "darwin":
             return self._run_elevated("vpn", action)
@@ -482,55 +442,12 @@ class RouterClient:
         return self._run("vpn", action)
 
     def _run_elevated(self, *args: str) -> tuple[int, str]:
-        """Run a router.py command as root, prompting at most once per install.
+        """Run through the user controller; it delegates exact root lifecycle.
 
-        Prefers the passwordless sudo granted by `router.py elevate install`
-        (one-time macOS admin prompt); falls back to the admin dialog per
-        run when the grant is missing. Mirrors router.py's env injection
-        (SUDO_UID/SUDO_GID for state-file hand-back, PROXY_ROUTER_ELEVATED
-        to suppress re-elevation, PATH passthrough so the bundled sing-box
-        still resolves) and the same AppleScript escaping rules.
+        The tray never invokes sudo/osascript or executes router.py as root.
+        Missing helper state is returned as the controller's actionable error.
         """
-        if _sudoers_ok(self.python, self.router):
-            try:
-                p = subprocess.run(
-                    ["sudo", "-n", self.python, self.router, *args],
-                    capture_output=True, text=True, timeout=ELEVATED_COMMAND_TIMEOUT,
-                )
-                out = (p.stdout or "") + ("\n" + p.stderr if p.stderr else "")
-                if p.returncode == 0 or not any(
-                        token in (p.stderr or "").lower() for token in _SUDO_DENIAL_TOKENS):
-                    return p.returncode, out.strip()
-                # sudo-level denial: the grant predates this command shape;
-                # fall through to the per-run admin dialog instead of
-                # surfacing a raw sudo error.
-            except subprocess.TimeoutExpired:
-                return -1, "timeout: sudo did not answer in time"
-            except FileNotFoundError:
-                return -2, "missing: sudo (this action needs root)"
-        env = (
-            f"SUDO_UID={os.getuid()} SUDO_GID={os.getgid()} "
-            f"PROXY_ROUTER_ELEVATED=1 "
-            f"PATH={shlex.quote(os.environ.get('PATH', ''))}"
-        )
-        cmd = shlex.join([self.python, self.router, *args])
-        shell_cmd = f"{env} {cmd}"
-        # AppleScript string literals accept only `\"` and `\\` escapes; escape
-        # the shell command's quotes/backslashes but keep the literal delimiters
-        # unescaped (a `\` at expression position is a syntax error).
-        content = shell_cmd.replace("\\", "\\\\").replace('"', '\\"')
-        script = f'do shell script "{content}" with administrator privileges'
-        try:
-            p = subprocess.run(
-                ["osascript", "-e", script], capture_output=True, text=True,
-                timeout=ELEVATED_COMMAND_TIMEOUT,
-            )
-            out = (p.stdout or "") + ("\n" + p.stderr if p.stderr else "")
-            return p.returncode, out.strip()
-        except subprocess.TimeoutExpired:
-            return -1, "timeout: admin dialog did not answer in time"
-        except FileNotFoundError:
-            return -2, "missing: osascript (this action needs macOS)"
+        return self._run(*args)
 
 
 def make_icon(color: str, size: int = 64) -> "Image.Image":

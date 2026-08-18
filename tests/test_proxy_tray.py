@@ -134,10 +134,7 @@ class HumanizeTests(unittest.TestCase):
 
 
 class RunElevatedFallbackTests(unittest.TestCase):
-    """`_run_elevated` falls back to the admin dialog when `sudo -n`
-    denies (stale grant missing a command shape added later), but returns
-    a real elevated-command failure unchanged (no dialog for an engine
-    error)."""
+    """Legacy-named wrapper now runs only the normal user controller."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -147,44 +144,35 @@ class RunElevatedFallbackTests(unittest.TestCase):
     def _probe(self, returncode, stdout="", stderr=""):
         return type("P", (), {"returncode": returncode, "stdout": stdout, "stderr": stderr})()
 
-    def test_sudo_denial_falls_back_to_osascript(self):
-        with mock.patch.object(tray, "_sudoers_ok", return_value=True), \
-             mock.patch.object(tray.subprocess, "run") as run:
-            run.side_effect = [
-                self._probe(1, stderr="a password is required"),
-                self._probe(0, stdout="stopped"),
-            ]
+    def test_controller_failure_never_falls_back_to_osascript(self):
+        with mock.patch.object(tray.subprocess, "run") as run:
+            run.return_value = self._probe(1, stderr="a password is required")
             rc, out = self.client._run_elevated("stop")
-        self.assertEqual((rc, out), (0, "stopped"))
-        self.assertEqual(run.call_args.args[0][0], "osascript")
-
-    def test_sudoers_denial_token_falls_back_to_osascript(self):
-        with mock.patch.object(tray, "_sudoers_ok", return_value=True), \
-             mock.patch.object(tray.subprocess, "run") as run:
-            run.side_effect = [
-                self._probe(1, stderr="alice is not in the sudoers file"),
-                self._probe(0, stdout="stopped"),
-            ]
-            rc, out = self.client._run_elevated("stop")
-        self.assertEqual((rc, out), (0, "stopped"))
-        self.assertEqual(run.call_args.args[0][0], "osascript")
-
-    def test_elevated_command_failure_returns_rc_without_osascript(self):
-        with mock.patch.object(tray, "_sudoers_ok", return_value=True), \
-             mock.patch.object(tray.subprocess, "run") as run:
-            run.return_value = self._probe(3, stderr="router: engine failed to start")
-            rc, out = self.client._run_elevated("stop")
-        self.assertEqual(rc, 3)
-        self.assertEqual(run.call_args.args[0][0], "sudo")
+        self.assertEqual((rc, out), (1, "a password is required"))
+        self.assertEqual(run.call_args.args[0][0], self.client.python)
         self.assertEqual(run.call_count, 1)
 
-    def test_success_returns_without_osascript(self):
-        with mock.patch.object(tray, "_sudoers_ok", return_value=True), \
-             mock.patch.object(tray.subprocess, "run") as run:
+    def test_controller_sudoers_message_is_returned_without_tray_fallback(self):
+        with mock.patch.object(tray.subprocess, "run") as run:
+            run.return_value = self._probe(1, stderr="alice is not in the sudoers file")
+            rc, out = self.client._run_elevated("stop")
+        self.assertEqual((rc, out), (1, "alice is not in the sudoers file"))
+        self.assertEqual(run.call_args.args[0][0], self.client.python)
+
+    def test_controller_command_failure_returns_unchanged(self):
+        with mock.patch.object(tray.subprocess, "run") as run:
+            run.return_value = self._probe(3, stderr="router: engine failed to start")
+            rc, _out = self.client._run_elevated("stop")
+        self.assertEqual(rc, 3)
+        self.assertEqual(run.call_args.args[0][0], self.client.python)
+        self.assertEqual(run.call_count, 1)
+
+    def test_controller_success_returns_unchanged(self):
+        with mock.patch.object(tray.subprocess, "run") as run:
             run.return_value = self._probe(0, stdout="stopped")
             rc, out = self.client._run_elevated("stop")
         self.assertEqual((rc, out), (0, "stopped"))
-        self.assertEqual(run.call_args.args[0][0], "sudo")
+        self.assertEqual(run.call_args.args[0][0], self.client.python)
         self.assertEqual(run.call_count, 1)
 
 
@@ -257,5 +245,17 @@ class DashboardOpenerTests(unittest.TestCase):
             self.assertTrue(tray.open_dashboard(self.root))
         self.assertEqual(calls[0][0], "osascript")
         self.assertIn("setup_tui.py", " ".join(calls[0]))
+
+
+class PrivilegedHelperTrayTests(unittest.TestCase):
+    def test_root_action_uses_normal_controller_and_never_sudo_or_osascript(self):
+        client = tray.RouterClient("/tmp/proxy-router")
+        with mock.patch.object(client, "_run", return_value=(0, "ok")) as run, \
+             mock.patch.object(tray.subprocess, "run") as subprocess_run:
+            result = client._run_elevated("vpn", "on")
+
+        self.assertEqual(result, (0, "ok"))
+        run.assert_called_once_with("vpn", "on")
+        subprocess_run.assert_not_called()
 
 

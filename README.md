@@ -99,12 +99,11 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py routes               # list route table
 ./router.py vpn on               # full TUN mode: route everything via the engines' rules
 ./router.py vpn off              # stop the TUN, back to proxy mode
-./router.py vpn restart          # stop + re-enter TUN in one step (single elevation prompt)
+./router.py vpn restart          # stop + re-enter TUN through the installed helper
 ./router.py vpn status           # show current mode and liveness
-./router.py elevate install      # one-time macOS admin prompt; afterwards engine commands run
-                                 # without prompts (vpn on/off/restart, reload, ensure, rotate)
-./router.py elevate uninstall    # remove the passwordless-sudo grant
-./router.py elevate status       # is the grant active for this interpreter/script?
+./router.py elevate install      # one-time macOS admin prompt; install root-owned lifecycle helper
+./router.py elevate uninstall    # stop engine and remove helper + exact sudoers policy
+./router.py elevate status       # is the safe helper active for this user?
 ./router.py add --domain example.com --provider proton [--id my-route]
 ./router.py add --ip 1.2.3.0/24 --provider proton [--id my-route]
 ./router.py remove <id>
@@ -290,19 +289,15 @@ Platform notes:
   (`sudo proxy-router vpn on`).
 - **Windows**: needs an elevated shell and `wintun.dll` next to
   `sing-box.exe` (drop it from the official Wintun release).
-- **macOS**: needs root to create the `utun` interface. Running
-  `proxy-router vpn on` (or any engine command while TUN mode is active) as a
-  regular user in an interactive terminal re-executes itself through the
-  standard macOS admin-password dialog (`osascript` with administrator
-  privileges). Run `proxy-router elevate install` once (single admin prompt)
-  to grant passwordless sudo for exactly the engine commands (see below);
-  afterwards `vpn on`/`vpn off`/`vpn restart`/`reload`/`ensure`/`rotate` run
-  silently, even from background keepalive/launchd ticks. Without the grant,
-  interactive runs ask for permission every time — no manual `sudo` needed —
-  and background ticks never prompt (they have no TTY) and keep the clear
-  "run with sudo" error instead. State files are handed back to the invoking
-  user automatically. Use `vpn restart` to cycle the TUN with a single prompt
-  (`vpn off && vpn on` asks twice). This is NOT a System Settings VPN
+- **macOS**: needs root to create the `utun` interface. Run
+  `proxy-router elevate install` once; the authenticated installer snapshots
+  and hashes its source, installs a minimal root-owned lifecycle helper and a
+  pinned official sing-box binary, validates an exact sudoers policy with
+  `visudo`, then grants only five helper operations. The normal controller,
+  tray, and keepalive stay unprivileged and silently request helper
+  `start`/`stop`/`reload` as needed. Without a valid helper, root-required
+  operations fail closed and tell you to install it; they never execute the
+  user-writable checkout as root or pop repeated admin dialogs. This is NOT a System Settings VPN
   provider entry — that would require a signed NetworkExtension app. It is a
   TUN interface managed from the terminal.
 
@@ -338,28 +333,35 @@ Two more knobs in `"vpn"` control address-family policy:
 
 ## One-time elevation (macOS)
 
-`vpn` engine commands need root to create the `utun` interface. Instead of an
-admin-password dialog on every run, grant passwordless sudo once:
+`vpn` engine commands need root to create the `utun` interface. Install the
+minimal lifecycle helper once:
 
 ```sh
-./router.py elevate install    # one admin prompt; installs /etc/sudoers.d/91-proxy-router
-./router.py elevate status     # exit 0 when the grant matches this interpreter/script
-./router.py elevate uninstall  # remove the grant
+./router.py elevate install    # one prompt; install/upgrade root-owned helper
+./router.py elevate status     # exit 0 when the exact helper status op works
+./router.py elevate uninstall  # stop engine; remove policy, helper, root state
 ```
 
-The sudoers file only authorizes router engine subcommands for this interpreter
-script path (NOPASSWD for `start`, `stop`, `vpn *`, `reload`, `ensure`,
-`rotate`, `add`, and `remove`, plus the explicit legacy rotate shapes).
-The no-argument sudoers entries allow the validated option forms for those
-subcommands; sudo execs the command directly (no shell), so shell syntax is
-not interpreted as part of the grant. State files are handed back to the invoking user via
-the `SUDO_UID`/`SUDO_GID` sudo sets automatically. With the grant in place,
-the interactive dialog path is skipped and background keepalive/launchd ticks
-can also elevate silently — `vpn on`/`vpn off`/`vpn restart` never prompt
-again. The tray's Connect/Disconnect and the CLI's proxy-mode `start`/`stop`
-also elevate automatically while the engine runs as root, so an engine
-started via `sudo vpn on` stays manageable after `vpn off` returns to proxy
-mode.
+The sudoers file never names the user checkout, `router.py`, a user-selected
+Python, or a wildcard command. It contains one exact argv line for each
+root-owned helper operation: `status`, `start`, `stop`, `reload`, and
+`uninstall`, pinned to the installing UID and executed with `/usr/bin/python3
+-I -S` through an empty environment. The helper accepts no extra arguments.
+
+The controller still owns routing, rotation, config generation, and the route
+watcher as the normal user. Before root sing-box sees a config, the helper
+safe-opens the fixed generated file without following links, validates a
+closed versioned schema (no file/command/plugin/controller fields), copies the
+bytes into root-owned state, and checks them with the hash-pinned binary.
+Helper code, binary, policy, PID, and config live under root-owned macOS paths;
+modifying the checkout after installation cannot change executable root code.
+
+Install/upgrade requires a fresh admin approval. A recognized legacy policy
+that authorized mutable `router.py` is revoked before fallible v2 staging and
+is never restored on migration failure. Unrecognized policy content aborts
+without being overwritten. The privileged DYLD/user-site adversarial gate is
+opt-in and requires admin approval; do not claim a deployment is verified
+until that gate has run on the target Mac.
 
 ## Provider setup
 

@@ -1934,27 +1934,26 @@ class ElevatedReloadTests(unittest.TestCase):
         self.assertEqual(captured["overrides"], {"proton": self.profile})
         self.assertFalse(router.RELOAD_OVERRIDE_FILE.exists())
 
-    def test_permission_error_elevates_through_granted_reload(self):
+    def test_root_backend_reload_uses_exact_helper_operation(self):
         router.PID_FILE = self.root / "state" / "engine.pid"
         router.PID_FILE.parent.mkdir(parents=True, exist_ok=True)
         router.PID_FILE.write_text("4242")
         profile = self.root / "providers" / "proton" / "a.conf"
         _write_conf(profile)
+        status = {"installed": True, "running": True, "pid": 4242, "mode": "tun", "schema_version": 1}
         with mock.patch.object(router, "resolve_sing_box", return_value=Path("/bin/sing-box")), \
                 mock.patch.object(router, "sing_box_at_least", return_value=True), \
                 mock.patch.object(router, "build_singbox_config",
                                   return_value=({"inbounds": []}, {"proton": profile})), \
                 mock.patch.object(router, "validate_config", return_value=True), \
                 mock.patch.object(router, "write_sing_box"), \
-                mock.patch.object(router, "_pid_matches", return_value=True), \
+                mock.patch.object(router, "_helper_status", return_value=status), \
+                mock.patch.object(router, "_helper_run", return_value=0) as helper_run, \
                 mock.patch.object(router.os, "geteuid", return_value=501), \
-                mock.patch.object(router.os, "kill", side_effect=PermissionError), \
-                mock.patch.object(router.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run:
+                mock.patch.object(router.os, "kill") as kill:
             self.assertEqual(router.engine_reload({"proton": profile}), 0)
-        argv = run.call_args[0][0]
-        self.assertEqual(argv[0], "sudo")
-        self.assertIn("reload", argv)
-        self.assertTrue(router.RELOAD_OVERRIDE_FILE.is_file() or True)
+        helper_run.assert_called_once_with("reload")
+        kill.assert_not_called()
 
 
 class DoctorTests(unittest.TestCase):

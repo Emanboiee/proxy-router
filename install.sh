@@ -32,10 +32,12 @@ fi
 
 mkdir -p "$PREFIX/bin" "$PREFIX/examples" "$PREFIX/providers" "$PREFIX/guides" "$PREFIX/presets" "$PREFIX/rulesets" "$USER_BIN"
 
-for runtime_file in router.py setup_tui.py monitor.py route_watcher.py proxy_tray.py; do
+for runtime_file in router.py setup_tui.py monitor.py route_watcher.py proxy_tray.py privileged_helper.py privileged_installer.py; do
   cp "$SCRIPT_DIR/$runtime_file" "$PREFIX/$runtime_file"
   chmod 755 "$PREFIX/$runtime_file"
 done
+cp "$SCRIPT_DIR/sing-box-release.json" "$PREFIX/sing-box-release.json"
+chmod 644 "$PREFIX/sing-box-release.json"
 
 if [ -f "$BIN_SOURCE" ] && [ -x "$BIN_SOURCE" ]; then
   cp "$BIN_SOURCE" "$PREFIX/bin/sing-box"
