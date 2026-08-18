@@ -144,6 +144,7 @@ class ConfigBuildTests(unittest.TestCase):
                 self.assertNotIn("detour", server, server["tag"])
         self.assertEqual(config["dns"]["rules"], [{"domain_suffix": ["example.com"], "server": "dns-proton"}])
         self.assertEqual(config["dns"]["strategy"], "ipv4_only")
+        self.assertEqual(config["dns"]["final"], "dns-local", "unmatched queries must not ride the first tunnel DNS server")
         rules = config["route"]["rules"]
         self.assertIn({"outbound": "proton", "domain_suffix": ["example.com"]}, rules)
         self.assertNotIn({"outbound": "cloudflare", "domain_suffix": ["roblox.com"]}, rules)
@@ -709,6 +710,20 @@ class WaitEngineTests(unittest.TestCase):
         with mock.patch.object(router, "listener_up", return_value=False), \
              mock.patch.object(router, "engine_alive", return_value=True):
             self.assertFalse(router.wait_engine(timeout=0.4))
+
+    def test_tun_readiness_requires_egress_probe(self):
+        with mock.patch.object(router, "current_mode", return_value="tun"), \
+             mock.patch.object(router, "engine_alive", return_value=True), \
+             mock.patch.object(router, "engine_mode_consistent", return_value=True), \
+             mock.patch.object(router, "_tun_egress_probe", return_value=False):
+            self.assertFalse(router.wait_engine(timeout=0.6))
+
+    def test_tun_readiness_passes_with_egress_probe(self):
+        with mock.patch.object(router, "current_mode", return_value="tun"), \
+             mock.patch.object(router, "engine_alive", return_value=True), \
+             mock.patch.object(router, "engine_mode_consistent", return_value=True), \
+             mock.patch.object(router, "_tun_egress_probe", return_value=True):
+            self.assertTrue(router.wait_engine(timeout=0.6))
 
 
 class EngineReloadTests(unittest.TestCase):
@@ -2079,6 +2094,17 @@ class LastGoodConfigTests(unittest.TestCase):
         self.assertTrue(router.LAST_GOOD_FILE.is_file())
         self.assertEqual(router.LAST_GOOD_FILE.read_text(), router.SING_BOX_CONFIG.read_text())
         self.assertEqual(stat.S_IMODE(router.LAST_GOOD_FILE.stat().st_mode), 0o600)
+
+    def test_start_hands_back_log_file_ownership(self):
+        class _Proc:
+            pid = 4242
+        with mock.patch.object(router, "validate_config", return_value=True), \
+             mock.patch.object(router, "wait_engine", return_value=True), \
+             mock.patch.object(router.subprocess, "Popen", return_value=_Proc()), \
+             mock.patch.object(router, "_hand_back_ownership") as handback:
+            self.assertEqual(router.engine_start(), 0)
+        log_calls = [c for c in handback.call_args_list if c.args and c.args[0] == router.LOG_FILE]
+        self.assertTrue(log_calls, f"_hand_back_ownership(LOG_FILE) missing: {handback.call_args_list}")
 
     def test_start_failure_never_writes_last_good(self):
         class _Proc:
