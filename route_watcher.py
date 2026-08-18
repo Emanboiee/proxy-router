@@ -18,6 +18,7 @@ import collections
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -369,7 +370,45 @@ def _pid_matches(root: Path, pid: int) -> bool:
     except (OSError, subprocess.TimeoutExpired):
         return False
     command = result.stdout.strip()
-    return "--worker" in command and str(Path(root).resolve()) in command and Path(__file__).resolve().name in command
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        argv = []
+    if argv:
+        if "--worker" not in argv:
+            return False
+        if not any(Path(token).name == Path(__file__).resolve().name for token in argv):
+            return False
+    else:
+        # An unquoted quote in a valid filesystem path can make shlex reject
+        # macOS ps output. Keep exact raw identity checks available rather than
+        # misclassifying the live worker as stale.
+        if not re.search(r"(?:^|\s)--worker(?:\s|$)", command):
+            return False
+        script_name = re.escape(Path(__file__).resolve().name)
+        if not re.search(rf"(?:^|[/\s]){script_name}(?:\s|$)", command):
+            return False
+    root_value = None
+    for index, token in enumerate(argv):
+        if token == "--root" and index + 1 < len(argv):
+            root_value = argv[index + 1]
+            break
+        if token.startswith("--root="):
+            root_value = token.split("=", 1)[1]
+            break
+    expected_root = str(Path(root).resolve())
+    if root_value is not None and str(Path(root_value).resolve()) == expected_root:
+        return True
+    # macOS `ps -o command=` joins argv without shell quoting, so a root with
+    # spaces is split by shlex. start() always places --interval immediately
+    # after --root, giving us an exact raw-command boundary without accepting
+    # prefix impostors such as `<root>-foreign`.
+    return (
+        f"--root {expected_root} --interval " in command
+        or f"--root={expected_root} --interval " in command
+        or command.endswith(f"--root {expected_root}")
+        or command.endswith(f"--root={expected_root}")
+    )
 
 
 def _pid_running(pid: int, root: Path | None = None) -> bool:
@@ -433,20 +472,53 @@ def start(root: Path | None = None, *, interval: float = DEFAULT_INTERVAL) -> di
     return {"started": True, "pid": proc.pid, "interval": interval}
 
 
-def stop(root: Path | None = None) -> dict:
+def _wait_until_stopped(pid: int, root: Path, *, timeout: float = 3.0,
+                        poll_interval: float = 0.1) -> bool:
+    """Wait until *pid* no longer exists with this watcher's full identity."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    while _pid_running(pid, root):
+        now = time.monotonic()
+        if now >= deadline:
+            return False
+        time.sleep(min(max(0.01, poll_interval), deadline - now))
+    return True
+
+
+def stop(root: Path | None = None, *, timeout: float = 3.0,
+         poll_interval: float = 0.1) -> dict:
     root = Path(root) if root is not None else ROOT
     try:
         pid = int(pid_file(root).read_text().strip())
     except (OSError, ValueError):
         pid = None
-    if pid and _pid_running(pid, root):
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            pass
+    had_state = pid_file(root).exists() or enabled_file(root).exists()
+    if not pid or not _pid_running(pid, root):
+        pid_file(root).unlink(missing_ok=True)
+        enabled_file(root).unlink(missing_ok=True)
+        return {"stopped": True, "pid": pid, "stale": had_state}
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as exc:
+        if _pid_running(pid, root):
+            return {
+                "stopped": False,
+                "pid": pid,
+                "error": f"failed to signal watcher: {type(exc).__name__}: {exc}",
+            }
+
+    if not _wait_until_stopped(
+        pid, root, timeout=timeout, poll_interval=poll_interval,
+    ):
+        return {
+            "stopped": False,
+            "pid": pid,
+            "error": f"timeout waiting for watcher PID {pid} to stop",
+        }
+
     pid_file(root).unlink(missing_ok=True)
     enabled_file(root).unlink(missing_ok=True)
-    return {"stopped": True, "pid": pid}
+    return {"stopped": True, "pid": pid, "stale": False}
 
 
 def main(argv: Iterable[str] | None = None, root: Path | None = None) -> int:
@@ -473,8 +545,9 @@ def main(argv: Iterable[str] | None = None, root: Path | None = None) -> int:
         print(json.dumps(start(root, interval=args.interval), indent=2, sort_keys=True))
         return 0
     if args.action == "off":
-        print(json.dumps(stop(root), indent=2, sort_keys=True))
-        return 0
+        result = stop(root)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0 if result.get("stopped") else 1
     path = events_file(root)
     if path.is_file():
         try:
