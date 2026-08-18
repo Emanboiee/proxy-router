@@ -191,12 +191,21 @@ Rotation is then egress-aware instead of blind round-robin:
   loop: it probes the ACTIVE exit(s) through the running tunnel and classifies
   each one `alive` (HTTP response rode the tunnel), `degraded` (an HTTP status
   arrived but was not ok - e.g. a Cloudflare 1010/403 reputation block or 5xx,
-  i.e. NOT a dead tunnel), or `dead` (transport-level failure, no HTTP status
-  at all - the tunnel path itself is broken). A companion DNS probe records
-  `dns_ok` in the egress record when determinable: `dead` with `dns_ok: false`
-  means resolution through the tunnel failed, `dns_ok: true` means a later
-  dial/read stage failed. Exit code is 1 only when an exit is `dead`, so
-  automation never rotates on a reputation-block HTTP status.
+  i.e. NOT a dead tunnel), or `dead` (connection-level failure, no HTTP status
+  and no TLS handshake - the tunnel path itself is broken). A TLS-classed
+  failure (SSL EOF / `SSL_ERROR_SYSCALL` / TLS alert) is also `degraded`: the
+  TCP CONNECT rode the tunnel, so the path works and the upstream endpoint is
+  throttling (Proton free tier routinely resets inner TLS ~1s in while real
+  traffic still succeeds) - never a cooldown, never a rotation. A companion
+  DNS probe records `dns_ok` in the egress record when determinable. DNS
+  resolution rides the DIRECT path by design, so `dns_ok: false` means the
+  direct DNS path failed (e.g. a flaky DoH endpoint on a filtered network) -
+  the tunnel was never dialed and is reported `degraded`, never dead. A
+  connection-level death with `dns_ok: true` means the dial/read stage through
+  the tunnel itself failed (`dns_ok` stays `None` when resolution is
+  inconclusive - both keep the dead verdict). Exit code is 1 only
+  when an exit is `dead`, so automation never rotates on a reputation-block
+  HTTP status, a throttle blip, or a DNS flake.
 - A provider can declare `fallback_provider` (the deployment maps Proton to
   Cloudflare WARP). The value may be a single provider name or an **ordered
   list** forming a fallback chain, e.g.
@@ -266,10 +275,23 @@ Where it is consumed:
   entry (seconds + action) for `<x>` instead of the flat
   `upstream_cooldown_seconds or max(...)` computation. 1010/403 text always
   blocks regardless of the table.
-- `probe_profile` / `check_egress_live` — a transport/TLS death (no HTTP
-  status) is cooled with the policy's `tls`/`connection` seconds (built-in
-  300s, which is the merged TLS-cooldown rule). A degraded HTTP status
-  (reputation block / 5xx) is never cooled.
+- `probe_profile` / `check_egress_live` — a connection-level death (no HTTP
+  status, no TLS handshake) is cooled with the policy's `connection` seconds
+  (built-in 300s) after `fail_threshold` (default 2) consecutive failures,
+  and only when the DNS probe succeeded (`dns_ok: true`): a failed lookup on
+  the direct DNS path (DNS is pinned direct by design) never proves the
+  tunnel dead, so `dns_ok: false` reports `degraded` instead of dead.
+  TLS-classed failures are never cooled either: they mean the TCP CONNECT
+  rode the tunnel and the upstream endpoint is throttling, so the exit is
+  reported `degraded` instead of dead. A degraded HTTP status (reputation
+  block / 5xx) is never cooled. HTTP 429 is the one exception: a probe that
+  rides the tunnel to the routed service and gets a 429 is direct evidence
+  the exit's egress IP is rate-limited, so it applies the 429 error-policy
+  entry (exhaust + cooldown by default) immediately — the exit stays
+  `degraded` for the keepalive (never rotated on a throttle), but scheduled
+  rotation and the sweep skip the lane until the reset. `rotate --reason
+  tls|connection|...` still applies the table (e.g. the merged 300s TLS
+  rule) when a failure is reported by real traffic.
 - `status --json` — echoes the effective policy for every provider under the
   top-level `"error_policy"` key, and each profile's egress record carries
   `exhausted`/`exhausted_at`/`exhausted_until` when an exhaust policy has
