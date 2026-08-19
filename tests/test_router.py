@@ -732,11 +732,15 @@ class WaitEngineTests(unittest.TestCase):
             self.assertFalse(router.wait_engine(timeout=0.6))
 
     def test_tun_readiness_passes_with_egress_probe(self):
+        # wait_engine burns a mandatory 0.5s settle on the first OK poll;
+        # a 0.6s timeout leaves <0.1s of CPU budget for the follow-up
+        # iteration, which flakes on loaded runners. Give the positive case
+        # real margin (saw intermittent False on macOS CI).
         with mock.patch.object(router, "current_mode", return_value="tun"), \
              mock.patch.object(router, "engine_alive", return_value=True), \
              mock.patch.object(router, "engine_mode_consistent", return_value=True), \
              mock.patch.object(router, "_tun_egress_probe", return_value=True):
-            self.assertTrue(router.wait_engine(timeout=0.6))
+            self.assertTrue(router.wait_engine(timeout=2.0))
 
 
 class EngineReloadTests(unittest.TestCase):
