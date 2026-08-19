@@ -37,6 +37,16 @@
 # through the tunnel, persists health/cooldown/block markers, and ends on the
 # best alive exit (no reload when the current exit already is best).
 #
+# Manual-off quiescence: when `state/manual-off` exists (user disconnected via
+# tray/CLI), the loop performs NO maintenance at all - no ensure, no probe, no
+# rotation, no sweep, no fallback restore. Manual disconnect is a deliberate
+# state, not an engine failure; the tunnel stays down until `router.py start`
+# clears the marker. The agent polls only its own enabled flag while quiescent.
+#
+# Runtime reconfiguration: the enabled flag is re-read from router.json on
+# every tick (env override wins), so `keepalive.enabled: false` stops the
+# agent without a launchctl reload, and true resumes it.
+#
 # Knobs (env vars, defaults):
 #   PROXY_KEEPALIVE_INTERVAL       base wait between ensures           (15)
 #   PROXY_KEEPALIVE_MAX_BACKOFF    cap for exponential backoff         (300)
@@ -185,6 +195,31 @@ restore_fallbacks() {
 }
 
 while true; do
+  # Re-read the enabled flag every tick so a runtime config flip takes effect
+  # without waiting for an agent restart (env override still wins for
+  # temporary ops changes).
+  ENABLED="${PROXY_KEEPALIVE_ENABLED:-$(config_setting enabled 1)}"
+  case "$ENABLED" in
+    0|false|False|off|OFF)
+      echo "$(date '+%Y-%m-%d %H:%M:%S') router: autocheck disabled by config; exiting" >&2
+      exit 0
+      ;;
+  esac
+  # Manual-off quiescence: the user disconnected deliberately. Do NOTHING
+  # until `router.py start` clears the marker - no ensure (which would report
+  # "ok" and let maintenance continue), no egress checks, no rotations, no
+  # sweeps, no fallback restore. Reset backoff so a reconnect is acted on at
+  # the base cadence, and log the transition once instead of every tick.
+  if [ -f "$ROOT/state/manual-off" ]; then
+    if [ "${manual_quiet:-0}" -ne 1 ]; then
+      echo "$(date '+%Y-%m-%d %H:%M:%S') router: manual-off present; supervision quiescent (ensure/probe/rotate/sweep paused)" >&2
+      manual_quiet=1
+    fi
+    backoff="$INTERVAL"
+    sleep "$backoff"
+    continue
+  fi
+  manual_quiet=0
   if ensure_out=$("$ROOT/router.py" ensure 2>&1); then
     if [ "$backoff" -ne "$INTERVAL" ]; then
       echo "$(date '+%Y-%m-%d %H:%M:%S') router: ensure ok; backoff reset to ${INTERVAL}s" >&2
@@ -253,6 +288,13 @@ while true; do
     fi
   else
     ensure_rc=$?
+    if [ "$ensure_rc" -eq 3 ]; then
+      # Quiescent: manual-off appeared between our marker check and ensure (or
+      # a direct ensure raced us). Not a failure - no backoff, no barf log.
+      backoff="$INTERVAL"
+      sleep "$backoff"
+      continue
+    fi
     backoff=$((backoff * 2))
     ((backoff < INTERVAL)) && backoff="$INTERVAL"
     ((backoff > MAX_BACKOFF)) && backoff="$MAX_BACKOFF"

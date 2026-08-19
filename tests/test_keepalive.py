@@ -106,9 +106,12 @@ class KeepaliveHarness:
 
     def __init__(self, *, interval="1", fail_ensures="", egress="alive",
                  probe_every="4", dead_strikes="2", storm_window="600",
-                 max_rotations="2", fallback=""):
-        self._tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self._tmp.name)
+                 max_rotations="2", fallback="", root=None):
+        self._tmp = None
+        if root is None:
+            self._tmp = tempfile.TemporaryDirectory()
+            root = Path(self._tmp.name)
+        self.root = Path(root)
         (self.root / "bin").mkdir()
         sleep_bin = self.root / "bin" / "sleep"
         sleep_bin.write_text(FAKE_SLEEP)
@@ -186,7 +189,8 @@ class KeepaliveHarness:
             else:
                 self.proc.kill()
             self.out, self.err = self.proc.communicate()
-        self._tmp.cleanup()
+        if self._tmp is not None:
+            self._tmp.cleanup()
 
 
 class KeepaliveBackoffTests(unittest.TestCase):
@@ -390,6 +394,53 @@ class KeepaliveFallbackRestoreTests(unittest.TestCase):
                           f"re-activation message missing: {h.err!r}")
         finally:
             h.close()
+
+
+class KeepaliveManualOffTests(unittest.TestCase):
+    """AC1/AC2: a manual disconnect marker must quiesce the loop (no maintain
+    calls at all), and a runtime config flip of keepalive.enabled must stop
+    the agent without a reload."""
+
+    def test_manual_off_suppresses_all_maintenance_and_resumes_after_clear(self):
+        # Seed the marker BEFORE the harness spawns the loop, so the very
+        # first tick sees it and never calls router.py at all.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / "state").mkdir(parents=True)
+        (root / "state" / "manual-off").write_text("manual stop\n")
+        h = KeepaliveHarness(interval="1", root=root)
+        try:
+            time.sleep(1.5)
+            lines = h.lines()
+            self.assertEqual(lines, [],
+                             f"manual-off must suppress ALL router calls: {lines}")
+            # Removing the marker resumes maintenance on the next tick.
+            h.root.joinpath("state", "manual-off").unlink()
+            h.wait_lines(2)
+            self.assertNotEqual(h.lines(), [],
+                                "maintenance must resume after marker clears")
+        finally:
+            h.close()
+        self.assertIn("manual-off present; supervision quiescent", h.err,
+                      f"quiescent note missing: {h.err!r}")
+
+    def test_enabled_reread_stops_loop_mid_run(self):
+        h = KeepaliveHarness(interval="1")
+        try:
+            h.wait_lines(2)
+            config = h.root / "router.json"
+            config.write_text(json.dumps({"keepalive": {"enabled": False}}))
+            h.proc.wait(timeout=10)
+            self.assertEqual(h.proc.returncode, 0, "agent must exit cleanly")
+            count_before = len(h.lines())
+            time.sleep(0.5)
+            self.assertEqual(len(h.lines()), count_before,
+                             "no router calls may happen after disable")
+        finally:
+            h.close()
+        self.assertIn("autocheck disabled by config", h.err,
+                      f"disable note missing: {h.err!r}")
 
 
 if __name__ == "__main__":

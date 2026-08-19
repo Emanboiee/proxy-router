@@ -2773,12 +2773,15 @@ def _config_drifted() -> bool:
 def engine_ensure() -> int:
     if MANUAL_OFF_FILE.is_file():
         # The user disconnected manually (tray Disconnect / `router.py
-        # stop`). keepalive.sh also skips its ensure tick while the marker
-        # exists, but a stray direct `router.py ensure` must not resurrect
-        # the engine either.
+        # stop`). keepalive.sh also skips its maintenance while the marker
+        # exists (see its manual-off quiescence check), but a stray direct
+        # `router.py ensure` must not resurrect the engine either. Return 3
+        # (NOT 0): 0 means "healthy, maintenance may proceed" and would let
+        # keepalive run egress checks/rotations against a deliberately
+        # disconnected tunnel (manual-off is quiescent, not healthy).
         print("router: manually disconnected (manual-off marker present); "
               "run 'router.py start' to reconnect", file=sys.stderr)
-        return 0
+        return 3
     if current_mode() == "tun":
         # A proxy engine running while state/mode says tun is NOT healthy
         # (status/vpn status report it as down); restart into the persisted
@@ -4451,7 +4454,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(prog="router", description="selective WireGuard proxy router")
     sub = parser.add_subparsers(dest="cmd")
 
-    sub.add_parser("ensure")
+    sub.add_parser("ensure", help="ensure the engine is up (0 = healthy, 1 = failure, 3 = manual-off quiescent)")
     sub.add_parser("start")
     sub.add_parser("stop")
     status = sub.add_parser("status")
