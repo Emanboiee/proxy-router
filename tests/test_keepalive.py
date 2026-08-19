@@ -240,6 +240,18 @@ class KeepaliveBackoffTests(unittest.TestCase):
         finally:
             h.close()
 
+    def test_failed_ensure_logs_timestamped_failure_then_recovery(self):
+        h = KeepaliveHarness(interval="1", fail_ensures="1")
+        try:
+            # 3rd line = boot self-test, which runs after the recovery echo.
+            h.wait_lines(3)
+        finally:
+            h.close()
+        self.assertRegex(h.err, r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} router: ensure failed \(rc=1\)",
+                         f"timestamped failure line missing: {h.err!r}")
+        self.assertIn("router: ensure ok; backoff reset to 1s", h.err,
+                      f"recovery line missing: {h.err!r}")
+
 
 class KeepaliveEgressCheckTests(unittest.TestCase):
     def test_boot_self_test_healthy_logs_and_never_rotates(self):

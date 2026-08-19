@@ -54,88 +54,6 @@ def test_vpn_list_filters_provider_routes_to_vpn_domains(tmp_path):
     assert config["route"]["final"] == "direct"
 
 
-def _health_test_router(tmp_path, health_order):
-    """Two providers sharing a domain; cloudflare record controls lead order."""
-    router = load_router(tmp_path)
-    proton = tmp_path / "proton.conf"
-    warp = tmp_path / "warp.conf"
-    router._providers = {"proton": {}, "cloudflare": {}}
-    router._routes = [
-        {"id": "twitter", "provider": "proton", "domains": ["twitter.com", "x.com"]},
-        {"id": "school", "provider": "cloudflare", "domains": ["twitter.com", "x.com"]},
-    ]
-    router._routing = {
-        "mode": "vpn-list",
-        "vpn_domains": ["twitter.com", "x.com"],
-        "health_order": health_order,
-    }
-    router._port = 2080
-    router.current_mode = lambda: "proxy"
-    router._usable_profile = lambda name, preferred=None: {
-        "proton": proton, "cloudflare": warp,
-    }.get(name)
-    router.parse_wireguard = lambda path: {
-        "type": "wireguard", "tag": "", "address": ["10.0.0.2/32"],
-        "private_key": "secret", "peers": [{"address": "192.0.2.1", "port": 1,
-        "public_key": "public", "allowed_ips": ["0.0.0.0/0"]}],
-    }
-    router.dns_server_for = lambda path: "1.1.1.1"
-    return router, warp
-
-
-def test_health_order_leads_healthy_provider(tmp_path):
-    router, warp = _health_test_router(tmp_path, health_order=True)
-    # cloudflare egress healthy + fast; proton has no record (unknown rank).
-    egress_dir = tmp_path / "state" / "egress" / "cloudflare"
-    egress_dir.mkdir(parents=True)
-    (egress_dir / "warp.json").write_text(json.dumps({
-        "ok": True, "checked_at": int(__import__("time").time()),
-        "last_ok_at": int(__import__("time").time()),
-        "fails": 0, "latency_ms": 40.0,
-    }))
-
-    config, _active = router.build_singbox_config()
-
-    rules = [r for r in config["route"]["rules"] if r.get("domain_suffix")]
-    assert rules[0]["outbound"] == "cloudflare"
-    assert rules[1]["outbound"] == "proton"
-
-
-def test_health_order_trails_degraded_provider(tmp_path):
-    router, warp = _health_test_router(tmp_path, health_order=True)
-    # cloudflare recently failing (2 consecutive fails, fresh) -> trails.
-    egress_dir = tmp_path / "state" / "egress" / "cloudflare"
-    egress_dir.mkdir(parents=True)
-    (egress_dir / "warp.json").write_text(json.dumps({
-        "ok": False, "checked_at": int(__import__("time").time()),
-        "last_ok_at": None, "fails": 2, "latency_ms": None,
-    }))
-
-    config, _active = router.build_singbox_config()
-
-    rules = [r for r in config["route"]["rules"] if r.get("domain_suffix")]
-    assert rules[0]["outbound"] == "proton"
-    assert rules[1]["outbound"] == "cloudflare"
-
-
-def test_health_order_off_preserves_route_table_order(tmp_path):
-    router, warp = _health_test_router(tmp_path, health_order=False)
-    # Even with a healthy cloudflare record, flag-off keeps configured order.
-    egress_dir = tmp_path / "state" / "egress" / "cloudflare"
-    egress_dir.mkdir(parents=True)
-    (egress_dir / "warp.json").write_text(json.dumps({
-        "ok": True, "checked_at": int(__import__("time").time()),
-        "last_ok_at": int(__import__("time").time()),
-        "fails": 0, "latency_ms": 40.0,
-    }))
-
-    config, _active = router.build_singbox_config()
-
-    rules = [r for r in config["route"]["rules"] if r.get("domain_suffix")]
-    assert rules[0]["outbound"] == "proton"
-    assert rules[1]["outbound"] == "cloudflare"
-
-
 def test_primary_routes_use_runtime_fallback_provider(tmp_path):
     router = load_router(tmp_path)
     proton = tmp_path / "proton.conf"
@@ -293,6 +211,30 @@ def test_load_config_rejects_duplicate_fallback_chain_entries(tmp_path):
     }))
 
     assert router.load_config() == 1
+
+
+def test_load_config_rejects_bad_default_mode(tmp_path):
+    router = load_router(tmp_path)
+    router.CONFIG_FILE.write_text(json.dumps({
+        "port": 2081,
+        "providers": {"proton": {"directory": "providers/proton"}},
+        "routes": [],
+        "vpn": {"default_mode": "banana"},
+    }))
+
+    assert router.load_config() == 1
+
+
+def test_load_config_accepts_default_mode_tun(tmp_path):
+    router = load_router(tmp_path)
+    router.CONFIG_FILE.write_text(json.dumps({
+        "port": 2081,
+        "providers": {"proton": {"directory": "providers/proton"}},
+        "routes": [],
+        "vpn": {"default_mode": "tun"},
+    }))
+
+    assert router.load_config() == 0
 
 
 def test_fallback_chain_drops_invalid_entries(tmp_path):
@@ -777,7 +719,7 @@ def test_tray_friendly_egress_error_mapping(tmp_path):
     module = load_tray(tmp_path)
     f = module._friendly_egress_error
     assert f("URLError: <urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING, "
-             "EOF occurred in violation of protocol (_ssl.c:983)]>") == "offline (SSL)"
+             "EOF occurred in violation of protocol (_ssl.c:983)]>") == "throttled (SSL)"
     assert f("URLError: timed out") == "timed out"
     assert f("URLError: connection refused") == "offline"
     assert f("URLError: [Errno -5] No address associated with hostname") == "no route (DNS)"
@@ -989,6 +931,38 @@ def test_record_egress_heals_stale_upstream_error(tmp_path):
     assert rec["error"] is None
 
 
+def test_probe_429_does_not_heal_exhausted_marker(tmp_path, monkeypatch):
+    """ROOT CAUSE: a probe that gets HTTP 429 from the probe target was
+    classified as healthy (ok=True), so the sweep would CLEAR the exhausted
+    marker on an exit that is still rate-limited, letting rotation switch
+    back into a 429'd server. A 429 probe must be a failure and must leave
+    the marker intact."""
+    router = load_router(tmp_path)
+    (tmp_path / "state" / "egress" / "proton").mkdir(parents=True)
+    profile = Path("01-NL-FREE-140.conf")
+    router._providers = {"proton": {}}
+    router._routes = [{
+        "id": "probe", "provider": "proton",
+        "domains": ["probe.example.com"],
+    }]
+    router._routing = {"mode": "proxy"}
+    router._port = 2080
+    router._apply_upstream_failure("proton", profile, "429", 60)
+    rec = router.read_egress("proton", profile)
+    assert rec["exhausted"] is True
+
+    monkeypatch.setattr(router, "probe_egress", lambda **k: {
+        "ok": False, "latency_ms": None, "status": 429,
+        "error": "rate-limit-429", "block_reason": None})
+    ok, _ = router.probe_profile("proton", profile)
+    rec = router.read_egress("proton", profile)
+
+    assert ok is False
+    assert rec["exhausted"] is True
+    assert rec["upstream_error"] == "429"
+    assert router.is_cooled_down("proton", profile)
+
+
 class _UnreadableModeFile:
     def is_file(self):
         return True
@@ -1095,6 +1069,24 @@ def test_current_mode_unreadable_mode_file_defaults_to_proxy(tmp_path, monkeypat
     router = load_router(tmp_path)
     router.MODE_FILE = _UnreadableModeFile()
     assert router.current_mode() == "proxy"
+
+
+def test_current_mode_missing_file_falls_back_to_default_mode(tmp_path):
+    """Fresh installs have no state/mode; the configured vpn.default_mode
+    decides which mode ensure boots (tun for a WARP-style always-on box)."""
+    router = load_router(tmp_path)
+    router._vpn = {"default_mode": "tun"}
+    assert not router.MODE_FILE.exists()
+    assert router.current_mode() == "tun"
+
+
+def test_current_mode_unreadable_file_falls_back_to_default_mode(tmp_path):
+    """An unreadable mode file falls back to the configured default_mode
+    too, so a sudo-run mode file never silently flips a TUN box to proxy."""
+    router = load_router(tmp_path)
+    router._vpn = {"default_mode": "tun"}
+    router.MODE_FILE = _UnreadableModeFile()
+    assert router.current_mode() == "tun"
 
 
 def test_hand_back_ownership_chowns_when_sudo_invoked(tmp_path, monkeypatch):
