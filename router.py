@@ -2197,7 +2197,10 @@ def _any_our_engine_running() -> bool:
     path in its command line.
 
     Used when the pid file itself is unreadable (root-owned after a
-    `sudo vpn on`): same identity check as ``_pid_matches``, minus the pid."""
+    `sudo vpn on`): same identity check as ``_pid_matches``, minus the pid.
+    Row-scoped: both identity tokens must appear on ONE process row, so a
+    foreign sing-box run plus an unrelated process carrying our config path
+    cannot combine into a false ownership result (issue #62)."""
     try:
         if os.name == "nt":
             out = subprocess.run(
@@ -2205,8 +2208,16 @@ def _any_our_engine_running() -> bool:
                  "(Get-CimInstance Win32_Process -Filter \"Name='sing-box.exe'\").CommandLine"],
                 capture_output=True, text=True, timeout=5,
             ).stdout
+            for line in out.splitlines():
+                # CIM already filters to sing-box.exe processes; require the
+                # exact process token too, so a foreign row merely carrying
+                # our config path (e.g. "sing-box.json" in some other tool's
+                # cmdline) cannot combine into a false ownership result
+                # (issue #62).
+                if "sing-box.exe" in line.lower() and str(SING_BOX_CONFIG) in line:
+                    return True
             if out:
-                return str(SING_BOX_CONFIG) in out
+                return False
             out = subprocess.run(
                 ["tasklist", "/FI", "IMAGENAME eq sing-box.exe", "/FO", "CSV", "/NH"],
                 capture_output=True, text=True, timeout=3,
@@ -2218,7 +2229,10 @@ def _any_our_engine_running() -> bool:
         ).stdout
     except (OSError, subprocess.TimeoutExpired):
         return False
-    return "sing-box run" in out and str(SING_BOX_CONFIG) in out
+    for line in out.splitlines():
+        if "sing-box run" in line and str(SING_BOX_CONFIG) in line:
+            return True
+    return False
 
 
 def _pid_matches(pid: int) -> bool:
@@ -2521,6 +2535,11 @@ def engine_start(use_existing_config: bool = False, *, recover: bool = True) -> 
     # engine's log would detach its (still open) fd and growth would continue
     # invisibly instead of being bounded.
     rotate_log_if_needed()
+    # Capture the pre-spawn offset BEFORE Popen: a FATAL written between
+    # Popen() and a post-spawn log_offset() read would be skipped as
+    # historical, yet wait_engine relies on early FATAL detection to catch
+    # bind conflicts and config deaths (issue #62).
+    spawn_log_offset = log_offset()
     log_handle = None
     try:
         log_handle = LOG_FILE.open("ab")
@@ -2541,7 +2560,7 @@ def engine_start(use_existing_config: bool = False, *, recover: bool = True) -> 
     PID_FILE.write_text(str(process.pid))
     os.chmod(PID_FILE, 0o600)
     _hand_back_ownership(PID_FILE)
-    if not wait_engine(log_from=log_offset()):
+    if not wait_engine(log_from=spawn_log_offset):
         engine_stop()
         if recover and not use_existing_config and LAST_GOOD_FILE.is_file():
             print("router: generated config failed to come up; restoring last-good", file=sys.stderr)
