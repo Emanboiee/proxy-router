@@ -57,7 +57,12 @@
     "mtu": 1500,
     "stack": "system",
     "dns_transport": "udp",
-    "selective": "roblox"
+    "selective": "roblox",
+    "network_auto": false,
+    "network_presets": {
+      "MySchoolWiFi": "school-warp",
+      "MyHomeWiFi": "default"
+    }
   },
   "egress": {
     "probe_url": "https://www.cloudflare.com/cdn-cgi/trace",
