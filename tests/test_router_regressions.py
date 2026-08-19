@@ -1022,6 +1022,13 @@ def test_probe_429_does_not_heal_exhausted_marker(tmp_path, monkeypatch):
     router = load_router(tmp_path)
     (tmp_path / "state" / "egress" / "proton").mkdir(parents=True)
     profile = Path("01-NL-FREE-140.conf")
+    router._providers = {"proton": {}}
+    router._routes = [{
+        "id": "probe", "provider": "proton",
+        "domains": ["probe.example.com"],
+    }]
+    router._routing = {"mode": "proxy"}
+    router._port = 2080
     router._apply_upstream_failure("proton", profile, "429", 60)
     rec = router.read_egress("proton", profile)
     assert rec["exhausted"] is True
