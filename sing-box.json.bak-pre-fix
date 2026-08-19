@@ -1,0 +1,312 @@
+{
+  "log": {
+    "level": "info"
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "address": [
+        "172.19.0.1/30"
+      ],
+      "mtu": 1280,
+      "stack": "system",
+      "strict_route": false,
+      "auto_route": true
+    },
+    {
+      "type": "mixed",
+      "tag": "local-proxy",
+      "listen": "127.0.0.1",
+      "listen_port": 2080
+    }
+  ],
+  "endpoints": [
+    {
+      "type": "wireguard",
+      "tag": "proton",
+      "address": [
+        "10.2.0.2/32",
+        "2a07:b944::2:2/128"
+      ],
+      "private_key": "6GMgHRqu0Y7h7rnolgfKTV0QKGDygLM1bIXpfolFqVo=",
+      "peers": [
+        {
+          "address": "149.88.30.88",
+          "port": 51820,
+          "public_key": "Uqp1/VJ/Lz2VoN/2D0HEG7G8WDxLJm7+JNC5KZrUREw=",
+          "allowed_ips": [
+            "0.0.0.0/0",
+            "::/0"
+          ],
+          "persistent_keepalive_interval": 25
+        }
+      ],
+      "mtu": 1280,
+      "domain_resolver": "dns-proton"
+    },
+    {
+      "type": "wireguard",
+      "tag": "proton2",
+      "address": [
+        "10.2.0.2/32",
+        "2a07:b944::2:2/128"
+      ],
+      "private_key": "qP/9qnNqYP9T7bFVywNekyopvl01H3OGu8lMWSlGjHo=",
+      "peers": [
+        {
+          "address": "95.173.205.166",
+          "port": 51820,
+          "public_key": "Z2pGk23p2uYtzedagHPvrF4jKm3cLpZkPedHWlQtkmk=",
+          "allowed_ips": [
+            "0.0.0.0/0",
+            "::/0"
+          ],
+          "persistent_keepalive_interval": 25
+        }
+      ],
+      "mtu": 1280,
+      "domain_resolver": "dns-proton2"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "dns": {
+    "servers": [
+      {
+        "type": "https",
+        "tag": "dns-proton",
+        "server": "1.1.1.1",
+        "server_port": 443
+      },
+      {
+        "type": "https",
+        "tag": "dns-proton2",
+        "server": "1.1.1.1",
+        "server_port": 443
+      },
+      {
+        "type": "local",
+        "tag": "dns-local"
+      }
+    ],
+    "rules": [
+      {
+        "domain_suffix": [
+          "opencode.ai"
+        ],
+        "server": "dns-proton"
+      },
+      {
+        "domain_suffix": [
+          "whatismyip.com"
+        ],
+        "server": "dns-proton"
+      },
+      {
+        "domain_suffix": [
+          "twitch.tv",
+          "twitchcdn.net",
+          "ttvnw.net",
+          "jtvnw.net"
+        ],
+        "server": "dns-proton"
+      },
+      {
+        "domain_suffix": [
+          "twitter.com",
+          "x.com",
+          "t.co",
+          "twimg.com"
+        ],
+        "server": "dns-proton"
+      },
+      {
+        "domain_suffix": [
+          "youtube.com",
+          "youtu.be",
+          "ytimg.com",
+          "googlevideo.com",
+          "googleusercontent.com",
+          "ggpht.com"
+        ],
+        "server": "dns-proton"
+      },
+      {
+        "domain_suffix": [
+          "discord.com",
+          "discordapp.com",
+          "discordapp.net",
+          "discord.gg",
+          "discord.media"
+        ],
+        "server": "dns-proton"
+      },
+      {
+        "domain_suffix": [
+          "facebook.com",
+          "fbcdn.net",
+          "instagram.com",
+          "cdninstagram.com"
+        ],
+        "server": "dns-proton"
+      },
+      {
+        "domain_suffix": [
+          "reddit.com",
+          "redditmedia.com",
+          "redd.it"
+        ],
+        "server": "dns-proton"
+      },
+      {
+        "domain_suffix": [
+          "tiktok.com",
+          "tiktokcdn.com",
+          "tiktokv.com"
+        ],
+        "server": "dns-proton"
+      },
+      {
+        "domain_suffix": [
+          "netflix.com",
+          "nflxvideo.net",
+          "nflxso.net",
+          "nflxext.com"
+        ],
+        "server": "dns-proton"
+      },
+      {
+        "domain_suffix": [
+          "api.ipify.org"
+        ],
+        "server": "dns-proton"
+      }
+    ],
+    "strategy": "ipv4_only",
+    "final": "dns-local"
+  },
+  "route": {
+    "auto_detect_interface": true,
+    "default_domain_resolver": "dns-local",
+    "rules": [
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
+      {
+        "action": "sniff"
+      },
+      {
+        "outbound": "proton",
+        "domain_suffix": [
+          "opencode.ai"
+        ]
+      },
+      {
+        "outbound": "proton",
+        "domain_suffix": [
+          "whatismyip.com"
+        ]
+      },
+      {
+        "outbound": "proton",
+        "domain_suffix": [
+          "twitch.tv",
+          "twitchcdn.net",
+          "ttvnw.net",
+          "jtvnw.net"
+        ]
+      },
+      {
+        "outbound": "proton",
+        "domain_suffix": [
+          "twitter.com",
+          "x.com",
+          "t.co",
+          "twimg.com"
+        ]
+      },
+      {
+        "outbound": "proton",
+        "domain_suffix": [
+          "youtube.com",
+          "youtu.be",
+          "ytimg.com",
+          "googlevideo.com",
+          "googleusercontent.com",
+          "ggpht.com"
+        ]
+      },
+      {
+        "outbound": "proton",
+        "domain_suffix": [
+          "discord.com",
+          "discordapp.com",
+          "discordapp.net",
+          "discord.gg",
+          "discord.media"
+        ]
+      },
+      {
+        "outbound": "proton",
+        "domain_suffix": [
+          "facebook.com",
+          "fbcdn.net",
+          "instagram.com",
+          "cdninstagram.com"
+        ]
+      },
+      {
+        "outbound": "proton",
+        "domain_suffix": [
+          "reddit.com",
+          "redditmedia.com",
+          "redd.it"
+        ]
+      },
+      {
+        "outbound": "proton",
+        "domain_suffix": [
+          "tiktok.com",
+          "tiktokcdn.com",
+          "tiktokv.com"
+        ]
+      },
+      {
+        "outbound": "proton",
+        "domain_suffix": [
+          "netflix.com",
+          "nflxvideo.net",
+          "nflxso.net",
+          "nflxext.com"
+        ]
+      },
+      {
+        "outbound": "proton",
+        "domain_suffix": [
+          "api.ipify.org"
+        ]
+      },
+      {
+        "domain": [
+          "localhost"
+        ],
+        "outbound": "direct"
+      },
+      {
+        "ip_cidr": [
+          "127.0.0.0/8",
+          "::1/128"
+        ],
+        "outbound": "direct"
+      }
+    ],
+    "rule_set": [],
+    "final": "direct"
+  }
+}

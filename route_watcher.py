@@ -41,6 +41,7 @@ CLIENT_SNAPSHOT_EVERY_SECONDS = 5.0
 FAILURE_WINDOW_SECONDS = 60.0
 MIN_TRANSPORT_FAILURES = 2
 ROTATE_COOLDOWN_SECONDS = 120.0
+NETWORK_CHECK_EVERY_SECONDS = 30.0
 EVENT_MAX_LINES = 5000
 EVENT_MAX_BYTES = 2_000_000
 TARGET_RE = re.compile(
@@ -207,14 +208,19 @@ def _rotate_events(path: Path) -> None:
 
 def append_event(root: Path, event: dict) -> None:
     path = events_file(root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _rotate_events(path)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(event, separators=(",", ":")) + "\n")
     try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _rotate_events(path)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, separators=(",", ":")) + "\n")
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    except OSError as exc:
+        # A log we cannot write (e.g. a root-owned file left by an elevated
+        # reload's watcher spawn) must never kill the watcher. Skip the event.
+        print(f"route-watcher: append_event skipped ({exc})", file=sys.stderr)
 
 
 
@@ -305,6 +311,25 @@ def _read_new_lines(path: Path, offset: int) -> tuple[int, list[str]]:
         return offset, []
 
 
+def _network_check_hop(root: Path) -> None:
+    """Best-effort `router.py network-check` hop for the current Wi-Fi.
+
+    Runs as a detached subprocess so the watcher stays independent of the
+    router CLI; failures are logged, never fatal. `network-check` applies the
+    mapped preset for the SSID (and reloads the engine) only when it changed.
+    """
+    try:
+        command = [sys.executable, str(Path(root) / "router.py"), "network-check"]
+        probe = subprocess.run(command, capture_output=True, text=True, timeout=20)
+        if probe.returncode != 0:
+            tail = probe.stderr.strip().splitlines()
+            detail = tail[-1] if tail else "unknown"
+            print(f"route-watcher: network-check failed rc={probe.returncode}: {detail[:160]}",
+                  file=sys.stderr)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"route-watcher: network-check unavailable: {type(exc).__name__}", file=sys.stderr)
+
+
 def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = time.sleep) -> int:
     root = Path(root).resolve()
     state_dir(root).mkdir(parents=True, exist_ok=True)
@@ -320,6 +345,7 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
     last_probe: dict[str, float] = {}
     clients: list[dict] = []
     clients_at = 0.0
+    last_network_check = -NETWORK_CHECK_EVERY_SECONDS
     guard = RotationGuard()
     engine_down_ticks = 0
     try:
@@ -332,6 +358,12 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
                     break
             else:
                 engine_down_ticks = 0
+                # Auto-switch the routing preset when the Wi-Fi network
+                # changed (school/home etc). Cheap hop; no-op when the preset
+                # is already active or no network mapping is configured.
+                if time.monotonic() - last_network_check >= NETWORK_CHECK_EVERY_SECONDS:
+                    last_network_check = time.monotonic()
+                    _network_check_hop(root)
             # Routes can be added while the watcher is running. Refresh the
             # target set each tick so transparent capture starts observing a
             # newly configured domain without requiring a router restart.
