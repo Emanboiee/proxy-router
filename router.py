@@ -1862,6 +1862,26 @@ def dns_transport() -> str:
     return transport
 
 
+def _routes_by_health_order(routes: list[dict], selected: dict[str, Path]) -> list[dict]:
+    """Stable-sort routes so providers with healthy egress records lead.
+
+    Ranks come from the persisted probe record of each provider's selected
+    profile (`_egress_rank`): healthy-fast first, unknown/slow in the middle,
+    recently-failing last. Routes within the same provider keep their config
+    order (stable sort). This powers ``routing.health_order``: when a second
+    provider (e.g. WARP) is healthy it wins the shared school domains; when
+    it degrades, the healthy lane's rules move ahead automatically without
+    any manual route reorder.
+    """
+    ranks: dict[str, tuple[int, float]] = {}
+    for name, profile in selected.items():
+        ranks[name] = _egress_rank(read_egress(name, profile))
+    return sorted(
+        routes,
+        key=lambda route: ranks.get(_effective_route_provider(route.get("provider", "")), (1, float("inf"))),
+    )
+
+
 def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tuple[dict, dict[str, Path]]:
     active: dict[str, dict] = {}
     selected: dict[str, Path] = {}
@@ -1916,6 +1936,14 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
     dns_servers.append({"type": "local", "tag": "dns-local"})
     routing = routing_state()
     routing_mode = routing["mode"]
+    # health_order: emit provider rules in egress-health order instead of
+    # pure route-table order, so a healthy lane leads shared domains and a
+    # degraded one trails (or drops out) without manual reorders. Falls back
+    # to the configured route order when the flag is off.
+    if routing.get("health_order") and selected:
+        build_routes = _routes_by_health_order(_routes, selected)
+    else:
+        build_routes = _routes
     dns_rules = []
     if routing_mode == "safe-list" and routing["direct_domains"]:
         # Safe-list: trusted domains go DIRECT, so their DNS must resolve via
@@ -1925,7 +1953,7 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
         # provider route always wins the direct resolver.
         dns_rules.append({"domain_suffix": list(routing["direct_domains"]), "server": "dns-local"})
     vpn_domains = frozenset(routing["vpn_domains"])
-    for route in _routes:
+    for route in build_routes:
         route_provider = _effective_route_provider(route["provider"])
         if route_provider not in active or not route.get("domains"):
             continue
@@ -1944,7 +1972,7 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
     # routing section (default mode) direct_pins is empty and the rule list
     # is byte-identical to the pre-routing-modes output.
     provider_rules = []
-    for route in _routes:
+    for route in build_routes:
         route_provider = _effective_route_provider(route["provider"])
         if route_provider not in active:
             continue
@@ -3109,6 +3137,7 @@ def routing_state() -> dict:
         "direct_domains": list(routing.get("direct_domains", []) or []),
         "vpn_domains": list(routing.get("vpn_domains", []) or []),
         "default_provider": routing.get("default_provider"),
+        "health_order": bool(routing.get("health_order", False)),
     }
 
 
@@ -3131,6 +3160,9 @@ def _routing_error(routing: dict, known_providers: set) -> str | None:
     default_provider = routing.get("default_provider")
     if default_provider is not None and not isinstance(default_provider, str):
         return "routing.default_provider must be a provider name string"
+    health_order = routing.get("health_order")
+    if health_order is not None and not isinstance(health_order, bool):
+        return "routing.health_order must be a boolean"
     if mode == "safe-list":
         if not default_provider:
             return "routing mode 'safe-list' needs 'default_provider' (everything not on the direct list goes through it)"
