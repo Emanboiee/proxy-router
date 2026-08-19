@@ -403,6 +403,11 @@ class RouterClient:
         return self._run("stop")
 
     def rotate(self) -> tuple[int, str]:
+        # Root-owned engine (started via `sudo vpn on`): a user-level rotate
+        # cannot signal it, so route through the elevation surface exactly
+        # like start/stop (issue #54).
+        if self._engine_runs_as_root() and self._active_provider:
+            return self._run_elevated("rotate", self._active_provider)
         return self._run("rotate", self._active_provider)
 
     def rotate_to(self, provider: str, profile: str, force: bool = False) -> tuple[int, str]:
@@ -411,6 +416,8 @@ class RouterClient:
             # Explicit pick of an offline/SSL exit: try it anyway, ignoring
             # the cooldown its failed probe left behind.
             cmd.append("--force")
+        if self._engine_runs_as_root():
+            return self._run_elevated(*cmd)
         return self._run(*cmd)
 
     def set_mode(self, mode: str, default_provider: str | None = None) -> tuple[int, str]:

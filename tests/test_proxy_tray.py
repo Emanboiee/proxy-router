@@ -109,6 +109,58 @@ class RouterClientStartStopElevationTests(unittest.TestCase):
         plain.assert_called_once_with("start")
         elev.assert_not_called()
 
+    def test_rotate_elevates_when_engine_root_owned(self):
+        # Issue #54: switching servers from the tray failed against a
+        # root-owned engine because rotate stayed user-level.
+        self.client._active_provider = "proton"
+        with mock.patch.object(self.client, "_engine_runs_as_root", return_value=True), \
+             mock.patch.object(self.client, "_run_elevated", return_value=(0, "elev")) as elev, \
+             mock.patch.object(self.client, "_run", return_value=(0, "plain")) as plain:
+            rc, out = self.client.rotate()
+        self.assertEqual((rc, out), (0, "elev"))
+        elev.assert_called_once_with("rotate", "proton")
+        plain.assert_not_called()
+
+    def test_rotate_to_elevates_when_engine_root_owned(self):
+        self.client._active_provider = "proton"
+        with mock.patch.object(self.client, "_engine_runs_as_root", return_value=True), \
+             mock.patch.object(self.client, "_run_elevated", return_value=(0, "elev")) as elev, \
+             mock.patch.object(self.client, "_run", return_value=(0, "plain")) as plain:
+            rc, out = self.client.rotate_to("proton", "06-SG-FREE-4")
+        self.assertEqual((rc, out), (0, "elev"))
+        elev.assert_called_once_with("rotate", "proton", "--to", "06-SG-FREE-4")
+        plain.assert_not_called()
+
+    def test_rotate_to_force_elevates_with_force_flag(self):
+        with mock.patch.object(self.client, "_engine_runs_as_root", return_value=True), \
+             mock.patch.object(self.client, "_run_elevated", return_value=(0, "elev")) as elev, \
+             mock.patch.object(self.client, "_run", return_value=(0, "plain")) as plain:
+            rc, out = self.client.rotate_to("proton", "06-SG-FREE-4", force=True)
+        self.assertEqual((rc, out), (0, "elev"))
+        elev.assert_called_once_with("rotate", "proton", "--to", "06-SG-FREE-4", "--force")
+        plain.assert_not_called()
+
+    def test_rotate_stays_user_level_when_engine_user_owned(self):
+        self.client._active_provider = "proton"
+        with mock.patch.object(self.client, "_engine_runs_as_root", return_value=False), \
+             mock.patch.object(self.client, "_run_elevated", return_value=(0, "elev")) as elev, \
+             mock.patch.object(self.client, "_run", return_value=(0, "plain")) as plain:
+            rc, out = self.client.rotate()
+        self.assertEqual((rc, out), (0, "plain"))
+        plain.assert_called_once_with("rotate", "proton")
+        elev.assert_not_called()
+
+    def test_rotate_without_active_provider_stays_user_level(self):
+        # _active_provider is None (no status seen yet): do not invent an
+        # elevated call with a None provider argument.
+        with mock.patch.object(self.client, "_engine_runs_as_root", return_value=True), \
+             mock.patch.object(self.client, "_run_elevated", return_value=(0, "elev")) as elev, \
+             mock.patch.object(self.client, "_run", return_value=(0, "plain")) as plain:
+            rc, out = self.client.rotate()
+        self.assertEqual((rc, out), (0, "plain"))
+        plain.assert_called_once()
+        elev.assert_not_called()
+
 
 class HumanizeTests(unittest.TestCase):
     def test_untouched_engine_shortcut_unchanged(self):
