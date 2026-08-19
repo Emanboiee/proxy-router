@@ -54,6 +54,88 @@ def test_vpn_list_filters_provider_routes_to_vpn_domains(tmp_path):
     assert config["route"]["final"] == "direct"
 
 
+def _health_test_router(tmp_path, health_order):
+    """Two providers sharing a domain; cloudflare record controls lead order."""
+    router = load_router(tmp_path)
+    proton = tmp_path / "proton.conf"
+    warp = tmp_path / "warp.conf"
+    router._providers = {"proton": {}, "cloudflare": {}}
+    router._routes = [
+        {"id": "twitter", "provider": "proton", "domains": ["twitter.com", "x.com"]},
+        {"id": "school", "provider": "cloudflare", "domains": ["twitter.com", "x.com"]},
+    ]
+    router._routing = {
+        "mode": "vpn-list",
+        "vpn_domains": ["twitter.com", "x.com"],
+        "health_order": health_order,
+    }
+    router._port = 2080
+    router.current_mode = lambda: "proxy"
+    router._usable_profile = lambda name, preferred=None: {
+        "proton": proton, "cloudflare": warp,
+    }.get(name)
+    router.parse_wireguard = lambda path: {
+        "type": "wireguard", "tag": "", "address": ["10.0.0.2/32"],
+        "private_key": "secret", "peers": [{"address": "192.0.2.1", "port": 1,
+        "public_key": "public", "allowed_ips": ["0.0.0.0/0"]}],
+    }
+    router.dns_server_for = lambda path: "1.1.1.1"
+    return router, warp
+
+
+def test_health_order_leads_healthy_provider(tmp_path):
+    router, warp = _health_test_router(tmp_path, health_order=True)
+    # cloudflare egress healthy + fast; proton has no record (unknown rank).
+    egress_dir = tmp_path / "state" / "egress" / "cloudflare"
+    egress_dir.mkdir(parents=True)
+    (egress_dir / "warp.json").write_text(json.dumps({
+        "ok": True, "checked_at": int(__import__("time").time()),
+        "last_ok_at": int(__import__("time").time()),
+        "fails": 0, "latency_ms": 40.0,
+    }))
+
+    config, _active = router.build_singbox_config()
+
+    rules = [r for r in config["route"]["rules"] if r.get("domain_suffix")]
+    assert rules[0]["outbound"] == "cloudflare"
+    assert rules[1]["outbound"] == "proton"
+
+
+def test_health_order_trails_degraded_provider(tmp_path):
+    router, warp = _health_test_router(tmp_path, health_order=True)
+    # cloudflare recently failing (2 consecutive fails, fresh) -> trails.
+    egress_dir = tmp_path / "state" / "egress" / "cloudflare"
+    egress_dir.mkdir(parents=True)
+    (egress_dir / "warp.json").write_text(json.dumps({
+        "ok": False, "checked_at": int(__import__("time").time()),
+        "last_ok_at": None, "fails": 2, "latency_ms": None,
+    }))
+
+    config, _active = router.build_singbox_config()
+
+    rules = [r for r in config["route"]["rules"] if r.get("domain_suffix")]
+    assert rules[0]["outbound"] == "proton"
+    assert rules[1]["outbound"] == "cloudflare"
+
+
+def test_health_order_off_preserves_route_table_order(tmp_path):
+    router, warp = _health_test_router(tmp_path, health_order=False)
+    # Even with a healthy cloudflare record, flag-off keeps configured order.
+    egress_dir = tmp_path / "state" / "egress" / "cloudflare"
+    egress_dir.mkdir(parents=True)
+    (egress_dir / "warp.json").write_text(json.dumps({
+        "ok": True, "checked_at": int(__import__("time").time()),
+        "last_ok_at": int(__import__("time").time()),
+        "fails": 0, "latency_ms": 40.0,
+    }))
+
+    config, _active = router.build_singbox_config()
+
+    rules = [r for r in config["route"]["rules"] if r.get("domain_suffix")]
+    assert rules[0]["outbound"] == "proton"
+    assert rules[1]["outbound"] == "cloudflare"
+
+
 def test_primary_routes_use_runtime_fallback_provider(tmp_path):
     router = load_router(tmp_path)
     proton = tmp_path / "proton.conf"
