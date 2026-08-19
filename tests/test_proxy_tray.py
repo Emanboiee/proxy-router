@@ -44,14 +44,18 @@ class RouterClientEngineOwnerTests(unittest.TestCase):
 
     def test_unreadable_root_pid_file_counts_as_root(self):
         self.pid.write_text("4242")
-        with mock.patch("os.stat") as st:
+        with mock.patch.object(tray.sys, "platform", "darwin"), \
+             mock.patch("os.geteuid", return_value=501), \
+             mock.patch("os.stat") as st:
             st.return_value.st_uid = 0
             with mock.patch("builtins.open", side_effect=PermissionError):
                 self.assertTrue(self.client._engine_runs_as_root())
 
     def test_readable_root_pid_confirmed_by_ps(self):
         self.pid.write_text("4242")
-        with mock.patch("os.stat") as st:
+        with mock.patch.object(tray.sys, "platform", "darwin"), \
+             mock.patch("os.geteuid", return_value=501), \
+             mock.patch("os.stat") as st:
             st.return_value.st_uid = 0
             with mock.patch.object(tray.subprocess, "run") as run:
                 run.return_value.stdout = "root\n"
