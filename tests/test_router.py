@@ -13,6 +13,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import router
@@ -227,6 +229,9 @@ class RotationTests(unittest.TestCase):
         # rotate() probes egress through the tunnel; tests never touch the network.
         self._probe = mock.patch.object(router, "probe_profile", return_value=(True, {"ok": True}))
         self._probe.start()
+        self._listener = mock.patch.object(router, "listener_up", return_value=True)
+        self._listener.start()
+        self.addCleanup(self._listener.stop)
 
     def tearDown(self):
         self._probe.stop()
@@ -618,15 +623,19 @@ class EngineEnsureConsistencyTests(unittest.TestCase):
     def test_proxy_listener_up_returns_without_start(self):
         with mock.patch.object(router, "listener_up", return_value=True), \
              mock.patch.object(router, "engine_alive", return_value=True), \
+             mock.patch.object(router, "route_watcher_start") as watcher_start, \
              mock.patch.object(router, "engine_start", side_effect=AssertionError("must not start")):
             self.assertEqual(router.engine_ensure(), 0)
+        watcher_start.assert_called_once()
 
     def test_tun_alive_and_consistent_is_healthy(self):
         router.set_mode("tun")
         with mock.patch.object(router, "engine_alive", return_value=True), \
              mock.patch.object(router, "engine_mode_consistent", return_value=True), \
+             mock.patch.object(router, "route_watcher_start") as watcher_start, \
              mock.patch.object(router, "engine_start", side_effect=AssertionError("must not start")):
             self.assertEqual(router.engine_ensure(), 0)
+        watcher_start.assert_called_once()
 
     def test_tun_alive_but_inconsistent_restarts(self):
         router.set_mode("tun")
@@ -639,9 +648,11 @@ class EngineEnsureConsistencyTests(unittest.TestCase):
     def test_tun_down_starts(self):
         router.set_mode("tun")
         with mock.patch.object(router, "engine_alive", return_value=False), \
+             mock.patch.object(router, "route_watcher_start") as watcher_start, \
              mock.patch.object(router, "engine_start", return_value=0) as start:
             self.assertEqual(router.engine_ensure(), 0)
         start.assert_called_once()
+        watcher_start.assert_called_once()
 
 
 class VpnOnRollbackTests(unittest.TestCase):
@@ -676,11 +687,13 @@ class VpnOnRollbackTests(unittest.TestCase):
     def test_successful_vpn_on_keeps_tun(self):
         with mock.patch.object(router, "resolve_sing_box", return_value="/bin/echo"), \
              mock.patch.object(router, "validate_config", return_value=True), \
-             mock.patch.object(router, "engine_start", return_value=0) as start:
+             mock.patch.object(router, "engine_start", return_value=0) as start, \
+             mock.patch.object(router, "system_proxy_off", return_value=0) as proxy_off:
             rc = router.vpn_on()
         self.assertEqual(rc, 0)
         self.assertEqual(router.current_mode(), "tun")
         start.assert_called_once()
+        proxy_off.assert_called_once()
 
 
 class WaitEngineTests(unittest.TestCase):
@@ -974,6 +987,9 @@ class RotationEgressTests(unittest.TestCase):
         self.engine_switch = self.switch_patch.start()
         self.probe_patch = mock.patch.object(router, "probe_profile", return_value=(True, {"ok": True}))
         self.probe = self.probe_patch.start()
+        self.listener_patch = mock.patch.object(router, "listener_up", return_value=True)
+        self.listener_patch.start()
+        self.addCleanup(self.listener_patch.stop)
 
     def tearDown(self):
         router._egress_settings = {}
@@ -2174,6 +2190,9 @@ class ErrorPolicyTests(unittest.TestCase):
         self.reload_patch.start()
         self.switch_patch = mock.patch.object(router, "engine_switch", return_value=0)
         self.switch_patch.start()
+        self.listener_patch = mock.patch.object(router, "listener_up", return_value=True)
+        self.listener_patch.start()
+        self.addCleanup(self.listener_patch.stop)
 
     def tearDown(self):
         self.switch_patch.stop()
@@ -2612,6 +2631,9 @@ class ScheduledRotationTests(unittest.TestCase):
         router._providers = {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}}
         router._rotation = {"interval_seconds": 3600, "jitter_seconds": 300}
         router._routes = []
+        self.listener_patch = mock.patch.object(router, "listener_up", return_value=True)
+        self.listener_patch.start()
+        self.addCleanup(self.listener_patch.stop)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -2688,6 +2710,9 @@ class RotationPolicyTests(unittest.TestCase):
         router._providers = {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}}
         router._rotation = {"interval_seconds": 0, "jitter_seconds": 300, "policy": "latency"}
         router._routes = []
+        self.listener_patch = mock.patch.object(router, "listener_up", return_value=True)
+        self.listener_patch.start()
+        self.addCleanup(self.listener_patch.stop)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -2783,6 +2808,7 @@ class RotationPolicyTests(unittest.TestCase):
         self.assertEqual(router.status_json()["rotation"]["policy"], "least-recent")
 
 
+@pytest.mark.enable_socket
 class WithProxyTests(unittest.TestCase):
     """with-proxy fail-open runner (listener probe + env set/strip)."""
 
@@ -2795,6 +2821,7 @@ class WithProxyTests(unittest.TestCase):
         self._srv.bind(("127.0.0.1", 0))
         self._srv.listen(1)
         self.port = self._srv.getsockname()[1]
+        self.assertNotEqual(self.port, 2080, "loopback fixture must never own production port")
         (self.root / "router.json").write_text(
             json.dumps({"port": self.port}), encoding="utf-8")
 
