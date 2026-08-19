@@ -55,11 +55,25 @@ if [ ! -f "$ROOT/router.py" ] && [ -f "$(dirname "$ROOT")/router.py" ]; then
   ROOT="$(dirname "$ROOT")"
 fi
 
+# Controller invocation. install-launchd.sh pins the exact interpreter that
+# elevation authorized into the plist environment (PROXY_ROUTER_PYTHON), so a
+# launchd run never resolves python3 through an ambient PATH that differs from
+# the authorized identity. Standalone/manual runs without the env var keep
+# executing router.py directly through its shebang.
+controller() {
+  if [ -n "${PROXY_ROUTER_PYTHON:-}" ]; then
+    "$PROXY_ROUTER_PYTHON" "$ROOT/router.py" "$@"
+  else
+    "$ROOT/router.py" "$@"
+  fi
+}
+
 # Read one validated value from router.json. Environment variables below win,
 # so launchd/system operators can make temporary changes without rewriting
 # config. Missing or malformed config falls back to the safe defaults.
 config_setting() {
-  python3 - "$ROOT/router.json" "$1" "$2" <<'PY' 2>/dev/null || printf '%s\n' "$2"
+  if [ -n "${PROXY_ROUTER_PYTHON:-}" ]; then
+    "$PROXY_ROUTER_PYTHON" - "$ROOT/router.json" "$1" "$2" <<'PY' 2>/dev/null || printf '%s\n' "$2"
 import json
 import sys
 
@@ -77,6 +91,26 @@ try:
 except (OSError, ValueError, TypeError, json.JSONDecodeError):
     raise SystemExit(1)
 PY
+  else
+    python3 - "$ROOT/router.json" "$1" "$2" <<'PY' 2>/dev/null || printf '%s\n' "$2"
+import json
+import sys
+
+path, key, default = sys.argv[1:]
+try:
+    data = json.loads(open(path, encoding="utf-8").read())
+    value = (data.get("keepalive") or {}).get(key, default)
+    if key == "enabled":
+        print("1" if value not in (False, 0, "0", "false", "off") else "0")
+    else:
+        value = int(value)
+        if value < 1:
+            raise ValueError
+        print(value)
+except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    raise SystemExit(1)
+PY
+  fi
 }
 
 ENABLED="${PROXY_KEEPALIVE_ENABLED:-$(config_setting enabled 1)}"
@@ -135,11 +169,11 @@ rotate_dead() {
   rotations=$((rotations + 1))
   strikes=0
   echo "router: rotating '$provider' after dead tunnel checks" >&2
-  if "$ROOT/router.py" rotate "$provider" --reason timeout; then
+  if controller rotate "$provider" --reason timeout; then
     :
   else
     echo "router: rotate '$provider' failed; checking configured fallback" >&2
-    fallback_state=$("$ROOT/router.py" failover "$provider" status 2>/dev/null || true)
+    fallback_state=$(controller failover "$provider" status 2>/dev/null || true)
     configured_fallback=$(printf '%s\n' "$fallback_state" | sed -n 's/.* configured=\([^ ]*\).*/\1/p')
     active_fallback=$(printf '%s\n' "$fallback_state" | sed -n 's/.* active=\([^ ]*\).*/\1/p')
     case "$active_fallback" in
@@ -156,7 +190,7 @@ rotate_dead() {
         return
         ;;
     esac
-    if ! "$ROOT/router.py" failover "$provider" on --reason timeout >/dev/null 2>&1; then
+    if ! controller failover "$provider" on --reason timeout >/dev/null 2>&1; then
       echo "router: fallback for '$provider' failed; will retry after the next dead check" >&2
       return
     fi
@@ -169,30 +203,30 @@ rotate_dead() {
 # primary is still dead. The sweep cadence throttles the restore, so a
 # genuinely dead primary never causes a failover off/on storm.
 restore_fallbacks() {
-  out=$("$ROOT/router.py" egress check 2>&1 || true)
+  out=$(controller egress check 2>&1 || true)
   printf '%s\n' "$out" | sed -n 's/^\([A-Za-z0-9._-]*\): fallback (.*)$/\1/p' | while IFS= read -r provider; do
     [ -n "$provider" ] || continue
-    if ! "$ROOT/router.py" failover "$provider" off >/dev/null 2>&1; then
+    if ! controller failover "$provider" off >/dev/null 2>&1; then
       continue
     fi
-    if "$ROOT/router.py" egress check --provider "$provider" >/dev/null 2>&1; then
+    if controller egress check --provider "$provider" >/dev/null 2>&1; then
       echo "router: '$provider' primary is alive again; fallback cleared" >&2
     else
       echo "router: '$provider' primary still dead; re-activating fallback" >&2
-      "$ROOT/router.py" failover "$provider" on --reason timeout >/dev/null 2>&1 || true
+      controller failover "$provider" on --reason timeout >/dev/null 2>&1 || true
     fi
   done
 }
 
 while true; do
-  if "$ROOT/router.py" ensure >/dev/null 2>&1; then
+  if controller ensure >/dev/null 2>&1; then
     backoff="$INTERVAL"
     if [ "$boot" -eq 1 ]; then
       boot=0
       # Boot self-test: one live egress check on the first successful ensure.
       # A dead tunnel gets ONE early rotation (storm guard applies); a
       # healthy one is logged and the normal loop continues.
-      if out=$("$ROOT/router.py" egress check 2>&1); then
+      if out=$(controller egress check 2>&1); then
         echo "router: boot self-test ok"
       else
         echo "router: boot self-test: active tunnel is dead - rotating once ($(printf '%s\n' "$out" | tail -n 1))" >&2
@@ -202,7 +236,7 @@ while true; do
       checks=$((checks + 1))
       if [ "$checks" -ge "$PROBE_EVERY" ]; then
         checks=0
-        if out=$("$ROOT/router.py" egress check 2>&1); then
+        if out=$(controller egress check 2>&1); then
           strikes=0
         else
           strikes=$((strikes + 1))
@@ -214,7 +248,7 @@ while true; do
       fi
       # Scheduled rotation: `rotate --if-due` self-gates on the configured
       # interval (exit 0 = rotated, 3 = not due); never logs when quiet.
-      if "$ROOT/router.py" rotate --if-due >/dev/null 2>&1; then
+      if controller rotate --if-due >/dev/null 2>&1; then
         echo "router: scheduled rotation: rotated provider(s)" >&2
       fi
     fi
@@ -239,7 +273,7 @@ while true; do
     if [ "$newest_rotation" -gt 0 ] && [ $((sweep_now - newest_rotation)) -lt "$STAGGER" ]; then
       echo "router: sweep deferred (rotation ${STAGGER}s stagger window)" >&2
     elif [ "$last_sweep" -eq 0 ] || [ $((sweep_now - last_sweep)) -ge "$SWEEP_EVERY" ]; then
-      if "$ROOT/router.py" egress sweep --json >/dev/null 2>&1; then
+      if controller egress sweep --json >/dev/null 2>&1; then
         echo "router: full-pool egress sweep done"
       else
         echo "router: sweep: some provider has no alive exits" >&2

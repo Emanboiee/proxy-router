@@ -5,6 +5,11 @@
   <key>Label</key>
   <string>com.proxy-router.keepalive</string>
 
+  <!-- keepalive.sh is a bash supervisor; the Python controller is pinned via
+       $PROXY_ROUTER_PYTHON below, so launchd never depends on /usr/bin/env,
+       an ambient PATH, or whichever python3 happens to be first. This is the
+       same executable identity the elevation policy authorized (see
+       install-launchd.sh @PYTHON@ rendering). -->
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
@@ -24,6 +29,8 @@
     <string>@PATH@</string>
     <key>SING_BOX</key>
     <string>/opt/homebrew/bin/sing-box</string>
+    <key>PROXY_ROUTER_PYTHON</key>
+    <string>@PYTHON@</string>
   </dict>
 
   <key>LimitLoadToSessionType</key>
