@@ -50,6 +50,7 @@
     "vpn_domains": []
   },
   "vpn": {
+    "default_mode": "tun",
     "capture": "ruleset",
     "address": [
       "172.19.0.1/30"
@@ -67,6 +68,8 @@
   "egress": {
     "probe_url": "https://www.cloudflare.com/cdn-cgi/trace",
     "probe_timeout": 8,
+    "probe_user_agent": "opencode/1.18.18",
+    "probe_settle_seconds": 60,
     "block_seconds": 3600,
     "upstream_cooldown_seconds": 300,
     "fail_threshold": 2,

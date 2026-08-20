@@ -167,7 +167,6 @@ class KeepaliveHarness:
     def close(self) -> None:
         if getattr(self, "_closed", False):
             return
-        self._closed = True
         if os.name == "posix":
             try:
                 os.killpg(self.proc.pid, signal.SIGTERM)
@@ -186,7 +185,38 @@ class KeepaliveHarness:
             else:
                 self.proc.kill()
             self.out, self.err = self.proc.communicate()
+        for stream in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
+            if stream is not None and not stream.closed:
+                stream.close()
+        if self.proc.returncode is None:
+            raise RuntimeError("keepalive child did not reach a terminal state")
+        from tests.safety import get_session_registry
+        get_session_registry().unregister(self.proc.pid)
         self._tmp.cleanup()
+        self._closed = True
+
+
+class KeepaliveHarnessCleanupTests(unittest.TestCase):
+    def test_close_reaps_process_closes_pipes_and_unregisters(self):
+        from tests.safety import get_session_registry
+
+        h = KeepaliveHarness()
+        pid = h.proc.pid
+        stdout = h.proc.stdout
+        stderr = h.proc.stderr
+        h.close()
+
+        self.assertIsNotNone(h.proc.returncode)
+        self.assertTrue(stdout is None or stdout.closed)
+        self.assertTrue(stderr is None or stderr.closed)
+        self.assertFalse(get_session_registry().is_registered(pid))
+
+    def test_close_is_idempotent(self):
+        h = KeepaliveHarness()
+        h.close()
+        first = (h.proc.returncode, h.out, h.err)
+        h.close()
+        self.assertEqual((h.proc.returncode, h.out, h.err), first)
 
 
 class KeepaliveBackoffTests(unittest.TestCase):
@@ -209,6 +239,18 @@ class KeepaliveBackoffTests(unittest.TestCase):
                             f"no recovery after cap: {durations}")
         finally:
             h.close()
+
+    def test_failed_ensure_logs_timestamped_failure_then_recovery(self):
+        h = KeepaliveHarness(interval="1", fail_ensures="1")
+        try:
+            # 3rd line = boot self-test, which runs after the recovery echo.
+            h.wait_lines(3)
+        finally:
+            h.close()
+        self.assertRegex(h.err, r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} router: ensure failed \(rc=1\)",
+                         f"timestamped failure line missing: {h.err!r}")
+        self.assertIn("router: ensure ok; backoff reset to 1s", h.err,
+                      f"recovery line missing: {h.err!r}")
 
 
 class KeepaliveEgressCheckTests(unittest.TestCase):
