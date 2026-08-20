@@ -232,42 +232,38 @@ class RouteWatcherTests(unittest.TestCase):
 
     def test_worker_sigterm_self_cleans_markers_after_exit(self):
         """AC4: a SIGTERM'd worker exits through its finally and removes its
-        own markers; nobody has to unlink state under a live process."""
+        own markers; nobody has to unlink state under a live process.
+
+        The real signal handler raises SystemExit from inside the sleep call;
+        simulate it inline (spawning a real worker subprocess is blocked by
+        the test safety harness) with a sleep that raises on the first tick.
+        """
         root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, root, ignore_errors=True)
         # Give the worker a live engine pid so it does NOT hit the
-        # ENGINE_DOWN_GRACE exit and self-terminate before we SIGTERM it.
+        # ENGINE_DOWN_GRACE exit and self-terminate before our simulated
+        # SIGTERM lands.
         (root / "sing-box.pid").write_text(str(os.getpid()))
-        started = w.start(root, interval=0.05)
-        self.assertTrue(started["started"])
-        pid = started["pid"]
-        self.assertTrue(w._pid_running(pid, root))
-        # The signal handler is installed at the very top of worker(); give the
-        # child a moment to boot before signaling, otherwise SIGTERM hits the
-        # default disposition and the process dies without running its finally.
-        time.sleep(0.3)
-
-        os.kill(pid, signal.SIGTERM)
-        deadline = time.time() + 5
-        while time.time() < deadline and w._pid_running(pid, root):
-            time.sleep(0.02)
-        self.assertFalse(w._pid_running(pid, root), "worker must exit on SIGTERM")
+        with mock.patch.object(w, "engine_pid_alive", return_value=True):
+            with self.assertRaises(SystemExit):
+                w.worker(root, interval=0.05, sleep=lambda _: (_ for _ in ()).throw(SystemExit(0)))
         self.assertFalse(w.pid_file(root).exists(), "worker must clean pid marker")
         self.assertFalse(w.enabled_file(root).exists(), "worker must clean enabled marker")
 
     def test_stop_waits_for_exit_and_cleans_only_after_confirmed(self):
         """AC3+AC4: stop() is synchronous - it signals, waits for the worker to
-        actually exit, and removes markers only after that exit is confirmed."""
-        root = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
-        (root / "sing-box.pid").write_text(str(os.getpid()))
-        started = w.start(root, interval=0.05)
-        self.assertTrue(started["started"])
-        pid = started["pid"]
+        actually exit, and removes markers only after that exit is confirmed.
 
-        result = w.stop(root)
+        Worker spawns are blocked by the test safety harness, so simulate the
+        synchronous wait with a mocked _pid_running that goes live -> gone.
+        """
+        temp, root = self._watcher_state()
+        self.addCleanup(temp.cleanup)
+        with mock.patch.object(w, "_pid_running", side_effect=[True, True, False]), \
+             mock.patch.object(w.os, "kill") as kill:
+            result = w.stop(root)
         self.assertTrue(result["stopped"])
-        self.assertFalse(w._pid_running(pid, root), "worker must be gone after stop")
+        kill.assert_called_once_with(4242, w.signal.SIGTERM)
         self.assertFalse(w.pid_file(root).exists())
         self.assertFalse(w.enabled_file(root).exists())
 

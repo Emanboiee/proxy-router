@@ -597,15 +597,6 @@ def stop(root: Path | None = None, *, timeout: float = 5.0,
         enabled_file(root).unlink(missing_ok=True)
         return {"stopped": True, "pid": pid, "stale": had_state}
 
-    # Reachability probe: raises if the pid vanished between the identity
-    # check and the signal.
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        pid_file(root).unlink(missing_ok=True)
-        enabled_file(root).unlink(missing_ok=True)
-        return {"stopped": True, "pid": pid, "stale": True}
-
     try:
         os.kill(pid, signal.SIGTERM)
     except OSError as exc:

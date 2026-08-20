@@ -195,7 +195,8 @@ class KeepaliveHarness:
             raise RuntimeError("keepalive child did not reach a terminal state")
         from tests.safety import get_session_registry
         get_session_registry().unregister(self.proc.pid)
-        self._tmp.cleanup()
+        if self._tmp is not None:
+            self._tmp.cleanup()
         self._closed = True
 
 
