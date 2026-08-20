@@ -7,6 +7,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -44,14 +45,18 @@ class RouterClientEngineOwnerTests(unittest.TestCase):
 
     def test_unreadable_root_pid_file_counts_as_root(self):
         self.pid.write_text("4242")
-        with mock.patch("os.stat") as st:
+        with mock.patch.object(tray.sys, "platform", "darwin"), \
+             mock.patch("os.geteuid", return_value=501), \
+             mock.patch("os.stat") as st:
             st.return_value.st_uid = 0
             with mock.patch("builtins.open", side_effect=PermissionError):
                 self.assertTrue(self.client._engine_runs_as_root())
 
     def test_readable_root_pid_confirmed_by_ps(self):
         self.pid.write_text("4242")
-        with mock.patch("os.stat") as st:
+        with mock.patch.object(tray.sys, "platform", "darwin"), \
+             mock.patch("os.geteuid", return_value=501), \
+             mock.patch("os.stat") as st:
             st.return_value.st_uid = 0
             with mock.patch.object(tray.subprocess, "run") as run:
                 run.return_value.stdout = "root\n"
@@ -184,6 +189,19 @@ class HumanizeTests(unittest.TestCase):
         self.assertIn("install sing-box 1.12+", detail)
         self.assertIn("github.com/SagerNet/sing-box/releases", detail)
 
+    def test_system_proxy_echo_line_is_stripped(self):
+        # macOS start/stop end with "system proxy disabled on 1 network
+        # service(s)"; showing that after "Connect: done" reads like a
+        # failure (issue #50).
+        detail = tray._humanize(
+            "router: engine started\nsystem proxy disabled on 1 network service(s)")
+        self.assertEqual(detail, "")
+
+    def test_system_proxy_enabled_echo_line_is_stripped(self):
+        detail = tray._humanize(
+            "system proxy enabled on 2 network service(s) -> 127.0.0.1:2080")
+        self.assertEqual(detail, "")
+
 
 class RunElevatedFallbackTests(unittest.TestCase):
     """Legacy-named wrapper now runs only the normal user controller."""
@@ -268,6 +286,49 @@ class TransientProbePresentationTests(unittest.TestCase):
         self.assertIn("rate-limited", status.profile_health("proton", "06-SG-FREE-4"))
 
 
+class QuitActionTests(unittest.TestCase):
+    """Quit must stop the engine BEFORE leaving the tray (issue #52):
+    a quitting tray that leaves the proxy-router engine running strands
+    the user with a live tunnel they can no longer control."""
+
+    def test_quit_stops_engine_then_tray(self):
+        calls = []
+        tray_stopped = threading.Event()
+
+        class FakeClient:
+            def stop(self):
+                calls.append("engine")
+                return 0, "stopped"
+
+        class FakeTray:
+            def stop(self):
+                calls.append("tray")
+                tray_stopped.set()
+
+        app = tray.TrayApp(FakeClient(), None)
+        app.tray = FakeTray()
+        app.action_quit()
+        self.assertTrue(tray_stopped.wait(2))
+        self.assertEqual(calls, ["engine", "tray"])
+        self.assertTrue(app.quit_flag.is_set())
+
+    def test_quit_stops_tray_even_when_engine_stop_fails(self):
+        tray_stopped = threading.Event()
+
+        class FakeClient:
+            def stop(self):
+                return 1, "engine not running"
+
+        class FakeTray:
+            def stop(self):
+                tray_stopped.set()
+
+        app = tray.TrayApp(FakeClient(), None)
+        app.tray = FakeTray()
+        app.action_quit()
+        self.assertTrue(tray_stopped.wait(2))
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -297,6 +358,49 @@ class DashboardOpenerTests(unittest.TestCase):
             self.assertTrue(tray.open_dashboard(self.root))
         self.assertEqual(calls[0][0], "osascript")
         self.assertIn("setup_tui.py", " ".join(calls[0]))
+
+    def test_macos_terminal_failure_fails_quietly(self):
+        failed = subprocess.CompletedProcess(["osascript"], 1)
+        with mock.patch.object(tray.sys, "platform", "darwin"), \
+             mock.patch.object(tray.subprocess, "run", return_value=failed):
+            self.assertFalse(tray.open_dashboard(self.root))
+
+
+class DashboardActionTests(unittest.TestCase):
+    """The tray callback owns root forwarding and visible outcome state."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.app = tray.TrayApp(tray.RouterClient(str(self.root)), None)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_callback_passes_client_root_and_records_success(self):
+        roots = []
+        with mock.patch.object(
+            tray, "open_dashboard", side_effect=lambda root: roots.append(root) or True
+        ):
+            self.app.action_dashboard()
+        self.assertEqual(roots, [str(self.root)])
+        self.assertEqual(self.app.last_action_result, "dashboard opened")
+
+    def test_callback_records_visible_failure_without_raising(self):
+        with mock.patch.object(tray, "open_dashboard", return_value=False):
+            self.app.action_dashboard()
+        self.assertEqual(self.app.last_action_result, "dashboard: no terminal")
+
+    def test_callback_rebuilds_attached_tray_menu(self):
+        sentinel = object()
+        self.app.tray = SimpleNamespace(menu=None)
+        self.app._menu_sig = "old"
+        with mock.patch.object(tray, "open_dashboard", return_value=True), \
+             mock.patch.object(self.app, "build_menu", return_value=sentinel) as build:
+            self.app.action_dashboard()
+        self.assertIsNone(self.app._menu_sig)
+        self.assertIs(self.app.tray.menu, sentinel)
+        build.assert_called_once_with()
 
 
 class PrivilegedHelperTrayTests(unittest.TestCase):
