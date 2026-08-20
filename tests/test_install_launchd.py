@@ -12,6 +12,7 @@ no real launchd agent is touched. Verifies:
 """
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -75,7 +76,7 @@ class InstallLaunchdHarness:
 
 class InstallLaunchdTests(unittest.TestCase):
     def test_renders_exact_pinned_python_into_plist(self):
-        pinned = "/opt/anaconda3/bin/python3"
+        pinned = sys.executable
         h = InstallLaunchdHarness(pinned_python=pinned)
         try:
             result = h.run()

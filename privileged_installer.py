@@ -159,6 +159,16 @@ def _write_new_file(directory_fd: int, name: str, payload: bytes, mode: int, own
         os.close(fd)
 
 
+def _locked_fchmod(parent_fd: int, name: str, mode: int) -> None:
+    """chmod one entry by dir_fd without ever following a symlink."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    fd = os.open(name, flags, dir_fd=parent_fd)
+    try:
+        os.fchmod(fd, mode)
+    finally:
+        os.close(fd)
+
+
 def _verify_existing_version(
     versions_fd: int,
     bundle_digest: str,
@@ -251,11 +261,14 @@ def stage_bundle(
             stage_fd = _secure_child_directory(versions_fd, stage_name, 0o700, owner_uid, owner_gid)
             for name, payload, mode in files:
                 _write_new_file(stage_fd, name, payload, mode, owner_uid, owner_gid)
-            os.fchmod(stage_fd, 0o555)
             os.fsync(stage_fd)
+            # Rename while the source is still writable; macOS refuses to
+            # rename a read-only directory (EACCES) even onto a confirmed
+            # spot, so the 0o555 immutability lands AFTER the atomic move.
             os.rename(stage_name, bundle_digest, src_dir_fd=versions_fd, dst_dir_fd=versions_fd)
             version_installed = True
             os.fsync(versions_fd)
+            _locked_fchmod(versions_fd, bundle_digest, 0o555)
         temporary_link = f".current-{secrets.token_hex(12)}"
         os.symlink(f"versions/{bundle_digest}", temporary_link, dir_fd=base_fd)
         try:

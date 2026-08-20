@@ -2373,6 +2373,7 @@ class LastGoodConfigTests(unittest.TestCase):
             mock.patch.object(router, "sing_box_at_least", return_value=True),
             mock.patch.object(router, "_pid_matches", return_value=True),
             mock.patch.object(router, "log_offset", return_value=0),
+            mock.patch.object(router, "_helper_status", return_value=None),
             mock.patch.object(router.os, "kill"),
         ]
         for p in self.patches:
