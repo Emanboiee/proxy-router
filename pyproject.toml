@@ -1,0 +1,10 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --disable-socket"
+filterwarnings = [
+  "error::ResourceWarning",
+]
+markers = [
+  "safety_guard: verifies the fail-closed test safety layer",
+  "enable_socket: permits an explicitly reviewed loopback-only socket test",
+]

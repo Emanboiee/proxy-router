@@ -1003,10 +1003,13 @@ def test_vpn_on_already_up_still_disables_system_proxy(tmp_path, monkeypatch):
     router.engine_alive = lambda: True
     router.engine_mode_consistent = lambda: True
     calls = []
+    watcher_calls = []
+    router.route_watcher_start = lambda: watcher_calls.append("start") or 0
     router.system_proxy_off = lambda: calls.append("off") or 0
     monkeypatch.setattr("sys.platform", "darwin")
 
     assert router.vpn_on() == 0
+    assert watcher_calls == ["start"]
     assert calls == ["off"]
 
 
@@ -1314,6 +1317,7 @@ def test_elevate_falls_back_to_admin_dialog(tmp_path, monkeypatch):
     monkeypatch.setattr(router.sys, "stdin", _TTY(True))
     monkeypatch.setattr(router, "_sudoers_installed", lambda: False)
     monkeypatch.setattr(router, "_elevate_macos", lambda: 99)
+    monkeypatch.setattr(router.sys, "stdin", _TTY(True))
     assert router._elevate() == 99
 
 
@@ -1578,12 +1582,14 @@ def test_tray_full_tunnel_toggle_invokes_vpn_action(tmp_path, monkeypatch):
     app = _tray_app(module, tmp_path, up=True, mode="tun")
     calls = []
     monkeypatch.setattr(app.client, "vpn", lambda a: calls.append(a) or (0, ""))
+    monkeypatch.setattr(app, "_do", lambda action, _label: action())
     app.action_toggle_vpn()
     assert calls == ["off"]
 
     app2 = _tray_app(module, tmp_path, up=True, mode="proxy")
     calls2 = []
     monkeypatch.setattr(app2.client, "vpn", lambda a: calls2.append(a) or (0, ""))
+    monkeypatch.setattr(app2, "_do", lambda action, _label: action())
     app2.action_toggle_vpn()
     assert calls2 == ["on"]
 

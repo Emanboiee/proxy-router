@@ -18,6 +18,7 @@ import collections
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -417,13 +418,52 @@ def _pid_matches(root: Path, pid: int) -> bool:
     except (OSError, subprocess.TimeoutExpired):
         return False
     command = result.stdout.strip()
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        argv = []
+    if argv:
+        if "--worker" not in argv:
+            return False
+        if not any(Path(token).name == Path(__file__).resolve().name for token in argv):
+            return False
+    else:
+        # An unquoted quote in a valid filesystem path can make shlex reject
+        # macOS ps output. Keep exact raw identity checks available rather than
+        # misclassifying the live worker as stale.
+        if not re.search(r"(?:^|\s)--worker(?:\s|$)", command):
+            return False
+        script_name = re.escape(Path(__file__).resolve().name)
+        if not re.search(rf"(?:^|[/\s]){script_name}(?:\s|$)", command):
+            return False
+    root_value = None
+    for index, token in enumerate(argv):
+        if token == "--root" and index + 1 < len(argv):
+            root_value = argv[index + 1]
+            break
+        if token.startswith("--root="):
+            root_value = token.split("=", 1)[1]
+            break
     # The worker was spawned with the caller's root string, which on macOS may
     # be the symlinked path (/var/folders/...) while resolve() yields the real
     # path (/private/var/folders/...). Accept either spelling so a spawned
     # worker is still recognized as ours.
-    root_candidates = {str(Path(root)), str(Path(root).resolve())}
-    return ("--worker" in command and Path(__file__).resolve().name in command
-            and any(r in command for r in root_candidates))
+    expected_roots = {str(Path(root).resolve()), str(Path(root))}
+    if root_value is not None and str(Path(root_value).resolve()) in expected_roots:
+        return True
+    # macOS `ps -o command=` joins argv without shell quoting, so a root with
+    # spaces is split by shlex. start() always places --interval immediately
+    # after --root, giving us an exact raw-command boundary without accepting
+    # prefix impostors such as `<root>-foreign`.
+    for expected_root in expected_roots:
+        if (
+            f"--root {expected_root} --interval " in command
+            or f"--root={expected_root} --interval " in command
+            or command.endswith(f"--root {expected_root}")
+            or command.endswith(f"--root={expected_root}")
+        ):
+            return True
+    return False
 
 
 def _pid_running(pid: int, root: Path | None = None) -> bool:
@@ -523,8 +563,20 @@ def start(root: Path | None = None, *, interval: float = DEFAULT_INTERVAL) -> di
     return {"started": True, "pid": proc.pid, "interval": interval, "log": str(worker_log)}
 
 
+def _wait_until_stopped(pid: int, root: Path, *, timeout: float = 3.0,
+                        poll_interval: float = 0.1) -> bool:
+    """Wait until *pid* no longer exists with this watcher's full identity."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    while _pid_running(pid, root):
+        now = time.monotonic()
+        if now >= deadline:
+            return False
+        time.sleep(min(max(0.01, poll_interval), deadline - now))
+    return True
+
+
 def stop(root: Path | None = None, *, timeout: float = 5.0,
-         kill_timeout: float = 2.0, poll: float = 0.1) -> dict:
+         kill_timeout: float = 2.0, poll_interval: float = 0.1) -> dict:
     """Stop only our worker; never signal arbitrary processes.
 
     Synchronous lifecycle: validate the recorded PID actually is our worker
@@ -539,32 +591,50 @@ def stop(root: Path | None = None, *, timeout: float = 5.0,
         pid = int(pid_file(root).read_text().strip())
     except (OSError, ValueError):
         pid = None
-    if pid is not None and _pid_running(pid, root):
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            pass  # raced exit; confirmed below
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline and _pid_running(pid, root):
-            time.sleep(poll)
-        if _pid_running(pid, root):
-            # Still alive after the SIGTERM grace: escalate only if it is
-            # still provably our worker (never kill a recycled PID).
-            if _pid_matches(root, pid):
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except OSError:
-                    pass
-                deadline = time.monotonic() + kill_timeout
-                while time.monotonic() < deadline and _pid_running(pid, root):
-                    time.sleep(poll)
-    # Markers are removed only after confirmed exit. A stale/foreign PID is
-    # not ours to kill; its markers are stale by definition (a live worker
-    # always writes its own PID), so removing them unblocks a clean restart.
+    had_state = pid_file(root).exists() or enabled_file(root).exists()
     if pid is None or not _pid_running(pid, root):
         pid_file(root).unlink(missing_ok=True)
         enabled_file(root).unlink(missing_ok=True)
-    return {"stopped": True, "pid": pid}
+        return {"stopped": True, "pid": pid, "stale": had_state}
+
+    # Reachability probe: raises if the pid vanished between the identity
+    # check and the signal.
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        pid_file(root).unlink(missing_ok=True)
+        enabled_file(root).unlink(missing_ok=True)
+        return {"stopped": True, "pid": pid, "stale": True}
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as exc:
+        if _pid_running(pid, root):
+            return {
+                "stopped": False,
+                "pid": pid,
+                "error": f"failed to signal watcher: {type(exc).__name__}: {exc}",
+            }
+
+    if not _wait_until_stopped(pid, root, timeout=timeout, poll_interval=poll_interval):
+        # Still alive after the SIGTERM grace: escalate only if it is
+        # still provably our worker (never kill a recycled PID).
+        if _pid_matches(root, pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+            _wait_until_stopped(pid, root, timeout=kill_timeout, poll_interval=poll_interval)
+        if _pid_running(pid, root):
+            return {
+                "stopped": False,
+                "pid": pid,
+                "error": f"timeout waiting for watcher PID {pid} to stop",
+            }
+
+    pid_file(root).unlink(missing_ok=True)
+    enabled_file(root).unlink(missing_ok=True)
+    return {"stopped": True, "pid": pid, "stale": False}
 
 
 def main(argv: Iterable[str] | None = None, root: Path | None = None) -> int:
@@ -591,8 +661,9 @@ def main(argv: Iterable[str] | None = None, root: Path | None = None) -> int:
         print(json.dumps(start(root, interval=args.interval), indent=2, sort_keys=True))
         return 0
     if args.action == "off":
-        print(json.dumps(stop(root), indent=2, sort_keys=True))
-        return 0
+        result = stop(root)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0 if result.get("stopped") else 1
     path = events_file(root)
     if path.is_file():
         try:
