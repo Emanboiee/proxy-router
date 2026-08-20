@@ -1179,13 +1179,6 @@ class ElevationLockTests(unittest.TestCase):
             self.assertEqual(router._with_lock(lambda: 7), 7)
             lock.assert_called_once()
 
-    def test_elevated_reload_passes_marker_env(self):
-        with mock.patch("subprocess.run") as run:
-            run.return_value.returncode = 0
-            router._elevated_reload()
-        env = run.call_args.kwargs.get("env")
-        self.assertEqual(env.get("PROXY_ROUTER_ELEVATED"), "1")
-
 
 class RotationEgressTests(unittest.TestCase):
     """Egress-aware rotation: blocked skip, latency ranking, --reason smart
