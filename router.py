@@ -58,6 +58,11 @@ DEFAULT_PROBE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
 DEFAULT_EGRESS_SETTINGS = {
     "probe_url": DEFAULT_PROBE_URL,
     "probe_timeout": 8.0,
+    # Probe identity. Cloudflare-fronted upstreams (zen's free tier) reset
+    # generic clients on TLS fingerprint and gate by client type; set this to
+    # the real client's UA (e.g. ``opencode/1.18.18``) so probe verdicts match
+    # what the client actually experiences through the tunnel.
+    "probe_user_agent": "proxy-router-egress/1.0",
     "block_seconds": 3600,
     "upstream_cooldown_seconds": 300,
     "fail_threshold": 2,
@@ -216,8 +221,10 @@ def fail(message: str) -> int:
 
 
 def current_mode() -> str:
-    """'proxy' (default) or 'tun'. Persisted in state/mode so ensure/reload
-    keep running whatever the user last selected."""
+    """'proxy' or 'tun'. Persisted in state/mode so ensure/reload keep
+    running whatever the user last selected; falls back to the configured
+    vpn.default_mode ('proxy' unless router.json says otherwise) when no
+    mode has been selected yet (fresh install)."""
     try:
         if MODE_FILE.is_file():
             mode = MODE_FILE.read_text().strip()
@@ -226,8 +233,8 @@ def current_mode() -> str:
     except OSError:
         # Root-owned mode file (written by a sudo run whose ownership was
         # not handed back) must not crash the regular-user CLI/keepalive.
-        return "proxy"
-    return "proxy"
+        pass
+    return _vpn.get("default_mode", "proxy")
 
 
 def _hand_back_ownership(path: Path) -> None:
@@ -307,6 +314,9 @@ def load_config() -> int:
         or any(not isinstance(cidr, str) or not cidr.strip() for cidr in exclude_cidr)
     ):
         return fail(f"bad {CONFIG_FILE.name}: vpn.exclude_cidr must be a list of CIDR strings")
+    default_mode = vpn.get("default_mode")
+    if default_mode is not None and default_mode not in ("proxy", "tun"):
+        return fail(f"bad {CONFIG_FILE.name}: vpn.default_mode must be 'proxy' or 'tun'")
     if not all(isinstance(name, str) and _PROVIDER_NAME.fullmatch(name) and isinstance(entry, dict)
                for name, entry in providers.items()):
         return fail(f"bad {CONFIG_FILE.name}: provider names/entries are invalid")
@@ -443,6 +453,7 @@ def write_default_config(force: bool = False) -> int:
             # stays "direct" and nothing is tunneled unless listed.
             "routing": {"mode": "vpn-list", "vpn_domains": []},
             "vpn": {
+                "default_mode": "tun",
                 "capture": "ruleset",
                 "address": DEFAULT_TUN_ADDRESS,
                 "mtu": DEFAULT_TUN_MTU,
@@ -453,6 +464,8 @@ def write_default_config(force: bool = False) -> int:
             "egress": {
                 "probe_url": DEFAULT_PROBE_URL,
                 "probe_timeout": 8,
+                "probe_user_agent": "opencode/1.18.18",
+                "probe_settle_seconds": 60,
                 "block_seconds": 3600,
                 "upstream_cooldown_seconds": 300,
                 "fail_threshold": 2,
@@ -519,6 +532,11 @@ def is_cooled_down(name: str, profile: Path) -> bool:
     try:
         return int(path.read_text().strip()) > int(time.time())
     except ValueError:
+        return False
+    except OSError:
+        # An unreadable marker (root keepalive wrote it 0600 without a
+        # SUDO_UID hand-back) must not crash the user-level CLI: with no
+        # readable marker the lane is treated as not cooled.
         return False
 
 
@@ -1128,6 +1146,20 @@ def _classify_probe_body(status: int, text: str) -> str | None:
     return None
 
 
+def _probe_failure_reason(status: int, text: str) -> tuple[str | None, str | None]:
+    """(error, block_reason) for a probe response. A reputation block is both
+    an error and a block marker; an upstream rate limit (HTTP 429) is an error
+    only — never a block (it is a transient quota signal, not an egress-IP
+    reputation block, so it must route through the error-policy exhaust path,
+    not mark_blocked)."""
+    reason = _classify_probe_body(status, text)
+    if reason is not None:
+        return reason, reason
+    if status == 429:
+        return "rate-limit-429", None
+    return None, None
+
+
 def _probe_via_curl(*, port: int, url: str, timeout: float) -> dict:
     """One probe via curl: its TLS handshake survives Cloudflare bot
     management that resets python-urllib clients on fingerprint (seen live:
@@ -1141,6 +1173,7 @@ def _probe_via_curl(*, port: int, url: str, timeout: float) -> dict:
         "--silent", "--show-error", "--output", "-",
         "--write-out", "\n%{http_code} %{time_total}",
         "--connect-timeout", f"{connect:g}", "--max-time", f"{float(timeout):g}",
+        "--user-agent", egress_settings()["probe_user_agent"],
         url,
     ]
     try:
@@ -1171,13 +1204,13 @@ def _probe_via_curl(*, port: int, url: str, timeout: float) -> dict:
         error = f"curl({result.returncode}): {err.strip()[-200:] or 'no response'}"
         return {"ok": False, "latency_ms": None, "status": None,
                 "error": error, "block_reason": None}
-    reason = _classify_probe_body(status, body[:4096])
+    error, block_reason = _probe_failure_reason(status, body[:4096])
     return {
-        "ok": reason is None,
+        "ok": error is None,
         "latency_ms": latency_ms,
         "status": status,
-        "error": reason,
-        "block_reason": reason,
+        "error": error,
+        "block_reason": block_reason,
     }
 
 
@@ -1198,7 +1231,7 @@ def probe_egress(*, port: int | None = None, url: str | None = None, timeout: fl
             urllib.request.ProxyHandler({"http": proxy, "https": proxy})
         )
     request = urllib.request.Request(
-        url, headers={"User-Agent": "proxy-router-egress/1.0", "Accept": "*/*"}
+        url, headers={"User-Agent": egress_settings()["probe_user_agent"], "Accept": "*/*"}
     )
     started = clock()
     response = None
@@ -1208,13 +1241,13 @@ def probe_egress(*, port: int | None = None, url: str | None = None, timeout: fl
         latency = (clock() - started) * 1000.0
         status = int(getattr(response, "status", getattr(response, "code", 200)))
         text = body.decode("utf-8", "replace")
-        reason = _classify_probe_body(status, text)
+        error, block_reason = _probe_failure_reason(status, text)
         return {
-            "ok": reason is None,
+            "ok": error is None,
             "latency_ms": round(latency, 2),
             "status": status,
-            "error": reason,
-            "block_reason": reason,
+            "error": error,
+            "block_reason": block_reason,
         }
     except Exception as exc:  # network errors are data, never a crash
         return {
@@ -1239,16 +1272,46 @@ def probe_profile(name: str, profile: Path, *, port: int | None = None) -> tuple
     if url is None:
         return True, None
     result = probe_egress(port=port, url=url)
+    dns_ok = None
+    if (not result["ok"] and result["status"] is None
+            and _transport_reason(result["error"]) != "tls"):
+        # TLS failures prove the tunnel path (CONNECT rode it); for every
+        # other connection-level failure ask whether resolution still works.
+        host = urllib.parse.urlsplit(url).hostname or ""
+        dns_ok = egress_dns_probe(host, port=port) if host else None
     record = record_egress(name, profile, ok=result["ok"], latency_ms=result["latency_ms"],
-                           status=result["status"], error=result["error"])
+                           status=result["status"], error=result["error"], dns_ok=dns_ok)
     if result["block_reason"]:
         mark_blocked(name, profile, result["block_reason"])
-    elif not result["ok"] and result["status"] is None and not is_cooled_down(name, profile):
-        # Transport-level failure (TLS/connection/read) with no HTTP status:
-        # the exit is failed for real traffic. Cool it so rotation and
+    elif result["error"] == "rate-limit-429":
+        # The probe observed an upstream rate limit (HTTP 429) on this exit
+        # THROUGH the real tunnel: apply the 429 error-policy entry (exhaust
+        # + cooldown by default) so rotation skips the lane until the reset —
+        # exactly as a real-traffic 429 does via `rotate --reason 429`. A
+        # probe 429 is direct evidence the exit's egress IP is throttled, so
+        # it acts immediately (no fail_threshold wait, unlike connection
+        # blips which can be transient handshake races).
+        seconds = int(_providers.get(name, {}).get("cooldown_seconds", 60))
+        _apply_upstream_failure(name, profile, "429", seconds)
+    elif (not result["ok"] and result["status"] is None
+          and not is_cooled_down(name, profile)
+          and dns_ok is not False
+          and _transport_reason(result["error"]) != "tls"
+          and int(record.get("fails") or 0) >= int(egress_settings()["fail_threshold"])):
+        # Connection-level failure (dial/connect/timeout/reset — no HTTP
+        # status, no TLS handshake): the tunnel path itself is broken, so the
+        # exit is failed for real traffic. Cool it so rotation and
         # resolve_active avoid it instead of re-picking the same dead exit.
         # Seconds come from the effective error policy for the reason class
-        # (tls/connection; built-in default matches the merged 300s rule).
+        # (connection; built-in default matches the merged 300s rule).
+        # Multi-strike: a single transient blip must not dead-mark a healthy
+        # exit; only fail_threshold (default 2) CONSECUTIVE failures cool it,
+        # mirroring keepalive's dead_strikes and _egress_rank.
+        # TLS-classified failures (SSL EOF / SSL_ERROR_SYSCALL / TLS alert)
+        # are deliberately excluded: the TCP CONNECT already rode the tunnel,
+        # so the path works and the upstream is throttling — never a cooldown.
+        # dns_ok False is excluded too: resolution rides the direct path, so
+        # a DNS flake never proves the tunnel dead (degraded, not dead).
         reason = _transport_reason(result["error"])
         _action, seconds = policy_action(name, reason)
         mark_cooldown(name, profile, seconds)
@@ -1324,8 +1387,10 @@ def egress_dns_probe(host: str, *, port: int | None = None, timeout: float | Non
     - Then a tiny proxied GET forces the engine to resolve+connect ``host``
       through the tunnel; a response proves the resolution path worked
       (True), a DNS-flavored error (getaddrinfo/no such host/...) means the
-      tunnel's resolution path is dead (False), and any other transport
-      error is inconclusive (None).
+      engine's resolution path failed (False), and any other transport
+      error is inconclusive (None). Resolution rides the direct path by
+      design (build_singbox_config), so False signals a direct-DNS failure,
+      not a dead tunnel.
 
     Bounded (getaddrinfo worker timeout + short request timeout), injectable
     openers for tests, no new dependencies.
@@ -1348,12 +1413,17 @@ def check_egress_live(name: str, profile: Path, *, port: int | None = None,
 
     - ``alive``: the HTTPS probe got an HTTP response through the tunnel.
     - ``degraded``: an HTTP response arrived but was not ok (e.g. Cloudflare
-      1010/403 reputation block or 5xx). The tunnel path works, so this is
-      NOT a dead tunnel and keepalive must not rotate on it.
-    - ``dead``: the probe failed at transport level (no HTTP status at all),
-      i.e. the tunnel path itself is broken. The DNS signal sharpens the
-      reason: ``dns_ok is False`` means resolution through the tunnel failed,
-      otherwise a later dial/read stage failed.
+      1010/403 reputation block or 5xx), OR the failure is TLS-classified
+      (SSL EOF / SSL_ERROR_SYSCALL / TLS alert): the TCP CONNECT rode the
+      tunnel, so the path demonstrably works and the upstream endpoint is
+      throttling — never a dead tunnel, so keepalive must not rotate on it.
+    - ``dead``: the probe failed at connection level (no HTTP status at all,
+      no TLS handshake), i.e. the tunnel path itself is broken. The DNS
+      signal sharpens the reason: ``dns_ok is True`` means the later
+      dial/read stage through the tunnel failed; ``dns_ok is False`` means
+      resolution failed on the DIRECT DNS path (DNS is pinned direct by
+      design) — the tunnel was never dialed, so the exit is ``degraded``,
+      not dead. ``dns_ok None`` keeps the dead verdict.
 
     The outcome is persisted in the normal egress health record (including
     ``dns_ok`` when determined) and reputation-block reasons still raise a
@@ -1373,20 +1443,45 @@ def check_egress_live(name: str, profile: Path, *, port: int | None = None,
         status, dns_ok = "alive", True
     elif probe["status"] is not None:
         status, dns_ok = "degraded", True  # HTTP response rode the tunnel
+    elif _transport_reason(probe["error"]) == "tls":
+        # TLS-handshake failure (SSL EOF / SSL_ERROR_SYSCALL / TLS alert)
+        # happens AFTER the TCP CONNECT rode the tunnel: the path demonstrably
+        # works and the upstream endpoint is throttling (Proton free tier
+        # resets inner TLS ~1s in while real traffic still succeeds). That is
+        # a degraded exit, never a dead tunnel — no cooldown, no rotation.
+        status, dns_ok = "degraded", True
     else:
-        status = "dead"
         host = urllib.parse.urlsplit(url).hostname or ""
         dns_ok = egress_dns_probe(host, port=port) if host else None
+        # DNS rides the DIRECT path by design (build_singbox_config), so a
+        # lookup failure (dns_ok False) means the direct DNS path failed and
+        # the tunnel was never dialed — it cannot be blamed. Unproven is
+        # degraded, not dead (same principle as the TLS case): no cooldown
+        # on DNS flakes. dns_ok True/None keep the conservative dead verdict.
+        status = "degraded" if dns_ok is False else "dead"
     record = record_egress(name, profile, ok=probe["ok"], latency_ms=probe["latency_ms"],
                            status=probe["status"], error=probe["error"], dns_ok=dns_ok)
     if probe["block_reason"]:
         mark_blocked(name, profile, probe["block_reason"])
-    elif status == "dead" and not is_cooled_down(name, profile):
-        # TLS/transport-level death (no HTTP status): the exit is failed for
-        # real traffic. Cool it so resolve_active/rotation stop re-picking the
-        # same dead exit. Seconds come from the effective error policy for the
-        # reason class (tls/connection; built-in default is the merged 300s
-        # rule for TLS/transport deaths).
+    elif probe["error"] == "rate-limit-429":
+        # The probe got an HTTP 429 through the real tunnel: the exit's egress
+        # IP is rate-limited. Same immediate exhaust/cooldown as probe_profile
+        # (and `rotate --reason 429`), so scheduled rotation and the sweep
+        # skip the lane until the reset. Keepalive still sees "degraded" above
+        # and never rotates on a throttle — this only steers future switches.
+        seconds = int(_providers.get(name, {}).get("cooldown_seconds", 60))
+        _apply_upstream_failure(name, profile, "429", seconds)
+    elif (status == "dead" and not is_cooled_down(name, profile)
+          and int(record.get("fails") or 0) >= int(egress_settings()["fail_threshold"])):
+        # Connection-level death (no HTTP status, no TLS handshake): the exit
+        # is failed for real traffic. Cool it so resolve_active/rotation stop
+        # re-picking the same dead exit. Seconds come from the effective error
+        # policy for the reason class (connection; built-in default is the
+        # merged 300s rule). TLS-classified failures never reach here — they
+        # are degraded (upstream throttle), not dead. Multi-strike: a single
+        # transient blip must not dead-mark an exit that recovers; only
+        # fail_threshold CONSECUTIVE dead checks cool it (keepalive's
+        # dead_strikes=2 gate already rotates only on repeated deaths).
         reason = _transport_reason(probe["error"])
         _action, seconds = policy_action(name, reason)
         mark_cooldown(name, profile, seconds)
@@ -1862,6 +1957,26 @@ def dns_transport() -> str:
     return transport
 
 
+def _routes_by_health_order(routes: list[dict], selected: dict[str, Path]) -> list[dict]:
+    """Stable-sort routes so providers with healthy egress records lead.
+
+    Ranks come from the persisted probe record of each provider's selected
+    profile (`_egress_rank`): healthy-fast first, unknown/slow in the middle,
+    recently-failing last. Routes within the same provider keep their config
+    order (stable sort). This powers ``routing.health_order``: when a second
+    provider (e.g. WARP) is healthy it wins the shared school domains; when
+    it degrades, the healthy lane's rules move ahead automatically without
+    any manual route reorder.
+    """
+    ranks: dict[str, tuple[int, float]] = {}
+    for name, profile in selected.items():
+        ranks[name] = _egress_rank(read_egress(name, profile))
+    return sorted(
+        routes,
+        key=lambda route: ranks.get(_effective_route_provider(route.get("provider", "")), (1, float("inf"))),
+    )
+
+
 def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tuple[dict, dict[str, Path]]:
     active: dict[str, dict] = {}
     selected: dict[str, Path] = {}
@@ -1916,6 +2031,14 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
     dns_servers.append({"type": "local", "tag": "dns-local"})
     routing = routing_state()
     routing_mode = routing["mode"]
+    # health_order: emit provider rules in egress-health order instead of
+    # pure route-table order, so a healthy lane leads shared domains and a
+    # degraded one trails (or drops out) without manual reorders. Falls back
+    # to the configured route order when the flag is off.
+    if routing.get("health_order") and selected:
+        build_routes = _routes_by_health_order(_routes, selected)
+    else:
+        build_routes = _routes
     dns_rules = []
     if routing_mode == "safe-list" and routing["direct_domains"]:
         # Safe-list: trusted domains go DIRECT, so their DNS must resolve via
@@ -1925,7 +2048,7 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
         # provider route always wins the direct resolver.
         dns_rules.append({"domain_suffix": list(routing["direct_domains"]), "server": "dns-local"})
     vpn_domains = frozenset(routing["vpn_domains"])
-    for route in _routes:
+    for route in build_routes:
         route_provider = _effective_route_provider(route["provider"])
         if route_provider not in active or not route.get("domains"):
             continue
@@ -1944,7 +2067,7 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
     # routing section (default mode) direct_pins is empty and the rule list
     # is byte-identical to the pre-routing-modes output.
     provider_rules = []
-    for route in _routes:
+    for route in build_routes:
         route_provider = _effective_route_provider(route["provider"])
         if route_provider not in active:
             continue
@@ -2081,7 +2204,9 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
         "inbounds": inbounds,
         "endpoints": list(active.values()),
         "outbounds": [{"type": "direct", "tag": "direct"}],
-        "dns": {"servers": dns_servers, "rules": dns_rules, "strategy": dns_strategy()},
+        # Without dns.final, unmatched queries hit the FIRST server (tunnel-riding
+        # provider DNS); pin them to the always-present local resolver instead.
+        "dns": {"servers": dns_servers, "rules": dns_rules, "strategy": dns_strategy(), "final": "dns-local"},
         "route": {
             "auto_detect_interface": True,
             "default_domain_resolver": "dns-local",
@@ -2345,6 +2470,29 @@ def log_has_fatal(after: int) -> bool:
     return "FATAL" in tail or "fatal" in tail
 
 
+def _tun_egress_probe(timeout: float) -> bool:
+    """Tun-mode egress proof: at least one routed target must answer through
+    the local proxy listener (which coexists with the TUN and rides the same
+    rules). A TLS-classed failure still counts as the path working (CONNECT
+    rode the tunnel); a connection-level failure means the tunnel is
+    up-but-dead. Returns True when nothing routed exists to prove."""
+    for name in _providers:
+        if active_fallback(name):
+            continue
+        if _usable_profile(name) is None:
+            continue
+        url = probe_url_for(name)
+        if url is None:
+            continue
+        result = probe_egress(url=url, timeout=timeout)
+        if result.get("ok") or result.get("status") is not None:
+            return True
+        if _transport_reason(result.get("error") or "") == "tls":
+            return True
+        return False
+    return True
+
+
 def wait_engine(timeout: float = 8.0, log_from: int = 0) -> bool:
     """Mode-aware readiness: the engine must come up AND survive a settle
     window without a FATAL in the log.
@@ -2353,15 +2501,18 @@ def wait_engine(timeout: float = 8.0, log_from: int = 0) -> bool:
       listener probe): a foreign process answering on the port while our
       sing-box dies on `bind: address already in use` is NOT a healthy
       start (H2).
-    - tun mode is ready when OUR process survives the launch window
-      (interface setup has no socket to poll, and a broken tun dies
-      instantly with FATAL - no root / no wintun.dll).
+    - tun mode is ready when OUR process survives the launch window AND a
+      routed target answers through the tunnel (bounded egress probe): a
+      captive portal / filtered network leaves the process alive but the
+      tunnel dead, so liveness alone would silently pass ensure and later
+      storm rotate_dead.
 
     Either way the first "up" poll just opens a 0.5s settle window instead of
     returning immediately, because sing-box can emit its FATAL a moment after
     the first successful poll (e.g. bind conflict or interface setup)."""
     deadline = time.time() + timeout
     first = True
+    probe_at = 0.0
     while time.time() < deadline:
         if log_has_fatal(log_from):
             return False
@@ -2375,7 +2526,15 @@ def wait_engine(timeout: float = 8.0, log_from: int = 0) -> bool:
                 time.sleep(0.5)
                 continue
             if not log_has_fatal(log_from):
-                return True
+                if current_mode() != "tun":
+                    return True
+                now = time.time()
+                if now >= probe_at:
+                    probe_at = now + 1.0  # re-probe cadence, bounded by deadline
+                    probe_timeout = min(max(0.5, deadline - now),
+                                        float(egress_settings()["probe_timeout"]))
+                    if _tun_egress_probe(probe_timeout):
+                        return True
         time.sleep(0.2)
     return False
 
@@ -2560,6 +2719,10 @@ def engine_start(use_existing_config: bool = False, *, recover: bool = True) -> 
     PID_FILE.write_text(str(process.pid))
     os.chmod(PID_FILE, 0o600)
     _hand_back_ownership(PID_FILE)
+    # The elevated start opened LOG_FILE as root (log_handle above); hand it
+    # back so non-root readers (log_has_fatal, keepalive rotation, status)
+    # can still open it. The engine keeps writing through its inherited fd.
+    _hand_back_ownership(LOG_FILE)
     if not wait_engine(log_from=spawn_log_offset):
         engine_stop()
         if recover and not use_existing_config and LAST_GOOD_FILE.is_file():
@@ -2762,7 +2925,8 @@ def _elevated_reload() -> int:
     overrides ride in RELOAD_OVERRIDE_FILE so sweep hops keep their
     candidate-without-commit semantics across the privilege boundary."""
     command = [sys.executable, os.path.abspath(__file__), "reload"]
-    probe = subprocess.run(["sudo", "-n", *command])
+    env = {**os.environ, "PROXY_ROUTER_ELEVATED": "1"}
+    probe = subprocess.run(["sudo", "-n", *command], env=env)
     if probe.returncode != 0:
         print("router: elevated reload denied; run `sudo python3 router.py reload` manually",
               file=sys.stderr)
@@ -3128,6 +3292,7 @@ def routing_state() -> dict:
         "direct_domains": list(routing.get("direct_domains", []) or []),
         "vpn_domains": list(routing.get("vpn_domains", []) or []),
         "default_provider": routing.get("default_provider"),
+        "health_order": bool(routing.get("health_order", False)),
     }
 
 
@@ -3150,6 +3315,9 @@ def _routing_error(routing: dict, known_providers: set) -> str | None:
     default_provider = routing.get("default_provider")
     if default_provider is not None and not isinstance(default_provider, str):
         return "routing.default_provider must be a provider name string"
+    health_order = routing.get("health_order")
+    if health_order is not None and not isinstance(health_order, bool):
+        return "routing.health_order must be a boolean"
     if mode == "safe-list":
         if not default_provider:
             return "routing mode 'safe-list' needs 'default_provider' (everything not on the direct list goes through it)"
@@ -3648,8 +3816,9 @@ def egress_check(name: str | None = None, as_json: bool = False) -> int:
             if status == "dead":
                 entry["detail"] = "dns" if entry.get("dns_ok") is False else "probe connection"
                 dead.append(provider)
-            elif status == "degraded" and record is not None and record.get("status") is not None:
-                entry["detail"] = f"HTTP {record['status']}"
+            elif status == "degraded" and record is not None:
+                entry["detail"] = (f"HTTP {record['status']}" if record.get("status") is not None
+                                   else "throttled (TLS)")
             results[provider] = entry
             continue
         if active is None:
@@ -3663,8 +3832,9 @@ def egress_check(name: str | None = None, as_json: bool = False) -> int:
         if status == "dead":
             entry["detail"] = "dns" if entry.get("dns_ok") is False else "probe connection"
             dead.append(provider)
-        elif status == "degraded" and record is not None and record.get("status") is not None:
-            entry["detail"] = f"HTTP {record['status']}"
+        elif status == "degraded" and record is not None:
+            entry["detail"] = (f"HTTP {record['status']}" if record.get("status") is not None
+                               else "throttled (TLS)")
         results[provider] = entry
     # No break after a dead provider: every provider's record must be
     # refreshed each cycle so status UIs never show stale failures from a
@@ -3768,6 +3938,7 @@ def egress_sweep(name: str | None = None, as_json: bool = False) -> int:
             if switch_to(profile) != 0:
                 entry[profile.stem] = {
                     "ok": False,
+                    "usable": False,
                     "latency_ms": None,
                     "status": None,
                     "error": "profile switch failed",
@@ -3777,12 +3948,20 @@ def egress_sweep(name: str | None = None, as_json: bool = False) -> int:
             if actual != original:
                 time.sleep(1.5)  # WireGuard handshake settle
             ok, record = _probe_with_settle(provider, profile)
+            error = record.get("error") if record else None
+            # A TLS-classed failure means the TCP CONNECT rode the tunnel and
+            # the upstream endpoint is throttling: the exit still serves real
+            # traffic (probes false-dead while traffic succeeds), so count it
+            # usable — an all-throttled pool must not read as "zero alive"
+            # and strand keepalive on fallback or churn the active profile.
+            usable = ok or _transport_reason(error) == "tls"
             entry[profile.stem] = {
                 "ok": ok,
+                "usable": usable,
                 "latency_ms": record.get("latency_ms") if record else None,
                 "status": record.get("status") if record else None,
             }
-        alive = [stem for stem, r in entry.items() if r["ok"]]
+        alive = [stem for stem, r in entry.items() if r["usable"]]
         if alive and not switch_failed:
             best = min(alive, key=lambda stem: (
                 entry[stem]["latency_ms"] is None,
@@ -4712,6 +4891,12 @@ class _EngineLock:
 
 
 def _with_lock(action) -> int:
+    # The elevated reload child is the same operation re-run as root; the
+    # parent holds the flock while it waits for the child, so a child that
+    # re-acquires the lock would deadlock (parent waits for child, child
+    # waits for the parent's lock).
+    if os.geteuid() == 0 and os.environ.get("PROXY_ROUTER_ELEVATED"):
+        return action()
     with _EngineLock():
         return action()
 
