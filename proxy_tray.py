@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import shutil
 from pathlib import Path
@@ -81,6 +82,13 @@ _FRIENDLY_ERRORS = (
 # (darwin) is ~424 chars, so 500 keeps it fully visible (issue #11).
 _MAX_DETAIL = 500
 
+# macOS start/stop echo their system-proxy toggle as the last CLI line
+# ("system proxy disabled on 1 network service(s)"). That is status
+# noise, not the action result — surfacing it after "Connect: done"
+# reads like a failure (issue #50).
+_SYSTEM_PROXY_ECHO = re.compile(
+    r"system proxy (enabled|disabled) on \d+ network service")
+
 
 def _friendly_egress_error(err: object) -> str:
     """Turn a raw probe/egress error tail into a short human label.
@@ -96,7 +104,7 @@ def _friendly_egress_error(err: object) -> str:
     if not s:
         return "offline"
     if "ssl" in low or "certificate" in low or "unexpected_eof" in low:
-        return "offline (SSL)"
+        return "throttled (SSL)"
     if "timed out" in low or "timeout" in low:
         return "timed out"
     if "connection refused" in low or "connection reset" in low:
@@ -126,6 +134,8 @@ def _humanize(out: str) -> str:
     # (issue #11). 500 chars keeps even the darwin message (measured ~424)
     # fully visible.
     detail = out.splitlines()[-1][:_MAX_DETAIL]
+    if _SYSTEM_PROXY_ECHO.search(detail):
+        return ""  # system-proxy echo line: not the action result (issue #50)
     for needle, repl in _FRIENDLY_ERRORS:
         if needle in detail:
             return repl
@@ -564,10 +574,12 @@ class TrayApp:
         threading.Thread(target=worker, daemon=True).start()
 
     def action_dashboard(self):
-        ok = open_dashboard(self.root)
+        ok = open_dashboard(self.client.root)
         with self.lock:
             self.last_action_result = "dashboard opened" if ok else "dashboard: no terminal"
-        self.refresh()
+        if self.tray is not None:
+            self._menu_sig = None
+            self.tray.menu = self.build_menu()
 
     def action_connect(self):
         # start (not ensure): also clears the manual-off marker written by
@@ -656,9 +668,24 @@ class TrayApp:
                 print(f"guide: cannot read {guide}: {e}", file=sys.stderr)
 
     def action_quit(self):
+        # Quit = stop the engine AND leave the tray (Tailscale/WARP-style):
+        # the engine must not keep serving after the user quits the tray.
+        # The stop can elevate (root-owned engine) and block up to
+        # ELEVATED_COMMAND_TIMEOUT, so it runs on the worker thread; the
+        # tray stops only once the engine is down (issue #52).
         self.quit_flag.set()
-        if self.tray is not None:
-            self.tray.stop()
+
+        def worker():
+            try:
+                rc, out = self.client.stop()
+            except Exception as e:
+                rc, out = -1, f"{type(e).__name__}: {e}"
+            if rc != 0:
+                print(f"quit: engine stop failed: {out}", file=sys.stderr)
+            if self.tray is not None:
+                self.tray.stop()
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # ---- menu -------------------------------------------------------------
     def build_menu(self) -> pystray.Menu:

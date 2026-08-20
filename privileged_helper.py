@@ -1127,7 +1127,7 @@ def _validate_outbounds(value: object) -> None:
 
 
 def _validate_dns(value: object) -> None:
-    dns = _exact_object(value, {"servers", "rules", "strategy"}, set(), "dns")
+    dns = _exact_object(value, {"servers", "rules", "strategy"}, {"final"}, "dns")
     if not isinstance(dns["strategy"], str) or dns["strategy"] not in {
         "ipv4_only", "ipv6_only", "prefer_ipv4", "prefer_ipv6"
     }:

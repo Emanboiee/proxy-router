@@ -219,7 +219,10 @@ restore_fallbacks() {
 }
 
 while true; do
-  if controller ensure >/dev/null 2>&1; then
+  if ensure_out=$(controller ensure 2>&1); then
+    if [ "$backoff" -ne "$INTERVAL" ]; then
+      echo "$(date '+%Y-%m-%d %H:%M:%S') router: ensure ok; backoff reset to ${INTERVAL}s" >&2
+    fi
     backoff="$INTERVAL"
     if [ "$boot" -eq 1 ]; then
       boot=0
@@ -283,9 +286,11 @@ while true; do
       last_sweep="$sweep_now"
     fi
   else
+    ensure_rc=$?
     backoff=$((backoff * 2))
     ((backoff < INTERVAL)) && backoff="$INTERVAL"
     ((backoff > MAX_BACKOFF)) && backoff="$MAX_BACKOFF"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') router: ensure failed (rc=$ensure_rc): $(printf '%s\n' "$ensure_out" | tail -n 1); backing off to ${backoff}s" >&2
   fi
   sleep "$backoff"
 done
