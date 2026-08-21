@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -363,3 +364,35 @@ class DashboardActionTests(unittest.TestCase):
         build.assert_called_once_with()
 
 
+
+
+class PresetApplyReloadTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.client = tray.RouterClient(self.tmp.name)
+
+    def test_reload_runs_router_reload_subcommand(self):
+        with mock.patch.object(self.client, "_run", return_value=(0, "ok")) as run:
+            rc, out = self.client.reload()
+        self.assertEqual(rc, 0)
+        run.assert_called_once_with("reload")
+
+    def test_apply_preset_failure_skips_reload(self):
+        # Drive the same closure action_apply_preset builds, without the
+        # TrayApp worker machinery (locks/menu) that needs a full app.
+        app = mock.Mock()
+        app.client = self.client
+        captured = {}
+        def fake_do(fn, label):
+            captured["rc"] = fn()
+            captured["label"] = label
+        with mock.patch.object(self.client, "_run",
+                               side_effect=[(1, "boom"), (0, "reloaded")]) as run:
+            bound = tray.TrayApp.action_apply_preset.__get__(app)
+            real_do = tray.TrayApp._do.__get__(app)
+            # replace _do on the instance for this call
+            app._do = fake_do
+            bound("school-warp")
+        run.assert_called_once_with("setup", "--preset", "school-warp")
+        self.assertEqual(captured["rc"], (1, "boom"))
