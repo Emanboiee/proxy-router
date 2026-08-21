@@ -3342,3 +3342,42 @@ class EgressCheckParallelTests(unittest.TestCase):
         finally:
             router.ROOT, router.CONFIG_FILE = old_root, old_config
             router._providers, router._port = old_providers, old_port
+
+
+class DnsServerDedupeTests(unittest.TestCase):
+    def test_identical_resolvers_collapse_to_one_entry(self):
+        # Two providers whose profiles pin the same DNS must share one
+        # server entry (one warm DoH session, not two identical handshakes).
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        old = (router.ROOT, router.CONFIG_FILE, router._providers,
+               router._routes, router._vpn, router._routing, router._port)
+        try:
+            router.ROOT = Path(self._tmp.name)
+            router.CONFIG_FILE = router.ROOT / "router.json"
+            router.CONFIG_FILE.write_text("{}")
+            router._providers = {"p1": {}, "p2": {}}
+            router._routes = []
+            router._vpn, router._routing, router._port = {}, {}, 2080
+            conf = "[Interface]\nPrivateKey = AAAA\nAddress = 10.0.0.2/32\nDNS = 1.1.1.1\n[Peer]\nPublicKey = BBBB\nEndpoint = 127.0.0.1:51820\nAllowedIPs = 0.0.0.0/0\n"
+            for name in ("p1", "p2"):
+                d = router.ROOT / "providers" / name
+                d.mkdir(parents=True)
+                (d / "a.conf").write_text(conf)
+            with mock.patch.object(router, "parse_wireguard",
+                                   return_value={"type": "wireguard", "tag": "x"}), \
+                    mock.patch.object(router, "_usable_profile",
+                                      side_effect=lambda name, preferred=None:
+                                      router.ROOT / "providers" / name / "a.conf"):
+                config, _active = router.build_singbox_config()
+            servers = config["dns"]["servers"]
+            provider_servers = [s for s in servers if s["tag"] != "dns-local"]
+            self.assertEqual(len(provider_servers), 1,
+                             f"expected one shared resolver, got {provider_servers}")
+            # both endpoints resolve through the shared tag
+            resolvers = {e["domain_resolver"] for e in config["endpoints"]}
+            self.assertEqual(resolvers, {provider_servers[0]["tag"]})
+        finally:
+            (router.ROOT, router.CONFIG_FILE, router._providers,
+             router._routes, router._vpn, router._routing,
+             router._port) = old
