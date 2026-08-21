@@ -211,6 +211,17 @@ class CustomPresetTests(unittest.TestCase):
         self.assertEqual(school["provider"], "cloudflare")
         self.assertIn("cloudflare", data["providers"])
 
+    def test_school_warp_enables_doh_and_default_restores_udp(self):
+        # school-warp declares vpn.dns_transport=https (filtered networks
+        # drop UDP 53); applying a preset without a "vpn" section must not
+        # clobber the operator's existing VPN knobs.
+        setup_tui.apply_preset_by_name(self.root, "school-warp")
+        data = json.loads(self.config.read_text())
+        self.assertEqual(data["vpn"]["dns_transport"], "https")
+        setup_tui.apply_preset_by_name(self.root, "default")
+        data = json.loads(self.config.read_text())
+        self.assertEqual(data["vpn"]["dns_transport"], "udp")
+
     def test_apply_preset_idempotent(self):
         setup_tui.apply_preset_by_name(self.root, "school-warp")
         result = setup_tui.apply_preset_by_name(self.root, "school-warp")

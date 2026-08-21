@@ -159,11 +159,16 @@ _BUILTIN_PRESETS: dict = {
     "default": {  # the classic combo: opencode via proton + roblox via warp
         "routes": [_PRESET_ROUTES["opencode-zen"], _PRESET_ROUTES["roblox"]],
         "routing": {"mode": "default"},
+        # Unfiltered home/default networks: plain UDP 53 DNS (fast path).
+        "vpn": {"dns_transport": "udp"},
     },
     "school-warp": {
         "routes": [_PRESET_ROUTES["school"]],
         "routing": {"mode": "vpn-list",
                     "vpn_domains": list(_PRESET_ROUTES["school"]["domains"])},
+        # Filtered school/captive networks drop UDP 53; tunnel DNS must ride
+        # DoH there. Applying any other built-in preset restores UDP.
+        "vpn": {"dns_transport": "https"},
     },
 }
 
@@ -603,6 +608,13 @@ def apply_preset_by_name(root: Path, name: str) -> dict:
         # never clobber an explicitly-set default_provider with None
         if routing.get("default_provider"):
             data["routing"]["default_provider"] = routing["default_provider"]
+    vpn = preset.get("vpn") or {}
+    if vpn:
+        # Preset-declared VPN knobs (e.g. dns_transport for filtered
+        # networks) merge into the live config; a preset without a "vpn"
+        # section leaves the operator's current settings untouched.
+        data["vpn"] = data.get("vpn") or {}
+        data["vpn"].update(vpn)
     config_path.parent.mkdir(parents=True, exist_ok=True)
     # record the applied preset so `status` (and the tray) can show it
     data["preset"] = name
