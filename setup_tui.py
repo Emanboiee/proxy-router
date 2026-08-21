@@ -385,9 +385,7 @@ def configure_autocheck(config_path, preset: str | None = None, **overrides) -> 
         settings[key] = value
     settings["preset"] = selected
     data["keepalive"] = settings
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(json.dumps(data, indent=2) + "\n")
-    os.chmod(config_path, 0o600)
+    _atomic_write_config(config_path, data)
     return settings
 
 
@@ -410,6 +408,24 @@ def guide_text(provider: str) -> str:
 # ---------------------------------------------------------------------------
 # presets
 # ---------------------------------------------------------------------------
+
+def _atomic_write_config(path: Path, data: dict) -> None:
+    """Write a router.json-shaped dict atomically (tmp + os.replace).
+
+    Every config writer must go through this: a crash or full disk mid-write
+    of the plain write_text path left a truncated router.json, and the next
+    ensure/rotate then failed to parse it — the proxy stayed down until the
+    file was fixed by hand.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", dir=str(path.parent), delete=False,
+                                     encoding="utf-8") as tmp:
+        json.dump(data, tmp, indent=2, sort_keys=True)
+        tmp.write("\n")
+        tmp_path = Path(tmp.name)
+    os.replace(tmp_path, path)
+    os.chmod(path, 0o600)
+
 
 def _default_config() -> dict:
     example = Path(__file__).resolve().parent / "router.example.json"
@@ -457,9 +473,7 @@ def apply_presets(config_path, opencode=True, warp_roblox=True) -> dict:
         if not any(r.get("id") == "roblox" for r in routes):
             routes.append(dict(_PRESET_ROUTES["roblox"]))
             added.append("roblox")
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(json.dumps(data, indent=2) + "\n")
-    os.chmod(config_path, 0o600)
+    _atomic_write_config(config_path, data)
     return {"added": added}
 
 
@@ -496,9 +510,7 @@ def configure_fallback(config_path, primary: str, candidates: list[str] | str) -
         entry["fallback_providers"] = candidates
     else:
         entry.pop("fallback_providers", None)
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(json.dumps(data, indent=2) + "\n")
-    os.chmod(config_path, 0o600)
+    _atomic_write_config(config_path, data)
     return {"provider": primary, "fallback_providers": candidates}
 
 
@@ -514,9 +526,7 @@ def configure_transparent(config_path, enabled: bool = True) -> dict:
         raise ValueError("vpn configuration must be an object")
     capture = "routes" if enabled else "ruleset"
     vpn["capture"] = capture
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(json.dumps(data, indent=2) + "\n")
-    os.chmod(config_path, 0o600)
+    _atomic_write_config(config_path, data)
     return {"capture": capture}
 
 
@@ -618,8 +628,7 @@ def apply_preset_by_name(root: Path, name: str) -> dict:
     config_path.parent.mkdir(parents=True, exist_ok=True)
     # record the applied preset so `status` (and the tray) can show it
     data["preset"] = name
-    config_path.write_text(json.dumps(data, indent=2) + "\n")
-    os.chmod(config_path, 0o600)
+    _atomic_write_config(config_path, data)
     return {"added": added, "mode": mode, "preset": name}
 
 
@@ -650,7 +659,7 @@ def add_custom_preset(root: Path, name: str, provider: str, domains: list[str],
     }
     path = custom_preset_path(root, name)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(preset, indent=2) + "\n")
+    _atomic_write_config(path, preset)
     os.chmod(path, 0o600)
     return path
 
