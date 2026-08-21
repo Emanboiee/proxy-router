@@ -2791,6 +2791,36 @@ def engine_switch() -> int:
     return 1
 
 
+def _config_inputs_fingerprint() -> tuple | None:
+    """Cheap fingerprint of everything build_singbox_config() reads.
+
+    Covers router.json plus every provider profile and active/cooldown
+    marker under state/, by (path, mtime_ns, size). When this is unchanged,
+    the generated config cannot have changed either, so the expensive
+    rebuild+compare in _config_drifted can be skipped (keepalive calls
+    ensure every 15s; the rebuild includes bounded DNS lookups per peer).
+    """
+    try:
+        entries: list[tuple[str, int, int]] = []
+        config_path = CONFIG_FILE
+        st = config_path.stat()
+        entries.append((str(config_path), st.st_mtime_ns, st.st_size))
+        for pattern in ("providers/*/*.conf", "state/*.active", "state/*.cooldown",
+                        "state/mode", "state/fallback", "state/egress/*/*.json"):
+            for path in ROOT.glob(pattern):
+                try:
+                    st = path.stat()
+                except OSError:
+                    continue
+                entries.append((str(path), st.st_mtime_ns, st.st_size))
+        return tuple(sorted(entries))
+    except OSError:
+        return None
+
+
+_DRIFT_CACHE: dict = {"fingerprint": None, "drifted": False}
+
+
 def _config_drifted() -> bool:
     """True when the running engine's config no longer matches what the
     current router.json + active markers would generate.
@@ -2799,13 +2829,25 @@ def _config_drifted() -> bool:
     editing the on-disk sing-box.json diverged from reality — the proxy
     listener TLS-failed while transparent capture served traffic, until a
     manual reload converged. The ensure watchdog heals that drift with the
-    same graceful in-place reload rotations use."""
+    same graceful in-place reload rotations use.
+
+    The full rebuild+compare runs only when an input file changed since the
+    last check; unchanged inputs short-circuit to the cached verdict.
+    """
+    fingerprint = _config_inputs_fingerprint()
+    if fingerprint is not None and fingerprint == _DRIFT_CACHE["fingerprint"]:
+        return _DRIFT_CACHE["drifted"]
     try:
         fresh, _active = build_singbox_config()
         running = json.loads(SING_BOX_CONFIG.read_text())
     except (SystemExit, KeyError, ValueError, OSError, configparser.Error, json.JSONDecodeError):
-        return False  # never block ensure on a build/read problem
-    return json.dumps(fresh, sort_keys=True) != json.dumps(running, sort_keys=True)
+        # never block ensure on a build/read problem; don't cache either
+        return False
+    drifted = json.dumps(fresh, sort_keys=True) != json.dumps(running, sort_keys=True)
+    if fingerprint is not None:
+        _DRIFT_CACHE["fingerprint"] = fingerprint
+        _DRIFT_CACHE["drifted"] = drifted
+    return drifted
 
 
 def engine_ensure() -> int:

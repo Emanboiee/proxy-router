@@ -3236,3 +3236,64 @@ class WithProxyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConfigDriftCacheTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._saved = (router.ROOT, router.CONFIG_FILE,
+                       router._providers, router._routes, router._vpn,
+                       router._routing, router._port)
+        self.addCleanup(lambda: setattr(router, "_providers", router._providers))
+        router.ROOT = Path(self._tmp.name)
+        router.CONFIG_FILE = router.ROOT / "router.json"
+        router.CONFIG_FILE.write_text("{}")
+        # Prior tests leave provider/route globals loaded from their own tmp
+        # roots; reset to a clean slate so both drifted() calls in this test
+        # read exactly the same inputs.
+        router._providers, router._routes = {}, []
+        router._vpn, router._routing, router._port = {}, {}, 2080
+        router._DRIFT_CACHE["fingerprint"] = None
+
+    def tearDown(self):
+        (router.ROOT, router.CONFIG_FILE, router._providers,
+         router._routes, router._vpn, router._routing,
+         router._port) = self._saved
+        router._DRIFT_CACHE["fingerprint"] = None
+
+    def test_unchanged_inputs_short_circuit_to_cached_verdict(self):
+        calls = {"n": 0}
+        real_build = router.build_singbox_config
+
+        def counting_build(*a, **k):
+            calls["n"] += 1
+            return real_build(*a, **k)
+
+        with mock.patch.object(router, "build_singbox_config", side_effect=counting_build), \
+                mock.patch.object(router, "SING_BOX_CONFIG",
+                                  Path(self._tmp.name) / "sing-box.json"):
+            (router.ROOT / "sing-box.json").write_text("{}")
+            first = router._config_drifted()
+            second = router._config_drifted()
+        self.assertEqual(first, second)
+        # second call served from the fingerprint cache
+        self.assertEqual(calls["n"], 1)
+
+    def test_changed_input_invalidates_cache(self):
+        calls = {"n": 0}
+        real_build = router.build_singbox_config
+
+        def counting_build(*a, **k):
+            calls["n"] += 1
+            return real_build(*a, **k)
+
+        with mock.patch.object(router, "build_singbox_config", side_effect=counting_build), \
+                mock.patch.object(router, "SING_BOX_CONFIG",
+                                  Path(self._tmp.name) / "sing-box.json"):
+            (router.ROOT / "sing-box.json").write_text("{}")
+            router._config_drifted()
+            time.sleep(0.01)
+            router.CONFIG_FILE.write_text('{"port": 2080}')
+            router._config_drifted()
+        self.assertEqual(calls["n"], 2)
