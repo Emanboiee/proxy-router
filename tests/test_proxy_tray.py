@@ -312,18 +312,18 @@ class DashboardOpenerTests(unittest.TestCase):
     @unittest.skipUnless(sys.platform == "darwin", "macOS Terminal path")
     def test_macos_opens_terminal_with_tui(self):
         calls = []
-        def fake_run(argv, **kwargs):
+        def fake_popen(argv, **kwargs):
             calls.append(argv)
-            return subprocess.CompletedProcess(argv, 0)
-        with mock.patch.object(tray.subprocess, "run", side_effect=fake_run):
+            return mock.Mock()
+        with mock.patch.object(tray.subprocess, "Popen", side_effect=fake_popen):
             self.assertTrue(tray.open_dashboard(self.root))
         self.assertEqual(calls[0][0], "osascript")
         self.assertIn("setup_tui.py", " ".join(calls[0]))
 
     def test_macos_terminal_failure_fails_quietly(self):
-        failed = subprocess.CompletedProcess(["osascript"], 1)
         with mock.patch.object(tray.sys, "platform", "darwin"), \
-             mock.patch.object(tray.subprocess, "run", return_value=failed):
+             mock.patch.object(tray.subprocess, "Popen",
+                               side_effect=OSError("no Terminal")):
             self.assertFalse(tray.open_dashboard(self.root))
 
 

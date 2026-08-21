@@ -335,14 +335,19 @@ def open_dashboard(root) -> bool:
         script = f"cd {shlex.quote(str(root))} && {shlex.quote(python)} setup_tui.py"
         content = script.replace("\\", "\\\\").replace('"', '\\"')
         try:
-            proc = subprocess.run(
+            # Popen, not run(): this fires from a Cocoa menu callback on the
+            # main thread. osascript's 10s synchronous timeout there froze
+            # the entire tray (menu + icon) whenever Terminal was slow to
+            # answer Apple events. We only need to LAUNCH osascript; its
+            # success/failure is not worth blocking the UI for.
+            subprocess.Popen(
                 ["osascript", "-e",
                  f'tell application "Terminal" to do script "{content}"'],
-                capture_output=True, text=True, timeout=10)
-        except (OSError, subprocess.TimeoutExpired) as exc:
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except OSError as exc:
             print(f"dashboard: could not open Terminal: {exc}", file=sys.stderr)
             return False
-        return proc.returncode == 0
     launchers = [
         ["x-terminal-emulator", "-e", f"{python} setup_tui.py"],
         ["gnome-terminal", "--", f"{python} setup_tui.py"],
