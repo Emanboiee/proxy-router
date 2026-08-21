@@ -230,3 +230,38 @@ class RouteWatcherTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProviderForHostTests(unittest.TestCase):
+    def _root_with_routes(self, routes):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / "router.json").write_text(json.dumps({"routes": routes}))
+        return root
+
+    def test_maps_host_to_its_route_provider(self):
+        root = self._root_with_routes([
+            {"id": "twitch", "domains": ["twitch.tv"], "provider": "proton"},
+            {"id": "school", "domains": ["discord.com"], "provider": "cloudflare"},
+        ])
+        self.assertEqual(w.provider_for_host(root, "discord.com"), "cloudflare")
+        self.assertEqual(w.provider_for_host(root, "www.twitch.tv"), "proton")
+
+    def test_first_matching_route_wins(self):
+        root = self._root_with_routes([
+            {"id": "a", "domains": ["x.com"], "provider": "proton"},
+            {"id": "b", "domains": ["x.com"], "provider": "cloudflare"},
+        ])
+        self.assertEqual(w.provider_for_host(root, "x.com"), "proton")
+
+    def test_unmatched_host_returns_none(self):
+        root = self._root_with_routes([
+            {"id": "a", "domains": ["x.com"], "provider": "proton"},
+        ])
+        self.assertIsNone(w.provider_for_host(root, "other.com"))
+
+    def test_unreadable_config_returns_none(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.assertIsNone(w.provider_for_host(Path(tmp.name), "x.com"))
