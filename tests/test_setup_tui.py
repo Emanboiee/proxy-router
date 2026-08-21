@@ -2,9 +2,12 @@
 import io
 import json
 import os
+import shutil
 import stat
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -844,3 +847,26 @@ class RoutingTuiTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class RouterCommandTimeoutTests(unittest.TestCase):
+    def test_hung_command_returns_within_budget(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        started = time.monotonic()
+        rc = setup_tui._router_command(root, "status", timeout=3.0)
+        elapsed = time.monotonic() - started
+        # router.py status against an empty root exits fast OR the timeout
+        # fires; either way we must never hang past the budget (+slack).
+        self.assertLess(elapsed, 10.0)
+        self.assertIsInstance(rc, int)
+
+    def test_timeout_returns_nonzero_with_message(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        with mock.patch.object(setup_tui.subprocess, "run",
+                               side_effect=subprocess.TimeoutExpired(cmd=["x"], timeout=1)):
+            err = io.StringIO()
+            with mock.patch("sys.stderr", err):
+                rc = setup_tui._router_command(root, "rotate", "proton", timeout=180.0)
+        self.assertEqual(rc, 1)
+        self.assertIn("timed out after 180s", err.getvalue())

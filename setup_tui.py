@@ -1037,12 +1037,24 @@ def _cmd_keepalive_install(root: Path, remove: bool = False) -> int:
     return result.returncode
 
 
-def _router_command(root: Path, *args: str) -> int:
-    """Run the existing router CLI against ``root`` (never enabled implicitly)."""
+def _router_command(root: Path, *args: str, timeout: float = 120.0) -> int:
+    """Run the existing router CLI against ``root`` (never enabled implicitly).
+
+    A timeout keeps a hung router.py (stuck lock, dead upstream probe) from
+    freezing the TUI key loop indefinitely; long-running mutations
+    (rotate/sweep with settle windows) pass an explicit larger budget.
+    """
     script = Path(__file__).resolve().parent / "router.py"
     env = dict(os.environ, PROXY_ROUTER_ROOT=str(root))
     try:
-        return subprocess.call([sys.executable, str(script), *args], env=env)
+        result = subprocess.run([sys.executable, str(script), *args],
+                                env=env, timeout=timeout)
+        return result.returncode
+    except subprocess.TimeoutExpired:
+        print(f"setup: {' '.join(args)} timed out after {timeout:.0f}s "
+              "(still running in the background? check `router.py status`)",
+              file=sys.stderr)
+        return 1
     except OSError as exc:
         print(f"setup: could not run {script}: {exc}", file=sys.stderr)
         return 1
@@ -2349,10 +2361,12 @@ def _execute_action(action: tuple, root: Path) -> tuple[str, int]:
                 buf.write(str(exc))
                 rc = 1
         elif kind == "rotate_provider":
-            rc = _router_command(root, "rotate", action[1])
+            # rotation includes probe + settle window + possible rollback
+            rc = _router_command(root, "rotate", action[1], timeout=180.0)
             buf.write(f"rotated {action[1]} (in place; settle retry applies)")
         elif kind == "rotate_to":
-            rc = _router_command(root, "rotate", action[1], "--to", action[2])
+            rc = _router_command(root, "rotate", action[1], "--to", action[2],
+                                 timeout=180.0)
             buf.write(f"set {action[1]} exit -> {action[2]}")
         elif kind == "failover_on":
             rc = _router_command(root, "failover", action[1], "on")
