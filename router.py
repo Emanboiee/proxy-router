@@ -1340,8 +1340,18 @@ def _probe_with_settle(name: str, profile: Path, *, port: int | None = None) -> 
         return ok, record
     print(f"router: probe failed for {profile.stem}; retrying once after {settle:.0f}s settle",
           file=sys.stderr)
-    time.sleep(settle)
-    return probe_profile(name, profile, port=port)
+    # Poll the settle window instead of sleeping through it: an exit whose
+    # handshake completes early is detected within one poll step instead of
+    # always paying the full settle (measured worst case: 20s of dead-riding
+    # traffic per failed rotation).
+    poll_step = min(2.0, max(0.5, settle / 10.0))
+    deadline = time.monotonic() + settle
+    while time.monotonic() < deadline:
+        time.sleep(min(poll_step, max(0.0, deadline - time.monotonic())))
+        ok, record = probe_profile(name, profile, port=port)
+        if ok:
+            return ok, record
+    return ok, record
 
 
 _DNS_ERROR_RE = re.compile(

@@ -1328,18 +1328,34 @@ class RotationEgressTests(unittest.TestCase):
 
     def test_rotate_retries_probe_once_after_settle(self):
         # A fresh WireGuard exit can blackhole inner TLS for its first
-        # seconds: one retry after the settle window must rescue the switch
-        # instead of rolling back a healthy exit.
+        # seconds: the settle window is polled, so a retry that succeeds
+        # rescues the switch instead of rolling back a healthy exit.
         router.set_active("proton", self._profile("a"))
         router._egress_settings = {**router.DEFAULT_EGRESS_SETTINGS, "probe_settle_seconds": 25}
         with mock.patch.object(router, "listener_up", return_value=True), \
-                mock.patch.object(router.time, "sleep") as slept, \
+                mock.patch.object(router.time, "sleep"), \
                 mock.patch.object(router, "probe_profile",
                                   side_effect=[(False, {"ok": False}), (True, {"ok": True})]) as probe:
             self.assertEqual(router.rotate("proton"), 0)
-        self.assertEqual(probe.call_count, 2)
-        slept.assert_called_once_with(25.0)
+        # first probe failed; polled retries rescued it within the window
+        self.assertGreaterEqual(probe.call_count, 2)
         self.assertEqual(self._active(), "b")  # kept the switched exit
+
+    def test_rotate_settle_poll_bounded_by_window(self):
+        # The settle poll must never exceed the configured window even when
+        # every retry fails (worst case: rotation still fails after ~settle,
+        # not settle + unbounded extra probes).
+        router.set_active("proton", self._profile("a"))
+        router._egress_settings = {**router.DEFAULT_EGRESS_SETTINGS, "probe_settle_seconds": 4}
+        started = router.time.monotonic()
+        with mock.patch.object(router, "listener_up", return_value=True), \
+                mock.patch.object(router, "probe_profile",
+                                  return_value=(False, {"ok": False})):
+            self.assertEqual(router.rotate("proton"), 1)
+        # The settle poll is wall-clock bounded by the configured window
+        # (plus one final probe), never an unbounded retry loop.
+        elapsed = router.time.monotonic() - started
+        self.assertLess(elapsed, 4 + 10)
 
     def test_rotate_no_probe_skips_probe(self):
         router.set_active("proton", self._profile("a"))
