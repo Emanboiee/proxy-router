@@ -1,5 +1,6 @@
 """Unit tests for router.py (stdlib only, no third-party deps, no network)."""
 import json
+import io
 import os
 import socket
 import stat
@@ -3297,3 +3298,40 @@ class ConfigDriftCacheTests(unittest.TestCase):
             router.CONFIG_FILE.write_text('{"port": 2080}')
             router._config_drifted()
         self.assertEqual(calls["n"], 2)
+
+
+class EgressCheckParallelTests(unittest.TestCase):
+    def test_parallel_probes_overlap_in_time(self):
+        # Three providers each probing with a 0.3s delay: sequential would
+        # take >=0.9s; the concurrent path must finish in well under that.
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        old_root, old_config = router.ROOT, router.CONFIG_FILE
+        old_providers, old_port = router._providers, router._port
+        router.ROOT = Path(self._tmp.name)
+        router.CONFIG_FILE = router.ROOT / "router.json"
+        router.CONFIG_FILE.write_text("{}")
+        router._providers = {"a": {}, "b": {}, "c": {}}
+        try:
+            for name in router._providers:
+                (router.ROOT / "state").mkdir(parents=True, exist_ok=True)
+            def slow_check(provider, profile, **k):
+                time.sleep(0.3)
+                return "alive", {"ok": True, "status": 200}
+            with mock.patch.object(router, "persisted_active", return_value=None), \
+                    mock.patch.object(router, "resolve_active",
+                                      side_effect=lambda name: Path(self._tmp.name) / f"{name}.conf"), \
+                    mock.patch.object(router, "active_fallback", return_value=None), \
+                    mock.patch.object(router, "check_egress_live", side_effect=slow_check), \
+                    mock.patch.object(router, "listener_up", return_value=True), \
+                    mock.patch.object(router, "_port", 2080), \
+                    mock.patch("sys.stdout", new_callable=io.StringIO):
+                started = time.monotonic()
+                rc = router.egress_check(None, as_json=False)
+                elapsed = time.monotonic() - started
+            self.assertEqual(rc, 0)
+            self.assertLess(elapsed, 0.9,
+                            "egress check probes appear to run sequentially")
+        finally:
+            router.ROOT, router.CONFIG_FILE = old_root, old_config
+            router._providers, router._port = old_providers, old_port
