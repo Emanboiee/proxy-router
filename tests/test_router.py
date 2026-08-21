@@ -1945,8 +1945,15 @@ class EgressCheckCommandTests(unittest.TestCase):
     def test_json_shape(self):
         router.set_active("proton", self.root / "providers" / "proton" / "a.conf")
         router.set_active("cloudflare", self.root / "providers" / "cloudflare" / "b.conf")
-        self._live(("dead", {"ok": False, "dns_ok": False}),
-                   ("alive", {"ok": True, "dns_ok": True}))
+        # key verdicts by provider (probes may run concurrently)
+        def by_provider(name, profile, **kwargs):
+            if name == "proton":
+                return ("dead", {"ok": False, "dns_ok": False})
+            return ("alive", {"ok": True, "dns_ok": True})
+        self.live_patch.stop()
+        self.live_patch = mock.patch.object(router, "check_egress_live",
+                                            side_effect=by_provider)
+        self.live = self.live_patch.start()
         with mock.patch("sys.stdout.write") as write:
             rc = router.egress_check(as_json=True)
         self.assertEqual(rc, 1)
