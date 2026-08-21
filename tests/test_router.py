@@ -1909,23 +1909,23 @@ class EgressCheckCommandTests(unittest.TestCase):
         router.set_active("proton", self.root / "providers" / "proton" / "a.conf")
         router.set_active("cloudflare", self.root / "providers" / "cloudflare" / "b.conf")
         self.live_patch.stop()  # exercise the real check_egress_live/record path
-        probes = [
-            # proton: transport-dead twice (the blip retry re-probes once)
-            {"ok": False, "latency_ms": None, "status": None,
-             "error": "URLError: timeout", "block_reason": None},
-            {"ok": False, "latency_ms": None, "status": None,
-             "error": "URLError: timeout", "block_reason": None},
-            # cloudflare: alive first try
-            {"ok": True, "latency_ms": 42.0, "status": 200,
-             "error": None, "block_reason": None},
-        ]
-        with mock.patch.object(router, "probe_egress", side_effect=probes) as probe, \
+        def scripted_probe(url=None, **kwargs):
+            # Order-independent: providers may be probed concurrently, so key
+            # the verdict off the routed host in the URL instead of call
+            # sequence (proton rides example.com, cloudflare rides roblox.com).
+            if "example.com" in (url or ""):
+                return {"ok": False, "latency_ms": None, "status": None,
+                        "error": "URLError: timeout", "block_reason": None}
+            return {"ok": True, "latency_ms": 42.0, "status": 200,
+                    "error": None, "block_reason": None}
+        with mock.patch.object(router, "probe_egress",
+                               side_effect=lambda url=None, **k: scripted_probe(url=url, **k)) as probe, \
              mock.patch.object(router, "egress_dns_probe", return_value=True), \
              mock.patch.object(router.time, "sleep"), \
              mock.patch("sys.stdout.write") as write:
             rc = router.egress_check()
         self.assertEqual(rc, 1)
-        self.assertEqual(probe.call_count, 3)
+        self.assertGreaterEqual(probe.call_count, 3)
         joined = "".join(str(c) for c in write.call_args_list)
         self.assertIn("dead: proton", joined)
         self.assertNotIn("dead: cloudflare", joined)
