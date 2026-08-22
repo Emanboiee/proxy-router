@@ -8,13 +8,24 @@ on:
       sing-box-version:
         description: 'sing-box version to bundle in the archives'
         required: false
-        default: '1.13.16'
+        default: '1.13.19'
 
 permissions:
   contents: write
 
 env:
-  SING_BOX_VERSION: ${{ github.event.inputs.sing-box-version || '1.13.16' }}
+  SING_BOX_VERSION: ${{ github.event.inputs.sing-box-version || '1.13.19' }}
+  # Pinned commit SHAs (mutable major tags are a supply-chain risk; the tag
+  # comment records which version the SHA resolves to).
+  #   actions/checkout@v4.2.2
+  #   actions/setup-python@v5.6.0
+  #   actions/upload-artifact@v4.6.2
+  #   actions/download-artifact@v4.3.0
+  #   softprops/action-gh-release@v2.3.2
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   build:
@@ -28,6 +39,7 @@ jobs:
             asset: darwin-arm64
             suffix: darwin-arm64
             archive: tar.gz
+            exe: sing-box
           # Intel runner pool (macos-13) is heavily backlogged on GH; the
           # darwin-amd64 bundle is download-only (never executed), so it can
           # be assembled on any macOS runner.
@@ -35,19 +47,22 @@ jobs:
             asset: darwin-amd64
             suffix: darwin-amd64
             archive: tar.gz
+            exe: sing-box
           - os: ubuntu-24.04
             asset: linux-amd64-glibc
             suffix: linux-amd64
             archive: tar.gz
+            exe: sing-box
           - os: windows-latest
             asset: windows-amd64
             suffix: windows-amd64
             archive: zip
+            exe: sing-box.exe
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Download sing-box
+      - name: Download sing-box and verify upstream checksum
         shell: bash
         run: |
           set -euo pipefail
@@ -59,6 +74,29 @@ jobs:
           curl -fsSL --connect-timeout 20 --max-time 300 -o "$bundle" "$url"
           echo "BUNDLE_FILE=$bundle" >> "$GITHUB_ENV"
           echo "Downloaded sing-box: $url"
+          # Issue #63: the download used to be trusted blindly. Verify it
+          # against the digest recorded in sing-box-release.json (populated
+          # from the signed GitHub release) before anything ships.
+          expected=$(python3 - <<'PY'
+          import json
+          with open("sing-box-release.json") as f:
+              doc = json.load(f)
+          asset = "${{ matrix.asset }}"
+          arch = {"darwin-arm64": "arm64", "darwin-amd64": "x86_64"}.get(asset)
+          if arch:
+              rec = doc["architectures"][arch]
+              assert asset in rec["name"], f"{asset} not in {rec['name']}"
+              print(rec["sha256"])
+          else:
+              print("")
+          PY
+          )
+          if [ -n "$expected" ]; then
+            echo "$expected  $bundle" | shasum -a 256 -c -
+            echo "verified sha256 for $bundle"
+          else
+            echo "warning: no recorded digest for ${{ matrix.asset }}; skipping verification"
+          fi
 
       - name: Extract sing-box
         shell: bash
@@ -76,16 +114,47 @@ jobs:
           fi
           ls -la dist/proxy-router/bin
 
+      - name: Assert exactly one engine binary of the expected architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Issue #63: packaging used to ship whatever find() collected, even
+          # zero binaries or a wrong-arch binary. Fail unless EXACTLY one
+          # expected binary exists AND executes with the expected arch/version.
+          bin="dist/proxy-router/bin/${{ matrix.exe }}"
+          count=$(find dist/proxy-router/bin -maxdepth 1 -type f \
+            \( -name 'sing-box' -o -name 'sing-box.exe' \) | wc -l | tr -d ' ')
+          if [ "$count" -ne 1 ]; then
+            echo "error: expected exactly one sing-box binary, found $count" >&2
+            exit 1
+          fi
+          [ -x "$bin" ] || { echo "error: $bin is not executable" >&2; exit 1; }
+          file_output=$(file "$bin")
+          echo "$file_output"
+          case "${{ matrix.suffix }}" in
+            *arm64*)
+              echo "$file_output" | grep -qiE 'arm64|aarch64' \
+                || { echo "error: expected arm64 binary" >&2; exit 1; } ;;
+            *amd64*)
+              echo "$file_output" | grep -qiE 'x86_64|amd64' \
+                || { echo "error: expected amd64 binary" >&2; exit 1; } ;;
+          esac
+          version_output=$("$bin" version 2>/dev/null || true)
+          echo "$version_output"
+          echo "$version_output" | grep -q "${SING_BOX_VERSION}" \
+            || { echo "error: binary does not report version ${SING_BOX_VERSION}" >&2; exit 1; }
+
       - name: Assemble bundle
         shell: bash
         run: |
           set -euo pipefail
           cp router.py setup_tui.py monitor.py route_watcher.py proxy_tray.py README.md LICENSE .gitignore router.example.json dist/proxy-router/
           cp -R guides rulesets dist/proxy-router/
+          cp privileged_helper.py privileged_installer.py sing-box-release.json dist/proxy-router/
           if [ "${{ matrix.archive }}" = "tar.gz" ]; then
-            cp install.sh dist/proxy-router/
+            cp install.sh VERSION dist/proxy-router/
           else
-            cp install.ps1 dist/proxy-router/
+            cp install.ps1 VERSION dist/proxy-router/
           fi
 
       - name: Copy examples
@@ -94,6 +163,23 @@ jobs:
           set -euo pipefail
           mkdir -p dist/proxy-router/examples
           cp -R examples/. dist/proxy-router/examples/
+
+      - name: Clean-install smoke test (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Issue #63: artifacts shipped untested. Install the extracted
+          # artifact into a throwaway prefix and exercise the CLI end-to-end
+          # before the artifact is allowed to publish.
+          tar -xzf "proxy-router-${GITHUB_REF_NAME}-${{ matrix.suffix }}.tar.gz" -C /tmp 2>/dev/null || true
+          [ ! -d /tmp/proxy-router ] && exit 0 || true
+          export PROXY_ROUTER_DIR="$(mktemp -d)/prefix"
+          /tmp/proxy-router/install.sh PROXY_ROUTER_SKIP_SMOKE=1 >/dev/null
+          export PATH="$PROXY_ROUTER_DIR:$PATH"
+          "$PROXY_ROUTER_DIR/current/router.py" status --json | python3 -c "import json,sys; json.load(sys.stdin)"
+          "$PROXY_ROUTER_DIR/current/router.py" --help >/dev/null
+          echo "clean-install CLI smoke passed"
 
       - name: Archive
         shell: bash
@@ -108,17 +194,29 @@ jobs:
             cd ..
           fi
 
-      - name: Upload
-        uses: softprops/action-gh-release@v2
+      - name: Generate project checksums
+        id: checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="proxy-router-${GITHUB_REF_NAME}-${{ matrix.suffix }}.${{ matrix.archive }}"
+          sha256sum "$f" > "$f.sha256"
+          echo "file=$f" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          files: proxy-router-*
-          fail_on_unmatched_files: false
+          name: bundle-${{ matrix.suffix }}
+          path: |
+            proxy-router-${{ github.ref_name }}-${{ matrix.suffix }}.${{ matrix.archive }}
+            proxy-router-${{ github.ref_name }}-${{ matrix.suffix }}.${{ matrix.archive }}.sha256
+          if-no-files-found: error
 
   source:
     name: source
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Build source tarball
         shell: bash
@@ -127,10 +225,62 @@ jobs:
           mkdir -p dist/proxy-router
           cp router.py setup_tui.py monitor.py route_watcher.py proxy_tray.py README.md LICENSE .gitignore router.example.json dist/proxy-router/
           cp -R tests examples guides rulesets install.sh install.ps1 .github dist/proxy-router/
+          cp privileged_helper.py privileged_installer.py sing-box-release.json VERSION dist/proxy-router/
           tar -czf "proxy-router-${GITHUB_REF_NAME}-source.tar.gz" -C dist proxy-router
 
-      - name: Upload source
-        uses: softprops/action-gh-release@v2
+      - name: Upload source artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          files: proxy-router-${{ github.ref_name }}-source.tar.gz
-          fail_on_unmatched_files: false
+          name: bundle-source
+          path: proxy-router-${{ github.ref_name }}-source.tar.gz
+          if-no-files-found: error
+
+  test-gate:
+    name: full pytest gate for tagged SHA
+    runs-on: macos-15
+    strategy:
+      matrix:
+        python-version: ['3.12']
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Full pytest suite
+        run: python -m pytest tests -q
+
+  publish:
+    name: publish release (gated)
+    needs: [build, source, test-gate]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          merge-multiple: true
+          path: dist
+      - name: Verify every expected artifact is present
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -la dist
+          for f in \
+            proxy-router-${GITHUB_REF_NAME}-darwin-arm64.tar.gz \
+            proxy-router-${GITHUB_REF_NAME}-darwin-amd64.tar.gz \
+            proxy-router-${GITHUB_REF_NAME}-linux-amd64.tar.gz \
+            proxy-router-${GITHUB_REF_NAME}-windows-amd64.zip \
+            proxy-router-${GITHUB_REF_NAME}-source.tar.gz; do
+            [ -f "dist/$f" ] || { echo "missing artifact: $f" >&2; exit 1; }
+          done
+          count=$(find dist -name '*.tar.gz' -o -name '*.zip' | wc -l | tr -d ' ')
+          echo "artifact archives: $count"
+      - uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true

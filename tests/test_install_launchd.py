@@ -35,6 +35,10 @@ class InstallLaunchdHarness:
         (self.home / "Library" / "LaunchAgents").mkdir(parents=True)
         self.root = Path(self._tmp.name) / "prefix"
         self.root.mkdir(parents=True)
+        # New install-launchd.sh validates that the prefix actually contains
+        # router.py before trusting it; stage a marker so positive-path tests
+        # exercise a well-formed root.
+        (self.root / "router.py").write_text("# test stub\n")
         (self.root / "examples").mkdir(parents=True)
         (self.root / "examples" / "com.proxy-router.keepalive.plist.template").write_text(
             TEMPLATE_SRC.read_text()
