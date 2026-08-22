@@ -476,6 +476,10 @@ class RouterClient:
         """Apply a named preset (idempotent, lossless) via the setup CLI."""
         return self._run("setup", "--preset", name)
 
+    def reload(self) -> tuple[int, str]:
+        """Hot-reload the engine config in place (SIGHUP; no restart)."""
+        return self._run("reload")
+
     def vpn(self, action: str) -> tuple[int, str]:
         """Toggle full-tunnel (TUN) mode via the router CLI.
 
@@ -725,8 +729,19 @@ class TrayApp:
         self._do(pick_and_import, f"import {provider}")
 
     def action_apply_preset(self, name: str):
-        """One-click preset apply (idempotent, lossless, no engine touch)."""
-        self._do(lambda: self.client.setup_preset(name), f"preset {name}")
+        """One-click preset apply (idempotent, lossless) + hot reload.
+
+        Writing router.json alone never re-routes traffic; without the
+        follow-up reload the menu reported "done" while the old exits kept
+        serving. The reload applies the preset in place (SIGHUP; the engine
+        keeps running) and the toast reports the combined result.
+        """
+        def _apply_and_reload():
+            rc, out = self.client.setup_preset(name)
+            if rc != 0:
+                return rc, out
+            return self.client.reload()
+        self._do(_apply_and_reload, f"preset {name}")
 
     def action_show_guide(self, provider: str):
         """Open the bundled setup guide in the default app (macOS) so a
