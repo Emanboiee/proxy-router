@@ -3011,7 +3011,13 @@ def engine_reload(active_overrides: dict[str, Path] | None = None) -> int:
             print("router: engine failed to start with new config; restoring last-good", file=sys.stderr)
             return restore_last_good()
         return 0
-    if wait_engine(2.0, log_from=reload_log_from):
+    # In tun mode a fresh WireGuard handshake routinely needs >2s before an
+    # end-to-end egress probe can succeed; a 2s budget almost always failed
+    # here and degraded every tun-mode reload into a full stop/start
+    # (multi-second traffic cut). Give the handshake a realistic budget —
+    # proxy mode keeps the snappy 2s (listener answers in ms).
+    reload_wait = 12.0 if current_mode() == "tun" else 2.0
+    if wait_engine(reload_wait, log_from=reload_log_from):
         # The new config demonstrably runs: snapshot it as last-good.
         write_last_good()
         return 0
