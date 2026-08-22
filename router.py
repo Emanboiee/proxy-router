@@ -248,17 +248,22 @@ def _hand_back_ownership(path: Path) -> None:
     tun mode needs root, so `sudo vpn on` writes state files as root with
     0600; the regular-user keepalive/CLI then cannot read them and treats
     a live engine as dead (garbage pid file H6, unreadable mode/config),
-    churning restarts. SUDO_UID/SUDO_GID identify who to hand back to."""
+    churning restarts. SUDO_UID/SUDO_GID identify who to hand back to.
+    Failures are reported, not swallowed: an unhanded-back file locks the
+    regular-user keepalive out and silently resurrects the churn loop."""
     if os.geteuid() != 0:
         return
     uid = os.environ.get("SUDO_UID")
     gid = os.environ.get("SUDO_GID")
     if not uid or not gid:
+        print(f"router: root run without SUDO_UID/SUDO_GID; {path} stays root-owned",
+              file=sys.stderr)
         return
     try:
         os.chown(path, int(uid), int(gid))
-    except (OSError, ValueError):
-        pass
+    except (OSError, ValueError) as exc:
+        print(f"router: ownership hand-back failed for {path}: {exc}",
+              file=sys.stderr)
 
 
 def set_mode(mode: str) -> None:
@@ -3086,7 +3091,6 @@ def _elevated_reload() -> int:
         )
     return _helper_run("reload")
 
-
 # ---------------------------------------------------------------------------
 # network-aware preset switching
 # ---------------------------------------------------------------------------
@@ -3938,6 +3942,25 @@ def _provider_status(name: str) -> dict:
     return entry
 
 
+def _legacy_launch_agents() -> list[str]:
+    """Read-only probe for known legacy proxy-router launch agents.
+
+    An older install (e.g. com.hermes.proxy-router) can coexist with the
+    current keepalive/tray agents and resurrect a stale engine on login.
+    The installer prints migration steps when it finds one; status surfaces
+    the same fact read-only so a live box is never silently half-migrated.
+    """
+    if sys.platform != "darwin":
+        return []
+    agents_dir = Path.home() / "Library" / "LaunchAgents"
+    if not agents_dir.is_dir():
+        return []
+    found = []
+    for plist in sorted(agents_dir.glob("com.hermes.proxy-router*.plist")):
+        found.append(plist.name)
+    return found
+
+
 def status_json() -> dict:
     """Full machine-readable status for `status --json`."""
     rc, line = _status_report()
@@ -3968,6 +3991,10 @@ def status_json() -> dict:
         data["watcher"] = route_watcher.status(ROOT)
     except Exception:
         data["watcher"] = {"running": False, "enabled": False, "scope": "proxy-observable only"}
+    try:
+        data["legacy_agents"] = _legacy_launch_agents()
+    except Exception:
+        data["legacy_agents"] = []
     rotation = {
         "interval_seconds": scheduled_interval(),
         "jitter_seconds": int(_rotation.get("jitter_seconds", DEFAULT_ROTATION_SETTINGS["jitter_seconds"]) or 0),
@@ -5120,6 +5147,16 @@ def main() -> int:
             print(json.dumps(status_json(), indent=2, sort_keys=True))
         else:
             print(line)
+            try:
+                legacy = _legacy_launch_agents()
+            except Exception:
+                legacy = []
+            if legacy:
+                names = ", ".join(legacy)
+                print(f"router: legacy launch agent(s) still installed: {names}",
+                      file=sys.stderr)
+                print("router: migrate with `router.py elevate install` or remove "
+                      "them from ~/Library/LaunchAgents", file=sys.stderr)
         return rc
     if args.cmd == "reload":
         rc = _with_lock(engine_reload)

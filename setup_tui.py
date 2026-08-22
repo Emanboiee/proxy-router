@@ -1078,14 +1078,48 @@ def _read_vpn_mode(root: Path) -> str:
     return mode if mode in ("proxy", "tun") else "proxy"
 
 
+# The tray needs pystray; the TUI may be running under a bare python
+# (framework installs, Homebrew) that lacks it. Prefer the same pinned
+# interpreter the launchd/keepalive/elevation paths use (PROXY_ROUTER_PYTHON),
+# then sys.executable, then known-good interpreters, probing each with
+# `import pystray`.
+_TRAY_PYTHON_CANDIDATES = (
+    os.environ.get("PROXY_ROUTER_PYTHON"),
+    sys.executable,
+    "/opt/anaconda3/bin/python3",
+)
+
+
+def _resolve_tray_python() -> str | None:
+    """Return the first candidate able to import pystray, else None."""
+    seen: set[str] = set()
+    for candidate in _TRAY_PYTHON_CANDIDATES:
+        if not candidate or candidate in seen or not os.path.isfile(candidate):
+            continue
+        seen.add(candidate)
+        try:
+            probe = subprocess.run(
+                [candidate, "-c", "import pystray"],
+                capture_output=True, timeout=15,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if probe.returncode == 0:
+            return candidate
+    return None
+
+
 def _launch_tray(root: Path) -> None:
     """Best-effort tray autostart; never fails the action when the tray is absent."""
     script = Path(__file__).resolve().parent / "proxy_tray.py"
     if not script.is_file():
         return
+    python = _resolve_tray_python()
+    if python is None:
+        return
     env = dict(os.environ, PROXY_ROUTER_ROOT=str(root))
     try:
-        subprocess.Popen([sys.executable, str(script)], env=env,
+        subprocess.Popen([python, str(script)], env=env,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True)
     except OSError:

@@ -100,18 +100,31 @@ FAKE_SLEEP = r"""#!/usr/bin/env bash
 printf '%s\n' "$1" >> "${SLEEP_LOG:-/dev/null}"
 """
 
+# Records every invocation of the PINNED interpreter, then forwards to the
+# real target. keepalive.sh must call router.py through this exact path when
+# PROXY_ROUTER_PYTHON is set (issue #57).
+FAKE_PINNED_PYTHON = r"""#!/usr/bin/env bash
+printf '%s\n' "$0 $*" >> "${PINNED_LOG:-/dev/null}"
+if [ "${1:-}" = "-" ]; then
+  shift
+  exec /usr/bin/env python3 - "$@"
+fi
+exec "$@"
+"""
+
 
 class KeepaliveHarness:
     """Run the real keepalive.sh against fake router.py/sleep on PATH."""
 
     def __init__(self, *, interval="1", fail_ensures="", egress="alive",
                  probe_every="4", dead_strikes="2", storm_window="600",
-                 max_rotations="2", fallback="", root=None):
+                 max_rotations="2", fallback="", root=None, pinned_python=""):
         self._tmp = None
         if root is None:
             self._tmp = tempfile.TemporaryDirectory()
             root = Path(self._tmp.name)
         self.root = Path(root)
+        self.pinned_python = pinned_python
         (self.root / "bin").mkdir()
         sleep_bin = self.root / "bin" / "sleep"
         sleep_bin.write_text(FAKE_SLEEP)
@@ -119,6 +132,11 @@ class KeepaliveHarness:
         router_bin = self.root / "router.py"
         router_bin.write_text(FAKE_ROUTER)
         router_bin.chmod(0o755)
+        self.pinned_log = self.root / "pinned.log"
+        if pinned_python:
+            pinned_bin = self.root / "bin" / "pinned-python"
+            pinned_bin.write_text(FAKE_PINNED_PYTHON)
+            pinned_bin.chmod(0o755)
         target = self.root / "keepalive.sh"
         target.write_text(KEEPALIVE_SRC.read_text())
         target.chmod(0o755)
@@ -143,6 +161,10 @@ class KeepaliveHarness:
         env["FAKE_ROUTER_ENSURE_COUNT"] = str(self.count)
         env["FAKE_ROUTER_EGRESS_FILE"] = str(self.egress_file)
         env["FAKE_ROUTER_FALLBACK_FILE"] = str(self.fallback_file)
+        if pinned_python:
+            pinned_bin = self.root / "bin" / "pinned-python"
+            env["PROXY_ROUTER_PYTHON"] = str(pinned_bin)
+            env["PINNED_LOG"] = str(self.pinned_log)
         if fail_ensures:
             env["FAKE_ROUTER_FAIL_ENSURES"] = fail_ensures
         self.env = env
@@ -175,6 +197,11 @@ class KeepaliveHarness:
                 os.killpg(self.proc.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
+            except PermissionError:
+                # Pinned-interpreter re-exec can leave the child outside the
+                # spawned process group; fall back to signalling the direct
+                # child (our own process — always permitted).
+                self.proc.terminate()
         else:
             self.proc.terminate()
         try:
@@ -185,6 +212,8 @@ class KeepaliveHarness:
                     os.killpg(self.proc.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+                except PermissionError:
+                    self.proc.kill()
             else:
                 self.proc.kill()
             self.out, self.err = self.proc.communicate()
@@ -426,6 +455,56 @@ class KeepaliveFallbackRestoreTests(unittest.TestCase):
             h.close()
 
 
+class KeepalivePinnedInterpreterTests(unittest.TestCase):
+    """Issue #57: with PROXY_ROUTER_PYTHON set, keepalive.sh must invoke the
+    controller through that exact pinned interpreter -- never bare python3 or
+    the router.py shebang (which resolves via an ambient launchd PATH)."""
+
+    def test_controller_runs_through_pinned_interpreter(self):
+        h = KeepaliveHarness(interval="1", pinned_python="1")
+        try:
+            lines = h.wait_lines(4)
+            pinned_lines = (h.pinned_log.read_text().splitlines()
+                            if h.pinned_log.is_file() else [])
+            h.close()
+            self.assertIn("ensure", lines, f"loop did not ensure: {lines}")
+            self.assertTrue(
+                pinned_lines,
+                "pinned interpreter was never invoked",
+            )
+            self.assertTrue(
+                any("ensure" in line for line in pinned_lines),
+                f"ensure did not run through pinned interpreter: {pinned_lines}",
+            )
+            # no controller call may bypass the pinned interpreter
+            self.assertTrue(
+                all("pinned-python" in line for line in pinned_lines),
+                f"controller call bypassed pinned interpreter: {pinned_lines}",
+            )
+        finally:
+            h.close()
+
+    def test_config_setting_uses_pinned_interpreter(self):
+        # ENABLED/etc read router.json through config_setting() at startup;
+        # that python call must also go through the pinned interpreter.
+        h = KeepaliveHarness(interval="1", pinned_python="1")
+        try:
+            h.wait_lines(2)
+            pinned_lines = (h.pinned_log.read_text().splitlines()
+                            if h.pinned_log.is_file() else [])
+            h.close()
+            self.assertTrue(
+                pinned_lines,
+                "pinned interpreter was never invoked for config",
+            )
+            self.assertTrue(
+                any("router.json" in line for line in pinned_lines),
+                f"config_setting did not use pinned interpreter: {pinned_lines}",
+            )
+        finally:
+            h.close()
+
+
 class KeepaliveManualOffTests(unittest.TestCase):
     """AC1/AC2: a manual disconnect marker must quiesce the loop (no maintain
     calls at all), and a runtime config flip of keepalive.enabled must stop
@@ -471,6 +550,7 @@ class KeepaliveManualOffTests(unittest.TestCase):
             h.close()
         self.assertIn("autocheck disabled by config", h.err,
                       f"disable note missing: {h.err!r}")
+
 
 
 if __name__ == "__main__":
