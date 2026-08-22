@@ -42,6 +42,7 @@ CLIENT_SNAPSHOT_EVERY_SECONDS = 5.0
 FAILURE_WINDOW_SECONDS = 60.0
 MIN_TRANSPORT_FAILURES = 2
 ROTATE_COOLDOWN_SECONDS = 120.0
+NETWORK_CHECK_EVERY_SECONDS = 30.0
 EVENT_MAX_LINES = 5000
 EVENT_MAX_BYTES = 2_000_000
 TARGET_RE = re.compile(
@@ -139,6 +140,18 @@ def _owned_pid(root: Path) -> int | None:
         return None
 
 
+def router_port(root: Path | None = None) -> int:
+    """Listener port from router.json; 2080 fallback keeps old roots working."""
+    root = Path(root) if root is not None else ROOT
+    try:
+        port = int(json.loads((root / "router.json").read_text(encoding="utf-8")).get("port", 2080))
+        if 1 <= port <= 65535:
+            return port
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return 2080
+
+
 def _hand_back_ownership(*paths: Path) -> None:
     """Make root-created watcher markers readable by the invoking user."""
     if os.geteuid() != 0:
@@ -168,7 +181,7 @@ def client_snapshot(root: Path, runner: Callable = subprocess.run) -> list[dict]
         return []
     try:
         result = runner(
-            ["lsof", "-nP", "-a", "-iTCP:2080", "-F", "pcn"],
+            ["lsof", "-nP", "-a", f"-iTCP:{router_port(root)}", "-F", "pcn"],
             capture_output=True, text=True, timeout=2,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -202,20 +215,32 @@ def _rotate_events(path: Path) -> None:
         archive = Path(str(path) + ".1")
         archive.unlink(missing_ok=True)
         path.rename(archive)
+        # The archive inherits the old (possibly root) ownership; hand it back
+        # so a later `watcher logs` can still rotate/read it as the user.
+        _hand_back_ownership(archive)
     except OSError:
         pass
 
 
 def append_event(root: Path, event: dict) -> None:
     path = events_file(root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _rotate_events(path)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(event, separators=(",", ":")) + "\n")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _rotate_events(path)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, separators=(",", ":")) + "\n")
+    except OSError as exc:
+        # An unwritable/starved log (e.g. root-owned from an elevated reload)
+        # must never kill the watcher loop; drop the event with a trace.
+        print(f"route-watcher: append_event skipped ({exc})", file=sys.stderr)
+        return
     try:
         os.chmod(path, 0o600)
     except OSError:
         pass
+    # A root-owned worker (sudo-start path) must hand events back to the
+    # invoking user; otherwise `watcher logs` fails on a 0600 root file.
+    _hand_back_ownership(path)
 
 
 
@@ -253,7 +278,7 @@ def probe_target(root: Path, host: str, *, runner: Callable = subprocess.run) ->
     url = f"https://{host}/zen/v1/models" if domain_matches(host, "opencode.ai") else f"https://{host}/"
     try:
         result = runner(
-            ["curl", "--proxy", "http://127.0.0.1:2080", "--noproxy", "",
+            ["curl", "--proxy", f"http://127.0.0.1:{router_port(root)}", "--noproxy", "",
              "--silent", "--show-error", "--output", "/dev/null",
              "--write-out", "%{http_code}", "--connect-timeout", "4",
              "--max-time", "8", url],
@@ -277,6 +302,27 @@ def probe_target(root: Path, host: str, *, runner: Callable = subprocess.run) ->
         "blocked": status in {403, 1010},
         "host": host,
     }
+
+
+def provider_for_host(root: Path, host: str) -> str | None:
+    """Map a failing host to the route provider that serves it.
+
+    Reads router.json's routes (first matching route wins, mirroring
+    sing-box rule evaluation) so rotation targets the exit actually carrying
+    the failing domain instead of a hardcoded default. Returns None when no
+    configured route matches (caller keeps its previous behavior).
+    """
+    try:
+        config = json.loads((Path(root) / "router.json").read_text())
+    except (OSError, ValueError, TypeError):
+        return None
+    normalized = normalize_host(str(host))
+    for route in config.get("routes", []):
+        for domain in route.get("domains", []):
+            if domain_matches(normalized, normalize_host(str(domain))):
+                provider = route.get("provider")
+                return str(provider) if provider else None
+    return None
 
 
 def rotate_provider(root: Path, provider: str = "proton", *, runner: Callable = subprocess.run) -> dict:
@@ -306,9 +352,42 @@ def _read_new_lines(path: Path, offset: int) -> tuple[int, list[str]]:
         return offset, []
 
 
+def _network_check_hop(root: Path) -> None:
+    """Best-effort `router.py network-check` hop for the current Wi-Fi.
+
+    Runs as a detached subprocess so the watcher stays independent of router
+    internals. The command no-ops when network auto-switching is disabled or
+    the mapped preset is already active.
+    """
+    try:
+        result = subprocess.run(
+            [sys.executable, str(Path(root) / "router.py"), "network-check"],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"route-watcher: network-check unavailable: {type(exc).__name__}", file=sys.stderr)
+        return
+    if result.returncode != 0:
+        print(
+            f"route-watcher: network-check failed rc={result.returncode}: "
+            f"{result.stderr.strip()[:200]}",
+            file=sys.stderr,
+        )
+
+
 def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = time.sleep) -> int:
     root = Path(root).resolve()
     state_dir(root).mkdir(parents=True, exist_ok=True)
+
+    def _on_sigterm(signum: int, frame: object) -> None:
+        # Exit through the loop's finally so the worker removes its own
+        # markers; `stop` waits for that confirmed exit instead of unlinking
+        # state files under a live process. Raising (not flagging) also
+        # interrupts an in-flight time.sleep promptly (PEP 475 would otherwise
+        # retry the syscall and delay shutdown by a full interval).
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
     pid_file(root).write_text(str(os.getpid()), encoding="ascii")
     enabled_file(root).write_text("enabled\n", encoding="ascii")
     os.chmod(pid_file(root), 0o600)
@@ -322,6 +401,7 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
     clients: list[dict] = []
     clients_at = 0.0
     guard = RotationGuard()
+    last_network_check = -NETWORK_CHECK_EVERY_SECONDS
     engine_down_ticks = 0
     try:
         while enabled_file(root).is_file():
@@ -358,12 +438,19 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
                     if is_critical:
                         last_target[host] = now
                         if event.get("failure") and guard.record_transport_failure(now, host):
-                            result = rotate_provider(root)
+                            target = provider_for_host(root, host) or "proton"
+                            result = rotate_provider(root, target)
                             append_event(root, {"kind": "rotation", "observed_at": time.time(), **result})
                 elif event["kind"] == "client":
                     # Client lines are retained only as a bounded observation;
                     # exact app attribution is captured on target events.
                     append_event(root, {**event, "observed_at": time.time()})
+            # Auto-switch the routing preset when the Wi-Fi network changed
+            # (school/home etc). Cheap hop; commands no-op unless a mapping
+            # applies and the preset actually changed.
+            if time.monotonic() - last_network_check >= NETWORK_CHECK_EVERY_SECONDS:
+                last_network_check = time.monotonic()
+                _network_check_hop(root)
             now = time.monotonic()
             for host, seen_at in list(last_target.items()):
                 if now - seen_at > TARGET_IDLE_SECONDS or now - last_probe.get(host, 0) < PROBE_EVERY_SECONDS:
@@ -372,7 +459,8 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
                 result = probe_target(root, host)
                 append_event(root, {"kind": "probe", "observed_at": time.time(), **result})
                 if result.get("transport_failure") and guard.record_transport_failure(now, host):
-                    rotation = rotate_provider(root)
+                    target = provider_for_host(root, host) or "proton"
+                    rotation = rotate_provider(root, target)
                     append_event(root, {"kind": "rotation", "observed_at": time.time(), **rotation})
             sleep(max(0.5, float(interval)))
     finally:
@@ -416,19 +504,26 @@ def _pid_matches(root: Path, pid: int) -> bool:
         if token.startswith("--root="):
             root_value = token.split("=", 1)[1]
             break
-    expected_root = str(Path(root).resolve())
-    if root_value is not None and str(Path(root_value).resolve()) == expected_root:
+    # The worker was spawned with the caller's root string, which on macOS may
+    # be the symlinked path (/var/folders/...) while resolve() yields the real
+    # path (/private/var/folders/...). Accept either spelling so a spawned
+    # worker is still recognized as ours.
+    expected_roots = {str(Path(root).resolve()), str(Path(root))}
+    if root_value is not None and str(Path(root_value).resolve()) in expected_roots:
         return True
     # macOS `ps -o command=` joins argv without shell quoting, so a root with
     # spaces is split by shlex. start() always places --interval immediately
     # after --root, giving us an exact raw-command boundary without accepting
     # prefix impostors such as `<root>-foreign`.
-    return (
-        f"--root {expected_root} --interval " in command
-        or f"--root={expected_root} --interval " in command
-        or command.endswith(f"--root {expected_root}")
-        or command.endswith(f"--root={expected_root}")
-    )
+    for expected_root in expected_roots:
+        if (
+            f"--root {expected_root} --interval " in command
+            or f"--root={expected_root} --interval " in command
+            or command.endswith(f"--root {expected_root}")
+            or command.endswith(f"--root={expected_root}")
+        ):
+            return True
+    return False
 
 
 def _pid_running(pid: int, root: Path | None = None) -> bool:
@@ -540,15 +635,24 @@ def _wait_until_stopped(pid: int, root: Path, *, timeout: float = 3.0,
     return True
 
 
-def stop(root: Path | None = None, *, timeout: float = 3.0,
-         poll_interval: float = 0.1) -> dict:
+def stop(root: Path | None = None, *, timeout: float = 5.0,
+         kill_timeout: float = 2.0, poll_interval: float = 0.1) -> dict:
+    """Stop only our worker; never signal arbitrary processes.
+
+    Synchronous lifecycle: validate the recorded PID actually is our worker
+    (``_pid_running`` includes an ownership check via ``ps``), SIGTERM, wait
+    for a confirmed exit, and only escalate to SIGKILL - again after
+    re-validating ownership so a recycled PID is never killed. Worker markers
+    are removed only after the exit is confirmed, or when the recorded PID is
+    stale/foreign (nothing live owns them).
+    """
     root = Path(root) if root is not None else ROOT
     try:
         pid = int(pid_file(root).read_text().strip())
     except (OSError, ValueError):
         pid = None
     had_state = pid_file(root).exists() or enabled_file(root).exists()
-    if not pid or not _pid_running(pid, root):
+    if pid is None or not _pid_running(pid, root):
         pid_file(root).unlink(missing_ok=True)
         enabled_file(root).unlink(missing_ok=True)
         return {"stopped": True, "pid": pid, "stale": had_state}
@@ -563,14 +667,21 @@ def stop(root: Path | None = None, *, timeout: float = 3.0,
                 "error": f"failed to signal watcher: {type(exc).__name__}: {exc}",
             }
 
-    if not _wait_until_stopped(
-        pid, root, timeout=timeout, poll_interval=poll_interval,
-    ):
-        return {
-            "stopped": False,
-            "pid": pid,
-            "error": f"timeout waiting for watcher PID {pid} to stop",
-        }
+    if not _wait_until_stopped(pid, root, timeout=timeout, poll_interval=poll_interval):
+        # Still alive after the SIGTERM grace: escalate only if it is
+        # still provably our worker (never kill a recycled PID).
+        if _pid_matches(root, pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+            _wait_until_stopped(pid, root, timeout=kill_timeout, poll_interval=poll_interval)
+        if _pid_running(pid, root):
+            return {
+                "stopped": False,
+                "pid": pid,
+                "error": f"timeout waiting for watcher PID {pid} to stop",
+            }
 
     pid_file(root).unlink(missing_ok=True)
     enabled_file(root).unlink(missing_ok=True)

@@ -2,9 +2,13 @@
 import io
 import json
 import os
+import re
+import shutil
 import stat
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -210,6 +214,17 @@ class CustomPresetTests(unittest.TestCase):
         school = next(r for r in data["routes"] if r["id"] == "school")
         self.assertEqual(school["provider"], "cloudflare")
         self.assertIn("cloudflare", data["providers"])
+
+    def test_school_warp_enables_doh_and_default_restores_udp(self):
+        # school-warp declares vpn.dns_transport=https (filtered networks
+        # drop UDP 53); applying a preset without a "vpn" section must not
+        # clobber the operator's existing VPN knobs.
+        setup_tui.apply_preset_by_name(self.root, "school-warp")
+        data = json.loads(self.config.read_text())
+        self.assertEqual(data["vpn"]["dns_transport"], "https")
+        setup_tui.apply_preset_by_name(self.root, "default")
+        data = json.loads(self.config.read_text())
+        self.assertEqual(data["vpn"]["dns_transport"], "udp")
 
     def test_apply_preset_idempotent(self):
         setup_tui.apply_preset_by_name(self.root, "school-warp")
@@ -833,3 +848,26 @@ class RoutingTuiTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class RouterCommandTimeoutTests(unittest.TestCase):
+    def test_hung_command_returns_within_budget(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        started = time.monotonic()
+        rc = setup_tui._router_command(root, "status", timeout=3.0)
+        elapsed = time.monotonic() - started
+        # router.py status against an empty root exits fast OR the timeout
+        # fires; either way we must never hang past the budget (+slack).
+        self.assertLess(elapsed, 10.0)
+        self.assertIsInstance(rc, int)
+
+    def test_timeout_returns_nonzero_with_message(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        with mock.patch.object(setup_tui.subprocess, "run",
+                               side_effect=subprocess.TimeoutExpired(cmd=["x"], timeout=1)):
+            err = io.StringIO()
+            with mock.patch("sys.stderr", err):
+                rc = setup_tui._router_command(root, "rotate", "proton", timeout=180.0)
+        self.assertEqual(rc, 1)
+        self.assertIn("timed out after 180s", err.getvalue())

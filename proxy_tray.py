@@ -297,14 +297,19 @@ def open_dashboard(root) -> bool:
         script = f"cd {shlex.quote(str(root))} && {shlex.quote(python)} setup_tui.py"
         content = script.replace("\\", "\\\\").replace('"', '\\"')
         try:
-            proc = subprocess.run(
+            # Popen, not run(): this fires from a Cocoa menu callback on the
+            # main thread. osascript's 10s synchronous timeout there froze
+            # the entire tray (menu + icon) whenever Terminal was slow to
+            # answer Apple events. We only need to LAUNCH osascript; its
+            # success/failure is not worth blocking the UI for.
+            subprocess.Popen(
                 ["osascript", "-e",
                  f'tell application "Terminal" to do script "{content}"'],
-                capture_output=True, text=True, timeout=10)
-        except (OSError, subprocess.TimeoutExpired) as exc:
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except OSError as exc:
             print(f"dashboard: could not open Terminal: {exc}", file=sys.stderr)
             return False
-        return proc.returncode == 0
     launchers = [
         ["x-terminal-emulator", "-e", f"{python} setup_tui.py"],
         ["gnome-terminal", "--", f"{python} setup_tui.py"],
@@ -413,6 +418,11 @@ class RouterClient:
         return self._run("stop")
 
     def rotate(self) -> tuple[int, str]:
+        # Root-owned engine (started via `sudo vpn on`): a user-level rotate
+        # cannot signal it, so route through the elevation surface exactly
+        # like start/stop (issue #54).
+        if self._engine_runs_as_root() and self._active_provider:
+            return self._run_elevated("rotate", self._active_provider)
         return self._run("rotate", self._active_provider)
 
     def rotate_to(self, provider: str, profile: str, force: bool = False) -> tuple[int, str]:
@@ -421,6 +431,8 @@ class RouterClient:
             # Explicit pick of an offline/SSL exit: try it anyway, ignoring
             # the cooldown its failed probe left behind.
             cmd.append("--force")
+        if self._engine_runs_as_root():
+            return self._run_elevated(*cmd)
         return self._run(*cmd)
 
     def set_mode(self, mode: str, default_provider: str | None = None) -> tuple[int, str]:
@@ -437,6 +449,10 @@ class RouterClient:
     def setup_preset(self, name: str) -> tuple[int, str]:
         """Apply a named preset (idempotent, lossless) via the setup CLI."""
         return self._run("setup", "--preset", name)
+
+    def reload(self) -> tuple[int, str]:
+        """Hot-reload the engine config in place (SIGHUP; no restart)."""
+        return self._run("reload")
 
     def vpn(self, action: str) -> tuple[int, str]:
         """Toggle full-tunnel (TUN) mode via the router CLI.
@@ -642,8 +658,19 @@ class TrayApp:
         self._do(pick_and_import, f"import {provider}")
 
     def action_apply_preset(self, name: str):
-        """One-click preset apply (idempotent, lossless, no engine touch)."""
-        self._do(lambda: self.client.setup_preset(name), f"preset {name}")
+        """One-click preset apply (idempotent, lossless) + hot reload.
+
+        Writing router.json alone never re-routes traffic; without the
+        follow-up reload the menu reported "done" while the old exits kept
+        serving. The reload applies the preset in place (SIGHUP; the engine
+        keeps running) and the toast reports the combined result.
+        """
+        def _apply_and_reload():
+            rc, out = self.client.setup_preset(name)
+            if rc != 0:
+                return rc, out
+            return self.client.reload()
+        self._do(_apply_and_reload, f"preset {name}")
 
     def action_show_guide(self, provider: str):
         """Open the bundled setup guide in the default app (macOS) so a
