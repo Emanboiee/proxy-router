@@ -744,6 +744,119 @@ class WaitEngineTests(unittest.TestCase):
             self.assertTrue(router.wait_engine(timeout=2.0))
 
 
+class ProcessIdentityTests(unittest.TestCase):
+    """Issue #62: whole-process-table liveness/ownership must be row-scoped.
+    A foreign sing-box run plus an unrelated process carrying our config
+    path must NOT combine into a false 'our engine is running' result."""
+
+    def _scan(self, ps_output: str, cfg: str = "/opt/router/sing-box.json"):
+        with mock.patch.object(router.subprocess, "run") as run:
+            run.return_value = SimpleNamespace(stdout=ps_output, returncode=0)
+            with mock.patch.object(router, "SING_BOX_CONFIG", cfg):
+                return router._any_our_engine_running()
+
+    def test_our_engine_on_one_row_is_true(self):
+        out = "/usr/local/bin/sing-box run -c /opt/router/sing-box.json\n"
+        self.assertTrue(self._scan(out))
+
+    def test_tokens_on_different_rows_is_false(self):
+        out = (
+            "/usr/local/bin/sing-box run -c /other/config.json\n"
+            "some-other-process --flag /opt/router/sing-box.json\n"
+        )
+        self.assertFalse(self._scan(out))
+
+    def test_no_sing_box_at_all_is_false(self):
+        self.assertFalse(self._scan("/bin/sleep 9999\n"))
+
+    def test_empty_output_is_false(self):
+        self.assertFalse(self._scan(""))
+
+    def test_config_missing_from_row_is_false(self):
+        out = "/usr/local/bin/sing-box run -c /other/config.json\n"
+        self.assertFalse(self._scan(out))
+
+    def test_windows_powershell_is_row_scoped(self):
+        # Windows: CommandLine rows; only rows carrying both identity tokens
+        # count (issue #62). tasklist fallback stays process-name only.
+        cfg = "C:\\router\\sing-box.json"
+        with mock.patch.object(router.os, "name", "nt"), \
+             mock.patch.object(router, "SING_BOX_CONFIG", cfg), \
+             mock.patch.object(router.subprocess, "run") as run:
+            run.return_value = SimpleNamespace(
+                stdout=(
+                    "C:\\sing-box.exe run -c C:\\router\\sing-box.json\r\n"
+                ), returncode=0)
+            self.assertTrue(router._any_our_engine_running())
+            run.return_value = SimpleNamespace(
+                stdout=(
+                    "C:\\sing-box.exe run -c C:\\other\\sing-box.json\r\n"
+                    "C:\\whatever.exe C:\\router\\sing-box.json\r\n"
+                ), returncode=0)
+            self.assertFalse(router._any_our_engine_running())
+
+
+class EngineStartSpawnRaceTests(unittest.TestCase):
+    """Issue #62: engine_start must capture the log offset BEFORE Popen so a
+    FATAL written between spawn and the offset read is not skipped."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        _relocate(router, self.root)
+        (self.root / "providers" / "proton").mkdir(parents=True)
+        _write_conf(self.root / "providers" / "proton" / "a.conf")
+        self._cfg = self.root / "sing-box.json"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_log_offset_captured_before_spawn(self):
+        # The offset read must be the LAST log_offset() call before Popen.
+        # Log a tiny file so log_offset() returns a real size.
+        self._cfg.write_text('{"log": {"level": "info"}}')
+        (self.root / "sing-box.log").write_text("old line\n")
+        router._providers = {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}}
+        router._routes = [{"id": "example", "domains": ["example.com"], "provider": "proton"}]
+        router._port = 2080
+        router._vpn = {}
+
+        calls = []
+
+        class _P:
+            pid = 4242
+
+        def _fake_popen(*a, **k):
+            calls.append("popen")
+            return _P()
+
+        def _fake_log_offset():
+            calls.append("offset")
+            return 10
+
+        def _fake_wait(log_from=0):
+            calls.append(f"wait:{log_from}")
+            return True
+
+        with mock.patch.object(router, "resolve_sing_box", return_value="/bin/echo"), \
+             mock.patch.object(router, "sing_box_at_least", return_value=True), \
+             mock.patch.object(router, "build_singbox_config",
+                               return_value=({"log": {}}, {"proton": self.root / "providers/proton/a.conf"})), \
+             mock.patch.object(router, "validate_config", return_value=True), \
+             mock.patch.object(router, "engine_stop", return_value=0), \
+             mock.patch.object(router, "rotate_log_if_needed", return_value=None), \
+             mock.patch.object(router, "log_offset", side_effect=_fake_log_offset), \
+             mock.patch.object(router.subprocess, "Popen", side_effect=_fake_popen), \
+             mock.patch.object(router, "wait_engine", side_effect=_fake_wait) as wait:
+            rc = router.engine_start()
+        self.assertEqual(rc, 0)
+        self.assertIn("offset", calls)
+        self.assertIn("popen", calls)
+        self.assertLess(calls.index("offset"), calls.index("popen"),
+                        "log offset must be captured BEFORE Popen")
+        wait.assert_called_once_with(log_from=10)
+
+
 class EngineReloadTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
