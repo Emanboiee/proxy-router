@@ -598,6 +598,10 @@ def _tray_app(module, root, *, up=False, providers=None, preset=None, error=None
     app.last_action_result = action
     app.lock = __import__("threading").Lock()
     app.tray = None
+    # Issue #60 state (build_menu reads these): default to idle/no-mutation
+    # so structural menu tests keep exercising the normal rendering path.
+    app._mutation_active = False
+    app._status_epoch = 0
     return app
 
 
