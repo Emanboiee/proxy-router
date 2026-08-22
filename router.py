@@ -2013,6 +2013,8 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
         # sing-box 1.12+: provider endpoint routed through this endpoint is
         # resolved with an explicit per-endpoint resolver instead of the
         # deprecated implicit DNS rule path. DialerOptions is embedded flat.
+        # Provisional per-provider tag; deduped below once all resolvers
+        # are known (identical servers collapse to one shared entry).
         endpoint["domain_resolver"] = f"dns-{name}"
         active[name] = endpoint
         selected[name] = profile
@@ -2024,15 +2026,33 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
     # server to the "direct" outbound with "empty direct outbound" at start).
     # The resolved IP still gets dialed through the provider's endpoint
     # outbound, so the destination traffic stays provider-routed.
-    dns_servers = [
-        {
+    # Deduplicate identical resolvers: multiple providers commonly share the
+    # same DNS (e.g. every Proton profile pins 1.1.1.1). One server entry per
+    # distinct (type, server, port) keeps sing-box's connection pool warm in
+    # ONE session instead of fragmenting into N identical DoH handshakes;
+    # per-provider tags become aliases resolved to the shared entry.
+    def _dns_entry(tag: str, name: str) -> dict:
+        return {
             "type": dns_transport(),
-            "tag": f"dns-{name}",
+            "tag": tag,
             "server": dns_map[name],
             **({"server_port": 443} if dns_transport() == "https" else {}),
         }
-        for name in active
-    ]
+
+    dns_servers: list[dict] = []
+    dns_alias: dict[str, str] = {}
+    seen_dns: dict[tuple, str] = {}  # (type, server, port) -> canonical tag
+    for name in active:
+        entry = _dns_entry(f"dns-{name}", name)
+        key = (entry["type"], entry["server"], entry.get("server_port"))
+        if key in seen_dns:
+            dns_alias[name] = seen_dns[key]
+        else:
+            seen_dns[key] = entry["tag"]
+            dns_servers.append(entry)
+    # Rewrite provisional per-provider resolver tags to the canonical entry.
+    for name in active:
+        active[name]["domain_resolver"] = dns_alias.get(name, f"dns-{name}")
     # sing-box 1.12+: any dial without an explicit resolver needs
     # route.default_domain_resolver; the system (local) transport keeps
     # non-routed domains away from the tunnels and silences the deprecated
@@ -2069,7 +2089,8 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
                 if any(domain == vpn or domain.endswith("." + vpn) for vpn in vpn_domains)
             ]
         if domains:
-            dns_rules.append({"domain_suffix": domains, "server": f"dns-{route_provider}"})
+            dns_rules.append({"domain_suffix": domains,
+                              "server": dns_alias.get(route_provider, f"dns-{route_provider}")})
 
     # Route rules: safe-list direct-domain pins first (a trusted domain is
     # never tunneled even if a provider route also mentions it), then the
