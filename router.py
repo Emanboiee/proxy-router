@@ -3847,7 +3847,15 @@ def egress_check(name: str | None = None, as_json: bool = False) -> int:
     providers = [name] if name is not None else list(_providers)
     results: dict[str, dict] = {}
     dead: list[str] = []
-    for provider in providers:
+
+    def _check_one(provider: str) -> tuple[str, dict, bool]:
+        """Probe one provider; returns (provider, entry, is_dead).
+
+        Probes are independent (each rides the shared local listener), so
+        they run concurrently: a dead exit costs its own probe timeout once,
+        not once per provider in sequence (3 providers x 8s timeout used to
+        serialize into ~24s+ per check cycle).
+        """
         active = persisted_active(provider) or resolve_active(provider)
         fallback = active_fallback(provider)
         if fallback:
@@ -3863,27 +3871,40 @@ def egress_check(name: str | None = None, as_json: bool = False) -> int:
                 entry["dns_ok"] = record["dns_ok"]
             if status == "dead":
                 entry["detail"] = "dns" if entry.get("dns_ok") is False else "probe connection"
-                dead.append(provider)
-            elif status == "degraded" and record is not None:
+                return provider, entry, True
+            if status == "degraded" and record is not None:
                 entry["detail"] = (f"HTTP {record['status']}" if record.get("status") is not None
                                    else "throttled (TLS)")
-            results[provider] = entry
-            continue
+            return provider, entry, False
         if active is None:
-            results[provider] = {"profile": None, "ok": True, "status": "skipped",
-                                 "detail": "no active profile"}
-            continue
+            return provider, {"profile": None, "ok": True, "status": "skipped",
+                              "detail": "no active profile"}, False
         status, record = check_egress_live(provider, active)
         entry: dict = {"profile": active.stem, "ok": status != "dead", "status": status}
         if record is not None and record.get("dns_ok") is not None:
             entry["dns_ok"] = record["dns_ok"]
         if status == "dead":
             entry["detail"] = "dns" if entry.get("dns_ok") is False else "probe connection"
-            dead.append(provider)
-        elif status == "degraded" and record is not None:
+            return provider, entry, True
+        if status == "degraded" and record is not None:
             entry["detail"] = (f"HTTP {record['status']}" if record.get("status") is not None
                                else "throttled (TLS)")
-        results[provider] = entry
+        return provider, entry, False
+
+    if len(providers) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(8, len(providers)),
+                                thread_name_prefix="egress-check") as pool:
+            for provider, entry, is_dead in pool.map(_check_one, providers):
+                results[provider] = entry
+                if is_dead:
+                    dead.append(provider)
+    else:
+        for provider in providers:
+            provider, entry, is_dead = _check_one(provider)
+            results[provider] = entry
+            if is_dead:
+                dead.append(provider)
     # No break after a dead provider: every provider's record must be
     # refreshed each cycle so status UIs never show stale failures from a
     # provider that merely follows a dead-first one in check order.
