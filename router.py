@@ -2747,51 +2747,50 @@ def engine_start(use_existing_config: bool = False, *, recover: bool = True) -> 
     # ordering guarantee independent of which start path runs below, and the
     # status probe itself must never be mistaken for an engine spawn.
     spawn_log_offset = log_offset()
-    if sys.platform == "darwin" and os.geteuid() != 0:
+    # Probe/consult the privileged helper only when a root-continuity start is
+    # actually plausible: TUN mode requested, or a live ROOT-owned engine is
+    # on record. An ambiently-running helper (other context, stale launchd
+    # state) must never capture plain proxy-mode starts — those work fine
+    # unprivileged and keep their spawn-ordering guarantees (issue #62).
+    helper_relevant = False
+    if current_mode() == "tun":
+        helper_relevant = True
+    elif PID_FILE.is_file():
+        try:
+            pid_text = PID_FILE.read_text().strip()
+            if pid_text.isdigit() and int(pid_text) > 0:
+                pid_int = int(pid_text)
+                if _pid_matches(pid_int):
+                    if sys.platform == "win32":
+                        helper_relevant = True
+                    else:
+                        out = subprocess.run(
+                            ["ps", "-o", "uid=", "-p", str(pid_int)],
+                            capture_output=True, text=True, timeout=5,
+                        ).stdout.strip()
+                        helper_relevant = bool(out) and int(out) == 0
+        except (OSError, subprocess.TimeoutExpired, ValueError,
+                TypeError, AttributeError):
+            # Under mocked environments Popen may lack context-manager
+            # support; a non-root verdict is the safe fallback.
+            helper_relevant = False
+
+    if sys.platform == "darwin" and os.geteuid() != 0 and helper_relevant:
         helper = _helper_status()
         helper_installed = bool(helper and helper.get("installed"))
-        # Route through the helper only when this start actually needs root
-        # continuity: TUN mode, or the live engine is a root-owned one that a
-        # user-level restart would strand. An ambiently running helper (e.g.
-        # another user context) must not capture plain proxy-mode starts —
-        # those work fine unprivileged and must keep their spawn ordering
-        # guarantees (issue #62 regression guard).
-        root_engine_live = False
-        try:
-            if PID_FILE.is_file():
-                pid_text = PID_FILE.read_text().strip()
-                if pid_text.isdigit() and int(pid_text) > 0:
-                    pid_int = int(pid_text)
-                    root_engine_live = _pid_matches(pid_int)
-                    if root_engine_live and sys.platform != "win32":
-                        try:
-                            out = subprocess.run(
-                                ["ps", "-o", "uid=", "-p", str(pid_int)],
-                                capture_output=True, text=True, timeout=5,
-                            ).stdout.strip()
-                            root_engine_live = bool(out) and int(out) == 0
-                        except (OSError, subprocess.TimeoutExpired, ValueError,
-                                TypeError, AttributeError):
-                            # TypeError/AttributeError: under tests, Popen may
-                            # be a mock lacking context-manager support; a
-                            # non-root verdict is the safe fallback.
-                            root_engine_live = False
-        except OSError:
-            root_engine_live = False
-        if current_mode() == "tun" or root_engine_live:
-            if not helper_installed:
-                return fail(
-                    "TUN/root engine requires the safe privileged helper; "
-                    "run `router.py elevate install`"
-                )
-            rc = _helper_run("start")
-            if rc != 0:
-                return rc
-            if not use_existing_config:
-                write_last_good()
-                for provider, profile in active.items():
-                    set_active(provider, profile)
-            return 0
+        if not helper_installed:
+            return fail(
+                "TUN/root engine requires the safe privileged helper; "
+                "run `router.py elevate install`"
+            )
+        rc = _helper_run("start")
+        if rc != 0:
+            return rc
+        if not use_existing_config:
+            write_last_good()
+            for provider, profile in active.items():
+                set_active(provider, profile)
+        return 0
     stop_rc = engine_stop()
     if stop_rc != 0:
         # The engine is root-owned (started via `sudo vpn on`) and could not
