@@ -113,6 +113,7 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py rotate <provider> --force   # switch anyway, ignoring cooldowns and blocked exits
 ./router.py rotate <provider> --no-probe # skip the post-switch egress probe
 ./router.py rotate --if-due      # scheduled rotation: only when the interval elapsed (exit 3 = not due)
+./router.py network-check        # auto-apply the preset mapped to the current Wi-Fi (run by the route watcher every 30s)
 ./router.py failover <provider> on [--to <fallback>]  # route the provider's domains through its configured fallback chain (first valid entry, or the named member)
 ./router.py failover <provider> off    # clear fallback and restore the provider's routes
 ./router.py failover <provider> status --json   # configured chain + active fallback
@@ -140,6 +141,12 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py up                   # enable macOS system proxy (also ensures engine)
 ./router.py down                 # disable macOS system proxy only (engine keeps running)
 ```
+
+Set `vpn.network_auto: true` and a `vpn.network_presets` map (`"SSID": "preset-name"`) in
+`router.json` to switch presets automatically when you join a known network — e.g.
+`{"MySchoolWiFi": "school-warp", "MyHomeWiFi": "default"}`. The route watcher applies
+the mapped preset and hot-reloads the engine within ~30s of a network change. Unknown
+networks keep the current preset.
 
 Every state-changing command takes an exclusive lock, so concurrent calls
 are safe; read-only commands (`status`, `routes`, `provider-count`, `vpn

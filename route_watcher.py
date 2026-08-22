@@ -42,6 +42,7 @@ CLIENT_SNAPSHOT_EVERY_SECONDS = 5.0
 FAILURE_WINDOW_SECONDS = 60.0
 MIN_TRANSPORT_FAILURES = 2
 ROTATE_COOLDOWN_SECONDS = 120.0
+NETWORK_CHECK_EVERY_SECONDS = 30.0
 EVENT_MAX_LINES = 5000
 EVENT_MAX_BYTES = 2_000_000
 TARGET_RE = re.compile(
@@ -208,10 +209,16 @@ def _rotate_events(path: Path) -> None:
 
 def append_event(root: Path, event: dict) -> None:
     path = events_file(root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _rotate_events(path)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(event, separators=(",", ":")) + "\n")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _rotate_events(path)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, separators=(",", ":")) + "\n")
+    except OSError as exc:
+        # An unwritable/starved log (e.g. root-owned from an elevated reload)
+        # must never kill the watcher loop; drop the event with a trace.
+        print(f"route-watcher: append_event skipped ({exc})", file=sys.stderr)
+        return
     try:
         os.chmod(path, 0o600)
     except OSError:
@@ -327,6 +334,29 @@ def _read_new_lines(path: Path, offset: int) -> tuple[int, list[str]]:
         return offset, []
 
 
+def _network_check_hop(root: Path) -> None:
+    """Best-effort `router.py network-check` hop for the current Wi-Fi.
+
+    Runs as a detached subprocess so the watcher stays independent of router
+    internals. The command no-ops when network auto-switching is disabled or
+    the mapped preset is already active.
+    """
+    try:
+        result = subprocess.run(
+            [sys.executable, str(Path(root) / "router.py"), "network-check"],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"route-watcher: network-check unavailable: {type(exc).__name__}", file=sys.stderr)
+        return
+    if result.returncode != 0:
+        print(
+            f"route-watcher: network-check failed rc={result.returncode}: "
+            f"{result.stderr.strip()[:200]}",
+            file=sys.stderr,
+        )
+
+
 def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = time.sleep) -> int:
     root = Path(root).resolve()
     state_dir(root).mkdir(parents=True, exist_ok=True)
@@ -343,6 +373,7 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
     clients: list[dict] = []
     clients_at = 0.0
     guard = RotationGuard()
+    last_network_check = -NETWORK_CHECK_EVERY_SECONDS
     engine_down_ticks = 0
     try:
         while enabled_file(root).is_file():
@@ -386,6 +417,12 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
                     # Client lines are retained only as a bounded observation;
                     # exact app attribution is captured on target events.
                     append_event(root, {**event, "observed_at": time.time()})
+            # Auto-switch the routing preset when the Wi-Fi network changed
+            # (school/home etc). Cheap hop; commands no-op unless a mapping
+            # applies and the preset actually changed.
+            if time.monotonic() - last_network_check >= NETWORK_CHECK_EVERY_SECONDS:
+                last_network_check = time.monotonic()
+                _network_check_hop(root)
             now = time.monotonic()
             for host, seen_at in list(last_target.items()):
                 if now - seen_at > TARGET_IDLE_SECONDS or now - last_probe.get(host, 0) < PROBE_EVERY_SECONDS:

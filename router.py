@@ -460,6 +460,11 @@ def write_default_config(force: bool = False) -> int:
                 "stack": DEFAULT_TUN_STACK,
                 "dns_transport": "udp",
                 "selective": "roblox",
+                "network_auto": False,
+                "network_presets": {
+                    "MySchoolWiFi": "school-warp",
+                    "MyHomeWiFi": "default",
+                },
             },
             "egress": {
                 "probe_url": DEFAULT_PROBE_URL,
@@ -2253,6 +2258,10 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
 
 
 def write_sing_box(config: dict) -> None:
+    if not any(endpoint.get("type") == "wireguard" for endpoint in config.get("endpoints", [])):
+        print("router: refusing to write an egress-less sing-box config; keeping existing file",
+              file=sys.stderr)
+        return
     SING_BOX_CONFIG.parent.mkdir(parents=True, exist_ok=True)
     temporary = None
     try:
@@ -3016,6 +3025,106 @@ def _elevated_reload() -> int:
         print("router: elevated reload denied; run `sudo python3 router.py reload` manually",
               file=sys.stderr)
     return probe.returncode
+
+
+# ---------------------------------------------------------------------------
+# network-aware preset switching
+# ---------------------------------------------------------------------------
+
+def current_ssid() -> str | None:
+    """Active Wi-Fi SSID via `ipconfig getsummary` (macOS, read-only).
+
+    Returns None when Wi-Fi is off or no interface answers. Pure getter;
+    tests inject synthetic output through subprocess mocks.
+    """
+    for iface in ("en0", "en1"):
+        try:
+            probe = subprocess.run(
+                ["ipconfig", "getsummary", iface],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if probe.returncode != 0:
+            continue
+        for line in probe.stdout.splitlines():
+            if line.strip().startswith("SSID"):
+                _, _, value = line.partition(":")
+                ssid = value.strip()
+                return ssid or None
+    return None
+
+
+def network_preset_map() -> dict[str, str]:
+    """SSID -> preset mapping from ``vpn.network_presets``."""
+    raw = _vpn.get("network_presets") or {}
+    if not isinstance(raw, dict):
+        return {}
+    return {str(ssid): str(name) for ssid, name in raw.items() if ssid and name}
+
+
+def network_auto_enabled() -> bool:
+    return bool(_vpn.get("network_auto", False))
+
+
+def preset_for_current_network() -> str | None:
+    """Preset mapped to the connected SSID, or None when auto is off."""
+    if not network_auto_enabled():
+        return None
+    ssid = current_ssid()
+    if not ssid:
+        return None
+    return network_preset_map().get(ssid)
+
+
+def network_preset_marker(root: Path | None = None) -> Path:
+    return (Path(root) if root is not None else ROOT) / "state" / "network-preset.json"
+
+
+def apply_network_preset(*, reload_engine: bool = True, root: Path | None = None) -> dict:
+    """Auto-switch the routing preset for the current network; no-op when unchanged.
+
+    Applies the mapped preset with ``setup_tui.apply_preset_by_name`` (lossless
+    merge: routes/providers are added, nothing removed) and, when the preset
+    changed, reloads the engine so the change goes live. Writes the
+    ``state/network-preset.json`` marker for the status/tray surface.
+    """
+    root = Path(root) if root is not None else ROOT
+    preset = preset_for_current_network()
+    now = int(time.time())
+    if preset is None:
+        return {"applied": False, "reason": "no network mapping", "checked_at": now}
+    try:
+        current = json.loads((root / "router.json").read_text()).get("preset")
+    except (OSError, json.JSONDecodeError):
+        current = None
+    if current == preset:
+        return {"applied": False, "reason": "already active", "preset": preset, "checked_at": now}
+    from setup_tui import apply_preset_by_name
+    result = apply_preset_by_name(root, preset)
+    marker = network_preset_marker(root)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps({
+        "ssid": current_ssid(),
+        "preset": preset,
+        "applied_at": now,
+    }))
+    os.chmod(marker, 0o600)
+    if reload_engine:
+        if _engine_runs_as_root():
+            result["reload_rc"] = _elevated_reload()
+        else:
+            result["reload_rc"] = engine_reload()
+    return {"applied": True, **result, "preset": preset, "checked_at": now}
+
+
+def cmd_network_check() -> int:
+    """Auto-switch the routing preset for the current network (SSID)."""
+    if load_config() != 0:
+        return 1
+    result = apply_network_preset()
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if result.get("reload_rc", 0) == 0 else 1
 
 
 def engine_reload(active_overrides: dict[str, Path] | None = None) -> int:
@@ -4726,9 +4835,13 @@ def main() -> int:
     elevate = sub.add_parser("elevate", help="one-time passwordless-sudo grant (install|uninstall|status)")
     elevate.add_argument("action", choices=["install", "uninstall", "status"])
 
+    sub.add_parser("network-check", help="auto-switch routing preset for the current Wi-Fi network")
+
     args, passthrough = parser.parse_known_args()
     if args.cmd == "elevate":
         return cmd_elevate(args.action)
+    if args.cmd == "network-check":
+        return cmd_network_check()
     if _needs_elevation(args):
         return _elevate()
     if args.cmd == "setup":
