@@ -140,6 +140,18 @@ def _owned_pid(root: Path) -> int | None:
         return None
 
 
+def router_port(root: Path | None = None) -> int:
+    """Listener port from router.json; 2080 fallback keeps old roots working."""
+    root = Path(root) if root is not None else ROOT
+    try:
+        port = int(json.loads((root / "router.json").read_text(encoding="utf-8")).get("port", 2080))
+        if 1 <= port <= 65535:
+            return port
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return 2080
+
+
 def _hand_back_ownership(*paths: Path) -> None:
     """Make root-created watcher markers readable by the invoking user."""
     if os.geteuid() != 0:
@@ -169,7 +181,7 @@ def client_snapshot(root: Path, runner: Callable = subprocess.run) -> list[dict]
         return []
     try:
         result = runner(
-            ["lsof", "-nP", "-a", "-iTCP:2080", "-F", "pcn"],
+            ["lsof", "-nP", "-a", f"-iTCP:{router_port(root)}", "-F", "pcn"],
             capture_output=True, text=True, timeout=2,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -203,6 +215,9 @@ def _rotate_events(path: Path) -> None:
         archive = Path(str(path) + ".1")
         archive.unlink(missing_ok=True)
         path.rename(archive)
+        # The archive inherits the old (possibly root) ownership; hand it back
+        # so a later `watcher logs` can still rotate/read it as the user.
+        _hand_back_ownership(archive)
     except OSError:
         pass
 
@@ -223,6 +238,9 @@ def append_event(root: Path, event: dict) -> None:
         os.chmod(path, 0o600)
     except OSError:
         pass
+    # A root-owned worker (sudo-start path) must hand events back to the
+    # invoking user; otherwise `watcher logs` fails on a 0600 root file.
+    _hand_back_ownership(path)
 
 
 
@@ -260,7 +278,7 @@ def probe_target(root: Path, host: str, *, runner: Callable = subprocess.run) ->
     url = f"https://{host}/zen/v1/models" if domain_matches(host, "opencode.ai") else f"https://{host}/"
     try:
         result = runner(
-            ["curl", "--proxy", "http://127.0.0.1:2080", "--noproxy", "",
+            ["curl", "--proxy", f"http://127.0.0.1:{router_port(root)}", "--noproxy", "",
              "--silent", "--show-error", "--output", "/dev/null",
              "--write-out", "%{http_code}", "--connect-timeout", "4",
              "--max-time", "8", url],
@@ -360,6 +378,16 @@ def _network_check_hop(root: Path) -> None:
 def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = time.sleep) -> int:
     root = Path(root).resolve()
     state_dir(root).mkdir(parents=True, exist_ok=True)
+
+    def _on_sigterm(signum: int, frame: object) -> None:
+        # Exit through the loop's finally so the worker removes its own
+        # markers; `stop` waits for that confirmed exit instead of unlinking
+        # state files under a live process. Raising (not flagging) also
+        # interrupts an in-flight time.sleep promptly (PEP 475 would otherwise
+        # retry the syscall and delay shutdown by a full interval).
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
     pid_file(root).write_text(str(os.getpid()), encoding="ascii")
     enabled_file(root).write_text("enabled\n", encoding="ascii")
     os.chmod(pid_file(root), 0o600)
@@ -476,19 +504,26 @@ def _pid_matches(root: Path, pid: int) -> bool:
         if token.startswith("--root="):
             root_value = token.split("=", 1)[1]
             break
-    expected_root = str(Path(root).resolve())
-    if root_value is not None and str(Path(root_value).resolve()) == expected_root:
+    # The worker was spawned with the caller's root string, which on macOS may
+    # be the symlinked path (/var/folders/...) while resolve() yields the real
+    # path (/private/var/folders/...). Accept either spelling so a spawned
+    # worker is still recognized as ours.
+    expected_roots = {str(Path(root).resolve()), str(Path(root))}
+    if root_value is not None and str(Path(root_value).resolve()) in expected_roots:
         return True
     # macOS `ps -o command=` joins argv without shell quoting, so a root with
     # spaces is split by shlex. start() always places --interval immediately
     # after --root, giving us an exact raw-command boundary without accepting
     # prefix impostors such as `<root>-foreign`.
-    return (
-        f"--root {expected_root} --interval " in command
-        or f"--root={expected_root} --interval " in command
-        or command.endswith(f"--root {expected_root}")
-        or command.endswith(f"--root={expected_root}")
-    )
+    for expected_root in expected_roots:
+        if (
+            f"--root {expected_root} --interval " in command
+            or f"--root={expected_root} --interval " in command
+            or command.endswith(f"--root {expected_root}")
+            or command.endswith(f"--root={expected_root}")
+        ):
+            return True
+    return False
 
 
 def _pid_running(pid: int, root: Path | None = None) -> bool:
@@ -600,15 +635,24 @@ def _wait_until_stopped(pid: int, root: Path, *, timeout: float = 3.0,
     return True
 
 
-def stop(root: Path | None = None, *, timeout: float = 3.0,
-         poll_interval: float = 0.1) -> dict:
+def stop(root: Path | None = None, *, timeout: float = 5.0,
+         kill_timeout: float = 2.0, poll_interval: float = 0.1) -> dict:
+    """Stop only our worker; never signal arbitrary processes.
+
+    Synchronous lifecycle: validate the recorded PID actually is our worker
+    (``_pid_running`` includes an ownership check via ``ps``), SIGTERM, wait
+    for a confirmed exit, and only escalate to SIGKILL - again after
+    re-validating ownership so a recycled PID is never killed. Worker markers
+    are removed only after the exit is confirmed, or when the recorded PID is
+    stale/foreign (nothing live owns them).
+    """
     root = Path(root) if root is not None else ROOT
     try:
         pid = int(pid_file(root).read_text().strip())
     except (OSError, ValueError):
         pid = None
     had_state = pid_file(root).exists() or enabled_file(root).exists()
-    if not pid or not _pid_running(pid, root):
+    if pid is None or not _pid_running(pid, root):
         pid_file(root).unlink(missing_ok=True)
         enabled_file(root).unlink(missing_ok=True)
         return {"stopped": True, "pid": pid, "stale": had_state}
@@ -623,14 +667,21 @@ def stop(root: Path | None = None, *, timeout: float = 3.0,
                 "error": f"failed to signal watcher: {type(exc).__name__}: {exc}",
             }
 
-    if not _wait_until_stopped(
-        pid, root, timeout=timeout, poll_interval=poll_interval,
-    ):
-        return {
-            "stopped": False,
-            "pid": pid,
-            "error": f"timeout waiting for watcher PID {pid} to stop",
-        }
+    if not _wait_until_stopped(pid, root, timeout=timeout, poll_interval=poll_interval):
+        # Still alive after the SIGTERM grace: escalate only if it is
+        # still provably our worker (never kill a recycled PID).
+        if _pid_matches(root, pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+            _wait_until_stopped(pid, root, timeout=kill_timeout, poll_interval=poll_interval)
+        if _pid_running(pid, root):
+            return {
+                "stopped": False,
+                "pid": pid,
+                "error": f"timeout waiting for watcher PID {pid} to stop",
+            }
 
     pid_file(root).unlink(missing_ok=True)
     enabled_file(root).unlink(missing_ok=True)
