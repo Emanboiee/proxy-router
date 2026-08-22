@@ -2889,7 +2889,16 @@ def engine_stop() -> int:
                 subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
             else:
                 os.kill(pid, signal.SIGTERM)
-                time.sleep(0.4)
+                # Poll for exit instead of a blind sleep: sing-box usually
+                # exits in <50ms, so the stop path returns immediately
+                # instead of costing a fixed 0.4s on every switch/restart.
+                # The grace window (and the ownership re-check before any
+                # hard kill) is unchanged.
+                grace_deadline = time.monotonic() + 0.4
+                while time.monotonic() < grace_deadline:
+                    if not _pid_matches(pid):
+                        break
+                    time.sleep(0.02)
                 # The process may have exited, or the PID may have been
                 # recycled during the grace period. Re-check ownership before
                 # sending a hard kill.
