@@ -2,3 +2,5 @@ pytest>=8.0,<9
 pytest-randomly>=3.15,<4
 pytest-socket>=0.7,<1
 PyYAML>=6.0,<7
+pystray>=0.19,<1
+pillow>=10.0,<12
