@@ -5,15 +5,63 @@
 # (@ROOT@, @HOME@, @PATH@, @LOG_DIR@, @PYTHON@), writes the agent plist into
 # ~/Library/LaunchAgents, and loads it with launchctl. Idempotent: rerunning
 # re-writes the plist and re-bootstraps. Pass --remove to tear the agent down.
+#
+# Issue #63: the agent prefix is DERIVED FROM WHERE THIS SCRIPT IS INSTALLED
+# (…/examples/install-launchd.sh inside the proxy-router root) instead of an
+# independent hardcoded default — a custom-prefix install used to get a plist
+# that silently pointed back at ~/.local/share/proxy-router. Every rendered
+# value is XML-escaped so paths containing &, <, >, ' or " produce valid
+# plists, and a stale loaded job pointing at a DIFFERENT root is detected and
+# migrated (bootout + report) before the new one is trusted.
 set -euo pipefail
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# Pure-bash dirname: the script must work in stripped-PATH sandboxes
+# (tests and minimal launchd contexts) where /usr/bin may be absent.
+_self=$0
+case $_self in
+  */*) SCRIPT_DIR=${_self%/*} ;;
+  *) SCRIPT_DIR=. ;;
+esac
+SCRIPT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR" && pwd)
 TEMPLATE="$SCRIPT_DIR/com.proxy-router.keepalive.plist.template"
 LABEL="com.proxy-router.keepalive"
 PLIST="$HOME/Library/LaunchAgents/com.proxy-router.keepalive.plist"
 LOG_DIR="$HOME/Library/Logs/proxy-router"
-# Same default prefix as install.sh; pre-set with PROXY_ROUTER_DIR.
-PREFIX="${PROXY_ROUTER_DIR:-${HOME}/.local/share/proxy-router}"
+
+# XML-escape every value substituted into the plist template. Raw sed
+# substitution used to accept any path but produced invalid XML for paths
+# containing & < > ' " (launchd then silently refused to load the agent).
+xml_escape() {
+  printf '%s' "$1" | sed -e 's/&/\&amp;/g' \
+                        -e 's/</\&lt;/g' \
+                        -e 's/>/\&gt;/g' \
+                        -e "s/'/\&apos;/g" \
+                        -e 's/"/\&quot;/g'
+}
+
+if [ "${1:-}" = "--remove" ]; then
+  launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null || true
+  rm -f "$PLIST"
+  printf 'removed %s\n' "$PLIST"
+  exit 0
+fi
+
+# Derive the proxy-router root FROM THIS SCRIPT'S INSTALLED LOCATION. The
+# installer lays the script out as <root>/examples/install-launchd.sh, so the
+# root is the parent of examples/. An explicit PROXY_ROUTER_DIR still wins;
+# a derived root that does not actually contain router.py is an error rather
+# than something we silently paper over.
+if [ -n "${PROXY_ROUTER_DIR:-}" ]; then
+  PREFIX="$PROXY_ROUTER_DIR"
+else
+  PREFIX=$(cd "$SCRIPT_DIR/.." && pwd)
+fi
+if [ ! -f "$PREFIX/router.py" ]; then
+  printf 'error: %s does not look like a proxy-router root (router.py missing).\n' "$PREFIX" >&2
+  printf '       set PROXY_ROUTER_DIR to your install prefix explicitly.\n' >&2
+  exit 1
+fi
+
 # launchd agents run without a login shell, so give the keepalive script a
 # PATH that covers Homebrew, /usr/local and the system tools.
 PATH_DEFAULT="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -51,20 +99,43 @@ if [ "$LEGACY_FOUND" -eq 1 ]; then
   printf '    rm ~/Library/LaunchAgents/com.hermes.proxy-router*.plist\n' >&2
 fi
 
-if [ "${1:-}" = "--remove" ]; then
-  launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null || true
-  rm -f "$PLIST"
-  printf 'removed %s\n' "$PLIST"
-  exit 0
+# Stale-job migration (issue #63): when an already-loaded keepalive job
+# points at a DIFFERENT root than the one being installed now, boot it out
+# before switching so two engines can never fight. The move is reversible —
+# the previous plist content stays on disk as *.stale and one command
+# reloads it.
+mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR"
+if [ -f "$PLIST" ]; then
+  OLD_ROOT=$(sed -n 's|.*<string>\(.*\)/examples/keepalive\.sh</string>.*|\1|p' "$PLIST" | head -1 || true)
+  OLD_ROOT_UNESCAPED=${OLD_ROOT//&amp;/\&}
+  OLD_ROOT_UNESCAPED=${OLD_ROOT_UNESCAPED//&lt;/<}
+  OLD_ROOT_UNESCAPED=${OLD_ROOT_UNESCAPED//&gt;/>}
+  OLD_ROOT_UNESCAPED=${OLD_ROOT_UNESCAPED//&apos;/\'}
+  OLD_ROOT_UNESCAPED=${OLD_ROOT_UNESCAPED//&quot;/\"}
+  LOADED=0
+  launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 && LOADED=1
+  if [ "$LOADED" -eq 1 ] && [ -n "$OLD_ROOT" ] && [ "$OLD_ROOT_UNESCAPED" != "$PREFIX" ]; then
+    cp "$PLIST" "$PLIST.stale"
+    launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null || true
+    printf 'warning: loaded keepalive job pointed at stale root: %s\n' "$OLD_ROOT_UNESCAPED" >&2
+    printf '  the old job was unloaded and its plist kept at:\n' >&2
+    printf '    %s.stale\n' "$PLIST" >&2
+    printf '  reversible with:\n' >&2
+    printf '    cp %s.stale %s && launchctl bootstrap "gui/%s" %s\n' "$PLIST" "$PLIST" "$(id -u)" "$PLIST" >&2
+  fi
 fi
 
-mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR" "$PREFIX"
+PREFIX_ESC=$(xml_escape "$PREFIX")
+HOME_ESC=$(xml_escape "$HOME")
+LOGDIR_ESC=$(xml_escape "$LOG_DIR")
+PYTHON_ESC=$(xml_escape "$PYTHON_BIN")
+PATH_ESC=$(xml_escape "$PATH_DEFAULT")
 
-sed -e "s|@ROOT@|$PREFIX|g" \
-    -e "s|@HOME@|$HOME|g" \
-    -e "s|@PATH@|$PATH_DEFAULT|g" \
-    -e "s|@LOG_DIR@|$LOG_DIR|g" \
-    -e "s|@PYTHON@|$PYTHON_BIN|g" \
+sed -e "s|@ROOT@|$PREFIX_ESC|g" \
+    -e "s|@HOME@|$HOME_ESC|g" \
+    -e "s|@PATH@|$PATH_ESC|g" \
+    -e "s|@LOG_DIR@|$LOGDIR_ESC|g" \
+    -e "s|@PYTHON@|$PYTHON_ESC|g" \
     "$TEMPLATE" > "$PLIST"
 
 launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null || true
