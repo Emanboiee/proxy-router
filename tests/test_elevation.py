@@ -1,6 +1,8 @@
 """Unit tests for the macOS elevation path of router.py (stdlib only)."""
 import io
+import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -48,15 +50,113 @@ def _block_pid_read():
 
 
 class SudoersRulesTests(unittest.TestCase):
-    def test_rules_cover_start_and_stop(self):
-        rules = router._sudoers_rules("alice", "/usr/bin/python3", "/opt/pr/router.py")
+    def test_rules_cover_only_exact_root_helper_operations(self):
+        rules = router._sudoers_rules("alice", 501)
         lines = rules.strip().splitlines()
-        cmds = [line.split("NOPASSWD: ", 1)[1] for line in lines[1:]]
-        self.assertIn("/usr/bin/python3 /opt/pr/router.py start", cmds)
-        self.assertIn("/usr/bin/python3 /opt/pr/router.py stop", cmds)
-        # Exact grant surface: tray Connect/Disconnect + engine commands only.
-        self.assertEqual(len(cmds), 10)
-        self.assertTrue(all(" ALL=(root) NOPASSWD: " in line for line in lines[1:]))
+        commands = [line.split("NOPASSWD: ", 1)[1] for line in lines if "NOPASSWD:" in line]
+        self.assertEqual(len(commands), 5)
+        self.assertTrue(all(str(router.PRIVILEGED_HELPER) in command for command in commands))
+        self.assertTrue(all("router.py" not in command and "*" not in command for command in commands))
+        self.assertEqual(
+            {command.rsplit(" ", 2)[-2] for command in commands},
+            {"status", "start", "stop", "reload", "uninstall"},
+        )
+
+
+class PrivilegedHelperCommandTests(unittest.TestCase):
+    def test_helper_command_is_exact_and_never_executes_checkout_code(self):
+        with mock.patch.object(router.os, "getuid", return_value=501):
+            command = router._helper_command("reload")
+
+        self.assertEqual(command[:2], ["sudo", "-n"])
+        self.assertEqual(
+            command[2:],
+            [
+                "/usr/bin/env", "-i", "HOME=/var/empty",
+                "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LANG=C",
+                "/usr/bin/python3", "-I", "-S",
+                "/Library/PrivilegedHelperTools/com.proxy-router/current/privileged_helper.py",
+                "reload", "501",
+            ],
+        )
+        self.assertNotIn(str(Path(router.__file__).resolve()), command)
+        self.assertNotIn(router.sys.executable, command)
+
+    def test_helper_status_executes_exact_status_and_parses_json(self):
+        payload = {"installed": True, "running": True, "pid": 4242, "mode": "tun", "schema_version": 1}
+        completed = subprocess.CompletedProcess([], 0, json.dumps(payload), "")
+        with mock.patch.object(router.os, "getuid", return_value=501), \
+             mock.patch.object(router.subprocess, "run", return_value=completed) as run:
+            status = router._helper_status()
+
+        self.assertEqual(status, payload)
+        self.assertEqual(run.call_args.args[0], router._helper_command("status", 501))
+
+    def test_helper_status_sudo_denial_is_absent_not_checkout_fallback(self):
+        denied = subprocess.CompletedProcess([], 1, "", "sudo: a password is required")
+        with mock.patch.object(router.subprocess, "run", return_value=denied), \
+             mock.patch.object(router, "_elevate_macos") as dialog:
+            status = router._helper_status()
+
+        self.assertIsNone(status)
+        dialog.assert_not_called()
+
+    def test_engine_liveness_and_mode_use_helper_backend_first(self):
+        helper_status = {"installed": True, "running": True, "pid": 4242, "mode": "tun", "schema_version": 1}
+        with mock.patch.object(router, "_helper_status", return_value=helper_status):
+            self.assertTrue(router.engine_alive())
+            with mock.patch.object(router, "current_mode", return_value="tun"):
+                self.assertTrue(router.engine_mode_consistent())
+            with mock.patch.object(router, "current_mode", return_value="proxy"):
+                self.assertFalse(router.engine_mode_consistent())
+
+    def test_tun_engine_start_builds_config_then_uses_helper_not_local_spawn(self):
+        config = {
+            "log": {"level": "info"}, "inbounds": [], "endpoints": [],
+            "outbounds": [], "dns": {}, "route": {},
+        }
+        with mock.patch.object(router, "resolve_sing_box", return_value="/trusted/sing-box"), \
+             mock.patch.object(router, "sing_box_at_least", return_value=True), \
+             mock.patch.object(router, "build_singbox_config", return_value=(config, {"p": Path("p.conf")})), \
+             mock.patch.object(router, "write_sing_box") as write_config, \
+             mock.patch.object(router, "validate_config", return_value=True), \
+             mock.patch.object(router, "current_mode", return_value="tun"), \
+             mock.patch.object(router, "_helper_status", return_value={"installed": True, "running": False}), \
+             mock.patch.object(router, "_helper_run", return_value=0) as helper_run, \
+             mock.patch.object(router.subprocess, "Popen") as popen, \
+             mock.patch.object(router, "engine_stop") as local_stop:
+            rc = router.engine_start()
+
+        self.assertEqual(rc, 0)
+        write_config.assert_called_once_with(config)
+        helper_run.assert_called_once_with("start")
+        popen.assert_not_called()
+        local_stop.assert_not_called()
+
+    def test_root_backend_stop_and_reload_use_only_helper_lifecycle(self):
+        status = {"installed": True, "running": True, "pid": 4242, "mode": "tun", "schema_version": 1}
+        with mock.patch.object(router, "_helper_status", return_value=status), \
+             mock.patch.object(router, "_helper_run", return_value=0) as helper_run, \
+             mock.patch.object(router.os, "kill") as kill:
+            self.assertEqual(router.engine_stop(), 0)
+        helper_run.assert_called_once_with("stop")
+        kill.assert_not_called()
+
+        config = {
+            "log": {"level": "info"}, "inbounds": [], "endpoints": [],
+            "outbounds": [], "dns": {}, "route": {},
+        }
+        with mock.patch.object(router, "_helper_status", return_value=status), \
+             mock.patch.object(router, "resolve_sing_box", return_value="/trusted/sing-box"), \
+             mock.patch.object(router, "sing_box_at_least", return_value=True), \
+             mock.patch.object(router, "build_singbox_config", return_value=(config, {"p": Path("p.conf")})), \
+             mock.patch.object(router, "write_sing_box"), \
+             mock.patch.object(router, "validate_config", return_value=True), \
+             mock.patch.object(router, "_helper_run", return_value=0) as helper_run, \
+             mock.patch.object(router.os, "kill") as kill:
+            self.assertEqual(router.engine_reload(), 0)
+        helper_run.assert_called_once_with("reload")
+        kill.assert_not_called()
 
 
 class EngineRunsAsRootTests(unittest.TestCase):
@@ -138,13 +238,13 @@ class NeedsElevationTests(unittest.TestCase):
         blocker.start()
         self.addCleanup(blocker.stop)
 
-    def test_proxy_mode_stop_elevates_when_engine_root_owned(self):
+    def test_proxy_mode_stop_stays_user_controller_when_helper_owns_engine(self):
         self._root_engine()
-        self.assertTrue(router._needs_elevation(self._args("stop")))
+        self.assertFalse(router._needs_elevation(self._args("stop")))
 
-    def test_proxy_mode_start_elevates_when_engine_root_owned(self):
+    def test_proxy_mode_start_stays_user_controller_when_helper_owns_engine(self):
         self._root_engine()
-        self.assertTrue(router._needs_elevation(self._args("start")))
+        self.assertFalse(router._needs_elevation(self._args("start")))
 
     def test_proxy_mode_engine_commands_stay_user_level_when_engine_user_owned(self):
         router.PID_FILE.write_text("4242")
@@ -166,11 +266,11 @@ class NeedsElevationTests(unittest.TestCase):
             self.assertFalse(router._needs_elevation(self._args("stop")))
             self.assertFalse(router._needs_elevation(self._args("start")))
 
-    def test_background_tick_lifts_when_sudoers_grant_installed(self):
+    def test_background_tick_with_helper_never_reexecutes_controller_as_root(self):
         self._root_engine()
         with mock.patch.object(router.sys.stdin, "isatty", return_value=False), \
              mock.patch.object(router, "_sudoers_installed", return_value=True):
-            self.assertTrue(router._needs_elevation(self._args("stop")))
+            self.assertFalse(router._needs_elevation(self._args("stop")))
 
 
 class EngineStopMessageTests(unittest.TestCase):
@@ -189,7 +289,8 @@ class EngineStopMessageTests(unittest.TestCase):
             rc = router.engine_stop()
         self.assertEqual(rc, 1)
         self.assertIn("elevate install", err.getvalue())
-        self.assertIn("sudo python3 router.py stop", err.getvalue())
+        self.assertIn("safe root-owned helper", err.getvalue())
+        self.assertNotIn("sudo python3 router.py", err.getvalue())
         self.assertTrue(router.PID_FILE.is_file())  # live engine pid kept
 
     def test_kill_permission_error_message_advises_elevate_install(self):
@@ -205,77 +306,15 @@ class EngineStopMessageTests(unittest.TestCase):
 
 
 class ElevateFallbackTests(unittest.TestCase):
-    """`_elevate` must fall back to the admin dialog when `sudo -n`
-    DENIES (stale grant missing a command shape added later, e.g.
-    `start`/`stop`), but return a real elevated-command failure unchanged
-    (no dialog for an engine error)."""
+    """Whole-controller elevation is permanently fail-closed."""
 
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        root = Path(self.tmp.name)
-        _relocate(router, root)
-        self.addCleanup(self.tmp.cleanup)
-        router.sys.argv = ["router.py", "stop"]
-
-    def _probe(self, returncode: int, stderr: str = ""):
-        return type("P", (), {"returncode": returncode, "stderr": stderr})()
-
-    def test_sudo_denial_falls_back_to_admin_dialog(self):
-        with mock.patch.object(router, "_sudoers_installed", return_value=True), \
-             mock.patch.object(router.sys.stdin, "isatty", return_value=True), \
-             mock.patch.object(router, "_elevate_macos", return_value=42) as dialog, \
-             mock.patch.object(router.subprocess, "run",
-                               return_value=self._probe(1, "a password is required")):
-            rc = router._elevate()
-        self.assertEqual(rc, 42)
-        dialog.assert_called_once()
-
-    def test_sudoers_denial_token_falls_back_to_admin_dialog(self):
-        with mock.patch.object(router, "_sudoers_installed", return_value=True), \
-             mock.patch.object(router.sys.stdin, "isatty", return_value=True), \
-             mock.patch.object(router, "_elevate_macos", return_value=42) as dialog, \
-             mock.patch.object(router.subprocess, "run",
-                               return_value=self._probe(1, "alice is not in the sudoers file")):
-            rc = router._elevate()
-        self.assertEqual(rc, 42)
-        dialog.assert_called_once()
-
-    def test_elevated_command_failure_returns_rc_without_dialog(self):
-        with mock.patch.object(router, "_sudoers_installed", return_value=True), \
-             mock.patch.object(router, "_elevate_macos", return_value=42) as dialog, \
-             mock.patch.object(router.subprocess, "run",
-                               return_value=self._probe(3, "router: engine failed to start")):
-            rc = router._elevate()
-        self.assertEqual(rc, 3)
-        dialog.assert_not_called()
-
-    def test_success_returns_zero_without_dialog(self):
-        with mock.patch.object(router, "_sudoers_installed", return_value=True), \
-             mock.patch.object(router, "_elevate_macos", return_value=42) as dialog, \
-             mock.patch.object(router.subprocess, "run", return_value=self._probe(0)):
-            rc = router._elevate()
-        self.assertEqual(rc, 0)
-        dialog.assert_not_called()
-
-    def test_non_tty_denial_never_opens_admin_dialog(self):
-        # A stale grant whose probed shape is denied must NOT pop the
-        # admin dialog from a keepalive/launchd tick (no TTY).
-        with mock.patch.object(router, "_sudoers_installed", return_value=True), \
-             mock.patch.object(router.sys.stdin, "isatty", return_value=False), \
-             mock.patch.object(router, "_elevate_macos", return_value=42) as dialog, \
-             mock.patch.object(router.subprocess, "run",
-                               return_value=self._probe(1, "a password is required")):
+    def test_elevate_never_calls_sudo_or_admin_dialog(self):
+        with mock.patch.object(router, "_elevate_macos", return_value=42) as dialog, \
+             mock.patch.object(router.subprocess, "run") as run:
             rc = router._elevate()
         self.assertEqual(rc, 1)
         dialog.assert_not_called()
-
-    def test_non_tty_without_grant_never_opens_admin_dialog(self):
-        with mock.patch.object(router, "_sudoers_installed", return_value=False), \
-             mock.patch.object(router.sys.stdin, "isatty", return_value=False), \
-             mock.patch.object(router, "_elevate_macos", return_value=42) as dialog:
-            rc = router._elevate()
-        self.assertEqual(rc, 1)
-        dialog.assert_not_called()
+        run.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -15,14 +15,18 @@ import argparse
 import configparser
 import datetime
 import getpass
+import hashlib
 import json
 import os
+import platform
+import pwd
 import random
 import re
 import shlex
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -31,6 +35,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from pathlib import Path
 
 ROOT = Path(os.environ.get("PROXY_ROUTER_ROOT") or Path(__file__).resolve().parent).resolve()
@@ -2439,6 +2444,10 @@ def engine_alive() -> bool:
     """True when a sing-box started by us is still running (tun mode has no
     TCP listener to probe, so process liveness is the health check). Also
     refuses foreign/recycled PIDs so a stale pid file can't claim liveness."""
+    if sys.platform == "darwin" and os.geteuid() != 0:
+        helper = _helper_status()
+        if helper and helper.get("installed") and helper.get("running"):
+            return True
     if not PID_FILE.is_file():
         return False
     try:
@@ -2475,6 +2484,10 @@ def engine_mode_consistent() -> bool:
 
     Prevents the H2 false-positive: a proxy-mode engine running while
     state/mode says 'tun' (or vice versa) is NOT the state we claim."""
+    if sys.platform == "darwin" and os.geteuid() != 0:
+        helper = _helper_status()
+        if helper and helper.get("installed") and helper.get("running"):
+            return helper.get("mode") == current_mode()
     if not SING_BOX_CONFIG.is_file():
         return False
     try:
@@ -2727,6 +2740,57 @@ def engine_start(use_existing_config: bool = False, *, recover: bool = True) -> 
                 print("router: generated config failed validation; restoring last-good", file=sys.stderr)
                 return restore_last_good()
             return fail("sing-box config check failed")
+    # Capture the pre-spawn offset BEFORE any engine spawn decision (helper
+    # or local): a FATAL written between spawn and a post-spawn log_offset()
+    # read would be skipped as historical, yet wait_engine relies on early
+    # FATAL detection (issue #62). Capturing unconditionally here keeps the
+    # ordering guarantee independent of which start path runs below, and the
+    # status probe itself must never be mistaken for an engine spawn.
+    spawn_log_offset = log_offset()
+    # Probe/consult the privileged helper only when a root-continuity start is
+    # actually plausible: TUN mode requested, or a live ROOT-owned engine is
+    # on record. An ambiently-running helper (other context, stale launchd
+    # state) must never capture plain proxy-mode starts — those work fine
+    # unprivileged and keep their spawn-ordering guarantees (issue #62).
+    helper_relevant = False
+    if current_mode() == "tun":
+        helper_relevant = True
+    elif PID_FILE.is_file():
+        try:
+            pid_text = PID_FILE.read_text().strip()
+            if pid_text.isdigit() and int(pid_text) > 0:
+                pid_int = int(pid_text)
+                if _pid_matches(pid_int):
+                    if sys.platform == "win32":
+                        helper_relevant = True
+                    else:
+                        out = subprocess.run(
+                            ["ps", "-o", "uid=", "-p", str(pid_int)],
+                            capture_output=True, text=True, timeout=5,
+                        ).stdout.strip()
+                        helper_relevant = bool(out) and int(out) == 0
+        except (OSError, subprocess.TimeoutExpired, ValueError,
+                TypeError, AttributeError):
+            # Under mocked environments Popen may lack context-manager
+            # support; a non-root verdict is the safe fallback.
+            helper_relevant = False
+
+    if sys.platform == "darwin" and os.geteuid() != 0 and helper_relevant:
+        helper = _helper_status()
+        helper_installed = bool(helper and helper.get("installed"))
+        if not helper_installed:
+            return fail(
+                "TUN/root engine requires the safe privileged helper; "
+                "run `router.py elevate install`"
+            )
+        rc = _helper_run("start")
+        if rc != 0:
+            return rc
+        if not use_existing_config:
+            write_last_good()
+            for provider, profile in active.items():
+                set_active(provider, profile)
+        return 0
     stop_rc = engine_stop()
     if stop_rc != 0:
         # The engine is root-owned (started via `sudo vpn on`) and could not
@@ -2737,11 +2801,6 @@ def engine_start(use_existing_config: bool = False, *, recover: bool = True) -> 
     # engine's log would detach its (still open) fd and growth would continue
     # invisibly instead of being bounded.
     rotate_log_if_needed()
-    # Capture the pre-spawn offset BEFORE Popen: a FATAL written between
-    # Popen() and a post-spawn log_offset() read would be skipped as
-    # historical, yet wait_engine relies on early FATAL detection to catch
-    # bind conflicts and config deaths (issue #62).
-    spawn_log_offset = log_offset()
     log_handle = None
     try:
         log_handle = LOG_FILE.open("ab")
@@ -2960,6 +3019,10 @@ def engine_ensure() -> int:
 
 
 def engine_stop() -> int:
+    if sys.platform == "darwin" and os.geteuid() != 0:
+        helper = _helper_status()
+        if helper and helper.get("installed") and helper.get("running"):
+            return _helper_run("stop")
     if PID_FILE.is_file():
         try:
             pid = int(PID_FILE.read_text().strip())
@@ -3014,20 +3077,14 @@ def engine_stop() -> int:
 
 
 def _elevated_reload() -> int:
-    """Re-run the granted `reload` shape as root.
-
-    `sudo vpn on` starts the engine as root (TUN needs it), so a user-level
-    keepalive sweep or rotation cannot SIGHUP the process. `reload` is a
-    granted sudoers shape, so re-run exactly that; pending per-provider
-    overrides ride in RELOAD_OVERRIDE_FILE so sweep hops keep their
-    candidate-without-commit semantics across the privilege boundary."""
-    command = [sys.executable, os.path.abspath(__file__), "reload"]
-    env = {**os.environ, "PROXY_ROUTER_ELEVATED": "1"}
-    probe = subprocess.run(["sudo", "-n", *command], env=env)
-    if probe.returncode != 0:
-        print("router: elevated reload denied; run `sudo python3 router.py reload` manually",
-              file=sys.stderr)
-    return probe.returncode
+    """Reload through the exact root-owned helper, never checkout code."""
+    status = _helper_status()
+    if not status or not status.get("installed"):
+        return fail(
+            "root engine reload requires the safe privileged helper; "
+            "run `router.py elevate install`"
+        )
+    return _helper_run("reload")
 
 
 # ---------------------------------------------------------------------------
@@ -3162,6 +3219,15 @@ def engine_reload(active_overrides: dict[str, Path] | None = None) -> int:
         # not leave the proxy dead while a known-good config exists).
         print("router: new sing-box config failed validation; restoring last-good", file=sys.stderr)
         return restore_last_good()
+    if sys.platform == "darwin" and os.geteuid() != 0:
+        helper = _helper_status()
+        if helper and helper.get("installed") and helper.get("running"):
+            rc = _helper_run("reload")
+            if rc == 0:
+                write_last_good()
+                for provider, profile in active.items():
+                    set_active(provider, profile)
+            return rc
     if not PID_FILE.is_file():
         if engine_start(recover=False) != 0:
             print("router: engine failed to start with new config; restoring last-good", file=sys.stderr)
@@ -3198,11 +3264,11 @@ def engine_reload(active_overrides: dict[str, Path] | None = None) -> int:
                 RELOAD_OVERRIDE_FILE.parent.mkdir(parents=True, exist_ok=True)
                 _atomic_write(RELOAD_OVERRIDE_FILE,
                               json.dumps({name: str(path) for name, path in overrides.items()}), 0o600)
-            print("router: engine runs as root; reloading through the granted sudo shape",
+            print("router: engine runs as root; reloading through the safe helper",
                   file=sys.stderr)
             return _elevated_reload()
-        return fail("engine runs as root (started via sudo); run `router.py elevate install` once, "
-                    "or reload it now with `sudo python3 router.py reload`")
+        return fail("root engine reload requires `router.py elevate install`; "
+                    "whole-controller sudo is intentionally disabled")
     except ProcessLookupError:
         if engine_start(recover=False) != 0:
             print("router: engine failed to start with new config; restoring last-good", file=sys.stderr)
@@ -3811,8 +3877,8 @@ def doctor() -> int:
         note("warn", "engine", f"down (mode {current_mode()}); run 'router.py ensure' to start it")
     if os.geteuid() != 0 and shutil.which("sudo"):
         note("ok" if _sudoers_installed() else "warn", "elevate",
-             "passwordless engine grant active" if _sudoers_installed()
-             else "grant absent; run 'router.py elevate install' to stop root-owned state churn")
+             "safe root-owned lifecycle helper active" if _sudoers_installed()
+             else "helper absent; run 'router.py elevate install' for TUN lifecycle")
     if sys.platform == "darwin":
         probe = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
         has_agent = "com.proxy-router.keepalive" in (probe.stdout or "")
@@ -4477,31 +4543,12 @@ def _engine_runs_as_root() -> bool:
 
 
 def _needs_elevation(args) -> bool:
-    """Whether this invocation must re-run as root before doing anything.
+    """Normal commands never re-execute the user-writable controller as root.
 
-    TUN mode needs root (utun creation, route table) and the engine then
-    runs as root, so `vpn on` and tun-mode engine commands cannot run as a
-    regular user. Proxy-mode engine commands must also elevate while the
-    engine ITSELF runs as root (started via `sudo vpn on`): a user-level
-    `stop` cannot signal it, and `start` would clobber the root-owned pid
-    file (issue #12 — the tray Stop failed with "Cannot stop because it is
-    run with sudo"). Only interactive macOS sessions elevate:
-    launchd/keepalive ticks have no TTY and must never pop a password
-    dialog on every interval (they keep the existing clear-error behavior
-    instead). Once `elevate install` granted passwordless sudo, elevation
-    is silent, so the TTY gate lifts and background ticks may also elevate.
+    Root lifecycle is delegated inside engine_start/stop/reload to the exact
+    root-owned helper. Missing helper state fails closed at that boundary.
     """
-    if sys.platform != "darwin" or os.geteuid() == 0:
-        return False
-    if os.environ.get("PROXY_ROUTER_ELEVATED"):
-        return False
-    if not sys.stdin.isatty() and not _sudoers_installed():
-        return False
-    mode = current_mode()
-    if args.cmd == "vpn":
-        return args.action in ("on", "restart") or (args.action == "off" and mode == "tun")
-    return (args.cmd in ("start", "stop", "ensure", "reload", "rotate", "add", "remove")
-            and (mode == "tun" or _engine_runs_as_root()))
+    return False
 
 
 def profile_copy(provider: str, sources: list[str]) -> int:
@@ -4540,55 +4587,126 @@ def profile_copy(provider: str, sources: list[str]) -> int:
 
 
 def _elevate_macos() -> int:
-    """Re-run the current command with administrator privileges (macOS).
-
-    Instead of requiring the user to type `sudo python3 router.py vpn on`,
-    re-exec the exact same CLI through the standard macOS "… wants to make
-    changes" password dialog (osascript `do shell script … with administrator
-    privileges`), which asks for permission on every run.
-
-    SUDO_UID/SUDO_GID are injected so `_hand_back_ownership` hands state
-    files back to the invoking user; PROXY_ROUTER_ELEVATED prevents
-    recursion; PATH is passed through so the bundled sing-box still resolves.
-    """
-    env = (
-        f"SUDO_UID={os.getuid()} SUDO_GID={os.getgid()} "
-        f"PROXY_ROUTER_ELEVATED=1 "
-        f"PATH={shlex.quote(os.environ.get('PATH', ''))}"
-    )
-    cmd = shlex.join([sys.executable, os.path.abspath(__file__), *sys.argv[1:]])
-    shell_cmd = f"{env} {cmd}"
-    # AppleScript string literals accept only `\"` and `\\` escapes; escape
-    # the shell command's quotes/backslashes but keep the literal delimiters
-    # unescaped (a `\` at expression position is a syntax error).
-    content = shell_cmd.replace("\\", "\\\\").replace('"', '\\"')
-    script = f'do shell script "{content}" with administrator privileges'
-    proc = subprocess.run(["osascript", "-e", script], text=True)
+    """Authenticate one hash-pinned installer snapshot through macOS."""
+    if sys.argv[1:3] != ["elevate", "install"]:
+        return fail("administrator dialog is reserved for `elevate install`")
+    owner_uid = os.getuid()
+    owner_gid = os.getgid()
+    members = ("router.py", "privileged_helper.py", "privileged_installer.py", "sing-box-release.json")
+    archive_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix="proxy-router-bootstrap-", suffix=".zip", delete=False
+        ) as handle:
+            archive_path = Path(handle.name)
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for name in members:
+                source = Path(__file__).resolve() if name == "router.py" else ROOT / name
+                archive.writestr(name, _safe_source_bytes(source, owner_uid))
+        os.chmod(archive_path, 0o600)
+        archive_bytes = archive_path.read_bytes()
+        digest = hashlib.sha256(archive_bytes).hexdigest()
+        bootstrap = (
+            "import hashlib,io,os,runpy,sys,tempfile,zipfile\n"
+            "path,digest,user_root,legacy_python,legacy_router,uid,gid=sys.argv[1:]\n"
+            "data=open(path,'rb').read(2*1024*1024+1)\n"
+            "if len(data)>2*1024*1024 or hashlib.sha256(data).hexdigest()!=digest: raise SystemExit('bootstrap digest mismatch')\n"
+            "names={'router.py','privileged_helper.py','privileged_installer.py','sing-box-release.json'}\n"
+            "z=zipfile.ZipFile(io.BytesIO(data),'r')\n"
+            "if set(z.namelist())!=names or not all(not i.is_dir() and i.file_size<=1024*1024 for i in z.infolist()): raise SystemExit('bootstrap archive shape mismatch')\n"
+            "with tempfile.TemporaryDirectory(prefix='proxy-router-install-',dir='/private/var/tmp') as d:\n"
+            "  for n in names:\n"
+            "    p=os.path.join(d,n); f=open(p,'xb'); f.write(z.read(n)); f.close(); os.chmod(p,0o600)\n"
+            "  os.environ.clear(); os.environ.update({'PROXY_ROUTER_ROOT':user_root,'PROXY_ROUTER_INSTALL_SOURCE':d,'PROXY_ROUTER_LEGACY_PYTHON':legacy_python,'PROXY_ROUTER_LEGACY_ROUTER':legacy_router,'SUDO_UID':uid,'SUDO_GID':gid})\n"
+            "  sys.path.insert(0,d); sys.argv=[os.path.join(d,'router.py'),'elevate','install']; runpy.run_path(sys.argv[0],run_name='__main__')\n"
+        )
+        command = [
+            "/usr/bin/python3", "-I", "-S", "-c", bootstrap,
+            str(archive_path), digest, str(ROOT), sys.executable,
+            os.path.abspath(__file__), str(owner_uid), str(owner_gid),
+        ]
+        content = shlex.join(command).replace("\\", "\\\\").replace('"', '\\"')
+        script = f'do shell script "{content}" with administrator privileges'
+        proc = subprocess.run(["osascript", "-e", script], text=True)
+    except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
+        return fail(f"could not prepare privileged helper installer: {exc}")
+    finally:
+        if archive_path is not None:
+            archive_path.unlink(missing_ok=True)
     if proc.returncode != 0:
-        print("router: elevation canceled or failed; run with sudo manually if needed",
-              file=sys.stderr)
+        print("router: privileged helper installation canceled or failed", file=sys.stderr)
     return proc.returncode
 
 
-SUDOERS_FILE = Path("/etc/sudoers.d/91-proxy-router")
-
-# One NOPASSWD entry per engine-command shape the elevation path may run.
-# sudoers matches the FULL argv; `*` matches exactly one argument, so
-# multi-arg shapes get their own line. sudo execs the command directly
-# (no shell interpolation), so `*` can never smuggle arguments into the
-# interpreter or script.
-SUDOERS_COMMANDS = (
-    ("vpn", "*"),
-    ("start",),
-    ("stop",),
-    ("reload",),
-    ("ensure",),
-    ("rotate",),
-    ("rotate", "*"),
-    ("rotate", "*", "--reason", "*"),
-    ("add",),
-    ("remove",),
+SUDOERS_FILE = Path("/private/etc/sudoers.d/91-proxy-router")
+PRIVILEGED_HELPER = Path(
+    "/Library/PrivilegedHelperTools/com.proxy-router/current/privileged_helper.py"
 )
+PRIVILEGED_STATE_BASE = Path("/private/var/db/proxy-router")
+PRIVILEGED_ENV = "/usr/bin/env"
+PRIVILEGED_PYTHON = "/usr/bin/python3"
+PRIVILEGED_OPERATIONS = frozenset({"status", "start", "stop", "reload", "uninstall"})
+
+
+def _helper_command(operation: str, uid: int | None = None) -> list[str]:
+    """Exact argv authorized by the v2 root-helper sudoers policy."""
+    if operation not in PRIVILEGED_OPERATIONS:
+        raise ValueError(f"unknown privileged helper operation: {operation}")
+    owner = os.getuid() if uid is None else uid
+    if isinstance(owner, bool) or not isinstance(owner, int) or owner <= 0:
+        raise ValueError("privileged helper uid is invalid")
+    return [
+        "sudo", "-n",
+        PRIVILEGED_ENV, "-i", "HOME=/var/empty",
+        "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LANG=C",
+        PRIVILEGED_PYTHON, "-I", "-S", str(PRIVILEGED_HELPER),
+        operation, str(owner),
+    ]
+
+
+def _helper_status() -> dict | None:
+    """Return canonical helper status, or None when exact NOPASSWD is absent."""
+    try:
+        result = subprocess.run(
+            _helper_command("status"),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired, TypeError, ValueError):
+        return None
+    stdout = getattr(result, "stdout", "") or ""
+    stderr_text = getattr(result, "stderr", "") or ""
+    if result.returncode != 0:
+        stderr = stderr_text.lower()
+        if any(token in stderr for token in _SUDO_DENIAL_TOKENS):
+            return None
+        return {"installed": False, "error": (stderr_text or stdout or "helper failed")[-300:]}
+    try:
+        value = json.loads(stdout)
+    except (json.JSONDecodeError, TypeError):
+        return {"installed": False, "error": "helper returned invalid JSON"}
+    required = {"installed", "running", "pid", "mode", "schema_version"}
+    if not isinstance(value, dict) or not required <= set(value) or value.get("schema_version") != 1:
+        return {"installed": False, "error": "helper status schema mismatch"}
+    return value
+
+
+def _helper_run(operation: str) -> int:
+    """Run one exact helper lifecycle operation without any dialog fallback."""
+    try:
+        result = subprocess.run(
+            _helper_command(operation),
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        return fail(f"privileged helper {operation} failed: {exc}")
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "helper denied the operation")[-300:]
+        return fail(f"privileged helper {operation} failed: {detail}")
+    return 0
 
 # stderr markers that prove `sudo -n` DENIED (vs the command itself
 # failing). A sudoers grant is a snapshot of the command shapes at install
@@ -4601,125 +4719,148 @@ _SUDO_DENIAL_TOKENS = (
     "must have a tty",
 )
 
-# Root-owned engine (started via `sudo vpn on`): a regular user cannot
-# signal it, so name the one-time grant and the manual sudo escape hatch
-# (issue #12). Shared by engine_stop's two PermissionError paths.
-_ROOT_ENGINE_HINT = ("router: engine runs as root (started via sudo); run "
-                     "`router.py elevate install` once to stop it from the tray, "
-                     "or stop it now with `sudo python3 router.py stop`")
+# Legacy root-owned engine: regular users cannot signal it directly; direct
+# them to the safe helper migration. Shared by engine_stop error paths.
+_ROOT_ENGINE_HINT = ("router: engine runs as root; run `router.py elevate install` "
+                     "to manage it through the safe root-owned helper")
 
 
-def _sudoers_rules(user: str, python: str, router_path: str) -> str:
-    """Render the sudoers NOPASSWD rules for the given interpreter + script."""
-    lines = ["# Managed by `proxy-router elevate install`; remove with `elevate uninstall`."]
-    for shape in SUDOERS_COMMANDS:
-        cmd = " ".join([python, router_path, *shape])
-        lines.append(f"{user} ALL=(root) NOPASSWD: {cmd}")
-    return "\n".join(lines) + "\n"
+def _sudoers_rules(user: str, uid: int) -> str:
+    """Render only exact root-owned helper operations; never checkout code."""
+    import privileged_installer
+
+    return privileged_installer.render_sudoers(user, uid, PRIVILEGED_HELPER)
 
 
 def _sudoers_installed() -> bool:
-    """True when `sudo -n` may run this script's engine commands without a prompt.
-
-    Executes (not lists) the read-only `vpn status` command with `-n`.
-    `sudo -n -l` is a false positive when a sudoers rule exists but still
-    requires a password: listing succeeds but executing fails, e.g. a
-    plain `alice ALL=(ALL) ALL` entry. Every sudoers rule shares the
-    interpreter + script prefix, so one execution proves the whole set."""
-    if os.geteuid() == 0 or not shutil.which("sudo"):
-        return os.geteuid() == 0
-    cmd = [sys.executable, os.path.abspath(__file__), "vpn", "status"]
-    probe = subprocess.run(["sudo", "-n", *cmd], capture_output=True, text=True)
-    if probe.returncode == 0:
+    """True only when the exact root-owned helper status command succeeds."""
+    if os.geteuid() == 0:
         return True
-    # `vpn status` exits 1 while the engine is down (rc 0 only when the
-    # engine is up and matches the persisted mode), so a nonzero exit is
-    # NOT proof the grant is missing. Only a sudo-level denial on stderr
-    # means the NOPASSWD rule is absent; `sudo -n` reports that denial
-    # there ("a password is required", "not in the sudoers file",
-    # requiretty) instead of running the command.
-    stderr = (probe.stderr or "").lower()
-    return not any(token in stderr for token in _SUDO_DENIAL_TOKENS)
+    status = _helper_status()
+    return bool(status and status.get("installed"))
 
 
 def _elevate() -> int:
-    """Re-run the current command as root: silently when `elevate install`
-    granted passwordless sudo, else through the macOS admin dialog.
+    """Fail closed: whole-controller root re-execution was removed by #56."""
+    return fail(
+        "unsafe whole-controller elevation is disabled; "
+        "run `router.py elevate install` for the safe privileged helper"
+    )
 
-    A sudoers grant is a snapshot of the command shapes at install time; a
-    command added to the elevation surface afterwards (e.g. `start`/`stop`
-    for issue #12) can be denied even though the probe passes. A sudo-level
-    denial on stderr falls back to the admin dialog; a nonzero exit that is
-    NOT a denial is the elevated command itself failing and is returned
-    unchanged (no dialog for a real engine error)."""
-    if _sudoers_installed():
-        cmd = [sys.executable, os.path.abspath(__file__), *sys.argv[1:]]
-        probe = subprocess.run(["sudo", "-n", *cmd], capture_output=True, text=True)
-        if probe.returncode == 0:
-            return 0
-        stderr = (probe.stderr or "").lower()
-        if not any(token in stderr for token in _SUDO_DENIAL_TOKENS):
-            return probe.returncode
-    if not sys.stdin.isatty():
-        # keepalive/launchd tick: never pop an admin dialog. The TTY gate in
-        # _needs_elevation normally stops ticks from reaching this; a stale
-        # grant whose probed shape was denied would otherwise fall through
-        # to the dialog on every interval (issue #13 review finding).
-        return 1
-    return _elevate_macos()
+
+def _safe_source_bytes(path: Path, owner_uid: int, *, maximum: int = 4 * 1024 * 1024) -> bytes:
+    """Snapshot one authenticated installer source file without following links."""
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_uid != owner_uid
+            or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or info.st_size > maximum
+        ):
+            raise RuntimeError(f"unsafe installer source: {path}")
+        payload = os.read(fd, maximum + 1)
+    finally:
+        os.close(fd)
+    if len(payload) > maximum:
+        raise RuntimeError(f"oversized installer source: {path}")
+    return payload
+
+
+def _install_privileged_helper_root() -> int:
+    """Authenticated root phase: revoke legacy grant, stage helper, install v2."""
+    if os.geteuid() != 0:
+        return fail("privileged helper install root phase requires administrator approval")
+    try:
+        import privileged_helper
+        import privileged_installer
+
+        root_info = os.lstat(ROOT)
+        owner_uid = int(os.environ.get("SUDO_UID") or root_info.st_uid)
+        owner_gid = int(os.environ.get("SUDO_GID") or root_info.st_gid)
+        if owner_uid <= 0 or root_info.st_uid != owner_uid or not stat.S_ISDIR(root_info.st_mode):
+            raise RuntimeError("installer root must be owned by the authenticated non-root user")
+        username = pwd.getpwuid(owner_uid).pw_name
+        source_root = Path(os.environ.get("PROXY_ROUTER_INSTALL_SOURCE") or ROOT).resolve()
+        source_owner = 0 if os.environ.get("PROXY_ROUTER_INSTALL_SOURCE") else owner_uid
+        helper_source = _safe_source_bytes(source_root / "privileged_helper.py", source_owner)
+        installer_source = _safe_source_bytes(source_root / "privileged_installer.py", source_owner)
+        manifest_path = source_root / "sing-box-release.json"
+        manifest_source = _safe_source_bytes(manifest_path, source_owner)
+        machine = platform.machine().lower()
+        architecture = "arm64" if machine == "arm64" else "x86_64" if machine in {"x86_64", "amd64"} else machine
+        layout = privileged_installer.InstallLayout()
+        policy = privileged_installer.render_sudoers(username, owner_uid)
+
+        def stop_legacy() -> None:
+            route_watcher_stop()
+            if engine_stop() != 0:
+                raise RuntimeError("could not stop the verified legacy root engine")
+
+        def stage():
+            release = privileged_helper.release_for_architecture(
+                manifest_path,
+                architecture,
+                owner_uid=source_owner,
+                anchor=source_root,
+            )
+            request = urllib.request.Request(release["url"], headers={"User-Agent": "proxy-router-installer/2"})
+            with urllib.request.urlopen(request, timeout=60) as response:
+                archive = response.read(release["size"] + 1)
+            binary = privileged_helper.verified_release_binary(archive, release)
+            bundle = privileged_installer.stage_bundle(
+                layout,
+                helper_bytes=helper_source,
+                installer_bytes=installer_source,
+                manifest_bytes=manifest_source,
+                binary_bytes=binary,
+            )
+            privileged_installer.write_install_metadata(
+                layout,
+                uid=owner_uid,
+                gid=owner_gid,
+                user_root=ROOT,
+                user_root_device=root_info.st_dev,
+                user_root_inode=root_info.st_ino,
+                bundle_digest=bundle["bundle_digest"],
+                binary_sha256=bundle["binary_sha256"],
+            )
+            privileged_installer.install_policy(layout, policy)
+            return bundle
+
+        privileged_installer.migrate_install(
+            layout,
+            legacy_python=os.environ.get("PROXY_ROUTER_LEGACY_PYTHON", sys.executable),
+            legacy_router=os.environ.get("PROXY_ROUTER_LEGACY_ROUTER", os.path.abspath(__file__)),
+            stop_legacy=stop_legacy,
+            stage=stage,
+        )
+    except (OSError, ValueError, RuntimeError, urllib.error.URLError) as exc:
+        return fail(f"privileged helper install failed: {exc}")
+    print("elevate: installed root-owned privileged helper; lifecycle commands are now passwordless")
+    return 0
 
 
 def cmd_elevate(action: str) -> int:
-    """`elevate install|uninstall|status`: manage the one-time sudoers grant."""
+    """Manage the root-owned helper; install is the sole admin-dialog path."""
     if action == "status":
         if _sudoers_installed():
-            print("elevate: passwordless sudo for engine commands is active")
+            print("elevate: safe root-owned privileged helper is active")
             return 0
         print("elevate: not installed; run `router.py elevate install` for one-time setup",
               file=sys.stderr)
         return 1
     if action == "uninstall":
-        if os.geteuid() != 0:
-            return _elevate()  # re-runs as root; silent when rules exist
-        # Rooted re-run: remove the file we manage.
-        if SUDOERS_FILE.exists():
-            SUDOERS_FILE.unlink()
-            print(f"elevate: removed {SUDOERS_FILE}")
-        return 0
-
-    rules = _sudoers_rules(getpass.getuser(), sys.executable, os.path.abspath(__file__))
+        if os.geteuid() == 0:
+            return fail("run uninstall through the installed helper as the owning user")
+        return _helper_run("uninstall")
     if os.geteuid() != 0:
-        # One prompt (or none, if sudo already works): write, validate with
-        # visudo, then atomically install. Re-run as root and continue.
-        # `_elevate` (not a raw `sudo -n`) so a grant that lacks the
-        # `elevate install` shape (it never includes itself) falls back to
-        # the admin dialog instead of a raw sudo denial.
-        return _elevate()
-
-    if SUDOERS_FILE.exists():
-        existing = SUDOERS_FILE.read_text()
-        managed = existing.splitlines()[0].startswith("# Managed by `proxy-router")
-        if not managed:
-            print(f"elevate: {SUDOERS_FILE} exists with foreign content; move it aside first",
-                  file=sys.stderr)
-            return 1
-        if existing == rules:
-            print(f"elevate: already installed ({SUDOERS_FILE})")
-            return 0
-        print("elevate: interpreter or script path changed; rewriting rules", file=sys.stderr)
-
-    tmp = SUDOERS_FILE.with_name(SUDOERS_FILE.name + ".tmp")
-    tmp.write_bytes(b"")
-    tmp.write_text(rules)
-    os.chmod(tmp, 0o440)
-    if subprocess.run(["/usr/sbin/visudo", "-c", "-f", str(tmp)]).returncode != 0:
-        tmp.unlink(missing_ok=True)
-        print("elevate: generated sudoers rules failed visudo validation; nothing installed",
-              file=sys.stderr)
-        return 1
-    tmp.rename(SUDOERS_FILE)
-    print(f"elevate: installed {SUDOERS_FILE}; engine commands now run without a password prompt")
-    return 0
+        if not sys.stdin.isatty():
+            return fail("elevate install needs an interactive terminal for administrator approval")
+        return _elevate_macos()
+    return _install_privileged_helper_root()
 
 
 def main() -> int:

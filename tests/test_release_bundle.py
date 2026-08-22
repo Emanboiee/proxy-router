@@ -36,6 +36,8 @@ class ReleaseBundleSourceTests(unittest.TestCase):
         for name in ("setup_tui.py", "monitor.py", "route_watcher.py", "proxy_tray.py"):
             self.assertIn(name, shell)
             self.assertIn(name, powershell)
+        for name in ("privileged_helper.py", "privileged_installer.py", "sing-box-release.json"):
+            self.assertIn(name, shell)
         for name in ("guides", "rulesets"):
             self.assertIn(name, shell)
             self.assertIn(name, powershell)
