@@ -2231,7 +2231,10 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
         route_final = default_provider
 
     config = {
-        "log": {"level": "info"},
+        # warn in steady state: info logs a line per connection, which costs
+        # syscall/IO on the proxy host and grows sing-box.log for no benefit.
+        # Diagnostics can flip back via `router.py log-level info` if needed.
+        "log": {"level": "warn"},
         "inbounds": inbounds,
         "endpoints": list(active.values()),
         "outbounds": [{"type": "direct", "tag": "direct"}],
