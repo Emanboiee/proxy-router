@@ -279,6 +279,27 @@ def probe_target(root: Path, host: str, *, runner: Callable = subprocess.run) ->
     }
 
 
+def provider_for_host(root: Path, host: str) -> str | None:
+    """Map a failing host to the route provider that serves it.
+
+    Reads router.json's routes (first matching route wins, mirroring
+    sing-box rule evaluation) so rotation targets the exit actually carrying
+    the failing domain instead of a hardcoded default. Returns None when no
+    configured route matches (caller keeps its previous behavior).
+    """
+    try:
+        config = json.loads((Path(root) / "router.json").read_text())
+    except (OSError, ValueError, TypeError):
+        return None
+    normalized = normalize_host(str(host))
+    for route in config.get("routes", []):
+        for domain in route.get("domains", []):
+            if domain_matches(normalized, normalize_host(str(domain))):
+                provider = route.get("provider")
+                return str(provider) if provider else None
+    return None
+
+
 def rotate_provider(root: Path, provider: str = "proton", *, runner: Callable = subprocess.run) -> dict:
     """Ask proxy-router itself to rotate; Hermes is not involved."""
     try:
@@ -358,7 +379,8 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
                     if is_critical:
                         last_target[host] = now
                         if event.get("failure") and guard.record_transport_failure(now, host):
-                            result = rotate_provider(root)
+                            target = provider_for_host(root, host) or "proton"
+                            result = rotate_provider(root, target)
                             append_event(root, {"kind": "rotation", "observed_at": time.time(), **result})
                 elif event["kind"] == "client":
                     # Client lines are retained only as a bounded observation;
@@ -372,7 +394,8 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
                 result = probe_target(root, host)
                 append_event(root, {"kind": "probe", "observed_at": time.time(), **result})
                 if result.get("transport_failure") and guard.record_transport_failure(now, host):
-                    rotation = rotate_provider(root)
+                    target = provider_for_host(root, host) or "proton"
+                    rotation = rotate_provider(root, target)
                     append_event(root, {"kind": "rotation", "observed_at": time.time(), **rotation})
             sleep(max(0.5, float(interval)))
     finally:
