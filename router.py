@@ -3090,9 +3090,6 @@ def _elevated_reload() -> int:
             "run `router.py elevate install`"
         )
     return _helper_run("reload")
-<<<<<<< HEAD
-=======
-
 
 # ---------------------------------------------------------------------------
 # network-aware preset switching
@@ -3192,7 +3189,6 @@ def cmd_network_check() -> int:
     result = apply_network_preset()
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if result.get("reload_rc", 0) == 0 else 1
->>>>>>> origin/main
 
 
 def engine_reload(active_overrides: dict[str, Path] | None = None) -> int:
