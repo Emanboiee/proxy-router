@@ -197,6 +197,11 @@ class KeepaliveHarness:
                 os.killpg(self.proc.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
+            except PermissionError:
+                # Pinned-interpreter re-exec can leave the child outside the
+                # spawned process group; fall back to signalling the direct
+                # child (our own process — always permitted).
+                self.proc.terminate()
         else:
             self.proc.terminate()
         try:
@@ -207,6 +212,8 @@ class KeepaliveHarness:
                     os.killpg(self.proc.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+                except PermissionError:
+                    self.proc.kill()
             else:
                 self.proc.kill()
             self.out, self.err = self.proc.communicate()

@@ -229,9 +229,6 @@ restore_fallbacks() {
 }
 
 while true; do
-<<<<<<< HEAD
-  if ensure_out=$(controller ensure 2>&1); then
-=======
   # Re-read the enabled flag every tick so a runtime config flip takes effect
   # without waiting for an agent restart (env override still wins for
   # temporary ops changes).
@@ -257,8 +254,7 @@ while true; do
     continue
   fi
   manual_quiet=0
-  if ensure_out=$("$ROOT/router.py" ensure 2>&1); then
->>>>>>> origin/main
+  if ensure_out=$(controller ensure 2>&1); then
     if [ "$backoff" -ne "$INTERVAL" ]; then
       echo "$(date '+%Y-%m-%d %H:%M:%S') router: ensure ok; backoff reset to ${INTERVAL}s" >&2
     fi
