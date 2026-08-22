@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -351,18 +352,18 @@ class DashboardOpenerTests(unittest.TestCase):
     @unittest.skipUnless(sys.platform == "darwin", "macOS Terminal path")
     def test_macos_opens_terminal_with_tui(self):
         calls = []
-        def fake_run(argv, **kwargs):
+        def fake_popen(argv, **kwargs):
             calls.append(argv)
-            return subprocess.CompletedProcess(argv, 0)
-        with mock.patch.object(tray.subprocess, "run", side_effect=fake_run):
+            return mock.Mock()
+        with mock.patch.object(tray.subprocess, "Popen", side_effect=fake_popen):
             self.assertTrue(tray.open_dashboard(self.root))
         self.assertEqual(calls[0][0], "osascript")
         self.assertIn("setup_tui.py", " ".join(calls[0]))
 
     def test_macos_terminal_failure_fails_quietly(self):
-        failed = subprocess.CompletedProcess(["osascript"], 1)
         with mock.patch.object(tray.sys, "platform", "darwin"), \
-             mock.patch.object(tray.subprocess, "run", return_value=failed):
+             mock.patch.object(tray.subprocess, "Popen",
+                               side_effect=OSError("no Terminal")):
             self.assertFalse(tray.open_dashboard(self.root))
 
 
@@ -415,3 +416,33 @@ class PrivilegedHelperTrayTests(unittest.TestCase):
         subprocess_run.assert_not_called()
 
 
+class PresetApplyReloadTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.client = tray.RouterClient(self.tmp.name)
+
+    def test_reload_runs_router_reload_subcommand(self):
+        with mock.patch.object(self.client, "_run", return_value=(0, "ok")) as run:
+            rc, out = self.client.reload()
+        self.assertEqual(rc, 0)
+        run.assert_called_once_with("reload")
+
+    def test_apply_preset_failure_skips_reload(self):
+        # Drive the same closure action_apply_preset builds, without the
+        # TrayApp worker machinery (locks/menu) that needs a full app.
+        app = mock.Mock()
+        app.client = self.client
+        captured = {}
+        def fake_do(fn, label):
+            captured["rc"] = fn()
+            captured["label"] = label
+        with mock.patch.object(self.client, "_run",
+                               side_effect=[(1, "boom"), (0, "reloaded")]) as run:
+            bound = tray.TrayApp.action_apply_preset.__get__(app)
+            real_do = tray.TrayApp._do.__get__(app)
+            # replace _do on the instance for this call
+            app._do = fake_do
+            bound("school-warp")
+        run.assert_called_once_with("setup", "--preset", "school-warp")
+        self.assertEqual(captured["rc"], (1, "boom"))

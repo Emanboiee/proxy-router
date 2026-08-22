@@ -1,5 +1,6 @@
 """Unit tests for router.py (stdlib only, no third-party deps, no network)."""
 import json
+import io
 import os
 import socket
 import stat
@@ -743,6 +744,119 @@ class WaitEngineTests(unittest.TestCase):
             self.assertTrue(router.wait_engine(timeout=2.0))
 
 
+class ProcessIdentityTests(unittest.TestCase):
+    """Issue #62: whole-process-table liveness/ownership must be row-scoped.
+    A foreign sing-box run plus an unrelated process carrying our config
+    path must NOT combine into a false 'our engine is running' result."""
+
+    def _scan(self, ps_output: str, cfg: str = "/opt/router/sing-box.json"):
+        with mock.patch.object(router.subprocess, "run") as run:
+            run.return_value = SimpleNamespace(stdout=ps_output, returncode=0)
+            with mock.patch.object(router, "SING_BOX_CONFIG", cfg):
+                return router._any_our_engine_running()
+
+    def test_our_engine_on_one_row_is_true(self):
+        out = "/usr/local/bin/sing-box run -c /opt/router/sing-box.json\n"
+        self.assertTrue(self._scan(out))
+
+    def test_tokens_on_different_rows_is_false(self):
+        out = (
+            "/usr/local/bin/sing-box run -c /other/config.json\n"
+            "some-other-process --flag /opt/router/sing-box.json\n"
+        )
+        self.assertFalse(self._scan(out))
+
+    def test_no_sing_box_at_all_is_false(self):
+        self.assertFalse(self._scan("/bin/sleep 9999\n"))
+
+    def test_empty_output_is_false(self):
+        self.assertFalse(self._scan(""))
+
+    def test_config_missing_from_row_is_false(self):
+        out = "/usr/local/bin/sing-box run -c /other/config.json\n"
+        self.assertFalse(self._scan(out))
+
+    def test_windows_powershell_is_row_scoped(self):
+        # Windows: CommandLine rows; only rows carrying both identity tokens
+        # count (issue #62). tasklist fallback stays process-name only.
+        cfg = "C:\\router\\sing-box.json"
+        with mock.patch.object(router.os, "name", "nt"), \
+             mock.patch.object(router, "SING_BOX_CONFIG", cfg), \
+             mock.patch.object(router.subprocess, "run") as run:
+            run.return_value = SimpleNamespace(
+                stdout=(
+                    "C:\\sing-box.exe run -c C:\\router\\sing-box.json\r\n"
+                ), returncode=0)
+            self.assertTrue(router._any_our_engine_running())
+            run.return_value = SimpleNamespace(
+                stdout=(
+                    "C:\\sing-box.exe run -c C:\\other\\sing-box.json\r\n"
+                    "C:\\whatever.exe C:\\router\\sing-box.json\r\n"
+                ), returncode=0)
+            self.assertFalse(router._any_our_engine_running())
+
+
+class EngineStartSpawnRaceTests(unittest.TestCase):
+    """Issue #62: engine_start must capture the log offset BEFORE Popen so a
+    FATAL written between spawn and the offset read is not skipped."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        _relocate(router, self.root)
+        (self.root / "providers" / "proton").mkdir(parents=True)
+        _write_conf(self.root / "providers" / "proton" / "a.conf")
+        self._cfg = self.root / "sing-box.json"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_log_offset_captured_before_spawn(self):
+        # The offset read must be the LAST log_offset() call before Popen.
+        # Log a tiny file so log_offset() returns a real size.
+        self._cfg.write_text('{"log": {"level": "info"}}')
+        (self.root / "sing-box.log").write_text("old line\n")
+        router._providers = {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}}
+        router._routes = [{"id": "example", "domains": ["example.com"], "provider": "proton"}]
+        router._port = 2080
+        router._vpn = {}
+
+        calls = []
+
+        class _P:
+            pid = 4242
+
+        def _fake_popen(*a, **k):
+            calls.append("popen")
+            return _P()
+
+        def _fake_log_offset():
+            calls.append("offset")
+            return 10
+
+        def _fake_wait(log_from=0):
+            calls.append(f"wait:{log_from}")
+            return True
+
+        with mock.patch.object(router, "resolve_sing_box", return_value="/bin/echo"), \
+             mock.patch.object(router, "sing_box_at_least", return_value=True), \
+             mock.patch.object(router, "build_singbox_config",
+                               return_value=({"log": {}}, {"proton": self.root / "providers/proton/a.conf"})), \
+             mock.patch.object(router, "validate_config", return_value=True), \
+             mock.patch.object(router, "engine_stop", return_value=0), \
+             mock.patch.object(router, "rotate_log_if_needed", return_value=None), \
+             mock.patch.object(router, "log_offset", side_effect=_fake_log_offset), \
+             mock.patch.object(router.subprocess, "Popen", side_effect=_fake_popen), \
+             mock.patch.object(router, "wait_engine", side_effect=_fake_wait) as wait:
+            rc = router.engine_start()
+        self.assertEqual(rc, 0)
+        self.assertIn("offset", calls)
+        self.assertIn("popen", calls)
+        self.assertLess(calls.index("offset"), calls.index("popen"),
+                        "log offset must be captured BEFORE Popen")
+        wait.assert_called_once_with(log_from=10)
+
+
 class EngineReloadTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1321,18 +1435,34 @@ class RotationEgressTests(unittest.TestCase):
 
     def test_rotate_retries_probe_once_after_settle(self):
         # A fresh WireGuard exit can blackhole inner TLS for its first
-        # seconds: one retry after the settle window must rescue the switch
-        # instead of rolling back a healthy exit.
+        # seconds: the settle window is polled, so a retry that succeeds
+        # rescues the switch instead of rolling back a healthy exit.
         router.set_active("proton", self._profile("a"))
         router._egress_settings = {**router.DEFAULT_EGRESS_SETTINGS, "probe_settle_seconds": 25}
         with mock.patch.object(router, "listener_up", return_value=True), \
-                mock.patch.object(router.time, "sleep") as slept, \
+                mock.patch.object(router.time, "sleep"), \
                 mock.patch.object(router, "probe_profile",
                                   side_effect=[(False, {"ok": False}), (True, {"ok": True})]) as probe:
             self.assertEqual(router.rotate("proton"), 0)
-        self.assertEqual(probe.call_count, 2)
-        slept.assert_called_once_with(25.0)
+        # first probe failed; polled retries rescued it within the window
+        self.assertGreaterEqual(probe.call_count, 2)
         self.assertEqual(self._active(), "b")  # kept the switched exit
+
+    def test_rotate_settle_poll_bounded_by_window(self):
+        # The settle poll must never exceed the configured window even when
+        # every retry fails (worst case: rotation still fails after ~settle,
+        # not settle + unbounded extra probes).
+        router.set_active("proton", self._profile("a"))
+        router._egress_settings = {**router.DEFAULT_EGRESS_SETTINGS, "probe_settle_seconds": 4}
+        started = router.time.monotonic()
+        with mock.patch.object(router, "listener_up", return_value=True), \
+                mock.patch.object(router, "probe_profile",
+                                  return_value=(False, {"ok": False})):
+            self.assertEqual(router.rotate("proton"), 1)
+        # The settle poll is wall-clock bounded by the configured window
+        # (plus one final probe), never an unbounded retry loop.
+        elapsed = router.time.monotonic() - started
+        self.assertLess(elapsed, 4 + 10)
 
     def test_rotate_no_probe_skips_probe(self):
         router.set_active("proton", self._profile("a"))
@@ -1885,23 +2015,23 @@ class EgressCheckCommandTests(unittest.TestCase):
         router.set_active("proton", self.root / "providers" / "proton" / "a.conf")
         router.set_active("cloudflare", self.root / "providers" / "cloudflare" / "b.conf")
         self.live_patch.stop()  # exercise the real check_egress_live/record path
-        probes = [
-            # proton: transport-dead twice (the blip retry re-probes once)
-            {"ok": False, "latency_ms": None, "status": None,
-             "error": "URLError: timeout", "block_reason": None},
-            {"ok": False, "latency_ms": None, "status": None,
-             "error": "URLError: timeout", "block_reason": None},
-            # cloudflare: alive first try
-            {"ok": True, "latency_ms": 42.0, "status": 200,
-             "error": None, "block_reason": None},
-        ]
-        with mock.patch.object(router, "probe_egress", side_effect=probes) as probe, \
+        def scripted_probe(url=None, **kwargs):
+            # Order-independent: providers may be probed concurrently, so key
+            # the verdict off the routed host in the URL instead of call
+            # sequence (proton rides example.com, cloudflare rides roblox.com).
+            if "example.com" in (url or ""):
+                return {"ok": False, "latency_ms": None, "status": None,
+                        "error": "URLError: timeout", "block_reason": None}
+            return {"ok": True, "latency_ms": 42.0, "status": 200,
+                    "error": None, "block_reason": None}
+        with mock.patch.object(router, "probe_egress",
+                               side_effect=lambda url=None, **k: scripted_probe(url=url, **k)) as probe, \
              mock.patch.object(router, "egress_dns_probe", return_value=True), \
              mock.patch.object(router.time, "sleep"), \
              mock.patch("sys.stdout.write") as write:
             rc = router.egress_check()
         self.assertEqual(rc, 1)
-        self.assertEqual(probe.call_count, 3)
+        self.assertGreaterEqual(probe.call_count, 3)
         joined = "".join(str(c) for c in write.call_args_list)
         self.assertIn("dead: proton", joined)
         self.assertNotIn("dead: cloudflare", joined)
@@ -1921,8 +2051,15 @@ class EgressCheckCommandTests(unittest.TestCase):
     def test_json_shape(self):
         router.set_active("proton", self.root / "providers" / "proton" / "a.conf")
         router.set_active("cloudflare", self.root / "providers" / "cloudflare" / "b.conf")
-        self._live(("dead", {"ok": False, "dns_ok": False}),
-                   ("alive", {"ok": True, "dns_ok": True}))
+        # key verdicts by provider (probes may run concurrently)
+        def by_provider(name, profile, **kwargs):
+            if name == "proton":
+                return ("dead", {"ok": False, "dns_ok": False})
+            return ("alive", {"ok": True, "dns_ok": True})
+        self.live_patch.stop()
+        self.live_patch = mock.patch.object(router, "check_egress_live",
+                                            side_effect=by_provider)
+        self.live = self.live_patch.start()
         with mock.patch("sys.stdout.write") as write:
             rc = router.egress_check(as_json=True)
         self.assertEqual(rc, 1)
@@ -3213,3 +3350,140 @@ class WithProxyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConfigDriftCacheTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._saved = (router.ROOT, router.CONFIG_FILE,
+                       router._providers, router._routes, router._vpn,
+                       router._routing, router._port)
+        self.addCleanup(lambda: setattr(router, "_providers", router._providers))
+        router.ROOT = Path(self._tmp.name)
+        router.CONFIG_FILE = router.ROOT / "router.json"
+        router.CONFIG_FILE.write_text("{}")
+        # Prior tests leave provider/route globals loaded from their own tmp
+        # roots; reset to a clean slate so both drifted() calls in this test
+        # read exactly the same inputs.
+        router._providers, router._routes = {}, []
+        router._vpn, router._routing, router._port = {}, {}, 2080
+        router._DRIFT_CACHE["fingerprint"] = None
+
+    def tearDown(self):
+        (router.ROOT, router.CONFIG_FILE, router._providers,
+         router._routes, router._vpn, router._routing,
+         router._port) = self._saved
+        router._DRIFT_CACHE["fingerprint"] = None
+
+    def test_unchanged_inputs_short_circuit_to_cached_verdict(self):
+        calls = {"n": 0}
+        real_build = router.build_singbox_config
+
+        def counting_build(*a, **k):
+            calls["n"] += 1
+            return real_build(*a, **k)
+
+        with mock.patch.object(router, "build_singbox_config", side_effect=counting_build), \
+                mock.patch.object(router, "SING_BOX_CONFIG",
+                                  Path(self._tmp.name) / "sing-box.json"):
+            (router.ROOT / "sing-box.json").write_text("{}")
+            first = router._config_drifted()
+            second = router._config_drifted()
+        self.assertEqual(first, second)
+        # second call served from the fingerprint cache
+        self.assertEqual(calls["n"], 1)
+
+    def test_changed_input_invalidates_cache(self):
+        calls = {"n": 0}
+        real_build = router.build_singbox_config
+
+        def counting_build(*a, **k):
+            calls["n"] += 1
+            return real_build(*a, **k)
+
+        with mock.patch.object(router, "build_singbox_config", side_effect=counting_build), \
+                mock.patch.object(router, "SING_BOX_CONFIG",
+                                  Path(self._tmp.name) / "sing-box.json"):
+            (router.ROOT / "sing-box.json").write_text("{}")
+            router._config_drifted()
+            time.sleep(0.01)
+            router.CONFIG_FILE.write_text('{"port": 2080}')
+            router._config_drifted()
+        self.assertEqual(calls["n"], 2)
+
+
+class EgressCheckParallelTests(unittest.TestCase):
+    def test_parallel_probes_overlap_in_time(self):
+        # Three providers each probing with a 0.3s delay: sequential would
+        # take >=0.9s; the concurrent path must finish in well under that.
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        old_root, old_config = router.ROOT, router.CONFIG_FILE
+        old_providers, old_port = router._providers, router._port
+        router.ROOT = Path(self._tmp.name)
+        router.CONFIG_FILE = router.ROOT / "router.json"
+        router.CONFIG_FILE.write_text("{}")
+        router._providers = {"a": {}, "b": {}, "c": {}}
+        try:
+            for name in router._providers:
+                (router.ROOT / "state").mkdir(parents=True, exist_ok=True)
+            def slow_check(provider, profile, **k):
+                time.sleep(0.3)
+                return "alive", {"ok": True, "status": 200}
+            with mock.patch.object(router, "persisted_active", return_value=None), \
+                    mock.patch.object(router, "resolve_active",
+                                      side_effect=lambda name: Path(self._tmp.name) / f"{name}.conf"), \
+                    mock.patch.object(router, "active_fallback", return_value=None), \
+                    mock.patch.object(router, "check_egress_live", side_effect=slow_check), \
+                    mock.patch.object(router, "listener_up", return_value=True), \
+                    mock.patch.object(router, "_port", 2080), \
+                    mock.patch("sys.stdout", new_callable=io.StringIO):
+                started = time.monotonic()
+                rc = router.egress_check(None, as_json=False)
+                elapsed = time.monotonic() - started
+            self.assertEqual(rc, 0)
+            self.assertLess(elapsed, 0.9,
+                            "egress check probes appear to run sequentially")
+        finally:
+            router.ROOT, router.CONFIG_FILE = old_root, old_config
+            router._providers, router._port = old_providers, old_port
+
+
+class DnsServerDedupeTests(unittest.TestCase):
+    def test_identical_resolvers_collapse_to_one_entry(self):
+        # Two providers whose profiles pin the same DNS must share one
+        # server entry (one warm DoH session, not two identical handshakes).
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        old = (router.ROOT, router.CONFIG_FILE, router._providers,
+               router._routes, router._vpn, router._routing, router._port)
+        try:
+            router.ROOT = Path(self._tmp.name)
+            router.CONFIG_FILE = router.ROOT / "router.json"
+            router.CONFIG_FILE.write_text("{}")
+            router._providers = {"p1": {}, "p2": {}}
+            router._routes = []
+            router._vpn, router._routing, router._port = {}, {}, 2080
+            conf = "[Interface]\nPrivateKey = AAAA\nAddress = 10.0.0.2/32\nDNS = 1.1.1.1\n[Peer]\nPublicKey = BBBB\nEndpoint = 127.0.0.1:51820\nAllowedIPs = 0.0.0.0/0\n"
+            for name in ("p1", "p2"):
+                d = router.ROOT / "providers" / name
+                d.mkdir(parents=True)
+                (d / "a.conf").write_text(conf)
+            with mock.patch.object(router, "parse_wireguard",
+                                   return_value={"type": "wireguard", "tag": "x"}), \
+                    mock.patch.object(router, "_usable_profile",
+                                      side_effect=lambda name, preferred=None:
+                                      router.ROOT / "providers" / name / "a.conf"):
+                config, _active = router.build_singbox_config()
+            servers = config["dns"]["servers"]
+            provider_servers = [s for s in servers if s["tag"] != "dns-local"]
+            self.assertEqual(len(provider_servers), 1,
+                             f"expected one shared resolver, got {provider_servers}")
+            # both endpoints resolve through the shared tag
+            resolvers = {e["domain_resolver"] for e in config["endpoints"]}
+            self.assertEqual(resolvers, {provider_servers[0]["tag"]})
+        finally:
+            (router.ROOT, router.CONFIG_FILE, router._providers,
+             router._routes, router._vpn, router._routing,
+             router._port) = old

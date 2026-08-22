@@ -465,6 +465,11 @@ def write_default_config(force: bool = False) -> int:
                 "stack": DEFAULT_TUN_STACK,
                 "dns_transport": "udp",
                 "selective": "roblox",
+                "network_auto": False,
+                "network_presets": {
+                    "MySchoolWiFi": "school-warp",
+                    "MyHomeWiFi": "default",
+                },
             },
             "egress": {
                 "probe_url": DEFAULT_PROBE_URL,
@@ -1345,8 +1350,18 @@ def _probe_with_settle(name: str, profile: Path, *, port: int | None = None) -> 
         return ok, record
     print(f"router: probe failed for {profile.stem}; retrying once after {settle:.0f}s settle",
           file=sys.stderr)
-    time.sleep(settle)
-    return probe_profile(name, profile, port=port)
+    # Poll the settle window instead of sleeping through it: an exit whose
+    # handshake completes early is detected within one poll step instead of
+    # always paying the full settle (measured worst case: 20s of dead-riding
+    # traffic per failed rotation).
+    poll_step = min(2.0, max(0.5, settle / 10.0))
+    deadline = time.monotonic() + settle
+    while time.monotonic() < deadline:
+        time.sleep(min(poll_step, max(0.0, deadline - time.monotonic())))
+        ok, record = probe_profile(name, profile, port=port)
+        if ok:
+            return ok, record
+    return ok, record
 
 
 _DNS_ERROR_RE = re.compile(
@@ -2008,6 +2023,8 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
         # sing-box 1.12+: provider endpoint routed through this endpoint is
         # resolved with an explicit per-endpoint resolver instead of the
         # deprecated implicit DNS rule path. DialerOptions is embedded flat.
+        # Provisional per-provider tag; deduped below once all resolvers
+        # are known (identical servers collapse to one shared entry).
         endpoint["domain_resolver"] = f"dns-{name}"
         active[name] = endpoint
         selected[name] = profile
@@ -2019,15 +2036,33 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
     # server to the "direct" outbound with "empty direct outbound" at start).
     # The resolved IP still gets dialed through the provider's endpoint
     # outbound, so the destination traffic stays provider-routed.
-    dns_servers = [
-        {
+    # Deduplicate identical resolvers: multiple providers commonly share the
+    # same DNS (e.g. every Proton profile pins 1.1.1.1). One server entry per
+    # distinct (type, server, port) keeps sing-box's connection pool warm in
+    # ONE session instead of fragmenting into N identical DoH handshakes;
+    # per-provider tags become aliases resolved to the shared entry.
+    def _dns_entry(tag: str, name: str) -> dict:
+        return {
             "type": dns_transport(),
-            "tag": f"dns-{name}",
+            "tag": tag,
             "server": dns_map[name],
             **({"server_port": 443} if dns_transport() == "https" else {}),
         }
-        for name in active
-    ]
+
+    dns_servers: list[dict] = []
+    dns_alias: dict[str, str] = {}
+    seen_dns: dict[tuple, str] = {}  # (type, server, port) -> canonical tag
+    for name in active:
+        entry = _dns_entry(f"dns-{name}", name)
+        key = (entry["type"], entry["server"], entry.get("server_port"))
+        if key in seen_dns:
+            dns_alias[name] = seen_dns[key]
+        else:
+            seen_dns[key] = entry["tag"]
+            dns_servers.append(entry)
+    # Rewrite provisional per-provider resolver tags to the canonical entry.
+    for name in active:
+        active[name]["domain_resolver"] = dns_alias.get(name, f"dns-{name}")
     # sing-box 1.12+: any dial without an explicit resolver needs
     # route.default_domain_resolver; the system (local) transport keeps
     # non-routed domains away from the tunnels and silences the deprecated
@@ -2064,7 +2099,8 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
                 if any(domain == vpn or domain.endswith("." + vpn) for vpn in vpn_domains)
             ]
         if domains:
-            dns_rules.append({"domain_suffix": domains, "server": f"dns-{route_provider}"})
+            dns_rules.append({"domain_suffix": domains,
+                              "server": dns_alias.get(route_provider, f"dns-{route_provider}")})
 
     # Route rules: safe-list direct-domain pins first (a trusted domain is
     # never tunneled even if a provider route also mentions it), then the
@@ -2205,7 +2241,10 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
         route_final = default_provider
 
     config = {
-        "log": {"level": "info"},
+        # warn in steady state: info logs a line per connection, which costs
+        # syscall/IO on the proxy host and grows sing-box.log for no benefit.
+        # Diagnostics can flip back via `router.py log-level info` if needed.
+        "log": {"level": "warn"},
         "inbounds": inbounds,
         "endpoints": list(active.values()),
         "outbounds": [{"type": "direct", "tag": "direct"}],
@@ -2224,6 +2263,10 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
 
 
 def write_sing_box(config: dict) -> None:
+    if not any(endpoint.get("type") == "wireguard" for endpoint in config.get("endpoints", [])):
+        print("router: refusing to write an egress-less sing-box config; keeping existing file",
+              file=sys.stderr)
+        return
     SING_BOX_CONFIG.parent.mkdir(parents=True, exist_ok=True)
     temporary = None
     try:
@@ -2327,7 +2370,10 @@ def _any_our_engine_running() -> bool:
     path in its command line.
 
     Used when the pid file itself is unreadable (root-owned after a
-    `sudo vpn on`): same identity check as ``_pid_matches``, minus the pid."""
+    `sudo vpn on`): same identity check as ``_pid_matches``, minus the pid.
+    Row-scoped: both identity tokens must appear on ONE process row, so a
+    foreign sing-box run plus an unrelated process carrying our config path
+    cannot combine into a false ownership result (issue #62)."""
     try:
         if os.name == "nt":
             out = subprocess.run(
@@ -2335,8 +2381,16 @@ def _any_our_engine_running() -> bool:
                  "(Get-CimInstance Win32_Process -Filter \"Name='sing-box.exe'\").CommandLine"],
                 capture_output=True, text=True, timeout=5,
             ).stdout
+            for line in out.splitlines():
+                # CIM already filters to sing-box.exe processes; require the
+                # exact process token too, so a foreign row merely carrying
+                # our config path (e.g. "sing-box.json" in some other tool's
+                # cmdline) cannot combine into a false ownership result
+                # (issue #62).
+                if "sing-box.exe" in line.lower() and str(SING_BOX_CONFIG) in line:
+                    return True
             if out:
-                return str(SING_BOX_CONFIG) in out
+                return False
             out = subprocess.run(
                 ["tasklist", "/FI", "IMAGENAME eq sing-box.exe", "/FO", "CSV", "/NH"],
                 capture_output=True, text=True, timeout=3,
@@ -2348,7 +2402,10 @@ def _any_our_engine_running() -> bool:
         ).stdout
     except (OSError, subprocess.TimeoutExpired):
         return False
-    return "sing-box run" in out and str(SING_BOX_CONFIG) in out
+    for line in out.splitlines():
+        if "sing-box run" in line and str(SING_BOX_CONFIG) in line:
+            return True
+    return False
 
 
 def _pid_matches(pid: int) -> bool:
@@ -2683,11 +2740,45 @@ def engine_start(use_existing_config: bool = False, *, recover: bool = True) -> 
                 print("router: generated config failed validation; restoring last-good", file=sys.stderr)
                 return restore_last_good()
             return fail("sing-box config check failed")
+    # Capture the pre-spawn offset BEFORE any engine spawn decision (helper
+    # or local): a FATAL written between spawn and a post-spawn log_offset()
+    # read would be skipped as historical, yet wait_engine relies on early
+    # FATAL detection (issue #62). Capturing unconditionally here keeps the
+    # ordering guarantee independent of which start path runs below, and the
+    # status probe itself must never be mistaken for an engine spawn.
+    spawn_log_offset = log_offset()
     if sys.platform == "darwin" and os.geteuid() != 0:
         helper = _helper_status()
         helper_installed = bool(helper and helper.get("installed"))
-        helper_running = bool(helper and helper.get("installed") and helper.get("running"))
-        if current_mode() == "tun" or helper_running:
+        # Route through the helper only when this start actually needs root
+        # continuity: TUN mode, or the live engine is a root-owned one that a
+        # user-level restart would strand. An ambiently running helper (e.g.
+        # another user context) must not capture plain proxy-mode starts —
+        # those work fine unprivileged and must keep their spawn ordering
+        # guarantees (issue #62 regression guard).
+        root_engine_live = False
+        try:
+            if PID_FILE.is_file():
+                pid_text = PID_FILE.read_text().strip()
+                if pid_text.isdigit() and int(pid_text) > 0:
+                    pid_int = int(pid_text)
+                    root_engine_live = _pid_matches(pid_int)
+                    if root_engine_live and sys.platform != "win32":
+                        try:
+                            out = subprocess.run(
+                                ["ps", "-o", "uid=", "-p", str(pid_int)],
+                                capture_output=True, text=True, timeout=5,
+                            ).stdout.strip()
+                            root_engine_live = bool(out) and int(out) == 0
+                        except (OSError, subprocess.TimeoutExpired, ValueError,
+                                TypeError, AttributeError):
+                            # TypeError/AttributeError: under tests, Popen may
+                            # be a mock lacking context-manager support; a
+                            # non-root verdict is the safe fallback.
+                            root_engine_live = False
+        except OSError:
+            root_engine_live = False
+        if current_mode() == "tun" or root_engine_live:
             if not helper_installed:
                 return fail(
                     "TUN/root engine requires the safe privileged helper; "
@@ -2735,7 +2826,7 @@ def engine_start(use_existing_config: bool = False, *, recover: bool = True) -> 
     # back so non-root readers (log_has_fatal, keepalive rotation, status)
     # can still open it. The engine keeps writing through its inherited fd.
     _hand_back_ownership(LOG_FILE)
-    if not wait_engine(log_from=log_offset()):
+    if not wait_engine(log_from=spawn_log_offset):
         engine_stop()
         if recover and not use_existing_config and LAST_GOOD_FILE.is_file():
             print("router: generated config failed to come up; restoring last-good", file=sys.stderr)
@@ -2812,6 +2903,36 @@ def engine_switch() -> int:
     return 1
 
 
+def _config_inputs_fingerprint() -> tuple | None:
+    """Cheap fingerprint of everything build_singbox_config() reads.
+
+    Covers router.json plus every provider profile and active/cooldown
+    marker under state/, by (path, mtime_ns, size). When this is unchanged,
+    the generated config cannot have changed either, so the expensive
+    rebuild+compare in _config_drifted can be skipped (keepalive calls
+    ensure every 15s; the rebuild includes bounded DNS lookups per peer).
+    """
+    try:
+        entries: list[tuple[str, int, int]] = []
+        config_path = CONFIG_FILE
+        st = config_path.stat()
+        entries.append((str(config_path), st.st_mtime_ns, st.st_size))
+        for pattern in ("providers/*/*.conf", "state/*.active", "state/*.cooldown",
+                        "state/mode", "state/fallback", "state/egress/*/*.json"):
+            for path in ROOT.glob(pattern):
+                try:
+                    st = path.stat()
+                except OSError:
+                    continue
+                entries.append((str(path), st.st_mtime_ns, st.st_size))
+        return tuple(sorted(entries))
+    except OSError:
+        return None
+
+
+_DRIFT_CACHE: dict = {"fingerprint": None, "drifted": False}
+
+
 def _config_drifted() -> bool:
     """True when the running engine's config no longer matches what the
     current router.json + active markers would generate.
@@ -2820,24 +2941,39 @@ def _config_drifted() -> bool:
     editing the on-disk sing-box.json diverged from reality — the proxy
     listener TLS-failed while transparent capture served traffic, until a
     manual reload converged. The ensure watchdog heals that drift with the
-    same graceful in-place reload rotations use."""
+    same graceful in-place reload rotations use.
+
+    The full rebuild+compare runs only when an input file changed since the
+    last check; unchanged inputs short-circuit to the cached verdict.
+    """
+    fingerprint = _config_inputs_fingerprint()
+    if fingerprint is not None and fingerprint == _DRIFT_CACHE["fingerprint"]:
+        return _DRIFT_CACHE["drifted"]
     try:
         fresh, _active = build_singbox_config()
         running = json.loads(SING_BOX_CONFIG.read_text())
     except (SystemExit, KeyError, ValueError, OSError, configparser.Error, json.JSONDecodeError):
-        return False  # never block ensure on a build/read problem
-    return json.dumps(fresh, sort_keys=True) != json.dumps(running, sort_keys=True)
+        # never block ensure on a build/read problem; don't cache either
+        return False
+    drifted = json.dumps(fresh, sort_keys=True) != json.dumps(running, sort_keys=True)
+    if fingerprint is not None:
+        _DRIFT_CACHE["fingerprint"] = fingerprint
+        _DRIFT_CACHE["drifted"] = drifted
+    return drifted
 
 
 def engine_ensure() -> int:
     if MANUAL_OFF_FILE.is_file():
         # The user disconnected manually (tray Disconnect / `router.py
-        # stop`). keepalive.sh also skips its ensure tick while the marker
-        # exists, but a stray direct `router.py ensure` must not resurrect
-        # the engine either.
+        # stop`). keepalive.sh also skips its maintenance while the marker
+        # exists (see its manual-off quiescence check), but a stray direct
+        # `router.py ensure` must not resurrect the engine either. Return 3
+        # (NOT 0): 0 means "healthy, maintenance may proceed" and would let
+        # keepalive run egress checks/rotations against a deliberately
+        # disconnected tunnel (manual-off is quiescent, not healthy).
         print("router: manually disconnected (manual-off marker present); "
               "run 'router.py start' to reconnect", file=sys.stderr)
-        return 0
+        return 3
     if current_mode() == "tun":
         # A proxy engine running while state/mode says tun is NOT healthy
         # (status/vpn status report it as down); restart into the persisted
@@ -2914,7 +3050,16 @@ def engine_stop() -> int:
                 subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
             else:
                 os.kill(pid, signal.SIGTERM)
-                time.sleep(0.4)
+                # Poll for exit instead of a blind sleep: sing-box usually
+                # exits in <50ms, so the stop path returns immediately
+                # instead of costing a fixed 0.4s on every switch/restart.
+                # The grace window (and the ownership re-check before any
+                # hard kill) is unchanged.
+                grace_deadline = time.monotonic() + 0.4
+                while time.monotonic() < grace_deadline:
+                    if not _pid_matches(pid):
+                        break
+                    time.sleep(0.02)
                 # The process may have exited, or the PID may have been
                 # recycled during the grace period. Re-check ownership before
                 # sending a hard kill.
@@ -2941,6 +3086,106 @@ def _elevated_reload() -> int:
             "run `router.py elevate install`"
         )
     return _helper_run("reload")
+
+
+# ---------------------------------------------------------------------------
+# network-aware preset switching
+# ---------------------------------------------------------------------------
+
+def current_ssid() -> str | None:
+    """Active Wi-Fi SSID via `ipconfig getsummary` (macOS, read-only).
+
+    Returns None when Wi-Fi is off or no interface answers. Pure getter;
+    tests inject synthetic output through subprocess mocks.
+    """
+    for iface in ("en0", "en1"):
+        try:
+            probe = subprocess.run(
+                ["ipconfig", "getsummary", iface],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if probe.returncode != 0:
+            continue
+        for line in probe.stdout.splitlines():
+            if line.strip().startswith("SSID"):
+                _, _, value = line.partition(":")
+                ssid = value.strip()
+                return ssid or None
+    return None
+
+
+def network_preset_map() -> dict[str, str]:
+    """SSID -> preset mapping from ``vpn.network_presets``."""
+    raw = _vpn.get("network_presets") or {}
+    if not isinstance(raw, dict):
+        return {}
+    return {str(ssid): str(name) for ssid, name in raw.items() if ssid and name}
+
+
+def network_auto_enabled() -> bool:
+    return bool(_vpn.get("network_auto", False))
+
+
+def preset_for_current_network() -> str | None:
+    """Preset mapped to the connected SSID, or None when auto is off."""
+    if not network_auto_enabled():
+        return None
+    ssid = current_ssid()
+    if not ssid:
+        return None
+    return network_preset_map().get(ssid)
+
+
+def network_preset_marker(root: Path | None = None) -> Path:
+    return (Path(root) if root is not None else ROOT) / "state" / "network-preset.json"
+
+
+def apply_network_preset(*, reload_engine: bool = True, root: Path | None = None) -> dict:
+    """Auto-switch the routing preset for the current network; no-op when unchanged.
+
+    Applies the mapped preset with ``setup_tui.apply_preset_by_name`` (lossless
+    merge: routes/providers are added, nothing removed) and, when the preset
+    changed, reloads the engine so the change goes live. Writes the
+    ``state/network-preset.json`` marker for the status/tray surface.
+    """
+    root = Path(root) if root is not None else ROOT
+    preset = preset_for_current_network()
+    now = int(time.time())
+    if preset is None:
+        return {"applied": False, "reason": "no network mapping", "checked_at": now}
+    try:
+        current = json.loads((root / "router.json").read_text()).get("preset")
+    except (OSError, json.JSONDecodeError):
+        current = None
+    if current == preset:
+        return {"applied": False, "reason": "already active", "preset": preset, "checked_at": now}
+    from setup_tui import apply_preset_by_name
+    result = apply_preset_by_name(root, preset)
+    marker = network_preset_marker(root)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps({
+        "ssid": current_ssid(),
+        "preset": preset,
+        "applied_at": now,
+    }))
+    os.chmod(marker, 0o600)
+    if reload_engine:
+        if _engine_runs_as_root():
+            result["reload_rc"] = _elevated_reload()
+        else:
+            result["reload_rc"] = engine_reload()
+    return {"applied": True, **result, "preset": preset, "checked_at": now}
+
+
+def cmd_network_check() -> int:
+    """Auto-switch the routing preset for the current network (SSID)."""
+    if load_config() != 0:
+        return 1
+    result = apply_network_preset()
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if result.get("reload_rc", 0) == 0 else 1
 
 
 def engine_reload(active_overrides: dict[str, Path] | None = None) -> int:
@@ -3030,7 +3275,13 @@ def engine_reload(active_overrides: dict[str, Path] | None = None) -> int:
             print("router: engine failed to start with new config; restoring last-good", file=sys.stderr)
             return restore_last_good()
         return 0
-    if wait_engine(2.0, log_from=reload_log_from):
+    # In tun mode a fresh WireGuard handshake routinely needs >2s before an
+    # end-to-end egress probe can succeed; a 2s budget almost always failed
+    # here and degraded every tun-mode reload into a full stop/start
+    # (multi-second traffic cut). Give the handshake a realistic budget —
+    # proxy mode keeps the snappy 2s (listener answers in ms).
+    reload_wait = 12.0 if current_mode() == "tun" else 2.0
+    if wait_engine(reload_wait, log_from=reload_log_from):
         # The new config demonstrably runs: snapshot it as last-good.
         write_last_good()
         return 0
@@ -3818,7 +4069,15 @@ def egress_check(name: str | None = None, as_json: bool = False) -> int:
     providers = [name] if name is not None else list(_providers)
     results: dict[str, dict] = {}
     dead: list[str] = []
-    for provider in providers:
+
+    def _check_one(provider: str) -> tuple[str, dict, bool]:
+        """Probe one provider; returns (provider, entry, is_dead).
+
+        Probes are independent (each rides the shared local listener), so
+        they run concurrently: a dead exit costs its own probe timeout once,
+        not once per provider in sequence (3 providers x 8s timeout used to
+        serialize into ~24s+ per check cycle).
+        """
         active = persisted_active(provider) or resolve_active(provider)
         fallback = active_fallback(provider)
         if fallback:
@@ -3834,27 +4093,40 @@ def egress_check(name: str | None = None, as_json: bool = False) -> int:
                 entry["dns_ok"] = record["dns_ok"]
             if status == "dead":
                 entry["detail"] = "dns" if entry.get("dns_ok") is False else "probe connection"
-                dead.append(provider)
-            elif status == "degraded" and record is not None:
+                return provider, entry, True
+            if status == "degraded" and record is not None:
                 entry["detail"] = (f"HTTP {record['status']}" if record.get("status") is not None
                                    else "throttled (TLS)")
-            results[provider] = entry
-            continue
+            return provider, entry, False
         if active is None:
-            results[provider] = {"profile": None, "ok": True, "status": "skipped",
-                                 "detail": "no active profile"}
-            continue
+            return provider, {"profile": None, "ok": True, "status": "skipped",
+                              "detail": "no active profile"}, False
         status, record = check_egress_live(provider, active)
         entry: dict = {"profile": active.stem, "ok": status != "dead", "status": status}
         if record is not None and record.get("dns_ok") is not None:
             entry["dns_ok"] = record["dns_ok"]
         if status == "dead":
             entry["detail"] = "dns" if entry.get("dns_ok") is False else "probe connection"
-            dead.append(provider)
-        elif status == "degraded" and record is not None:
+            return provider, entry, True
+        if status == "degraded" and record is not None:
             entry["detail"] = (f"HTTP {record['status']}" if record.get("status") is not None
                                else "throttled (TLS)")
-        results[provider] = entry
+        return provider, entry, False
+
+    if len(providers) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(8, len(providers)),
+                                thread_name_prefix="egress-check") as pool:
+            for provider, entry, is_dead in pool.map(_check_one, providers):
+                results[provider] = entry
+                if is_dead:
+                    dead.append(provider)
+    else:
+        for provider in providers:
+            provider, entry, is_dead = _check_one(provider)
+            results[provider] = entry
+            if is_dead:
+                dead.append(provider)
     # No break after a dead provider: every provider's record must be
     # refreshed each cycle so status UIs never show stale failures from a
     # provider that merely follows a dead-first one in check order.
@@ -4596,7 +4868,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(prog="router", description="selective WireGuard proxy router")
     sub = parser.add_subparsers(dest="cmd")
 
-    sub.add_parser("ensure")
+    sub.add_parser("ensure", help="ensure the engine is up (0 = healthy, 1 = failure, 3 = manual-off quiescent)")
     sub.add_parser("start")
     sub.add_parser("stop")
     status = sub.add_parser("status")
@@ -4708,9 +4980,13 @@ def main() -> int:
     elevate = sub.add_parser("elevate", help="one-time passwordless-sudo grant (install|uninstall|status)")
     elevate.add_argument("action", choices=["install", "uninstall", "status"])
 
+    sub.add_parser("network-check", help="auto-switch routing preset for the current Wi-Fi network")
+
     args, passthrough = parser.parse_known_args()
     if args.cmd == "elevate":
         return cmd_elevate(args.action)
+    if args.cmd == "network-check":
+        return cmd_network_check()
     if _needs_elevation(args):
         return _elevate()
     if args.cmd == "setup":

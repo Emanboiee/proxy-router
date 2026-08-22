@@ -159,11 +159,16 @@ _BUILTIN_PRESETS: dict = {
     "default": {  # the classic combo: opencode via proton + roblox via warp
         "routes": [_PRESET_ROUTES["opencode-zen"], _PRESET_ROUTES["roblox"]],
         "routing": {"mode": "default"},
+        # Unfiltered home/default networks: plain UDP 53 DNS (fast path).
+        "vpn": {"dns_transport": "udp"},
     },
     "school-warp": {
         "routes": [_PRESET_ROUTES["school"]],
         "routing": {"mode": "vpn-list",
                     "vpn_domains": list(_PRESET_ROUTES["school"]["domains"])},
+        # Filtered school/captive networks drop UDP 53; tunnel DNS must ride
+        # DoH there. Applying any other built-in preset restores UDP.
+        "vpn": {"dns_transport": "https"},
     },
 }
 
@@ -380,9 +385,7 @@ def configure_autocheck(config_path, preset: str | None = None, **overrides) -> 
         settings[key] = value
     settings["preset"] = selected
     data["keepalive"] = settings
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(json.dumps(data, indent=2) + "\n")
-    os.chmod(config_path, 0o600)
+    _atomic_write_config(config_path, data)
     return settings
 
 
@@ -405,6 +408,24 @@ def guide_text(provider: str) -> str:
 # ---------------------------------------------------------------------------
 # presets
 # ---------------------------------------------------------------------------
+
+def _atomic_write_config(path: Path, data: dict) -> None:
+    """Write a router.json-shaped dict atomically (tmp + os.replace).
+
+    Every config writer must go through this: a crash or full disk mid-write
+    of the plain write_text path left a truncated router.json, and the next
+    ensure/rotate then failed to parse it — the proxy stayed down until the
+    file was fixed by hand.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", dir=str(path.parent), delete=False,
+                                     encoding="utf-8") as tmp:
+        json.dump(data, tmp, indent=2, sort_keys=True)
+        tmp.write("\n")
+        tmp_path = Path(tmp.name)
+    os.replace(tmp_path, path)
+    os.chmod(path, 0o600)
+
 
 def _default_config() -> dict:
     example = Path(__file__).resolve().parent / "router.example.json"
@@ -452,9 +473,7 @@ def apply_presets(config_path, opencode=True, warp_roblox=True) -> dict:
         if not any(r.get("id") == "roblox" for r in routes):
             routes.append(dict(_PRESET_ROUTES["roblox"]))
             added.append("roblox")
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(json.dumps(data, indent=2) + "\n")
-    os.chmod(config_path, 0o600)
+    _atomic_write_config(config_path, data)
     return {"added": added}
 
 
@@ -491,9 +510,7 @@ def configure_fallback(config_path, primary: str, candidates: list[str] | str) -
         entry["fallback_providers"] = candidates
     else:
         entry.pop("fallback_providers", None)
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(json.dumps(data, indent=2) + "\n")
-    os.chmod(config_path, 0o600)
+    _atomic_write_config(config_path, data)
     return {"provider": primary, "fallback_providers": candidates}
 
 
@@ -509,9 +526,7 @@ def configure_transparent(config_path, enabled: bool = True) -> dict:
         raise ValueError("vpn configuration must be an object")
     capture = "routes" if enabled else "ruleset"
     vpn["capture"] = capture
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(json.dumps(data, indent=2) + "\n")
-    os.chmod(config_path, 0o600)
+    _atomic_write_config(config_path, data)
     return {"capture": capture}
 
 
@@ -603,11 +618,17 @@ def apply_preset_by_name(root: Path, name: str) -> dict:
         # never clobber an explicitly-set default_provider with None
         if routing.get("default_provider"):
             data["routing"]["default_provider"] = routing["default_provider"]
+    vpn = preset.get("vpn") or {}
+    if vpn:
+        # Preset-declared VPN knobs (e.g. dns_transport for filtered
+        # networks) merge into the live config; a preset without a "vpn"
+        # section leaves the operator's current settings untouched.
+        data["vpn"] = data.get("vpn") or {}
+        data["vpn"].update(vpn)
     config_path.parent.mkdir(parents=True, exist_ok=True)
     # record the applied preset so `status` (and the tray) can show it
     data["preset"] = name
-    config_path.write_text(json.dumps(data, indent=2) + "\n")
-    os.chmod(config_path, 0o600)
+    _atomic_write_config(config_path, data)
     return {"added": added, "mode": mode, "preset": name}
 
 
@@ -638,7 +659,7 @@ def add_custom_preset(root: Path, name: str, provider: str, domains: list[str],
     }
     path = custom_preset_path(root, name)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(preset, indent=2) + "\n")
+    _atomic_write_config(path, preset)
     os.chmod(path, 0o600)
     return path
 
@@ -1025,12 +1046,24 @@ def _cmd_keepalive_install(root: Path, remove: bool = False) -> int:
     return result.returncode
 
 
-def _router_command(root: Path, *args: str) -> int:
-    """Run the existing router CLI against ``root`` (never enabled implicitly)."""
+def _router_command(root: Path, *args: str, timeout: float = 120.0) -> int:
+    """Run the existing router CLI against ``root`` (never enabled implicitly).
+
+    A timeout keeps a hung router.py (stuck lock, dead upstream probe) from
+    freezing the TUI key loop indefinitely; long-running mutations
+    (rotate/sweep with settle windows) pass an explicit larger budget.
+    """
     script = Path(__file__).resolve().parent / "router.py"
     env = dict(os.environ, PROXY_ROUTER_ROOT=str(root))
     try:
-        return subprocess.call([sys.executable, str(script), *args], env=env)
+        result = subprocess.run([sys.executable, str(script), *args],
+                                env=env, timeout=timeout)
+        return result.returncode
+    except subprocess.TimeoutExpired:
+        print(f"setup: {' '.join(args)} timed out after {timeout:.0f}s "
+              "(still running in the background? check `router.py status`)",
+              file=sys.stderr)
+        return 1
     except OSError as exc:
         print(f"setup: could not run {script}: {exc}", file=sys.stderr)
         return 1
@@ -2337,10 +2370,12 @@ def _execute_action(action: tuple, root: Path) -> tuple[str, int]:
                 buf.write(str(exc))
                 rc = 1
         elif kind == "rotate_provider":
-            rc = _router_command(root, "rotate", action[1])
+            # rotation includes probe + settle window + possible rollback
+            rc = _router_command(root, "rotate", action[1], timeout=180.0)
             buf.write(f"rotated {action[1]} (in place; settle retry applies)")
         elif kind == "rotate_to":
-            rc = _router_command(root, "rotate", action[1], "--to", action[2])
+            rc = _router_command(root, "rotate", action[1], "--to", action[2],
+                                 timeout=180.0)
             buf.write(f"set {action[1]} exit -> {action[2]}")
         elif kind == "failover_on":
             rc = _router_command(root, "failover", action[1], "on")
