@@ -287,10 +287,210 @@ class TransientProbePresentationTests(unittest.TestCase):
         self.assertIn("rate-limited", status.profile_health("proton", "06-SG-FREE-4"))
 
 
+class MutationSerializationTests(unittest.TestCase):
+    """Issue #60: tray mutations used to run on independent daemon threads.
+
+    Two rapid clicks raced inside router.py, and an older completion or poll
+    could overwrite newer status. These tests pin the contract: strict FIFO
+    execution (no concurrency), newest-snapshot-wins publication, and a
+    menu signature that covers every field the menu renders.
+    """
+
+    def _make_app(self):
+        class FakeClient:
+            def status(self):
+                return tray.RouterStatus()
+        app = tray.TrayApp(FakeClient(), None)
+        return app
+
+    def _wait_until(self, pred, timeout=2.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if pred():
+                return True
+            time.sleep(0.005)
+        return pred()
+
+    def test_overlapping_clicks_execute_serially_in_click_order(self):
+        app = self._make_app()
+        events = []
+        lock = threading.Lock()
+
+        def make_job(name, hold):
+            def job():
+                with lock:
+                    running = getattr(app, "_concurrency_probe", 0)
+                    app._concurrency_probe = running + 1
+                    events.append(f"{name}:start")
+                if hold:
+                    time.sleep(0.15)  # long enough for the next click to land
+                with lock:
+                    app._concurrency_probe -= 1
+                    events.append(f"{name}:done")
+                return 0, "ok"
+            return job
+
+        # Click 1 starts a slow mutation; clicks 2..4 arrive while it runs.
+        app._do(make_job("a", True), "a")
+        app._do(make_job("b", False), "b")
+        app._do(make_job("c", False), "c")
+        app._do(make_job("d", False), "d")
+        self.assertTrue(self._wait_until(
+            lambda: len([e for e in events if e.endswith(":done")]) == 4))
+        order = [e.split(":")[0] for e in events if e.endswith(":start")]
+        dones = [e.split(":")[0] for e in events if e.endswith(":done")]
+        self.assertEqual(order, ["a", "b", "c", "d"])
+        self.assertEqual(dones, ["a", "b", "c", "d"])
+        # No two bodies ever overlapped: the pump leaves no residual count.
+        self.assertEqual(app._concurrency_probe, 0)
+
+    def test_worker_exception_becomes_visible_failed_result(self):
+        app = self._make_app()
+
+        def boom():
+            raise RuntimeError("kaboom")
+
+        app._do(boom, "explode")
+        self.assertTrue(self._wait_until(
+            lambda: app.last_action_result
+            and "failed" in app.last_action_result))
+        self.assertIn("RuntimeError", app.last_action_result)
+
+    def test_stale_poll_cannot_overwrite_newer_post_action_snapshot(self):
+        # Deliberately inverted completion driven through the REAL poll
+        # loop: the poll claims its slot and fetches status BEFORE the
+        # action finishes, then publishes AFTER the post-action snapshot
+        # landed. The newer post-action snapshot must win.
+        gate = threading.Event()
+
+        class BlockingStatusClient:
+            root = "/tmp"
+
+            def __init__(self):
+                self.calls = 0
+
+            def status(self):
+                self.calls += 1
+                if self.calls == 1:
+                    gate.wait(2)  # poll fetch stalls "mid-network"
+                    return tray.RouterStatus(up=False)
+                return tray.RouterStatus()
+
+        client = BlockingStatusClient()
+        app = tray.TrayApp(client, None)
+        app._publish_status(tray.RouterStatus(), None)  # baseline
+        poller = threading.Thread(target=self._guarded_poll(app), daemon=True)
+        poller.start()
+        deadline = time.time() + 2
+        while client.calls < 1 and time.time() < deadline:
+            time.sleep(0.005)
+        time.sleep(0.05)  # ensure the poll is parked inside its fetch
+
+        # The mutation finishes meanwhile and publishes its fresh snapshot,
+        # exactly like _mutation_worker does (new epoch, newest-wins).
+        with app.lock:
+            app._status_epoch += 1
+        app._publish_status(tray.RouterStatus(up=True),
+                            app._status_epoch)
+        app.quit_flag.set()  # end the loop after this in-flight iteration
+        gate.set()  # release the stale fetch; its publish lands LAST
+
+        poller.join(5)
+        self.assertTrue(
+            app.latest.up,
+            "stale poll overwrote the post-action snapshot")
+
+    @staticmethod
+    def _guarded_poll(app):
+        def run():
+            try:
+                app.poll_loop()
+            except Exception:
+                pass
+        return run
+
+    def test_signature_changes_when_preset_or_profile_lists_change(self):
+        # These fields are rendered by build_menu but were unsigned before
+        # issue #60: preset changes and provider profile lists went stale.
+        base = tray.RouterStatus()
+        app = self._make_app()
+
+        with_preset = tray.RouterStatus(preset="school-warp")
+        self.assertNotEqual(app._status_signature(base),
+                            app._status_signature(with_preset))
+
+        no_profiles = tray.RouterStatus()
+        info = dict(no_profiles.providers)
+        info["proton"] = {"active": None,
+                          "profiles": ["01-NL"], "egress": {}}
+        with_profiles = tray.RouterStatus(providers=info)
+        self.assertNotEqual(app._status_signature(no_profiles),
+                            app._status_signature(with_profiles))
+
+        plain = tray.RouterStatus()
+        marked = dict(plain.providers)
+        marked["proton"] = {"active": None, "profiles": [],
+                            "egress": {"nl": {"ok": False, "error": None,
+                                              "latency_ms": None,
+                                              "status": None,
+                                              "upstream_error": None,
+                                              "blocked": True}}}
+        self.assertNotEqual(
+            app._status_signature(plain),
+            app._status_signature(tray.RouterStatus(providers=marked)))
+
+    def test_publish_status_without_epoch_always_installs(self):
+        # Error snapshots from poll failures carry no epoch; they install
+        # unconditionally so a broken CLI still surfaces in the menu.
+        app = self._make_app()
+        app._publish_status(tray.RouterStatus(up=True), 3)
+        err = tray.RouterStatus(error="status exit 7")
+        app._publish_status(err, None)
+        self.assertEqual(app.latest.error, "status exit 7")
+
+    def test_menu_controls_disabled_while_mutation_active(self):
+        release = threading.Event()
+
+        class RootedClient:
+            root = "/tmp"
+
+            def status(self):
+                return tray.RouterStatus()
+
+        app = tray.TrayApp(RootedClient(), None)
+
+        def job():
+            release.wait(2)
+            return 0, "ok"
+
+        app.latest = tray.RouterStatus(up=True, providers={
+            "proton": {"active": "nl", "profiles": ["nl"], "egress": {}}})
+        app._mutation_active = True
+        menu = app.build_menu()
+        labels = {item.text: item.enabled for item in menu}
+        connect = next(v for k, v in labels.items() if k in ("Connect", "Reconnect"))
+        disconnect = next(v for k, v in labels.items() if k == "Disconnect")
+        rotate = next(v for k, v in labels.items() if k == "Switch VPN server")
+        quit_item = next(v for k, v in labels.items() if k == "Quit")
+        self.assertFalse(connect)
+        self.assertFalse(disconnect)
+        self.assertFalse(rotate)
+        self.assertTrue(quit_item, "Quit must stay clickable")
+        release.set()
+
+
 class QuitActionTests(unittest.TestCase):
     """Quit must stop the engine BEFORE leaving the tray (issue #52):
     a quitting tray that leaves the proxy-router engine running strands
     the user with a live tunnel they can no longer control."""
+
+    def _make_app(self, client, drain_ok=None):
+        app = tray.TrayApp(client, None)
+        if drain_ok is not None:
+            # Shrink the quit drain window so a stuck mutation cannot slow
+            # the suite; production uses MUTATION_DRAIN_TIMEOUT.
+            app._drain_timeout = drain_ok
+        return app
 
     def test_quit_stops_engine_then_tray(self):
         calls = []
@@ -306,7 +506,7 @@ class QuitActionTests(unittest.TestCase):
                 calls.append("tray")
                 tray_stopped.set()
 
-        app = tray.TrayApp(FakeClient(), None)
+        app = self._make_app(FakeClient(), 2)
         app.tray = FakeTray()
         app.action_quit()
         self.assertTrue(tray_stopped.wait(2))
@@ -324,10 +524,92 @@ class QuitActionTests(unittest.TestCase):
             def stop(self):
                 tray_stopped.set()
 
-        app = tray.TrayApp(FakeClient(), None)
+        app = self._make_app(FakeClient(), 2)
         app.tray = FakeTray()
         app.action_quit()
         self.assertTrue(tray_stopped.wait(2))
+
+    def test_quit_drains_in_flight_mutation_before_engine_stop(self):
+        # Issue #60: quit used to race the per-click daemon threads. The
+        # engine stop must land AFTER an already-running mutation finished.
+        calls = []
+        mutation_running = threading.Event()
+        release_mutation = threading.Event()
+        tray_stopped = threading.Event()
+
+        class FakeClient:
+            root = "/tmp"
+
+            def mutate(self):
+                calls.append("mutate-start")
+                mutation_running.set()
+                release_mutation.wait(2)
+                calls.append("mutate-done")
+                return 0, "ok"
+
+            def status(self):
+                return tray.RouterStatus(up=False)
+
+            def stop(self):
+                calls.append("engine-stop")
+                return 0, "stopped"
+
+        class FakeTray:
+            def stop(self):
+                calls.append("tray")
+                tray_stopped.set()
+
+        app = self._make_app(FakeClient(), 5)
+        app.tray = FakeTray()
+        app._do(app.client.mutate, "mutate")
+        self.assertTrue(mutation_running.wait(2))
+        app.action_quit()
+        # Give quit's worker a beat to observe the in-flight mutation, then
+        # let the mutation finish. Engine stop must come after "mutate-done"
+        # and the tray must leave after the engine stopped.
+        time.sleep(0.1)
+        release_mutation.set()
+        self.assertTrue(tray_stopped.wait(3))
+        self.assertLess(calls.index("mutate-done"), calls.index("engine-stop"))
+        self.assertLess(calls.index("engine-stop"), calls.index("tray"))
+
+    def test_quit_after_mutation_finished_does_not_wait(self):
+        # Once the pump is idle, quit stops the engine without any drain wait
+        # (the idle condition is already true).
+        calls = []
+        tray_stopped = threading.Event()
+
+        class FakeClient:
+            root = "/tmp"
+
+            def mutate(self):
+                calls.append("mutate")
+                return 0, "ok"
+
+            def status(self):
+                return tray.RouterStatus()
+
+            def stop(self):
+                calls.append("engine-stop")
+                return 0, "stopped"
+
+        class FakeTray:
+            def stop(self):
+                tray_stopped.set()
+
+        app = self._make_app(FakeClient(), 5)
+        app.tray = FakeTray()
+        app._do(app.client.mutate, "mutate")
+        deadline = time.time() + 2
+        while not app._mutation_idle() and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(app._mutation_idle())
+        app.action_quit()
+        self.assertTrue(tray_stopped.wait(3))
+        # mutate ran on the pump before quit; engine stop came after it.
+        self.assertIn("mutate", calls)
+        self.assertLess(calls.index("mutate"),
+                        calls.index("engine-stop"))
 
 
 if __name__ == "__main__":

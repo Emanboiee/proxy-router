@@ -32,6 +32,7 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 try:
@@ -43,6 +44,9 @@ except ImportError:  # --selftest and --help must work without the GUI stack
 
 POLL_SECONDS = 5.0  # live-enough menu state without spawning 24 CLI procs/min
 COMMAND_TIMEOUT = 20
+# Quit waits at most this long for an in-flight mutation to finish before
+# stopping the engine anyway — a hung mutation must not make Quit unkillable.
+MUTATION_DRAIN_TIMEOUT = COMMAND_TIMEOUT + 5.0
 
 # Friendly, non-jargon labels for tray menu entries. The router CLI words
 # (safe-list / vpn-list / rotate / exit) stay in the terminal; the tray
@@ -500,6 +504,27 @@ class TrayApp:
         self._menu_sig: str | None = None
         self._icon_sig: str | None = None
 
+        # Issue #60: mutations used to run on independent daemon threads, so
+        # two clicks raced each other inside router.py and an older
+        # completion could overwrite newer status. One serialized worker +
+        # a generation counter give every mutation a strict completion order;
+        # `_status_epoch` stamps the snapshot a worker produced so a stale
+        # poll can never overwrite it (polls only win when they are NEWER).
+        self._mutation_gate = threading.Semaphore(0)
+        self._pending_mutations: list[tuple[str, Callable]] = []
+        self._pending_lock = threading.Lock()
+        # Signalled whenever the mutation pump goes idle (queue drained and
+        # nothing executing); action_quit waits on it, bounded.
+        self._idle_cond = threading.Condition(self._pending_lock)
+        self._status_epoch = 0
+        self._worker_thread: threading.Thread | None = None
+        # True while one mutation is popped and executing (menu controls
+        # render disabled/coalesced meanwhile — issue #60).
+        self._mutation_active = False
+        # Quit's bounded drain window (tests shrink it; production uses
+        # MUTATION_DRAIN_TIMEOUT so a hung job cannot make Quit unkillable).
+        self._drain_timeout = MUTATION_DRAIN_TIMEOUT
+
     # ---- status polling ------------------------------------------------
     def _status_signature(self, st: RouterStatus) -> str:
         """Stable signature of everything the menu/icon renders.
@@ -509,26 +534,70 @@ class TrayApp:
         exactly the 'half the buttons don't work' symptom. Rebuild ONLY when
         the rendered state actually changed, never on a timer tick with the
         same values.
+
+        Issue #60: the signature must cover EVERY field the menu renders.
+        It previously omitted preset, blocked/exhausted/upstream-error/HTTP
+        status markers and profile lists — changes to those left stale menu
+        entries indefinitely because the rebuild never fired.
         """
         health = {}
         for name, info in (st.providers or {}).items():
             health[name] = {
-                p: (rec.get("ok"), rec.get("error"), rec.get("latency_ms"))
+                p: (
+                    rec.get("ok"), rec.get("error"), rec.get("latency_ms"),
+                    rec.get("status"), rec.get("upstream_error"),
+                    rec.get("blocked"), rec.get("exhausted"),
+                )
                 for p, rec in (info.get("egress") or {}).items()
             }
         return repr({
             "up": st.up, "error": st.error, "mode": st.mode, "port": st.port,
             "watcher": st.watcher, "routing": st.routing_mode,
-            "active": st.active_providers, "health": health,
+            "preset": st.preset,
+            "active": st.active_providers,
+            "profiles": {n: list((i or {}).get("profiles") or [])
+                         for n, i in (st.providers or {}).items()},
+            "health": health,
             "action": self.last_action_result,
+            "epoch": self._status_epoch,
         })
+
+    def _publish_status(self, st: RouterStatus, epoch: int | None = None) -> None:
+        """Install a new status snapshot unless a NEWER one already landed.
+
+        Polls fetch `router.py status` OUTSIDE the lock; between the fetch
+        and this call a mutation worker may finish and publish its fresh
+        post-action snapshot. Publishing unconditionally would roll the menu
+        back to pre-action state (issue #60). The epoch check makes the
+        newest observation win instead of the last writer.
+        """
+        with self.lock:
+            if epoch is not None and epoch < self._status_epoch:
+                return  # stale poll: a newer post-action snapshot won already
+            if epoch is not None:
+                self._status_epoch = max(self._status_epoch, epoch)
+            self.latest = st
+        self._refresh_menu()
+
+    def _refresh_menu(self) -> None:
+        """Rebuild the tray menu from live state (no-op without a tray)."""
+        if self.tray is None:
+            return
+        self._menu_sig = None
+        self.tray.menu = self.build_menu()
 
     def poll_loop(self) -> None:
         while not self.quit_flag.is_set():
             try:
-                st = self.client.status()
+                # Claim the epoch BEFORE fetching (issue #60): a poll that
+                # fetched pre-action but publishes post-action must lose to
+                # the mutation's snapshot, so its epoch has to be older than
+                # anything the mutation claims meanwhile.
                 with self.lock:
-                    self.latest = st
+                    epoch = self._status_epoch + 1
+                    self._status_epoch = epoch
+                st = self.client.status()
+                self._publish_status(st, epoch)
                 if self.tray is not None:
                     icon_color = (
                         "#4caf50" if st.up
@@ -546,8 +615,7 @@ class TrayApp:
                         # stay frozen at whatever was captured at startup.
                         self.tray.menu = self.build_menu()
             except Exception as e:  # keep the tray alive on any poll failure
-                with self.lock:
-                    self.latest = RouterStatus(error=str(e)[:80])
+                self._publish_status(RouterStatus(error=str(e)[:80]))
             self.quit_flag.wait(POLL_SECONDS)
 
     def _snapshot(self) -> RouterStatus:
@@ -556,18 +624,44 @@ class TrayApp:
 
     # ---- actions ---------------------------------------------------------
     def _do(self, fn, label: str):
-        # Run the mutation on a worker thread: pystray invokes callbacks on
-        # its own thread, and a synchronous 20s router.py subprocess would
-        # freeze the menu (and on some macOS builds, the run loop) for the
-        # whole command. Show a "working…" line immediately, then swap in
-        # the real result when the command lands.
+        # Issue #60: every click used to spawn its own daemon thread, so two
+        # rapid clicks ran connect/disconnect/rotate CONCURRENTLY inside
+        # router.py and completion order was arbitrary. Mutations now queue
+        # onto ONE serialized worker: clicks coalesce into pending jobs,
+        # results land strictly in click order, and the "working…" line
+        # shows immediately without blocking the menu callback thread.
+        if self.quit_flag.is_set():
+            return  # quitting: stop accepting mutations before they queue
         with self.lock:
             self.last_action_result = f"{label}: working…"
-        if self.tray is not None:
-            self._menu_sig = None  # force a rebuild that shows "working…"
-            self.tray.menu = self.build_menu()
+        self._refresh_menu()
 
-        def worker():
+        with self._pending_lock:
+            self._pending_mutations.append((label, fn))
+            worker = self._worker_thread
+            if worker is None or not worker.is_alive():
+                worker = threading.Thread(
+                    target=self._mutation_worker, daemon=True,
+                    name="tray-mutations")
+                self._worker_thread = worker
+                worker.start()
+        # One permit per queued job: the pump pops exactly one job per
+        # acquire, so FIFO order holds no matter how fast clicks arrive.
+        self._mutation_gate.release()
+
+    def _mutation_idle(self) -> bool:
+        """True when no mutation is executing and the queue is empty."""
+        return not self._pending_mutations and not self._mutation_active
+
+    def _mutation_worker(self) -> None:
+        """Serialized mutation pump: one job at a time, strict FIFO order."""
+        while True:
+            self._mutation_gate.acquire()
+            with self._pending_lock:
+                if not self._pending_mutations:
+                    continue
+                label, fn = self._pending_mutations.pop(0)
+                self._mutation_active = True
             try:
                 rc, out = fn()
             except Exception as e:
@@ -582,20 +676,18 @@ class TrayApp:
                 refreshed = RouterStatus(error=str(e)[:80])
             with self.lock:
                 self.last_action_result = result
-                self.latest = refreshed
-            if self.tray is not None:
-                self._menu_sig = None
-                self.tray.menu = self.build_menu()
-
-        threading.Thread(target=worker, daemon=True).start()
+                epoch = self._status_epoch + 1
+                self._status_epoch = epoch
+            with self._idle_cond:
+                self._mutation_active = False
+                self._idle_cond.notify_all()
+            self._publish_status(refreshed, epoch)
 
     def action_dashboard(self):
         ok = open_dashboard(self.client.root)
         with self.lock:
             self.last_action_result = "dashboard opened" if ok else "dashboard: no terminal"
-        if self.tray is not None:
-            self._menu_sig = None
-            self.tray.menu = self.build_menu()
+        self._refresh_menu()
 
     def action_connect(self):
         # start (not ensure): also clears the manual-off marker written by
@@ -697,12 +789,22 @@ class TrayApp:
     def action_quit(self):
         # Quit = stop the engine AND leave the tray (Tailscale/WARP-style):
         # the engine must not keep serving after the user quits the tray.
-        # The stop can elevate (root-owned engine) and block up to
-        # ELEVATED_COMMAND_TIMEOUT, so it runs on the worker thread; the
-        # tray stops only once the engine is down (issue #52).
+        # Issue #60: quit used to race the per-click daemon threads — the
+        # tray could vanish while a mutation was still running. Quit now
+        # stops ACCEPTING mutations first, then waits (bounded) for any
+        # in-flight mutation to finish before stopping the engine, so an
+        # interrupted connect/rotate can never strand half-applied state.
         self.quit_flag.set()
 
         def worker():
+            # Wait (bounded) for any in-flight/queued mutation to drain so
+            # the engine is never stopped out from under a half-applied
+            # action; a hung job must not make Quit unkillable, hence the
+            # timeout. The pump itself keeps running — quit does not cancel
+            # already-accepted work, it only stops accepting new work.
+            with self._idle_cond:
+                self._idle_cond.wait_for(
+                    self._mutation_idle, timeout=self._drain_timeout)
             try:
                 rc, out = self.client.stop()
             except Exception as e:
@@ -719,7 +821,16 @@ class TrayApp:
         with self.lock:
             st = self.latest
             last_action_result = self.last_action_result
+            mutation_active = self._mutation_active
         items = []
+
+        # Issue #60: while one mutation executes, further engine mutations
+        # are coalesced (disabled) instead of racing it inside router.py.
+        # The queue keeps clicks; they run after the active job completes.
+        if mutation_active and last_action_result:
+            items.append(pystray.MenuItem(
+                f"{last_action_result} (queued actions run in order)",
+                None, enabled=False))
 
         # Status header — compact, human-readable. A fresh install (no
         # providers, engine never started) gets its own banner instead of a
@@ -761,25 +872,32 @@ class TrayApp:
         # Actions — terse, no CLI flags. Connect is only offered once at
         # least one provider exists; on a fresh install the banner above
         # directs to Setup instead of producing a raw CLI failure.
+        # While a mutation runs, controls render disabled (issue #60) —
+        # clicks during that window are coalesced into the queue instead.
         items.append(pystray.MenuItem(
             "Reconnect" if st.up else "Connect",
-            self.action_connect, enabled=bool(st.providers)))
+            self.action_connect, enabled=bool(st.providers)
+            and not mutation_active))
         items.append(pystray.MenuItem(
-            "Switch VPN server", self.action_rotate, enabled=st.up))
+            "Switch VPN server", self.action_rotate,
+            enabled=st.up and not mutation_active))
 
         # Provider picker — like Tailscale/Proton: pick a provider, then an exit
         if st.providers and st.up:
             provider_menu = self._build_provider_menu(st)
-            items.append(pystray.MenuItem("Provider", provider_menu))
+            items.append(pystray.MenuItem("Provider", provider_menu,
+                                          enabled=not mutation_active))
         items.append(pystray.MenuItem(
-            "Disconnect", self.action_disconnect, enabled=st.up))
+            "Disconnect", self.action_disconnect,
+            enabled=st.up and not mutation_active))
         # Full tunnel (TUN) — checked when on. Clicking toggles it, which on
         # macOS pops the standard admin dialog (the engine/utun needs root).
         items.append(pystray.MenuItem(
             "Full tunnel (WARP): on" if st.mode == "tun"
             else "Full tunnel (WARP): off",
             self.action_toggle_vpn,
-            checked=lambda item: st.mode == "tun"))
+            checked=lambda item: st.mode == "tun",
+            enabled=not mutation_active))
 
         items.append(pystray.Menu.SEPARATOR)
 
@@ -800,6 +918,7 @@ class TrayApp:
                 pystray.MenuItem("Use safe-list at home, vpn-list at school",
                                  None, enabled=False),
             ),
+            enabled=not mutation_active,
         ))
 
         # Setup — plain-language entries for non-terminal users. The guide
@@ -836,7 +955,8 @@ class TrayApp:
                 self._custom_preset_label(name),
                 lambda n=name: self.action_apply_preset(n),
                 checked=lambda item, n=name: st.preset == n))
-        items.append(pystray.MenuItem("Presets", pystray.Menu(*preset_items)))
+        items.append(pystray.MenuItem("Presets", pystray.Menu(*preset_items),
+                                      enabled=not mutation_active))
         items.append(pystray.Menu.SEPARATOR)
         items.append(pystray.MenuItem("Quit", self.action_quit))
         return pystray.Menu(*items)
