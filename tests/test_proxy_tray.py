@@ -573,6 +573,50 @@ class QuitActionTests(unittest.TestCase):
         self.assertLess(calls.index("mutate-done"), calls.index("engine-stop"))
         self.assertLess(calls.index("engine-stop"), calls.index("tray"))
 
+    def test_click_racing_quit_does_not_run_after_quit_completes(self):
+        # Issue #52 hardening: a click that lands while quit is draining must
+        # not resurrect the engine after quit finished stopping it. _do()
+        # refuses new work once quit_flag is set, so a late Connect can only
+        # queue if it won the race BEFORE quit set the flag; either way, no
+        # mutation may execute after engine-stop/tray teardown.
+        calls = []
+        tray_stopped = threading.Event()
+        release_mutation = threading.Event()
+
+        class FakeClient:
+            root = "/tmp"
+
+            def mutate(self):
+                calls.append("mutate-start")
+                release_mutation.wait(2)
+                calls.append("mutate-done")
+                return 0, "ok"
+
+            def status(self):
+                return tray.RouterStatus(up=False)
+
+            def stop(self):
+                calls.append("engine-stop")
+                return 0, "stopped"
+
+        class FakeTray:
+            def stop(self):
+                calls.append("tray")
+                tray_stopped.set()
+
+        app = self._make_app(FakeClient(), 5)
+        app.tray = FakeTray()
+        app.action_quit()          # drain window opens
+        self.assertTrue(app.quit_flag.is_set())
+        app._do(app.client.mutate, "late connect")   # click during quit: refused
+        # Give any (wrongly) queued job a beat to run on the pump.
+        time.sleep(0.2)
+        release_mutation.set()
+        self.assertTrue(tray_stopped.wait(3))
+        self.assertNotIn("mutate-start", calls)
+        self.assertEqual(calls.index("engine-stop"), len(calls) - 1 - calls.count("tray"))
+        self.assertLess(calls.index("engine-stop"), calls.index("tray"))
+
     def test_quit_after_mutation_finished_does_not_wait(self):
         # Once the pump is idle, quit stops the engine without any drain wait
         # (the idle condition is already true).
