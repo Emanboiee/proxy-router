@@ -4338,6 +4338,151 @@ def egress_show(name: str | None = None) -> int:
 
 
 # ---------------------------------------------------------------------------
+# provider validity preflight (`providers check`, issue #51)
+# ---------------------------------------------------------------------------
+
+def _provider_config_errors(name: str, entry: dict) -> list[str]:
+    """Static config errors for one provider entry (offline, no probing).
+
+    ``load_config`` already enforces the schema-wide rules (types, fallback
+    references, directory containment); this re-checks only what a single
+    provider entry controls, so the report can name the offending provider
+    instead of failing the whole load.
+    """
+    errors: list[str] = []
+    cooldown = entry.get("cooldown_seconds")
+    if cooldown is not None and not isinstance(cooldown, int):
+        # Non-integer cooldowns are coerced elsewhere with int(); flag the
+        # ones that would raise at rotation time.
+        try:
+            int(cooldown)
+        except (TypeError, ValueError):
+            errors.append(f"cooldown_seconds must be an integer (got {cooldown!r})")
+    probe_url = entry.get("probe_url")
+    if probe_url is not None and not (isinstance(probe_url, str) and probe_url.startswith("https://")):
+        errors.append("probe_url must be an https:// URL when set")
+    return errors
+
+
+def _check_provider_validity(name: str) -> dict:
+    """One provider's validity verdict: config, profile pool, parseability,
+    active-profile state. Offline by design (no probes, no engine I/O).
+
+    Returns a machine-readable dict; ``valid`` is False whenever any finding
+    means the provider cannot carry traffic right now (issue #51: providers
+    that look configured but silently never work)."""
+    result: dict = {"name": name, "valid": True, "issues": [], "profiles": 0}
+    issues: list[str] = result["issues"]
+    entry = _providers.get(name)
+
+    if not isinstance(entry, dict):
+        result["valid"] = False
+        issues.append("not a configured provider object")
+        return result
+
+    try:
+        directory = provider_dir(name)
+        relative = directory.relative_to(ROOT)
+    except ValueError as exc:
+        result["valid"] = False
+        issues.append(str(exc))
+        return result
+    result["directory"] = str(relative)
+    if not directory.is_dir():
+        result["valid"] = False
+        issues.append(f"missing profile directory {relative} "
+                      f"(create it and drop valid .conf files inside)")
+        return result
+
+    profiles = provider_files(name)
+    result["profiles"] = len(profiles)
+    if not profiles:
+        result["valid"] = False
+        issues.append(f"no .conf profiles in {relative}")
+        return result
+
+    bad_profiles = []
+    for profile in profiles:
+        error = _profile_error(profile)
+        if error is not None:
+            bad_profiles.append({"profile": profile.stem, "error": error})
+    result["bad_profiles"] = [item["profile"] for item in bad_profiles]
+    usable_count = len(profiles) - len(bad_profiles)
+    if bad_profiles:
+        issues.append(
+            f"{len(bad_profiles)} unparseable profile(s): "
+            + ", ".join(item["profile"] for item in bad_profiles)
+        )
+    if usable_count == 0:
+        result["valid"] = False
+        issues.insert(0, "no parseable profiles remain")
+        return result
+
+    cooled = [p.stem for p in profiles
+              if p.stem not in {item["profile"] for item in bad_profiles}
+              and is_cooled_down(name, p)]
+    result["cooled_down"] = cooled
+
+    active = persisted_active(name) or resolve_active(name)
+    result["active"] = active.stem if active else None
+    if active is None:
+        result["valid"] = False
+        detail = "every remaining profile is cooled down" if cooled \
+            else "no active profile could be selected"
+        issues.append(detail)
+
+    issues.extend(_provider_config_errors(name, entry))
+    return result
+
+
+def providers_check(name: str | None = None, as_json: bool = False) -> int:
+    """Preflight every configured provider (or just ``name``): does its
+    configuration and profile pool describe a lane that can carry traffic?
+
+    Read-only and offline — no probes ride the tunnel and no engine action is
+    taken — so it answers "is this provider VALID?" separately from the live
+    `egress check` answer "is the exit HEALTHY?". Issue #51's failure mode is
+    exactly the gap between the two: providers that stay configured but can
+    never serve traffic (empty/missing directories, every profile unparseable,
+    all exits cooled down) drag the working-provider count down without any
+    single loud error.
+
+    Human output prints one line per provider plus a summary line;
+    invalid providers are also listed on stderr. Exit code: 0 when every
+    checked provider is valid, 1 otherwise (so scripts/keepalive can gate on
+    it); unknown provider names fail fast with exit 2.
+    """
+    if name is not None and name not in _providers:
+        print(f"router: unknown provider '{name}' (have {', '.join(_providers)})", file=sys.stderr)
+        return 2
+    providers = [name] if name is not None else sorted(_providers)
+    results = [_check_provider_validity(provider) for provider in providers]
+    if as_json:
+        report = {
+            "total": len(results),
+            "valid": sum(1 for r in results if r["valid"]),
+            "invalid": sum(1 for r in results if not r["valid"]),
+            "results": results,
+        }
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        for result in results:
+            mark = "ok" if result["valid"] else "INVALID"
+            line = f"{result['name']}: {mark} ({result['profiles']} profile(s)"
+            if result.get("active"):
+                line += f", active {result['active']}"
+            line += ")"
+            print(line)
+            for issue in result["issues"]:
+                print(f"    ! {issue}")
+        invalid = [r["name"] for r in results if not r["valid"]]
+        print(f"providers check: {sum(1 for r in results if r['valid'])}/{len(results)} valid")
+        if invalid:
+            print(f"invalid: {', '.join(invalid)}", file=sys.stderr)
+    return 0 if all(r["valid"] for r in results) else 1
+
+
+# ---------------------------------------------------------------------------
 # macOS system proxy toggle
 # ---------------------------------------------------------------------------
 
@@ -4994,6 +5139,20 @@ def main() -> int:
     r_count = sub.add_parser("provider-count")
     r_count.add_argument("provider")
 
+    providers = sub.add_parser(
+        "providers",
+        help="provider pool maintenance (check: offline validity preflight)",
+    )
+    providers_sub = providers.add_subparsers(dest="providers_action")
+    p_check = providers_sub.add_parser(
+        "check",
+        help="offline validity preflight: config, profile pool, active exit (issue #51)",
+    )
+    p_check.add_argument("provider", nargs="?", default=None,
+                         help="check a single provider instead of all")
+    p_check.add_argument("--json", action="store_true",
+                         help="machine-readable JSON report")
+
     profile = sub.add_parser("profile", help="manage local WireGuard profiles")
     profile_sub = profile.add_subparsers(dest="profile_action")
     profile_copy_parser = profile_sub.add_parser(
@@ -5199,6 +5358,10 @@ def main() -> int:
     if args.cmd == "provider-count":
         print(provider_count(args.provider))
         return 0
+    if args.cmd == "providers":
+        if args.providers_action == "check":
+            return providers_check(args.provider, as_json=args.json)
+        parser.error("providers needs an action: check")
     if args.cmd == "profile":
         if args.profile_action == "copy":
             return profile_copy(args.provider, args.sources)

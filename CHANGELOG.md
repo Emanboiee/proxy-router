@@ -27,7 +27,6 @@ Security and identity:
   longer resurrects an engine the user explicitly turned off (#77, audit #61).
 
 Reliability and latency:
-
 - Poll instead of sleeping through rotation settle windows; stop paths wait
   on real engine exit rather than a blind sleep (#79, #80).
 - Give tun-mode reloads a realistic readiness budget and skip no-op ensure
@@ -41,6 +40,13 @@ Reliability and latency:
 - Bound TUI router commands with timeouts so a stuck CLI cannot freeze the
   dashboard (#88); open the dashboard via fire-and-forget so a slow terminal
   cannot freeze the tray (#90).
+- `providers check` preflight (#51): offline, read-only validity audit of
+  every configured provider (missing/empty profile directories, unparseable
+  `.conf` files, all exits cooled down, bad per-provider entries), with
+  `--json`, a valid/total summary, and exit 1 when any lane can't carry
+  traffic — so "only 10/27 working" is diagnosable without probe traffic.
+  `docs/REFACTOR_PLAN.md` proposes the router.py decomposition for #66
+  (design only).
 
 Installer and release (this change):
 
