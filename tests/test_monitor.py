@@ -1,10 +1,14 @@
 """Tests for the opt-in monitor; no network or real daemons."""
+import ipaddress
 import json
+import os
+import socket
 import stat
 import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -179,6 +183,139 @@ class StateTests(unittest.TestCase):
         path.write_text("\n".join(json.dumps({"n": i}) for i in range(5)) + "\n")
         text = monitor.tail_logs(self.root, lines=2)
         self.assertEqual([json.loads(line)["n"] for line in text.splitlines()], [3, 4])
+
+
+class ValidatedTargetTests(unittest.TestCase):
+    """Issue #64: monitor URLs are validated — no SSRF to loopback/LAN/
+    link-local/metadata, no non-http schemes (arbitrary file reads), and
+    resolved addresses re-checked at connection time against DNS rebinding."""
+
+    def test_file_scheme_url_is_rejected(self):
+        result = monitor.measure_http_latency("file:///etc/passwd")
+        self.assertIn("unsafe monitor target", result["error"])
+        self.assertIn("http/https", result["error"])
+
+    def test_localhost_literal_is_rejected(self):
+        for url in ("http://127.0.0.1:8080/admin", "https://localhost/",
+                    "http://[::1]/", "http://0.0.0.0/"):
+            result = monitor.measure_http_latency(url)
+            self.assertIn("unsafe monitor target", result["error"], url)
+
+    def test_private_lan_and_metadata_addresses_are_rejected(self):
+        for url in ("http://10.1.2.3/", "http://192.168.1.1/",
+                    "https://169.254.169.254/latest/meta-data/",
+                    "http://172.16.0.9/", "http://metadata.google.internal/"):
+            result = monitor.measure_http_latency(url)
+            self.assertIn("unsafe monitor target", result["error"], url)
+
+    def test_credentials_in_url_are_rejected(self):
+        result = monitor.measure_http_latency("https://user:pass@example.com/")
+        self.assertIn("unsafe monitor target", result["error"])
+
+    def test_public_target_still_probes(self):
+        response = FakeResponse(b"ok")
+        opened = []
+
+        def opener(url, timeout):
+            opened.append(url)
+            return response
+
+        with mock.patch.object(monitor, "resolve_target_addresses",
+                               return_value=["104.16.132.229"]):
+            result = monitor.measure_http_latency(
+                "https://example.invalid", opener=opener, clock=iter([1.0, 1.05]).__next__
+            )
+        self.assertEqual(result["status"], 200)
+        self.assertEqual(opened, ["https://example.invalid"])
+
+    def test_dns_rebinding_to_loopback_is_caught_at_connection_time(self):
+        # config-time check passes for the public name, but resolution returns
+        # 127.0.0.1 right before connecting -> refused without dialing.
+        def opener(url, timeout):  # must never be reached
+            raise AssertionError(f"dialed rebinding target {url}")
+
+        with mock.patch.object(monitor, "resolve_target_addresses",
+                               return_value=["127.0.0.1"]):
+            result = monitor.measure_http_latency(
+                "https://rebind.invalid/", opener=urllib.request.urlopen
+            )
+        self.assertIn("resolved to private/loopback", result["error"])
+        self.assertIn("unsafe monitor target", result["error"])
+
+    def test_explicit_opt_in_allows_private_targets(self):
+        with mock.patch.dict(os.environ, {monitor.PRIVATE_TARGET_BYPASS_ENV: "1"}):
+            violation = monitor.target_violation("http://127.0.0.1:9090/metrics")
+            self.assertIsNone(violation)
+
+    def test_download_and_upload_share_the_same_guard(self):
+        download = monitor.measure_download(
+            "https://169.254.169.254/latest/meta-data/", max_bytes=8,
+            opener=lambda url, timeout: FakeResponse(b"x"), clock=iter([0.0, 0.1]).__next__,
+        )
+        upload = monitor.measure_upload(
+            "http://10.0.0.1/upload", max_bytes=8,
+            opener=lambda request, timeout: FakeResponse(b""), clock=iter([0.0, 0.1]).__next__,
+        )
+        for result in (download, upload):
+            self.assertIn("unsafe monitor target", result["error"])
+
+    def test_settings_fall_back_to_defaults_for_unsafe_urls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "router.json").write_text(json.dumps({
+                "monitor": {
+                    "http_url": "file:///etc/passwd",
+                    "download_url": "http://192.168.0.1/speed",
+                    "upload_url": "https://169.254.169.254/up",
+                }
+            }))
+            settings = monitor._monitor_settings(root)
+        self.assertEqual(settings["http_url"], monitor.DEFAULT_HTTP_URL)
+        self.assertEqual(settings["download_url"], monitor.DEFAULT_DOWNLOAD_URL)
+        self.assertEqual(settings["upload_url"], monitor.DEFAULT_UPLOAD_URL)
+
+
+class PingHostValidationTests(unittest.TestCase):
+    """Issue #64: configured ping hosts cannot inject options into argv."""
+
+    def test_leading_hyphen_host_rejected_as_option_injection(self):
+        ran = []
+        result = monitor.measure_ping("-c", command_runner=lambda cmd, **kw: ran.append(cmd))
+        self.assertFalse(ran, "ping must not run with an option-like host")
+        self.assertIn("unsafe ping target", result["error"])
+        self.assertIn("option injection", result["error"])
+
+    def test_metacharacter_hosts_are_rejected(self):
+        for host in ("1.1.1.1; reboot", "1.1.1.1 -i 0.001", "$(x)", "`x`", "a b"):
+            ran = []
+            result = monitor.measure_ping(
+                host, command_runner=lambda cmd, **kw: ran.append(cmd)
+            )
+            self.assertFalse(ran, host)
+            self.assertIn("unsafe ping target", result["error"], host)
+
+    def test_valid_ip_and_hostname_still_run(self):
+        captured = {}
+
+        def runner(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return subprocess.CompletedProcess(cmd, 0,
+                                               stdout="min/avg/max/stddev = 1/2/3/4 ms",
+                                               stderr="")
+
+        for host in ("1.1.1.1", "dns.google", "[2606:4700:4700::1111]"):
+            result = monitor.measure_ping(host, command_runner=runner)
+            self.assertEqual(result.get("avg_ms"), 2.0, host)
+            self.assertEqual(captured["cmd"][-1], host)
+
+    def test_settings_drop_invalid_ping_hosts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "router.json").write_text(json.dumps({
+                "monitor": {"ping_hosts": ["-c", "1.1.1.1", "bad host", "3"]}
+            }))
+            settings = monitor._monitor_settings(root)
+        self.assertEqual(settings["ping_hosts"], ["1.1.1.1"])
 
 
 if __name__ == "__main__":

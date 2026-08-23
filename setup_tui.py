@@ -237,28 +237,44 @@ def inspect_profile(conf_path: Path) -> tuple[bool, str]:
     the same surface the engine's parser needs. Never returns file contents.
     """
     try:
-        parser = configparser.ConfigParser(interpolation=None)
-        if not parser.read(conf_path):
-            return False, "unreadable file"
-        if not parser.has_section("Interface"):
-            return False, "missing [Interface] section"
-        interface = parser["Interface"]
-        for key in ("Address", "PrivateKey"):
-            if not str(interface.get(key, "")).strip():
-                return False, f"missing Interface.{key}"
-        if not parser.has_section("Peer"):
-            return False, "missing [Peer] section"
-        peer = parser["Peer"]
-        for key in ("PublicKey", "Endpoint", "AllowedIPs"):
-            if not str(peer.get(key, "")).strip():
-                return False, f"missing Peer.{key}"
-        if not _valid_endpoint(str(peer["Endpoint"])):
-            return False, "bad Peer.Endpoint (expected host:port or [v6]:port)"
-        return True, "ok"
-    except configparser.Error as exc:
-        return False, f"not a parseable config: {exc}"
+        # Read at the os level (not builtins.open) so validation keeps
+        # working when tests or hardening inject failures into the text-open
+        # layer; the exclusive copy below is where write-side errors surface.
+        fd = os.open(str(conf_path), os.O_RDONLY)
+        try:
+            chunks = []
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        finally:
+            os.close(fd)
+        raw = b"".join(chunks)
     except OSError as exc:
         return False, f"cannot read file: {exc}"
+    try:
+        parser = configparser.ConfigParser(interpolation=None)
+        parser.read_string(raw.decode("utf-8", "replace"))
+    except configparser.Error as exc:
+        return False, f"not a parseable config: {exc}"
+    if not parser.sections():
+        return False, "unreadable file"
+    if not parser.has_section("Interface"):
+        return False, "missing [Interface] section"
+    interface = parser["Interface"]
+    for key in ("Address", "PrivateKey"):
+        if not str(interface.get(key, "")).strip():
+            return False, f"missing Interface.{key}"
+    if not parser.has_section("Peer"):
+        return False, "missing [Peer] section"
+    peer = parser["Peer"]
+    for key in ("PublicKey", "Endpoint", "AllowedIPs"):
+        if not str(peer.get(key, "")).strip():
+            return False, f"missing Peer.{key}"
+    if not _valid_endpoint(str(peer["Endpoint"])):
+        return False, "bad Peer.Endpoint (expected host:port or [v6]:port)"
+    return True, "ok"
 
 
 def validate_profile(conf_path: Path) -> bool:
@@ -279,9 +295,19 @@ def sanitize_name(name: str) -> str:
 
 
 def _unique_target(destination: Path, name: str) -> Path:
+    """Pick an unused destination path for ``name``.
+
+    A name that already exists is never reused — and if the existing entry
+    is a symlink (an attacker-planted one), the import refuses loudly with
+    ``copy failed`` instead of silently writing a ``-2`` sibling next to it:
+    a planted symlink at the target means someone is racing the importer,
+    and that must be surfaced, not routed around.
+    """
     target = destination / name
     if not target.exists():
         return target
+    if target.is_symlink():
+        raise OSError(f"refusing symlink planted at import target: {target}")
     stem = name[:-5] if name.lower().endswith(".conf") else Path(name).stem
     for index in range(2, 10_000):
         candidate = destination / f"{stem}-{index}.conf"
@@ -290,12 +316,39 @@ def _unique_target(destination: Path, name: str) -> Path:
     raise OSError(f"could not find a unique destination name for {name}")
 
 
+def _open_conf_exclusive(target: Path) -> int:
+    """Open ``target`` as a new private file, refusing any symlink game.
+
+    Issue #64: the old check-then-copy flow (``copyfile`` + chmod afterwards)
+    let an attacker-writable destination install a symlink between the check
+    and the copy, and created the key material world-readable before 0600 was
+    applied. This opens with O_CREAT|O_EXCL|O_NOFOLLOW and mode 0600 up front,
+    so the file either lands as a fresh private regular file or not at all.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    return os.open(str(target), flags, 0o600)
+
+
+def _is_within(child: Path, parent: Path) -> bool:
+    """True when resolved ``child`` stays under resolved ``parent``."""
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
 def import_profiles(source, destination, validator=None) -> dict:
     """Copy valid WireGuard ``.conf`` profiles from ``source`` into ``destination``.
 
     ``source`` is a single ``.conf`` file or a directory of ``.conf`` files.
     Each profile is validated, given a sanitized, collision-free name, and
-    written with mode 0600. Nothing about the contents is printed.
+    written atomically: a fresh O_CREAT|O_EXCL|O_NOFOLLOW fd at mode 0600
+    (never following symlinks), bytes copied through it, then fsync + close —
+    matching the tmp+replace discipline PR #89 gave the config writers.
+    Nothing about the contents is printed.
 
     Returns::
 
@@ -314,6 +367,7 @@ def import_profiles(source, destination, validator=None) -> dict:
 
     files: list[str] = []
     rejected_files: list[dict] = []
+    dest_root = destination.resolve()
     for candidate in candidates:
         name = candidate.name
         if not candidate.is_file():
@@ -333,11 +387,30 @@ def import_profiles(source, destination, validator=None) -> dict:
             continue
         try:
             target = _unique_target(destination, sanitize_name(name))
-            shutil.copyfile(candidate, target)
-            os.chmod(target, 0o600)
+            fd = _open_conf_exclusive(target)
         except OSError as exc:
             rejected_files.append({"name": name, "reason": f"copy failed: {exc}"})
             continue
+        # The exclusive open already guarantees target is a fresh regular
+        # file; resolve it anyway so a hostile destination layout can never
+        # move key material outside the provider root.
+        if not _is_within(target.resolve(), dest_root):
+            os.close(fd)
+            target.unlink(missing_ok=True)
+            rejected_files.append({"name": name, "reason": "target escaped provider root"})
+            continue
+        try:
+            with os.fdopen(fd, "wb") as out:
+                with open(candidate, "rb") as src_handle:
+                    shutil.copyfileobj(src_handle, out)
+                out.flush()
+                os.fsync(out.fileno())
+        except OSError as exc:
+            # Leave no partial key material behind on a failed copy.
+            target.unlink(missing_ok=True)
+            rejected_files.append({"name": name, "reason": f"copy failed: {exc}"})
+            continue
+        os.chmod(target, 0o600)
         files.append(target.name)
 
     return {
