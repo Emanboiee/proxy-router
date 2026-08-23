@@ -22,6 +22,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
+import ipaddress
 
 ROOT = Path(os.environ.get("PROXY_ROUTER_ROOT") or Path(__file__).resolve().parent).resolve()
 DEFAULT_INTERVAL = 60
@@ -40,6 +41,131 @@ DEFAULT_HEADERS = {
     "User-Agent": "proxy-router-monitor/1.0",
     "Accept": "*/*",
 }
+
+# --- Issue #64: validated monitor targets -----------------------------------
+# Trust model: router.json's monitor URLs point at public internet endpoints
+# (default: Cloudflare) and are NOT a place where secrets live, but they must
+# never aim the worker at infrastructure. Loopback, private, link-local and
+# known cloud-metadata ranges are therefore rejected unless the operator sets
+# PROXY_ROUTER_ALLOW_PRIVATE_TARGETS=1 (the explicit opt-in). Validation is
+# re-run against the *resolved* addresses right before connecting, which also
+# closes the DNS-rebinding window (config-time check passes on a public name,
+# resolution later returns 127.0.0.1 / 169.254.169.254).
+PRIVATE_TARGET_BYPASS_ENV = "PROXY_ROUTER_ALLOW_PRIVATE_TARGETS"
+_METADATA_HOSTNAMES = {"metadata", "metadata.google.internal"}
+_METADATA_ADDRESSES = {"169.254.169.254", "fd00:ec2::254"}
+
+
+def _addr_is_private(addr: str) -> bool:
+    """True for loopback / private / link-local / reserved / multicast IPs."""
+    try:
+        parsed = ipaddress.ip_address(str(addr))
+    except ValueError:
+        return True  # cannot prove it public -> treat as private (fail closed)
+    return (
+        parsed.is_private or parsed.is_loopback or parsed.is_link_local
+        or parsed.is_reserved or parsed.is_multicast or parsed.is_unspecified
+    )
+
+
+def target_violation(url: str, *, resolved_addresses=None) -> str | None:
+    """Return why ``url`` is an unsafe monitor target, or None when allowed.
+
+    Checks scheme (http/https only — no file://, ftp://, ...), credentials,
+    literal private/metadata hosts, and — when ``resolved_addresses`` is given
+    — every address the name actually resolves to, so a rebinding DNS answer
+    cannot slip a probe to loopback/LAN/metadata after config validation.
+    """
+    if os.environ.get(PRIVATE_TARGET_BYPASS_ENV, "").strip().lower() in {"1", "true", "yes"}:
+        if isinstance(url, str):
+            try:
+                parsed = urlsplit(url)
+                if parsed.scheme in ("http", "https") and parsed.hostname:
+                    return None
+            except ValueError:
+                pass
+        return "scheme must be http/https with a hostname"
+    if not isinstance(url, str):
+        return "target must be a string URL"
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return "unparseable URL"
+    if parsed.scheme not in ("http", "https"):
+        return f"scheme {parsed.scheme!r} must be http/https"
+    host = parsed.hostname
+    if not host:
+        return "missing hostname"
+    if parsed.username is not None or parsed.password is not None:
+        return "credentials in URL are not allowed"
+    bare = host.rstrip(".").lower()
+    if bare in _METADATA_HOSTNAMES:
+        return f"{bare} is a metadata endpoint"
+    if bare == "localhost" or bare.endswith(".localhost") or bare.endswith(".local"):
+        # Names that can only ever mean this machine / the LAN segment.
+        return f"{bare} is a private/loopback/metadata target"
+    try:
+        ipaddress.ip_address(bare)
+    except ValueError:
+        pass
+    else:
+        if _addr_is_private(bare):
+            return f"{bare} is a private/loopback/metadata target"
+    for addr in resolved_addresses or ():
+        if str(addr).strip("[]").lower() in _METADATA_ADDRESSES:
+            return "resolved to a metadata endpoint"
+        if _addr_is_private(str(addr).strip("[]")):
+            return f"resolved to private/loopback address {addr}"
+    return None
+
+
+def resolve_target_addresses(url: str) -> list[str]:
+    """Best-effort DNS resolution of ``url``'s hostname (empty list on error).
+
+    Used to validate resolved addresses at connection time (issue #64's DNS
+    rebinding criterion); failures simply yield no addresses, and callers then
+    rely on the pre-connect check plus urllib's own connection error handling.
+    Any exception counts as failure: sandboxed test runs actively block
+    sockets, and a broken resolver must never crash the worker.
+    """
+    import socket
+
+    try:
+        host = urlsplit(str(url)).hostname
+        if not host:
+            return []
+        return [info[4][0] for info in socket.getaddrinfo(host, None)][:8]
+    except Exception:  # noqa: BLE001 - best-effort: no addresses on any failure
+        return []
+
+
+def _reject_unsafe_url(url: str) -> str | None:
+    """Config-time violation for ``url``, else None. No DNS here."""
+    return target_violation(url)
+
+
+def validate_ping_host(host: str) -> str | None:
+    """Return why ``host`` is unsafe to append to a ping argv, else None.
+
+    Conservative allow-list: IPv4/IPv6 literals (bracketed or bare) or
+    hostnames made only of letters/digits/dots/hyphens/colons — no whitespace,
+    no shell metacharacters and, critically, no leading hyphen, so option
+    injection like ``-c 1`` or ``-i 0.001`` is impossible. Length capped at
+    253 per hostname limits.
+    """
+    text = str(host)
+    if not text or len(text) > 253:
+        return "host empty or over 253 characters"
+    if text.startswith("-"):
+        return "leading hyphen looks like a ping option injection"
+    if text.isdigit():
+        # Bare numbers ("3", "8080") are never valid hosts; they read as
+        # injected argv values and must not survive settings sanitization.
+        return "bare number is not a host"
+    allowed = ".:-[]0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    if any(ch not in allowed for ch in text):
+        return "host has characters outside [.:-] alphanumerics"
+    return None
 
 
 def _open(opener, url: str, timeout: float):
@@ -125,6 +251,16 @@ def measure_http_latency(url: str = DEFAULT_HTTP_URL, *, opener=urllib.request.u
                          clock=time.monotonic, timeout: float = 5) -> dict:
     started = clock()
     response = None
+    violation = target_violation(url)
+    if violation is None and opener is urllib.request.urlopen:
+        # Connection-time revalidation of what the name resolves to right now
+        # closes the DNS-rebinding window left by config-time checks alone.
+        violation = target_violation(
+            url, resolved_addresses=resolve_target_addresses(url)
+        )
+    if violation is not None:
+        return _network_error(ValueError(f"unsafe monitor target: {violation}"),
+                              url, target=_safe_target(url))
     try:
         response = _open(opener, url, timeout)
         response.read(1)
@@ -154,6 +290,13 @@ def measure_download(url: str = DEFAULT_DOWNLOAD_URL, *, max_bytes: int = DEFAUL
     started = clock()
     response = None
     total = 0
+    violation = target_violation(url)
+    if violation is None and opener is urllib.request.urlopen:
+        violation = target_violation(
+            url, resolved_addresses=resolve_target_addresses(url)
+        )
+    if violation is not None:
+        return _network_error(ValueError(f"unsafe monitor target: {violation}"), url, bytes=0)
     try:
         response = _open(opener, url, timeout)
         while total < max_bytes:
@@ -177,6 +320,13 @@ def measure_upload(url: str = DEFAULT_UPLOAD_URL, *, max_bytes: int = DEFAULT_MA
     payload = b"0" * max_bytes
     started = clock()
     response = None
+    violation = target_violation(url)
+    if violation is None and opener is urllib.request.urlopen:
+        violation = target_violation(
+            url, resolved_addresses=resolve_target_addresses(url)
+        )
+    if violation is not None:
+        return _network_error(ValueError(f"unsafe monitor target: {violation}"), url, bytes=max_bytes)
     try:
         request = urllib.request.Request(url, data=payload, headers=DEFAULT_HEADERS, method="POST")
         response = opener(request, timeout=timeout)
@@ -193,6 +343,9 @@ def measure_upload(url: str = DEFAULT_UPLOAD_URL, *, max_bytes: int = DEFAULT_MA
 
 def measure_ping(host: str, *, command_runner=subprocess.run,
                  system: str | None = None, timeout: float = 8) -> dict:
+    violation = validate_ping_host(host)
+    if violation is not None:
+        return _error(f"unsafe ping target: {violation}", host=host)
     system = system or platform.system()
     if system == "Windows":
         command = ["ping", "-n", "3", "-w", "2000", host]
@@ -247,6 +400,18 @@ def _monitor_settings(root: Path) -> dict:
                 "download_url": DEFAULT_DOWNLOAD_URL,
                 "upload_url": DEFAULT_UPLOAD_URL,
             }[key]
+        else:
+            # Issue #64: config-time target validation. A URL that aims the
+            # worker at loopback/LAN/link-local/metadata (or a non-http
+            # scheme smuggled past the check above) falls back to the safe
+            # default instead of being probed.
+            violation = _reject_unsafe_url(settings[key])
+            if violation is not None:
+                settings[key] = {
+                    "http_url": DEFAULT_HTTP_URL,
+                    "download_url": DEFAULT_DOWNLOAD_URL,
+                    "upload_url": DEFAULT_UPLOAD_URL,
+                }[key]
     try:
         settings["interval_seconds"] = max(5, int(settings["interval_seconds"]))
     except (TypeError, ValueError):
@@ -262,7 +427,12 @@ def _monitor_settings(root: Path) -> dict:
     hosts = settings["ping_hosts"]
     if not isinstance(hosts, (list, tuple)):
         hosts = DEFAULT_PING_HOSTS
-    settings["ping_hosts"] = [str(x) for x in hosts if str(x)][:8]
+    # Issue #64: keep only conservative DNS/IP values; anything option-like or
+    # metacharacter-bearing is dropped rather than passed to the ping argv.
+    settings["ping_hosts"] = [
+        str(x) for x in hosts
+        if str(x) and validate_ping_host(str(x)) is None
+    ][:8]
     return settings
 
 

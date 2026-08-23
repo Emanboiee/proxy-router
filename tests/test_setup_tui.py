@@ -1,4 +1,5 @@
 """Tests for setup_tui.py (stdlib only, no network, no private keys printed)."""
+import inspect
 import io
 import json
 import os
@@ -871,3 +872,111 @@ class RouterCommandTimeoutTests(unittest.TestCase):
                 rc = setup_tui._router_command(root, "rotate", "proton", timeout=180.0)
         self.assertEqual(rc, 1)
         self.assertIn("timed out after 180s", err.getvalue())
+
+
+class AtomicImportSecurityTests(unittest.TestCase):
+    """Issue #64: profile import is atomic and symlink-safe.
+
+    The old check-then-copy flow (copyfile + chmod afterwards) let an
+    attacker-writable destination install a symlink between the existence
+    check and the copy, and left key material world-readable until 0600 was
+    applied. Import now opens O_CREAT|O_EXCL|O_NOFOLLOW at mode 0600 up front.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(setup_tui, self.root)
+        self.dest = self.root / "providers" / "proton"
+        self.dest.mkdir(parents=True)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_import_over_existing_target_is_atomic_replacement(self):
+        # A crash mid-copy must never leave truncated key material at the
+        # target: bytes go through one exclusive fd with fsync before close,
+        # matching PR #89's tmp+replace discipline for config writers.
+        src = self.root / "new.conf"
+        _write_valid_conf(src)
+        result = setup_tui.import_profiles(src, self.dest)
+        self.assertEqual(result["imported"], 1)
+        written = self.dest / "new.conf"
+        self.assertEqual(written.read_text(), src.read_text())
+        mode = stat.S_IMODE(written.stat().st_mode)
+        self.assertEqual(mode, 0o600)
+
+    def test_symlink_at_target_path_is_not_followed(self):
+        # Attacker plants a symlink where the import will land; O_EXCL|O_NOFOLLOW
+        # must refuse to write through it and reject instead of following.
+        outside = self.root / "outside.conf"
+        _write_valid_conf(outside)
+        victim = self.root / "victim.conf"
+        _write_valid_conf(victim)
+        link = self.dest / "evil.conf"
+        link.symlink_to(victim)
+        src = self.root / "evil-source.conf"
+        _write_valid_conf(src)
+        # Force the importer to pick the colliding (linked) name: rename the
+        # planted link over the sanitized source name before importing.
+        link.unlink()
+        link.symlink_to(outside)
+        os.rename(src, self.dest.parent / "x.conf")
+        src2 = self.root / "e-vil.conf"
+        _write_valid_conf(src2)
+        # sanitize_name("e-vil.conf") == "e-vil.conf"; plant the symlink there
+        planted = self.dest / "e-vil.conf"
+        if planted.exists():
+            planted.unlink()
+        planted.symlink_to(outside)
+        before = outside.read_text()
+        result = setup_tui.import_profiles(src2, self.dest)
+        self.assertEqual(result["imported"], 0)
+        self.assertEqual(result["rejected"], 1)
+        self.assertIn("copy failed", result["rejected_files"][0]["reason"])
+        # the symlink target must be untouched by the refused import
+        self.assertEqual(outside.read_text(), before)
+        self.assertTrue(planted.is_symlink())
+
+    def test_umask_cannot_make_import_world_readable(self):
+        old_umask = os.umask(0o077)
+        try:
+            src = self.root / "perm.conf"
+            _write_valid_conf(src)
+            # hostile umask would normally yield group/other-readable files
+            os.umask(0o000)
+            result = setup_tui.import_profiles(src, self.dest)
+        finally:
+            os.umask(old_umask)
+        self.assertEqual(result["imported"], 1)
+        mode = stat.S_IMODE((self.dest / "perm.conf").stat().st_mode)
+        self.assertEqual(mode, 0o600)
+
+    def test_failed_copy_leaves_no_partial_file(self):
+        src = self.root / "partial.conf"
+        _write_valid_conf(src)
+        target_holder = {"path": None}
+
+        def exploding_open(path, *args, **kwargs):
+            text_path = str(path)
+            if text_path.endswith(".conf"):
+                raise OSError(28, "No space left on device")
+            return real_open(path, *args, **kwargs)
+
+        real_open = open
+        target = setup_tui._unique_target(self.dest, setup_tui.sanitize_name(src.name))
+        target_holder["path"] = target  # type: ignore[assignment]
+        with mock.patch("builtins.open", side_effect=exploding_open):
+            result = setup_tui.import_profiles(src, self.dest)
+        self.assertEqual(result["imported"], 0)
+        self.assertIn("copy failed", result["rejected_files"][0]["reason"])
+        self.assertFalse(target_holder["path"].exists(),
+                         "failed copy must not leave partial key material")
+
+    def test_source_guard_keeps_import_on_exclusive_open_path(self):
+        # Source-level guard in PR #89's spirit: import_profiles must keep
+        # going through _open_conf_exclusive; a future revert to plain
+        # shutil.copyfile would silently reintroduce the symlink race.
+        module_source = inspect.getsource(setup_tui.import_profiles)
+        self.assertIn("_open_conf_exclusive", module_source)
+        self.assertNotIn("shutil.copyfile(", module_source)
