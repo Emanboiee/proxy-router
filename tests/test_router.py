@@ -796,6 +796,59 @@ class ProcessIdentityTests(unittest.TestCase):
             self.assertFalse(router._any_our_engine_running())
 
 
+class EngineStopTerminationTests(unittest.TestCase):
+    """Issue #52 regression pin: `stop` (the exact call the tray's Quit
+    issues through RouterClient.stop) must TERMINATE the running engine
+    process — not merely clean up bookkeeping. The tray-order pins live in
+    test_proxy_tray.QuitActionTests; this pins the engine-kill contract
+    against a real subprocess instead of a fake."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        _relocate(router, self.root)
+        # darwin + non-root: engine_stop probes the privileged helper before
+        # taking the user-level path; none is installed under pytest.
+        self._orig_helper_status = router._helper_status
+        router._helper_status = lambda: None
+
+    def tearDown(self):
+        router._helper_status = self._orig_helper_status
+        self.tmp.cleanup()
+
+    def test_engine_stop_terminates_engine_process(self):
+        # A harmless stand-in for sing-box: a sleeping interpreter whose
+        # argv advertises "sing-box run --config <our config>" so the
+        # _pid_matches() ownership check accepts it without any binary.
+        # The exact relocated config path must appear verbatim in argv.
+        cfg = router.SING_BOX_CONFIG
+        child_code = (
+            "import time\n"
+            f"print('sing-box run --config {cfg}')\n"
+            "time.sleep(30)\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", child_code], stdout=subprocess.DEVNULL)
+        try:
+            router.PID_FILE.write_text(f"{proc.pid}\n")
+            self.assertTrue(
+                router._pid_matches(proc.pid),
+                "precondition: stand-in engine must be recognized as ours")
+            self.assertTrue(router.engine_alive())
+
+            rc = router.engine_stop()
+
+            self.assertEqual(rc, 0)
+            proc.wait(timeout=5)
+            self.assertIsNotNone(proc.poll(), "engine process must be gone")
+            self.assertFalse(router.PID_FILE.exists())
+            self.assertFalse(router.engine_alive())
+        finally:
+            if proc.poll() is None:  # never leak a sleeper on failure
+                proc.kill()
+                proc.wait(timeout=5)
+
+
 class EngineStartSpawnRaceTests(unittest.TestCase):
     """Issue #62: engine_start must capture the log offset BEFORE Popen so a
     FATAL written between spawn and the offset read is not skipped."""
