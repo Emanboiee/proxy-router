@@ -80,6 +80,18 @@ _FRIENDLY_ERRORS = (
     ("all profiles cooling down",
      "no servers available right now — try again in a minute"),
     ("no valid profiles", "no usable profiles found — re-add your .conf under Setup"),
+    # Issue #76: the launchd-autostarted tray has no TTY, so a missing or
+    # stale elevation grant surfaces as raw sudo/helper jargon that reads
+    # like "the app is broken". Map both the router's actionable message and
+    # the raw sudo fragments to the one-time fix.
+    ("startup permission not set up yet",
+     "one-time permission needed — open Dashboard → Fix Startup Permissions (or run `router.py elevate install` once)"),
+    ("VPN startup permission missing",
+     "one-time permission needed — open Dashboard → Fix Startup Permissions (or run `router.py elevate install` once)"),
+    ("a password is required",
+     "permission needed for automatic start — run `router.py elevate install` once from a terminal"),
+    ("not in the sudoers",
+     "permission needed for automatic start — run `router.py elevate install` once from a terminal"),
 )
 
 # Longest tail line _humanize keeps: the sing-box missing-binary message
@@ -144,6 +156,33 @@ def _humanize(out: str) -> str:
         if needle in detail:
             return repl
     return detail
+
+
+_PERMISSION_ERROR_MARKERS = (
+    "startup permission not set up yet",
+    "vpn startup permission missing",
+    "a password is required",
+    "not in the sudoers",
+)
+
+
+def _permission_error_markers() -> tuple[str, ...]:
+    """Needles that identify a startup-permission failure (issue #76).
+
+    Covers both directions of the pipeline: the router's actionable message
+    ("VPN startup permission missing…", "startup permission not set up
+    yet") and raw sudo fragments ("a password is required", "not in the
+    sudoers file") that can reach the tray before the router maps them.
+    """
+    return _PERMISSION_ERROR_MARKERS
+
+
+def _is_permission_error(text: str | None) -> bool:
+    """True when a toast/action result describes the #76 permission gap."""
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in _PERMISSION_ERROR_MARKERS)
 
 
 @dataclass
@@ -283,22 +322,23 @@ class RouterStatus:
         return f"proxy {state} · {detail} · {watcher}"
 
 
-def open_dashboard(root) -> bool:
-    """Open the full dashboard TUI in a terminal window (tray one-click).
+def _launch_terminal(root, script_args: list[str]) -> bool:
+    """Open a terminal in ``root`` running ``python setup_tui.py [*args]``.
 
-    The tray menu is compact by design; the dashboard is where profiles,
-    exits, fallbacks, routing, and presets get managed. macOS: Terminal runs
-    setup_tui.py in the router root. Elsewhere: the first common terminal
-    emulator that exists wins. Never raises — the tray must survive a
-    broken terminal setup."""
+    Shared by the dashboard one-click and the permission-repair path
+    (issue #76). Never raises — a broken terminal setup must not take the
+    tray down.
+    """
     root = Path(root)
     tui = root / "setup_tui.py"
     if not tui.is_file():
-        print(f"dashboard: missing {tui}", file=sys.stderr)
+        print(f"terminal: missing {tui}", file=sys.stderr)
         return False
     python = sys.executable or "python3"
     if sys.platform == "darwin":
-        script = f"cd {shlex.quote(str(root))} && {shlex.quote(python)} setup_tui.py"
+        quoted_args = "".join(" " + shlex.quote(a) for a in script_args)
+        script = (f"cd {shlex.quote(str(root))} && "
+                  f"{shlex.quote(python)} setup_tui.py{quoted_args}")
         content = script.replace("\\", "\\\\").replace('"', '\\"')
         try:
             # Popen, not run(): this fires from a Cocoa menu callback on the
@@ -312,13 +352,14 @@ def open_dashboard(root) -> bool:
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return True
         except OSError as exc:
-            print(f"dashboard: could not open Terminal: {exc}", file=sys.stderr)
+            print(f"terminal: could not open Terminal: {exc}", file=sys.stderr)
             return False
+    tail = ["setup_tui.py", *script_args]
     launchers = [
-        ["x-terminal-emulator", "-e", f"{python} setup_tui.py"],
-        ["gnome-terminal", "--", f"{python} setup_tui.py"],
-        ["konsole", "-e", f"{python} setup_tui.py"],
-        ["xterm", "-e", f"{python} setup_tui.py"],
+        ["x-terminal-emulator", "-e", python, *tail],
+        ["gnome-terminal", "--", python, *tail],
+        ["konsole", "-e", python, *tail],
+        ["xterm", "-e", python, *tail],
     ]
     for launcher in launchers:
         if shutil.which(launcher[0]) is None:
@@ -329,9 +370,24 @@ def open_dashboard(root) -> bool:
             return True
         except OSError:
             continue
-    print("dashboard: no terminal emulator found (xterm/gnome-terminal/konsole)",
+    print("terminal: no terminal emulator found (xterm/gnome-terminal/konsole)",
           file=sys.stderr)
     return False
+
+
+def open_dashboard(root) -> bool:
+    """Open the full dashboard TUI in a terminal window (tray one-click).
+
+    The tray menu is compact by design; the dashboard is where profiles,
+    exits, fallbacks, routing, and presets get managed. macOS: Terminal runs
+    setup_tui.py in the router root. Elsewhere: the first common terminal
+    emulator that exists wins. Never raises — the tray must survive a
+    broken terminal setup."""
+    root = Path(root)
+    if not (root / "setup_tui.py").is_file():
+        print(f"dashboard: missing {root / 'setup_tui.py'}", file=sys.stderr)
+        return False
+    return _launch_terminal(root, [])
 
 
 class RouterClient:
@@ -453,6 +509,16 @@ class RouterClient:
     def setup_preset(self, name: str) -> tuple[int, str]:
         """Apply a named preset (idempotent, lossless) via the setup CLI."""
         return self._run("setup", "--preset", name)
+
+    def elevate(self) -> tuple[int, str]:
+        """One-time startup-permission install via the router CLI.
+
+        Issue #76: this is the ONLY command that may show the macOS admin
+        dialog. It is run from a Terminal window the user just opened (see
+        TrayApp.action_fix_permissions), so elevation has an interactive
+        context — the tray process itself never prompts.
+        """
+        return self._run("elevate", "install")
 
     def reload(self) -> tuple[int, str]:
         """Hot-reload the engine config in place (SIGHUP; no restart)."""
@@ -786,6 +852,21 @@ class TrayApp:
             except OSError as e:
                 print(f"guide: cannot read {guide}: {e}", file=sys.stderr)
 
+    def action_fix_permissions(self):
+        """One-click repair for the startup-permission gap (issue #76).
+
+        The launchd-autostarted tray cannot answer macOS admin prompts
+        itself, so the fix opens a Terminal window running
+        `router.py elevate install` — the one command that may prompt.
+        The tray only reports that it handed off; the terminal session owns
+        the dialog and its outcome."""
+        opened = _launch_terminal(Path(self.client.root), ["elevate", "install"])
+        with self.lock:
+            self.last_action_result = (
+                "permission repair: follow the Terminal window"
+                if opened else "permission repair: no terminal available")
+        self._refresh_menu()
+
     def action_quit(self):
         # Quit = stop the engine AND leave the tray (Tailscale/WARP-style):
         # the engine must not keep serving after the user quits the tray.
@@ -860,6 +941,12 @@ class TrayApp:
                 f"preset: {st.preset}", None))
         if last_action_result:
             items.append(pystray.MenuItem(last_action_result, None))
+        # Issue #76: when the failure was a permission gap, surface the
+        # repair right where the error appeared instead of leaving a toast
+        # the user cannot act on.
+        if _is_permission_error(last_action_result):
+            items.append(pystray.MenuItem(
+                "Fix Startup Permissions…", self.action_fix_permissions))
 
         items.append(pystray.Menu.SEPARATOR)
 
@@ -939,6 +1026,12 @@ class TrayApp:
                                  lambda: self.action_import_profile("proton")),
                 pystray.MenuItem("Add Cloudflare WARP profile (.conf)…",
                                  lambda: self.action_import_profile("cloudflare")),
+                pystray.Menu.SEPARATOR,
+                # Issue #76: always discoverable, not only right after a
+                # failed click — the autostart permission gap is easy to hit
+                # long before anyone opens this menu.
+                pystray.MenuItem("Fix Startup Permissions (one-time)…",
+                                 self.action_fix_permissions),
             ),
         ))
 

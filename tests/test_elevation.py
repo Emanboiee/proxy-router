@@ -317,5 +317,152 @@ class ElevateFallbackTests(unittest.TestCase):
         run.assert_not_called()
 
 
+class HelperPermissionUxTests(unittest.TestCase):
+    """Issue #76: the launchd-autostarted app has no TTY; when its one-time
+    elevation grant is missing every action failed with raw sudo jargon and
+    no fix. The failure must name the gap and the exact one-time command."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        _relocate(router, root)
+        self.addCleanup(self.tmp.cleanup)
+
+    def _denied(self, stderr="sudo: a password is required\n"):
+        return subprocess.CompletedProcess([], 1, "", stderr)
+
+    def test_helper_run_denial_prints_actionable_permission_message(self):
+        denied = subprocess.CompletedProcess(
+            [], 1, "", "sudo: no tty present and no askpass program specified")
+        with mock.patch.object(router.subprocess, "run", return_value=denied), \
+             mock.patch.object(router.os, "getuid", return_value=501), \
+             mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            rc = router._helper_run("start")
+        self.assertEqual(rc, 1)
+        text = err.getvalue()
+        self.assertIn("startup permission missing", text.lower())
+        self.assertIn("elevate install", text)
+        self.assertIn("raw error:", text)
+
+    def test_helper_run_genuine_failure_keeps_helper_prefix(self):
+        failed = subprocess.CompletedProcess([], 1, "", "boom: engine exploded")
+        with mock.patch.object(router.subprocess, "run", return_value=failed), \
+             mock.patch.object(router.os, "getuid", return_value=501), \
+             mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            rc = router._helper_run("stop")
+        self.assertEqual(rc, 1)
+        text = err.getvalue()
+        self.assertIn("privileged helper stop failed", text)
+        self.assertIn("boom", text)
+        self.assertNotIn("permission missing", text.lower())
+
+    def test_denied_reason_classifier(self):
+        self.assertEqual(
+            router._helper_denied_reason("sudo: a password is required"),
+            "not-granted")
+        self.assertEqual(
+            router._helper_denied_reason("user is not in the sudoers file"),
+            "not-granted")
+        self.assertIsNone(router._helper_denied_reason("engine exploded"))
+
+    def test_start_without_helper_uses_actionable_not_installed_message(self):
+        """The autostarted tray's first Connect hits exactly this path."""
+        config = {
+            "log": {"level": "info"}, "inbounds": [], "endpoints": [],
+            "outbounds": [], "dns": {}, "route": {},
+        }
+        platform = mock.patch.object(router.sys, "platform", "darwin")
+        euid = mock.patch.object(router.os, "geteuid", return_value=501)
+        mode = mock.patch.object(router, "current_mode", return_value="tun")
+        status = mock.patch.object(router, "_helper_status", return_value=None)
+        # CI runners have no sing-box; the permission gate must fire before
+        # any binary/version dependency is consulted.
+        sing = mock.patch.object(
+            router, "resolve_sing_box", return_value=Path("/usr/bin/false"))
+        version = mock.patch.object(router, "sing_box_at_least", return_value=True)
+        for patcher in (platform, euid, mode, status, sing, version):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        with mock.patch.object(router, "_helper_run") as helper_run, \
+             mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            rc = router.engine_start()
+        self.assertEqual(rc, 1)
+        helper_run.assert_not_called()
+        text = err.getvalue()
+        self.assertIn("startup permission not set up yet", text.lower())
+        self.assertIn("launchd", text.lower())
+        self.assertIn("elevate install", text)
+        self.assertNotIn("TUN/root engine requires", text)
+
+    def test_reload_without_helper_uses_actionable_message(self):
+        platform = mock.patch.object(router.sys, "platform", "darwin")
+        euid = mock.patch.object(router.os, "geteuid", return_value=501)
+        status = mock.patch.object(router, "_helper_status", return_value=None)
+        for patcher in (platform, euid, status):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            rc = router._elevated_reload()
+        self.assertEqual(rc, 1)
+        text = err.getvalue()
+        self.assertIn("startup permission not set up yet", text.lower())
+        self.assertIn("elevate install", text)
+
+    def test_status_json_exposes_elevation_block(self):
+        platform = mock.patch.object(router.sys, "platform", "linux")
+        euid = mock.patch.object(router.os, "geteuid", return_value=501)
+        root_engine = mock.patch.object(
+            router, "_engine_runs_as_root", return_value=False)
+        sudoers = mock.patch.object(router, "_sudoers_installed",
+                                    return_value=True)
+        report = mock.patch.object(
+            router, "_status_report", return_value=(0, "up"))
+        for patcher in (platform, euid, root_engine, sudoers, report):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        data = router.status_json()
+        elevation = data["elevation"]
+        self.assertFalse(elevation["root_engine"])
+        self.assertTrue(elevation["sudo_grant"])
+        # Non-macOS: helper probe skipped -> installed flag stays False.
+        self.assertFalse(elevation["helper_installed"])
+        self.assertIn("elevate install", elevation["fix_hint"])
+
+    def test_status_json_darwin_includes_launchd_agents(self):
+        platform = mock.patch.object(router.sys, "platform", "darwin")
+        euid = mock.patch.object(router.os, "geteuid", return_value=501)
+        root_engine = mock.patch.object(
+            router, "_engine_runs_as_root", return_value=True)
+        sudoers = mock.patch.object(router, "_sudoers_installed",
+                                    return_value=False)
+        helper = mock.patch.object(
+            router, "_helper_status",
+            return_value={"installed": False, "error": "denied"})
+        listing = subprocess.CompletedProcess(
+            [], 0,
+            "PID\tStatus\tLabel\n-\t0\tcom.proxy-router.keepalive\n"
+            "-\t0\tcom.apple.Finder\n", "")
+        probe = mock.patch.object(
+            router.subprocess, "run", return_value=listing)
+        report = mock.patch.object(
+            router, "_status_report", return_value=(0, "up"))
+        for patcher in (platform, euid, root_engine, sudoers, helper, probe,
+                        report):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        data = router.status_json()
+        elevation = data["elevation"]
+        self.assertTrue(elevation["keepalive_agent"])
+        self.assertFalse(elevation["tray_agent"])
+        self.assertFalse(elevation["helper_installed"])
+        self.assertTrue(elevation["root_engine"])
+
+    def test_launchd_agent_state_false_off_darwin(self):
+        platform = mock.patch.object(router.sys, "platform", "win32")
+        platform.start()
+        self.addCleanup(platform.stop)
+        self.assertFalse(router._launchd_agent_state("com.proxy-router.tray"))
+
+
 if __name__ == "__main__":
     unittest.main()
