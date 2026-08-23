@@ -82,9 +82,10 @@ else {
 Write-Host ''
 Write-Host "proxy-router installed to $Dest"
 Write-Host 'Usage (requires Python 3.10+):'
-Write-Host "  & `"$Dest\router.py`" init"
-Write-Host "  & `"$Dest\router.py`" ensure"
+Write-Host "  & `"$Dest\router.py`" setup --check   # validate router.json (already created by this installer)"
+Write-Host "  & `"$Dest\router.py`" ensure          # start the engine if the listener is down"
 Write-Host "  & `"$Dest\router.py`" status"
 Write-Host "  & `"$Dest\router.py`" routes"
 Write-Host "Add providers: drop WireGuard configs into $Dest\providers\<provider>\<profile>.conf"
+Write-Host "Or import one:  & `"$Dest\router.py`" setup --import-proton <profile.conf>"
 Write-Host 'Python 3.10+ is required (python.org); sing-box is bundled as sing-box.exe.'

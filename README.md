@@ -25,7 +25,10 @@ and the launchd keep-alive) are guarded and print a clear message elsewhere.
 
 ## Requirements
 
-- Python 3.10+ (stdlib only — no pip install)
+- Python 3.10+. The core CLI (`router.py`, `setup_tui.py`, `monitor.py`,
+  `route_watcher.py`) is stdlib-only — no `pip install` needed. The optional
+  macOS menu-bar tray additionally needs **pystray + Pillow**
+  (`python3 -m pip install pystray pillow`; see the Tray section below).
 - sing-box **1.12.0 or newer** — bundled in the release archives
   (`bin/sing-box`), or available on `PATH`, or pointed at via `SING_BOX` env
   var. Older binaries are rejected up front: the generated config relies on
@@ -50,20 +53,39 @@ cd proxy-router
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-Then initialize the config and use the setup TUI/guide path:
+The installer creates `router.json` from `router.example.json` on first run
+(once — reruns never clobber it), so there is nothing to initialize by hand.
+`init` is only for creating a fresh config from a bare checkout, and it
+refuses to overwrite an existing file unless you pass `--force`. After
+installing, validate what shipped and bring the engine up:
 
 ```sh
-proxy-router init
+proxy-router setup --check    # validate router.json + provider profiles (offline)
+proxy-router ensure           # start the engine if the listener is down
+```
+
+Then add providers with the wizard:
+
+```sh
 proxy-router setup --guide all
 proxy-router setup --import-proton ~/Downloads/protonvpn-*.conf
 proxy-router setup --import-warp ~/Downloads/wgcf-profile.conf  # optional
-proxy-router setup --preset
-proxy-router setup --check
-proxy-router setup --bridge-install  # install the Hermes OpenCode rotation bridge
-proxy-router setup --bridge-force-install  # overwrite an existing bridge file
-proxy-router setup --bridge-check    # verify the installed bridge
+proxy-router setup --preset            # apply the default preset
+proxy-router setup --preset-list       # list built-in + custom presets
+proxy-router setup --bridge-install    # install the Hermes OpenCode rotation bridge
+proxy-router setup --bridge-check      # verify the installed bridge
+proxy-router setup --check             # re-validate after importing
 proxy-router ensure
 ```
+
+The shipped `router.example.json` template is deliberately vendor-neutral:
+generic providers `primary-vpn` / `fallback-vpn` (with a
+`fallback_providers` chain) and a conservative route table. The validated,
+provider-specific presets are applied explicitly by name via
+`setup --preset <name>` — built-ins: `default` (OpenCode → Proton + Roblox →
+WARP combo), `opencode`, `roblox`, `school-warp` (VPN-list routing plus DoH
+DNS for filtered/captive networks). List them any time with
+`proxy-router setup --preset-list`.
 
 `proxy-router setup` with no flags opens the custom terminal wizard. It never
 enables TUN mode or starts monitoring unless you explicitly choose those
@@ -76,6 +98,8 @@ bridge (placed at `$OPENCODE_ZEN_VPN_ROOT/proxy-manager.sh`).
 router.py                    engine + CLI (single file, stdlib only)
 setup_tui.py                 custom terminal setup wizard + safe imports
 monitor.py                   opt-in latency/ping/speed monitor worker
+route_watcher.py             standalone routed-connection watcher
+proxy_tray.py                optional macOS/Windows tray (needs pystray + Pillow)
 router.example.json          config template (port, providers, cooldowns, route table)
 guides/proton-vpn-free.md    Proton VPN Free WireGuard guide
 guides/cloudflare-warp.md    Cloudflare WARP/wgcf guide
@@ -96,11 +120,19 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ```sh
 ./router.py ensure                # start engine if the listener is down (idempotent)
 ./router.py start / stop / status
+./router.py doctor                # read-only health audit: config, profiles, listener, egress summary
 ./router.py routes               # list route table
 ./router.py vpn on               # full TUN mode: route everything via the engines' rules
 ./router.py vpn off              # stop the TUN, back to proxy mode
 ./router.py vpn restart          # stop + re-enter TUN through the installed helper
 ./router.py vpn status           # show current mode and liveness
+./router.py vpn capture routes   # dump the TUN route rules sing-box is using
+./router.py vpn capture ruleset  # dump the selective ruleset capture config
+./router.py routing show         # effective routing mode + lists (JSON + human)
+./router.py routing set --mode vpn-list        # switch routing mode (safe-list | vpn-list | default)
+./router.py routing set --mode safe-list --default-provider proton
+./router.py routing add --mode safe-list --domain example.com  # add a domain to a list
+./router.py routing remove --mode vpn-list --domain example.com
 ./router.py elevate install      # one-time macOS admin prompt; install root-owned lifecycle helper
 ./router.py elevate uninstall    # stop engine and remove helper + exact sudoers policy
 ./router.py elevate status       # is the safe helper active for this user?
@@ -112,6 +144,15 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py rotate <provider> --force   # switch anyway, ignoring cooldowns and blocked exits
 ./router.py rotate <provider> --no-probe # skip the post-switch egress probe
 ./router.py rotate --if-due      # scheduled rotation: only when the interval elapsed (exit 3 = not due)
+./router.py rotate <provider> --to 01-NL-FREE-140  # switch to this exact exit profile (used by the tray's Provider picker)
+./router.py response-event --host example.com --status 429 [--provider proton]
+                                 # feed an observed upstream status into cooldown/error-policy handling
+./router.py profile copy <path...> --provider proton
+                                 # copy validated .conf file(s)/directory into a provider
+./router.py watcher status       # routed-connection watcher state (JSON)
+./router.py watcher on           # start the standalone watcher (config-driven critical domains)
+./router.py watcher off          # stop it (exit 1 when nothing was running)
+./router.py watcher logs         # tail recent watcher event lines
 ./router.py network-check        # auto-apply the preset mapped to the current Wi-Fi (run by the route watcher every 30s)
 ./router.py failover <provider> on [--to <fallback>]  # route the provider's domains through its configured fallback chain (first valid entry, or the named member)
 ./router.py failover <provider> off    # clear fallback and restore the provider's routes
@@ -150,7 +191,8 @@ networks keep the current preset.
 
 Every state-changing command takes an exclusive lock, so concurrent calls
 are safe; read-only commands (`status`, `routes`, `provider-count`, `vpn
-status`, `init`) do not.
+status`) do not. (`init` is NOT in that group: it writes `router.json`, and
+it refuses to touch one that already exists unless you pass `--force`.)
 
 `status` and `vpn status` report the same state (exit 0 = engine up and
 matching the persisted mode; exit 1 = down, degraded, or unusable config), so
@@ -213,10 +255,10 @@ Rotation is then egress-aware instead of blind round-robin:
   inconclusive - both keep the dead verdict). Exit code is 1 only
   when an exit is `dead`, so automation never rotates on a reputation-block
   HTTP status, a throttle blip, or a DNS flake.
-- A provider can declare `fallback_provider` (the deployment maps Proton to
-  Cloudflare WARP). The value may be a single provider name or an **ordered
-  list** forming a fallback chain, e.g.
-  `"fallback_provider": ["cloudflare", "mullvad"]` — entries are validated at
+- A provider can declare an ordered fallback chain under `fallback_providers`
+  (the deployment maps Proton to Cloudflare WARP). The value may be a single
+  provider name or an **ordered list** forming a fallback chain, e.g.
+  `"fallback_providers": ["cloudflare", "mullvad"]` — entries are validated at
   load (must name another configured provider, no self/duplicates) and the
   chain is walked in order, so the first entry with valid profiles wins. When
   rotation exhausts the primary pool, the wrapper, keepalive, or Hermes
@@ -233,6 +275,10 @@ Rotation is then egress-aware instead of blind round-robin:
   the router restores the last-good config and reloads/starts once - never
   looping, and failing with a clear message when no last-good exists or the
   restore itself fails.
+
+The singular `"fallback_provider"` key still loads as a compatibility alias
+for existing configs (a single name or list; both keys together are an
+error). New configurations should use `"fallback_providers"`.
 
 Tunables live in `router.json` under `"egress"` (see `router.example.json`).
 
@@ -423,27 +469,45 @@ replaced by public DNS through the tunnel.
 
 ### Config reference (`router.json`)
 
+What actually ships — `router.example.json`, copied to `router.json` by the
+installer (abridged):
+
 ```json
 {
   "port": 2080,
   "providers": {
-    "proton":     { "cooldown_seconds": 60 },
-    "cloudflare": { "cooldown_seconds": 60 }
+    "primary-vpn": {
+      "directory": "providers/primary-vpn",
+      "cooldown_seconds": 60,
+      "fallback_providers": ["fallback-vpn"]
+    },
+    "fallback-vpn": { "directory": "providers/fallback-vpn", "cooldown_seconds": 60 }
   },
   "routes": [
-    { "id": "opencode-zen", "domains": ["opencode.ai"], "provider": "proton" },
-    { "id": "roblox", "domains": ["roblox.com", "rbxcdn.com", "robloxlabs.com", "rblx.com"], "provider": "cloudflare" }
+    { "id": "opencode-zen", "domains": ["opencode.ai"], "provider": "primary-vpn" },
+    { "id": "roblox", "domains": ["roblox.com", "rbxcdn.com"], "provider": "fallback-vpn" }
   ],
+  "routing": { "mode": "vpn-list", "vpn_domains": [] },
   "rotation": { "interval_seconds": 7200, "jitter_seconds": 300 }
 }
 ```
 
-`proxy-router setup --preset` adds the two routes above idempotently. Route
-choice is configurable: the current validated deployment uses the Proton pool
-for OpenCode Zen and Cloudflare WARP for Roblox, while unmatched traffic stays
-direct. If every tunnel exit is unhealthy, direct OpenCode egress remains the
-fallback; the router does not claim that a tunnel is healthy merely because a
-profile parses.
+Rename the providers to whatever you use (`proton`, `cloudflare`, ...) and
+point each `directory` at its profile folder, or let the presets do it:
+
+```sh
+proxy-router setup --preset          # apply the default combo preset
+proxy-router setup --preset school-warp   # filtered networks: vpn-list + DoH
+proxy-router setup --preset-list     # built-ins: default/opencode/roblox/school-warp
+```
+
+`setup --preset <name>` applies a NAMED bundle of routes plus an optional
+routing-mode/DNS section idempotently. Route choice is configurable: the
+current validated deployment uses the Proton pool for OpenCode Zen and
+Cloudflare WARP for Roblox, while unmatched traffic stays direct. If every
+tunnel exit is unhealthy, direct OpenCode egress remains the fallback; the
+router does not claim that a tunnel is healthy merely because a profile
+parses.
 
 - Route domains and IP CIDRs select which traffic enters a tunnel; everything
   else matches `direct` (unmatched) traffic.
@@ -463,6 +527,59 @@ Notes on claims vs reality:
   `sing-box.json` are also protected.
 - `router.py init` refuses to overwrite an existing `router.json` unless you
   pass `--force`; the installer never overwrites it either.
+
+## Tray (menu bar / taskbar)
+
+`proxy_tray.py` is an optional resident status icon: macOS menu-bar accessory
+(no Dock icon) or Windows taskbar tray. It never mutates engine state itself —
+every click shells out to `router.py`, so rotation ownership, cooldowns, and
+keepalive semantics stay exactly where they are.
+
+The tray needs two GUI dependencies beyond the stdlib-only core:
+
+```sh
+python3 -m pip install pystray pillow
+python3 proxy_tray.py --selftest   # no GUI needed: validates CLI contract + dispatch
+python3 proxy_tray.py              # run it in the foreground
+```
+
+macOS login autostart (launchd agent):
+
+```sh
+examples/install-tray.sh            # fills the plist template, bootstraps gui/$UID agent
+examples/install-tray.sh --remove   # unload + remove ~/Library/LaunchAgents/com.proxy-router.tray.plist
+```
+
+Rerunning the installer is safe: with the same root it re-renders and
+re-bootstraps (a real upgrade); with a different root it unloads the stale
+job, keeps the old plist as `*.stale`, and prints the restore command. Logs go
+to `~/Library/Logs/proxy-router/`.
+
+Menu map:
+
+- **Status header** (`● Connected` / `○ Disconnected` / `! Error`; a fresh
+  install shows "No VPN set up yet" with a pointer at Setup).
+- **Open Dashboard** — opens the full terminal wizard in a Terminal window
+  (the bold default action).
+- **Connect / Reconnect · Disconnect** — `router.py start` / `stop`.
+  Disconnect writes the manual-off marker, so the keepalive will NOT
+  resurrect the engine until you connect again.
+- **Switch VPN server** — rotate to the next healthy exit of the active pool.
+- **Provider** — pick an exact exit profile per provider (runs
+  `rotate <provider> --to <profile>`); hard-blocked/exhausted exits are
+  greyed out.
+- **Full tunnel (WARP): on/off** — TUN-mode toggle. On macOS this pops the
+  standard administrator dialog: creating the `utun` interface needs root via
+  the installed lifecycle helper (see One-time elevation).
+- **Routing mode** — safe-list (home) / vpn-list (school) / default.
+- **Setup** — provider guides and native file-picker `.conf` import
+  (no terminal needed).
+- **Presets** — built-in presets plus custom ones from `presets/*.json`,
+  active one checked.
+- **Quit** — stops the engine AND exits the tray (Tailscale/WARP-style):
+  quitting deliberately takes the VPN down, and Quit waits (bounded) for any
+  in-flight action before stopping. Use Disconnect if you want the VPN off
+  but the tray to stay resident.
 
 ## Optional network monitoring
 

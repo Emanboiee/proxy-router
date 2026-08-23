@@ -13,10 +13,6 @@ threads.
 - **Fallback settings view in the TUI** (from #32): settings entry for
   provider fallback chains — view chains, set/clear via a two-stage prompt,
   plus a line-mode writer. Test spec preserved in #31's description.
-- **route_watcher config-driven redesign** (from #33): `proxy_port(root)`,
-  config-driven `critical_domains`, and fallback-aware `route_provider(root,
-  host)`; `probe_target` should use the configured port. Coordinate with any
-  response-aware work (see below).
 
 ## Engine / networking
 
@@ -25,9 +21,6 @@ threads.
   alive, but flows bound to the old WireGuard endpoint cannot migrate — same
   behavior as commercial VPN clients on server switch. Use
   `vpn.exclude_cidr` to pin must-never-blip destinations outside the engine.
-- **Reload-vs-config drift watchdog** (from #37's findings): when check
-  verdicts disagree with listener state, `ensure` could regenerate and
-  compare configs instead of trusting the running one.
 - **Scheduled-rotation etiquette**: stagger rotation and sweep windows so
   they never collide; consider a pre-switch drain notice in status output.
 

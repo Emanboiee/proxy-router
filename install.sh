@@ -191,13 +191,18 @@ Run it via:
   $USER_BIN/proxy-router
 
 First-time setup:
-  proxy-router init      # write router.json from the example
-  proxy-router ensure     # start the engine if the listener is down
+  proxy-router setup --check   # validate router.json (already created by this installer)
+  proxy-router ensure          # start the engine if the listener is down
 
 Add providers:
   drop a WireGuard profile into
     $PREFIX/providers/<provider>/<profile>.conf
   (one file per profile; the active one is rotated automatically)
+  or import one:
+    proxy-router setup --import-proton <profile.conf>
+  then apply a validated preset:
+    proxy-router setup --preset-list
+    proxy-router setup --preset
 
 Docs:
   README.md at $PREFIX/README.md
