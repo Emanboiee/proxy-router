@@ -660,6 +660,168 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class PermissionErrorMappingTests(unittest.TestCase):
+    """Issue #76: the autostarted tray must turn permission jargon into a
+    one-time fix instead of an unexplained 'Connect: failed'."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.client = tray.RouterClient(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+
+    def _probe(self, returncode, stdout="", stderr=""):
+        return type("P", (), {"returncode": returncode, "stdout": stdout, "stderr": stderr})()
+
+    def test_router_permission_message_maps_to_one_time_fix(self):
+        out = tray._humanize(
+            "router: VPN startup permission missing (sudo grant denied during "
+            "'start'): run `router.py elevate install` once in a terminal "
+            "(admin password), then Connect again")
+        self.assertIn("permission", out.lower())
+        self.assertIn("elevate install", out)
+
+    def test_router_not_set_up_message_maps_to_fix(self):
+        out = tray._humanize(
+            "router: startup permission not set up yet: the automatic (launchd) "
+            "app cannot control the VPN engine without it; run "
+            "`router.py elevate install` once in a terminal (admin password), "
+            "then Connect again")
+        self.assertIn("Fix Startup Permissions", out)
+
+    def test_raw_sudo_password_denial_maps_to_fix(self):
+        out = tray._humanize(
+            "privileged helper start failed: sudo: a password is required")
+        self.assertIn("elevate install", out)
+        self.assertNotIn("a password is required", out)
+
+    def test_sudoers_denial_maps_to_fix(self):
+        out = tray._humanize(
+            "privileged helper stop failed: kyson is not in the sudoers file. "
+            "This incident has been reported.")
+        self.assertIn("elevate install", out)
+
+    def test_is_permission_error_matches_all_markers(self):
+        self.assertTrue(tray._is_permission_error(
+            "connect: failed — router: VPN startup permission missing"))
+        self.assertTrue(tray._is_permission_error(
+            "connect: failed — startup permission not set up yet"))
+        self.assertTrue(tray._is_permission_error(
+            "switch server: failed — sudo: a password is required"))
+        self.assertTrue(tray._is_permission_error(
+            "stop: failed — alice is not in the sudoers file"))
+        self.assertFalse(tray._is_permission_error(None))
+        self.assertFalse(tray._is_permission_error(
+            "connect: done"))
+        self.assertFalse(tray._is_permission_error(
+            "connect: failed — sing-box not found"))
+
+    def test_menu_offers_repair_after_permission_failure(self):
+        class RootedClient:
+            root = "/tmp"
+
+            def status(self):
+                return tray.RouterStatus(up=True, providers={
+                    "proton": {"active": "nl", "profiles": ["nl"], "egress": {}}})
+
+        app = tray.TrayApp(RootedClient(), None)
+        app.last_action_result = (
+            "connect: failed — router: VPN startup permission missing "
+            "(sudo grant denied during 'start')")
+        labels = [item.text for item in app.build_menu()]
+        self.assertTrue(
+            any("Fix Startup Permissions" in label for label in labels),
+            f"repair entry missing from menu: {labels}")
+
+    def test_menu_has_no_repair_entry_on_normal_failure(self):
+        class RootedClient:
+            root = "/tmp"
+
+            def status(self):
+                return tray.RouterStatus(up=True, providers={
+                    "proton": {"active": "nl", "profiles": ["nl"], "egress": {}}})
+
+        app = tray.TrayApp(RootedClient(), None)
+        app.last_action_result = "connect: failed — sing-box not found"
+        labels = [item.text for item in app.build_menu()]
+        self.assertFalse(any("Fix Startup Permissions" in label for label in labels))
+
+    def test_setup_submenu_always_offers_the_repair(self):
+        class RootedClient:
+            root = "/tmp"
+
+            def status(self):
+                return tray.RouterStatus()
+
+        app = tray.TrayApp(RootedClient(), None)
+
+        def collect(menu):
+            texts = []
+            for item in menu:
+                if item.__class__.__name__ != "MenuItem":
+                    continue
+                try:
+                    submenu = item.submenu
+                except Exception:
+                    submenu = None
+                texts.append(item.text)
+            return texts
+
+        # Walk the built tree via pystray's descriptors on the Setup item.
+        setup_item = next(item for item in app.build_menu()
+                          if getattr(item, "text", "") == "Setup")
+        entries = []
+
+        def walk(m):
+            for sub in m:
+                entries.append(sub.text)
+                inner = getattr(sub, "submenu", None) or getattr(sub, "_Menu__menu", None)
+                if inner is not None and not callable(inner):
+                    walk(inner)
+
+        walk(setup_item.submenu if hasattr(setup_item, "submenu") else setup_item[0])
+        self.assertTrue(any("Fix Startup Permissions" in e for e in entries),
+                        f"Setup submenu lacks repair entry: {entries}")
+
+    def test_fix_permissions_action_launches_terminal_and_reports(self):
+        app = tray.TrayApp(self.client, None)
+        with mock.patch.object(tray, "_launch_terminal",
+                               return_value=True) as launch:
+            app.action_fix_permissions()
+        launch.assert_called_once()
+        args = launch.call_args
+        self.assertEqual(args.args[0], Path(self.tmp.name))
+        self.assertEqual(args.args[1], ["elevate", "install"])
+        self.assertEqual(app.last_action_result,
+                         "permission repair: follow the Terminal window")
+
+    def test_fix_permissions_action_reports_missing_terminal(self):
+        app = tray.TrayApp(self.client, None)
+        with mock.patch.object(tray, "_launch_terminal", return_value=False):
+            app.action_fix_permissions()
+        self.assertEqual(app.last_action_result,
+                         "permission repair: no terminal available")
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS Terminal path")
+    def test_fix_permissions_terminal_command_carries_elevate_install(self):
+        (Path(self.tmp.name) / "setup_tui.py").write_text("# tui")
+        calls = []
+        with mock.patch.object(tray.subprocess, "Popen",
+                               side_effect=lambda argv, **kw: calls.append(argv)):
+            opened = tray._launch_terminal(Path(self.tmp.name), ["elevate", "install"])
+        self.assertTrue(opened)
+        joined = " ".join(calls[0])
+        self.assertIn("elevate install", joined)
+        self.assertIn("setup_tui.py", joined)
+
+    def test_elevate_runs_router_cli_not_sudo_or_osascript(self):
+        with mock.patch.object(self.client, "_run", return_value=(0, "ok")) as run, \
+             mock.patch.object(tray.subprocess, "run") as subprocess_run:
+            rc, _out = self.client.elevate()
+        self.assertEqual(rc, 0)
+        run.assert_called_once_with("elevate", "install")
+        subprocess_run.assert_not_called()
+
+
 class DashboardOpenerTests(unittest.TestCase):
     """Tray one-click: open the full TUI in a terminal window."""
 

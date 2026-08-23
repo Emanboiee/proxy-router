@@ -16,6 +16,7 @@ import configparser
 import datetime
 import getpass
 import hashlib
+import ipaddress
 import json
 import os
 import platform
@@ -674,6 +675,104 @@ def _iso_ts(epoch: int) -> str:
     return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).isoformat()
 
 
+# --- Issue #64: validated probe/monitor targets ------------------------------
+# The egress probe rides the local proxy by design, but its target URL is still
+# configuration, and a hostile router.json (imported config, tampered state)
+# must not aim probes at loopback/LAN/link-local/metadata endpoints. These
+# checks mirror monitor.py so both files share one trust model; the explicit
+# opt-out environment variable is honored identically.
+PRIVATE_TARGET_BYPASS_ENV = "PROXY_ROUTER_ALLOW_PRIVATE_TARGETS"
+_METADATA_HOSTNAMES = {"metadata", "metadata.google.internal"}
+_METADATA_ADDRESSES = {"169.254.169.254", "fd00:ec2::254"}
+
+
+def _probe_addr_is_private(addr: str) -> bool:
+    """True for loopback / private / link-local / reserved / multicast IPs."""
+    try:
+        parsed_ip = ipaddress.ip_address(str(addr))
+    except ValueError:
+        return True  # cannot prove it public -> treat as private (fail closed)
+    return (
+        parsed_ip.is_private or parsed_ip.is_loopback or parsed_ip.is_link_local
+        or parsed_ip.is_reserved or parsed_ip.is_multicast or parsed_ip.is_unspecified
+    )
+
+
+def unsafe_probe_target(url, *, resolved_addresses=None) -> str | None:
+    """Return why ``url`` is an unsafe probe target, or None when allowed.
+
+    http/https only, no credentials, no literal or resolved loopback/LAN/
+    link-local/metadata targets unless PROXY_ROUTER_ALLOW_PRIVATE_TARGETS is
+    set to 1/true/yes (the documented explicit opt-in). ``resolved_addresses``
+    carries connection-time DNS answers so a rebinding resolution that turns a
+    public name into 127.0.0.1/169.254.169.254 is still caught.
+    """
+    if os.environ.get(PRIVATE_TARGET_BYPASS_ENV, "").strip().lower() in {"1", "true", "yes"}:
+        if isinstance(url, str):
+            try:
+                parsed_env = urllib.parse.urlsplit(url)
+                if parsed_env.scheme in ("http", "https") and parsed_env.hostname:
+                    return None
+            except ValueError:
+                pass
+        return "scheme must be http/https with a hostname"
+    if not isinstance(url, str):
+        return "target must be a string URL"
+    try:
+        parsed_url = urllib.parse.urlsplit(url)
+    except ValueError:
+        return "unparseable URL"
+    if parsed_url.scheme not in ("http", "https"):
+        return f"scheme {parsed_url.scheme!r} must be http/https"
+    host = parsed_url.hostname
+    if not host:
+        return "missing hostname"
+    if parsed_url.username is not None or parsed_url.password is not None:
+        return "credentials in URL are not allowed"
+    bare = host.rstrip(".").lower()
+    if bare in _METADATA_HOSTNAMES:
+        return f"{bare} is a metadata endpoint"
+    if bare == "localhost" or bare.endswith(".localhost") or bare.endswith(".local"):
+        # Names that can only ever mean this machine / the LAN segment.
+        return f"{bare} is a private/loopback/metadata target"
+    try:
+        ipaddress.ip_address(bare)
+    except ValueError:
+        pass
+    else:
+        if _probe_addr_is_private(bare):
+            return f"{bare} is a private/loopback/metadata target"
+    for addr in resolved_addresses or ():
+        text = str(addr).strip("[]").lower()
+        if text in _METADATA_ADDRESSES:
+            return "resolved to a metadata endpoint"
+        if _probe_addr_is_private(text):
+            return f"resolved to private/loopback address {addr}"
+    return None
+
+
+def resolve_target_addresses(url: str) -> list[str]:
+    """Best-effort resolution of ``url``'s hostname (empty list on any error).
+
+    Connection-time companion to :func:`unsafe_probe_target`: validating what
+    the name resolves to right before dialing closes the DNS-rebinding window
+    a config-time-only check leaves open.
+    """
+    try:
+        host = urllib.parse.urlsplit(str(url)).hostname
+        if not host:
+            return []
+        infos = socket.getaddrinfo(host, None)
+        addresses: list[str] = []
+        for info in infos:
+            addr = str(info[4][0]).strip("[]")
+            if addr not in addresses:
+                addresses.append(addr)
+        return addresses[:8]
+    except Exception:  # noqa: BLE001 - best-effort: no addresses on any failure
+        return []
+
+
 def _transport_reason(error_text) -> str:
     """Classify a transport-level probe failure (no HTTP status) into a policy
     reason: TLS/SSL/handshake/certificate errors are ``tls``, everything else
@@ -1182,6 +1281,13 @@ def _probe_via_curl(*, port: int, url: str, timeout: float) -> dict:
     Same transport route_watcher's transparent probes already use. The
     write-out line carries the HTTP status and total time; the response body
     (first 4 KiB) feeds the reputation-block classification."""
+    # Issue #64: validate at connection time, including what the name resolves
+    # to right now, so imported/tampered config cannot aim curl at loopback,
+    # LAN, link-local or metadata endpoints.
+    violation = unsafe_probe_target(url, resolved_addresses=resolve_target_addresses(url))
+    if violation is not None:
+        return {"ok": False, "latency_ms": None, "status": None,
+                "error": f"unsafe probe target: {violation}", "block_reason": None}
     connect = max(1.0, min(float(timeout), 4.0))
     command = [
         "curl", "--proxy", f"http://127.0.0.1:{port}", "--noproxy", "",
@@ -1238,6 +1344,16 @@ def probe_egress(*, port: int | None = None, url: str | None = None, timeout: fl
     port = port or _port
     url = url or egress_settings()["probe_url"]
     timeout = timeout if timeout is not None else egress_settings()["probe_timeout"]
+    # Issue #64: connection-time validation (scheme, credentials, literal and
+    # resolved private/metadata targets). Injected test openers skip the DNS
+    # revalidation but still get the static checks.
+    violation = unsafe_probe_target(url)
+    if violation is None:
+        dns_addresses = None if opener is not None else resolve_target_addresses(url)
+        violation = unsafe_probe_target(url, resolved_addresses=dns_addresses)
+    if violation is not None:
+        return {"ok": False, "latency_ms": None, "status": None,
+                "error": f"unsafe probe target: {violation}", "block_reason": None}
     if opener is None and shutil.which("curl") is not None:
         return _probe_via_curl(port=port, url=url, timeout=float(timeout))
     if opener is None:
@@ -2724,6 +2840,16 @@ def engine_start(use_existing_config: bool = False, *, recover: bool = True) -> 
         return fail(_sing_box_missing_message())
     if not sing_box_at_least(MIN_SING_BOX_VERSION):
         return fail(f"{_sing_box_version_message(MIN_SING_BOX_VERSION)}")
+    # Issue #76: surface a missing startup permission before anything else.
+    # The launchd-autostarted tray hits this on every login when the one-time
+    # elevation grant is missing; diagnosing it only after config assembly
+    # made the gap look like a broken engine instead of the one-time fix.
+    # Scoped to TUN like the helper consult below: plain proxy-mode starts
+    # work unprivileged and must never depend on helper state (issue #62).
+    if sys.platform == "darwin" and os.geteuid() != 0 and current_mode() == "tun":
+        helper = _helper_status()
+        if not (helper and helper.get("installed")):
+            return fail(_HELPER_NOT_INSTALLED)
     active: dict[str, Path] = {}
     if use_existing_config:
         # restore_last_good path: boot the sing-box.json file as it now
@@ -2781,13 +2907,9 @@ def engine_start(use_existing_config: bool = False, *, recover: bool = True) -> 
             helper_relevant = False
 
     if sys.platform == "darwin" and os.geteuid() != 0 and helper_relevant:
-        helper = _helper_status()
-        helper_installed = bool(helper and helper.get("installed"))
-        if not helper_installed:
-            return fail(
-                "TUN/root engine requires the safe privileged helper; "
-                "run `router.py elevate install`"
-            )
+        # Issue #76: the missing-grant case was already surfaced (with the
+        # actionable message) by the early permission gate above, so reaching
+        # this point means the helper is installed and authorized.
         rc = _helper_run("start")
         if rc != 0:
             return rc
@@ -3085,10 +3207,9 @@ def _elevated_reload() -> int:
     """Reload through the exact root-owned helper, never checkout code."""
     status = _helper_status()
     if not status or not status.get("installed"):
-        return fail(
-            "root engine reload requires the safe privileged helper; "
-            "run `router.py elevate install`"
-        )
+        # Issue #76: same actionable wording as the start path — this fires
+        # from the tray's preset-apply/reload when only elevation is missing.
+        return fail(_HELPER_NOT_INSTALLED)
     return _helper_run("reload")
 
 # ---------------------------------------------------------------------------
@@ -3888,6 +4009,13 @@ def doctor() -> int:
         has_agent = "com.proxy-router.keepalive" in (probe.stdout or "")
         note("ok" if has_agent else "warn", "keepalive",
              "launchd agent loaded" if has_agent else "launchd agent NOT loaded (examples/install-launchd.sh)")
+        # Issue #76: the autostarted tray is the surface users actually see;
+        # a silently-not-loaded agent means every action happens in a TUI
+        # instead and the tray looks broken. Verify it like the keepalive.
+        has_tray = "com.proxy-router.tray" in (probe.stdout or "")
+        note("ok" if has_tray else "warn", "tray",
+             "menu-bar agent loaded" if has_tray
+             else "menu-bar agent NOT loaded (examples/install-tray.sh)")
     for severity, area, detail in findings:
         mark = {"ok": "[ok]  ", "warn": "[warn]", "fail": "[FAIL]"}[severity]
         print(f"{mark} {area:<10} {detail}")
@@ -3961,6 +4089,26 @@ def _legacy_launch_agents() -> list[str]:
     return found
 
 
+def _launchd_agent_state(label: str) -> bool:
+    """True when the given launchd agent label is loaded for this user.
+
+    Read-only `launchctl list` probe. Issue #76: a tray/keepalive agent that
+    launchd silently refused to load (bad interpreter, missing GUI session)
+    is indistinguishable from "not installed" for the user; doctor and
+    `status --json` must surface the difference so the autostart path can be
+    verified instead of assumed.
+    """
+    if sys.platform != "darwin":
+        return False
+    try:
+        probe = subprocess.run(
+            ["launchctl", "list"], capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return f"{label}" in (probe.stdout or "")
+
+
 def status_json() -> dict:
     """Full machine-readable status for `status --json`."""
     rc, line = _status_report()
@@ -3995,6 +4143,28 @@ def status_json() -> dict:
         data["legacy_agents"] = _legacy_launch_agents()
     except Exception:
         data["legacy_agents"] = []
+    # Issue #76: expose the startup-permission state so the tray (and any
+    # dashboard) can tell a permission gap apart from a broken engine and
+    # offer the one-click repair instead of a generic failure.
+    helper = None
+    if sys.platform == "darwin" and os.geteuid() != 0:
+        try:
+            helper = _helper_status()
+        except Exception:
+            helper = {"installed": False, "error": "helper status probe crashed"}
+    data["elevation"] = {
+        "platform": sys.platform,
+        "root_engine": _engine_runs_as_root(),
+        "helper_installed": bool(helper and helper.get("installed")),
+        "sudo_grant": _sudoers_installed(),
+        # The one-time fix every consumer should point at when any of the
+        # flags above shows the grant missing.
+        "fix_hint": _HELPER_FIX,
+    }
+    if sys.platform == "darwin":
+        data["elevation"]["tray_agent"] = _launchd_agent_state("com.proxy-router.tray")
+        data["elevation"]["keepalive_agent"] = _launchd_agent_state(
+            "com.proxy-router.keepalive")
     rotation = {
         "interval_seconds": scheduled_interval(),
         "jitter_seconds": int(_rotation.get("jitter_seconds", DEFAULT_ROTATION_SETTINGS["jitter_seconds"]) or 0),
@@ -4864,6 +5034,29 @@ def _helper_status() -> dict | None:
     return value
 
 
+def _helper_denied_reason(stderr: str) -> str | None:
+    """Classify why a `sudo -n` helper invocation was refused (issue #76).
+
+    The launchd-autostarted tray runs without a TTY and cannot fall back to
+    an admin dialog, so when the one-time elevation grant is missing or
+    stale every lifecycle action fails at the sudo boundary. Distinguishing
+    that from a genuine helper failure lets callers print the ONE fix
+    (`router.py elevate install`) instead of raw sudo jargon.
+    """
+    lowered = (stderr or "").lower()
+    if any(token in lowered for token in _SUDO_DENIAL_TOKENS):
+        return "not-granted"
+    if "no such file" in lowered or "command not found" in lowered:
+        return "helper-missing"
+    return None
+
+
+_HELPER_FIX = "run `router.py elevate install` once in a terminal (admin password), then Connect again"
+_HELPER_NOT_INSTALLED = (
+    "startup permission not set up yet: the automatic (launchd) app cannot "
+    "control the VPN engine without it; " + _HELPER_FIX)
+
+
 def _helper_run(operation: str) -> int:
     """Run one exact helper lifecycle operation without any dialog fallback."""
     try:
@@ -4876,7 +5069,19 @@ def _helper_run(operation: str) -> int:
     except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
         return fail(f"privileged helper {operation} failed: {exc}")
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "helper denied the operation")[-300:]
+        stderr_text = result.stderr or ""
+        stdout_text = result.stdout or ""
+        detail = (stderr_text or stdout_text or "helper denied the operation")[-300:]
+        if _helper_denied_reason(stderr_text) == "not-granted":
+            # Issue #76: the autostarted tray/keepalive has no TTY and no way
+            # to answer sudo's password prompt; a raw "a password is
+            # required" reads like a broken app. Name the actual gap and the
+            # exact one-time fix so the error is actionable everywhere,
+            # including launchd logs.
+            return fail(
+                f"VPN startup permission missing (sudo grant denied during "
+                f"'{operation}'): {_HELPER_FIX}. raw error: {detail.strip()}"
+            )
         return fail(f"privileged helper {operation} failed: {detail}")
     return 0
 
@@ -4889,6 +5094,10 @@ _SUDO_DENIAL_TOKENS = (
     "a password is required",
     "not in the sudoers",
     "must have a tty",
+    # Issue #76: non-interactive contexts (launchd agents, cron) hit these
+    # phrasings instead; they prove the same sudo grant denial.
+    "no tty present",
+    "no askpass program",
 )
 
 # Legacy root-owned engine: regular users cannot signal it directly; direct

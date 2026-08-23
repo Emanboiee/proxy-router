@@ -88,9 +88,34 @@ sed -e "s|@ROOT@|$ROOT_ESC|g" \
     "$PLIST_SRC" > "$PLIST_DST"
 
 chmod 644 "$PLIST_DST"
-launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "$PLIST_DST"
-launchctl enable "gui/$(id -u)/$LABEL"
-echo "installed $LABEL -> $PLIST_DST"
+
+# Issue #76: bootstrap used to be trusted blindly; when launchd refused the
+# agent (bad interpreter, pystray import crash at startup) the script exited
+# 0 and the user's autostart silently never came back. Verify the job is
+# actually loaded, and on failure print the exact triage path instead of a
+# bare exit code.
+bootstrap_ok=0
+if launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true; then
+  if launchctl bootstrap "gui/$(id -u)" "$PLIST_DST" 2>/dev/null; then
+    if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+      bootstrap_ok=1
+    fi
+  fi
+fi
+launchctl enable "gui/$(id -u)/$LABEL" 2>/dev/null || true
+if [ "$bootstrap_ok" -ne 1 ]; then
+  echo "error: launchd did not accept $LABEL — automatic start will NOT work" >&2
+  echo "  plist: $PLIST_DST" >&2
+  echo "  triage:" >&2
+  echo "    plutil -lint $PLIST_DST" >&2
+  echo "    launchctl print gui/$(id -u)/$LABEL   # full error" >&2
+  echo "    tail -50 $LOG_DIR/proxy-tray.log      # startup crash output" >&2
+  echo "  after fixing, re-run this script." >&2
+  exit 1
+fi
+echo "installed $LABEL -> $PLIST_DST (verified loaded)"
 echo "menu-bar agent starts at next login; to force start now:"
 echo "  launchctl kickstart -k gui/$(id -u)/$LABEL"
+echo "startup permission (one-time): open the tray menu -> Setup ->"
+echo "  'Fix Startup Permissions (one-time)' or run:"
+echo "  $ROOT/router.py elevate install"
