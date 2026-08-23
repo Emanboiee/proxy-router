@@ -4934,14 +4934,64 @@ def main() -> int:
     vpn.add_argument("capture", nargs="?", choices=["ruleset", "routes"],
                      help="TUN capture scope for `vpn capture`")
 
+    # setup / monitor / watcher delegate to their modules with a
+    # parse_known_args passthrough, but they mirror each module's real
+    # flags so `--help` documents the actual surface instead of an opaque
+    # catch-all REMAINDER argument.
+    def _add_delegated_flags(parser: argparse.ArgumentParser,
+                             flags: tuple[tuple[tuple[str, ...], dict], ...]) -> None:
+        for fargs, fkwargs in flags:
+            parser.add_argument(*fargs, **fkwargs)
+
     setup = sub.add_parser("setup", help="interactive Proton/WARP setup wizard")
-    setup.add_argument("setup_args", nargs=argparse.REMAINDER)
+    _add_delegated_flags(setup, (
+        (("--guide",), {"choices": ("proton", "warp", "all"), "metavar": "PROVIDER",
+                        "help": "print a setup guide (proton, warp, or all)"}),
+        (("--check",), {"action": "store_true",
+                        "help": "verify router.json and provider profiles"}),
+        (("--import-proton",), {"nargs": "+", "metavar": "PATH",
+                                "help": "import WireGuard .conf file(s)/directory into providers/proton"}),
+        (("--import-warp",), {"nargs": "+", "metavar": "PATH",
+                              "help": "import WireGuard .conf file(s)/directory into providers/cloudflare"}),
+        (("--preset",), {"nargs": "?", "const": "default", "metavar": "NAME",
+                         "help": "apply a preset by name (built-in or custom; bare --preset applies 'default')"}),
+        (("--preset-list",), {"action": "store_true",
+                              "help": "list available presets (built-in and custom)"}),
+        (("--preset-add",), {"metavar": "NAME",
+                             "help": "create a custom preset file under presets/"}),
+        (("--provider",), {"metavar": "PROVIDER",
+                           "help": "provider for --preset-add (e.g. proton, cloudflare)"}),
+        (("--domain",), {"action": "append", "default": [], "metavar": "DOMAIN",
+                         "help": "domain for --preset-add (repeatable)"}),
+        (("--bridge-install",), {"action": "store_true",
+                                 "help": "install the Hermes OpenCode auto-rotation bridge"}),
+        (("--bridge-check",), {"action": "store_true",
+                               "help": "verify the installed OpenCode auto-rotation bridge"}),
+    ))
+    # Unlisted wizard flags (--fallback*, --autocheck*, --keepalive-*,
+    # --transparent*, ...) still reach setup_tui.main via parse_known_args.
 
     monitor = sub.add_parser("monitor", help="opt-in network monitoring")
-    monitor.add_argument("monitor_args", nargs=argparse.REMAINDER)
+    monitor.add_argument("monitor_action", nargs="?",
+                         choices=["check", "on", "off", "status", "logs"],
+                         help="monitor subcommand (default status)")
+    monitor.add_argument("--interval", type=int, default=None,
+                         help="worker sample interval in seconds")
+    monitor.add_argument("--lines", type=int, default=20,
+                         help="log tail length for `monitor logs`")
+    monitor.add_argument("--root", default=None, help=argparse.SUPPRESS)
+    monitor.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
 
     watcher = sub.add_parser("watcher", help="standalone routed-connection watcher")
-    watcher.add_argument("watcher_args", nargs=argparse.REMAINDER)
+    watcher.add_argument("watcher_action", nargs="?",
+                         choices=["status", "on", "off", "logs"],
+                         help="watcher subcommand (default status)")
+    watcher.add_argument("--interval", type=float, default=None,
+                         help="poll interval in seconds")
+    watcher.add_argument("--lines", type=int, default=20,
+                         help="log tail length for `watcher logs`")
+    watcher.add_argument("--root", default=None, help=argparse.SUPPRESS)
+    watcher.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
 
     r_add = sub.add_parser("add")
     r_add.add_argument("--id")
@@ -5015,18 +5065,72 @@ def main() -> int:
         return cmd_network_check()
     if _needs_elevation(args):
         return _elevate()
+    def _delegated_setup_argv() -> list[str]:
+        """Forward exactly the wizard flags the operator passed on.
+
+        Mirrored arguments are parsed above so `--help` documents them;
+        they are rebuilt here so setup_tui's own parser stays the single
+        authority for validation and defaults.
+        """
+        forwarded: list[str] = []
+        if args.guide:
+            forwarded += ["--guide", args.guide]
+        if args.check:
+            forwarded.append("--check")
+        if args.import_proton:
+            forwarded += ["--import-proton", *args.import_proton]
+        if args.import_warp:
+            forwarded += ["--import-warp", *args.import_warp]
+        if args.preset is not None:  # bare --preset arrives as the "default" const
+            forwarded += ["--preset", args.preset]
+        if args.preset_list:
+            forwarded.append("--preset-list")
+        if args.preset_add:
+            forwarded += ["--preset-add", args.preset_add]
+        if args.provider:
+            forwarded += ["--provider", args.provider]
+        for domain in args.domain:
+            forwarded += ["--domain", domain]
+        if args.bridge_install:
+            forwarded.append("--bridge-install")
+        if args.bridge_check:
+            forwarded.append("--bridge-check")
+        return forwarded
+
     if args.cmd == "setup":
         import setup_tui
 
-        return setup_tui.main(["setup", *passthrough, *args.setup_args], root=ROOT)
+        return setup_tui.main(["setup", *_delegated_setup_argv(), *passthrough], root=ROOT)
     if args.cmd == "monitor":
         import monitor
 
-        return monitor.main(["monitor", *args.monitor_args, *passthrough], root=ROOT)
+        forwarded = []
+        if args.monitor_action:
+            forwarded.append(args.monitor_action)
+        if args.interval is not None:
+            forwarded += ["--interval", str(args.interval)]
+        if args.lines != 20:
+            forwarded += ["--lines", str(args.lines)]
+        if args.root:
+            forwarded += ["--root", args.root]
+        if args.worker:
+            forwarded.append("--worker")
+        return monitor.main(["monitor", *forwarded, *passthrough], root=ROOT)
     if args.cmd == "watcher":
         import route_watcher
 
-        return route_watcher.main(["watcher", *args.watcher_args, *passthrough], root=ROOT)
+        forwarded = []
+        if args.watcher_action:
+            forwarded.append(args.watcher_action)
+        if args.interval is not None:
+            forwarded += ["--interval", str(args.interval)]
+        if args.lines != 20:
+            forwarded += ["--lines", str(args.lines)]
+        if args.root:
+            forwarded += ["--root", args.root]
+        if args.worker:
+            forwarded.append("--worker")
+        return route_watcher.main(["watcher", *forwarded, *passthrough], root=ROOT)
     if passthrough:
         parser.error("unrecognized arguments: " + " ".join(passthrough))
     if args.cmd == "with-proxy":
