@@ -117,6 +117,7 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py failover <provider> off    # clear fallback and restore the provider's routes
 ./router.py failover <provider> status --json   # configured chain + active fallback
 ./router.py provider-count proton # rotation candidates (retry budget)
+./router.py providers check [provider] [--json]  # offline validity preflight: which providers can carry traffic at all (exit 1 = some invalid)
 ./router.py with-proxy [--timeout-ms 300] [--force-proxy|--force-direct] -- <cmd...>
                                  # fail-open runner: exec <cmd> through the proxy when up, else direct
 ./router.py with-proxy --check   # health check: prints proxy URL + exit 0 when up, exit 1 when down
