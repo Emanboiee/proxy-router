@@ -1016,8 +1016,18 @@ def active_fallback(name: str) -> str | None:
 
 
 def _effective_route_provider(name: str) -> str:
-    """Map a primary route to its fallback only while failover is active."""
-    return active_fallback(name) or name
+    """Map a route through every active fallback until the live provider."""
+    current = name
+    seen: set[str] = set()
+    while current not in seen:
+        seen.add(current)
+        target = active_fallback(current)
+        if target is None:
+            return current
+        current = target
+    # Validation rejects cycles, but fail closed if a stale runtime marker
+    # somehow creates one instead of looping or silently routing direct.
+    return current
 
 
 def activate_fallback(name: str, *, target: str | None = None, reason: str = "transport") -> int:
@@ -1600,6 +1610,13 @@ def check_egress_live(name: str, profile: Path, *, port: int | None = None,
         # degraded, not dead (same principle as the TLS case): no cooldown
         # on DNS flakes. dns_ok True/None keep the conservative dead verdict.
         status = "degraded" if dns_ok is False else "dead"
+
+    # A successful probe is fresh evidence that this profile is usable. Clear
+    # an old failure cooldown before the next config build can omit a recovered
+    # endpoint (especially important for providers with one profile, such as
+    # WARP).
+    if status == "alive":
+        _clear_cooldown(name, profile)
     record = record_egress(name, profile, ok=probe["ok"], latency_ms=probe["latency_ms"],
                            status=probe["status"], error=probe["error"], dns_ok=dns_ok)
     if probe["block_reason"]:
@@ -1913,13 +1930,22 @@ def _profile_error(profile: Path) -> str | None:
 
 
 def _usable_profile(name: str, preferred: Path | None = None) -> Path | None:
-    """Profile for ``name`` that builds cleanly: the persisted active one when
-    valid, else the first non-cooled valid profile. Malformed profiles are
-    logged and skipped so one bad file never disables the provider (F6)."""
+    """Select a valid profile without dropping a one-profile provider."""
     profiles = provider_files(name)
     if not profiles:
         return None
     active = preferred or resolve_active(name)
+    # ``resolve_active`` intentionally avoids cooled profiles. Remember the
+    # persisted selection so a provider with no non-cooled alternatives keeps a
+    # valid endpoint instead of disappearing from the generated config.
+    persisted_active = active
+    if persisted_active is None and preferred is None:
+        state = ROOT / "state" / f"{name}.active"
+        try:
+            stem = state.read_text(encoding="utf-8").strip()
+            persisted_active = next((p for p in profiles if p.stem == stem), None)
+        except OSError:
+            persisted_active = None
     if active is not None:
         error = _profile_error(active)
         if error is None:
@@ -1934,6 +1960,10 @@ def _usable_profile(name: str, preferred: Path | None = None) -> Path | None:
             continue
         if not is_cooled_down(name, profile):
             return profile
+    if persisted_active is not None:
+        error = _profile_error(persisted_active)
+        if error is None:
+            return persisted_active
     return None
 
 

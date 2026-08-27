@@ -91,6 +91,36 @@ def test_primary_routes_use_runtime_fallback_provider(tmp_path):
     }]
 
 
+def test_primary_routes_follow_nested_runtime_fallback_chain(tmp_path):
+    router = load_router(tmp_path)
+    profiles = {name: tmp_path / f"{name}.conf" for name in ("cloudflare", "proton", "proton2")}
+    router._providers = {
+        "cloudflare": {"fallback_provider": "proton"},
+        "proton": {"fallback_provider": "proton2"},
+        "proton2": {},
+    }
+    router._routes = [{"id": "discord", "domains": ["discord.com"], "provider": "cloudflare"}]
+    router._routing = {}
+    router._port = 2081
+    router.current_mode = lambda: "proxy"
+    router._usable_profile = lambda name, preferred=None: profiles[name]
+    router.parse_wireguard = lambda path: {
+        "type": "wireguard", "tag": "", "address": ["10.0.0.2/32"],
+        "private_key": "secret", "peers": [{"address": "192.0.2.1", "port": 1,
+        "public_key": "public", "allowed_ips": ["0.0.0.0/0"]}],
+    }
+    router.dns_server_for = lambda path: "1.1.1.1"
+    fallback_dir = tmp_path / "state" / "fallback"
+    fallback_dir.mkdir(parents=True)
+    (fallback_dir / "cloudflare.json").write_text(json.dumps({"provider": "proton"}))
+    (fallback_dir / "proton.json").write_text(json.dumps({"provider": "proton2"}))
+
+    config, _active = router.build_singbox_config()
+
+    assert {endpoint["tag"] for endpoint in config["endpoints"]} == {"proton2"}
+    assert {rule["outbound"] for rule in config["route"]["rules"] if rule.get("domain_suffix")} == {"proton2"}
+
+
 def test_activate_fallback_writes_marker_and_reloads_once(tmp_path, monkeypatch):
     router = load_router(tmp_path)
     for provider in ("proton", "cloudflare"):
