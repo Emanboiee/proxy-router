@@ -36,6 +36,20 @@ class RouteWatcherTests(unittest.TestCase):
             "line": "INFO inbound/mixed[local-proxy]: inbound connection from 127.0.0.1:55180",
         })
 
+    def test_parse_provider_tag_from_endpoint_and_failure(self):
+        event = w.parse_line(
+            "ERROR endpoint/wireguard[cloudflare]: open connection to discord.com:443: TLS handshake timeout"
+        )
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event["provider"], "cloudflare")
+        event = w.parse_line(
+            "ERROR using outbound/wireguard[proton2]: open connection to discord.com:443: connection reset"
+        )
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event["provider"], "proton2")
+
     def test_parse_transport_failure(self):
         event = w.parse_line(
             "ERROR connection: open connection to opencode.ai:443: "
@@ -230,6 +244,40 @@ class RouteWatcherTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertGreaterEqual(ticks, 3)
 
+    def test_worker_rotates_provider_from_outbound_tag(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        w.state_dir(root).mkdir(parents=True)
+        (root / "router.json").write_text(json.dumps({
+            "routes": [{"id": "discord", "domains": ["discord.com"], "provider": "cloudflare"}],
+            "routing": {"mode": "vpn-list", "vpn_domains": ["discord.com"]},
+        }))
+        lines = [
+            "ERROR using outbound/wireguard[cloudflare]: open connection to discord.com:443: connection reset\n",
+            "ERROR using outbound/wireguard[cloudflare]: open connection to discord.com:443: connection reset\n",
+        ]
+        reads = [0]
+        calls = []
+
+        def fake_read(_path, offset):
+            if reads[0] == 0:
+                reads[0] += 1
+                return offset, lines
+            return offset, []
+
+        def stop_after_tick(_seconds):
+            w.enabled_file(root).unlink(missing_ok=True)
+
+        with mock.patch.object(w, "engine_pid_alive", return_value=True), \
+             mock.patch.object(w, "_read_new_lines", side_effect=fake_read), \
+             mock.patch.object(w, "client_snapshot", return_value=[]), \
+             mock.patch.object(w, "_network_check_hop"), \
+             mock.patch.object(w, "probe_target", return_value={"transport_failure": False}), \
+             mock.patch.object(w, "rotate_provider", side_effect=lambda *args, **kwargs: calls.append(args) or {"rotated": False}):
+            rc = w.worker(root, interval=0.05, sleep=stop_after_tick)
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, [(root.resolve(), "cloudflare")])
+
     def test_worker_sigterm_self_cleans_markers_after_exit(self):
         """AC4: a SIGTERM'd worker exits through its finally and removes its
         own markers; nobody has to unlink state under a live process.
@@ -385,11 +433,14 @@ if __name__ == "__main__":
 
 
 class ProviderForHostTests(unittest.TestCase):
-    def _root_with_routes(self, routes):
+    def _root_with_routes(self, routes, routing=None):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
-        (root / "router.json").write_text(json.dumps({"routes": routes}))
+        data = {"routes": routes}
+        if routing is not None:
+            data["routing"] = routing
+        (root / "router.json").write_text(json.dumps(data))
         return root
 
     def test_maps_host_to_its_route_provider(self):
@@ -399,6 +450,31 @@ class ProviderForHostTests(unittest.TestCase):
         ])
         self.assertEqual(w.provider_for_host(root, "discord.com"), "cloudflare")
         self.assertEqual(w.provider_for_host(root, "www.twitch.tv"), "proton")
+
+    def test_vpn_list_ignores_unlisted_routes(self):
+        root = self._root_with_routes([
+            {"id": "direct", "domains": ["direct.example"], "provider": "proton"},
+            {"id": "discord", "domains": ["discord.com"], "provider": "cloudflare"},
+        ], {"mode": "vpn-list", "vpn_domains": ["discord.com"]})
+        self.assertIsNone(w.provider_for_host(root, "direct.example"))
+        self.assertEqual(w.provider_for_host(root, "discord.com"), "cloudflare")
+        self.assertEqual(w.critical_domains(root), ("discord.com",))
+
+    def test_empty_vpn_list_has_no_critical_targets(self):
+        root = self._root_with_routes([
+            {"id": "direct", "domains": ["direct.example"], "provider": "proton"},
+        ], {"mode": "vpn-list", "vpn_domains": []})
+        self.assertIsNone(w.provider_for_host(root, "direct.example"))
+        self.assertEqual(w.critical_domains(root), ())
+
+    def test_actual_outbound_provider_is_parsed(self):
+        event = w.parse_line(
+            "ERROR connection: open connection to discord.com:443 using "
+            "outbound/wireguard[proton2]: connection reset"
+        )
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event["provider"], "proton2")
 
     def test_first_matching_route_wins(self):
         root = self._root_with_routes([
