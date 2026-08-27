@@ -138,6 +138,14 @@ _PRESET_ROUTES = {
             "x.com",
             "twitter.com",
             "cdn.sstatic.net",
+            # Wayground/Quizizz requires these first-party and challenge hosts;
+            # apex entries cover all subdomains through domain-suffix matching.
+            "wayground.com",
+            "quizizz.com",
+            "joinmyquiz.com",
+            "quizizz.app.link",
+            "challenges.cloudflare.com",
+            "pro.ip-api.com",
         ],
         "provider": "cloudflare",
     },
