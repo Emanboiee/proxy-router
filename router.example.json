@@ -47,11 +47,18 @@
   ],
   "routing": {
     "mode": "vpn-list",
-    "vpn_domains": []
+    "vpn_domains": [
+      "opencode.ai",
+      "whatismyip.com",
+      "roblox.com",
+      "rbxcdn.com",
+      "robloxlabs.com",
+      "rblx.com"
+    ]
   },
   "vpn": {
     "default_mode": "tun",
-    "capture": "ruleset",
+    "capture": "routes",
     "address": [
       "172.19.0.1/30"
     ],

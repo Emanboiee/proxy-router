@@ -243,6 +243,39 @@ def current_mode() -> str:
     return _vpn.get("default_mode", "proxy")
 
 
+def _generated_config_mode() -> str | None:
+    """Return the mode represented by ``sing-box.json`` when readable.
+
+    ``None`` means no generated config exists yet. ``unknown`` is deliberately
+    distinct from a proxy config so automatic maintenance can fail closed
+    instead of treating a broken/stale file as permission to reload.
+    """
+    if not SING_BOX_CONFIG.is_file():
+        return None
+    try:
+        data = json.loads(SING_BOX_CONFIG.read_text())
+        if not isinstance(data, dict):
+            return "unknown"
+        inbounds = data.get("inbounds")
+        if not isinstance(inbounds, list):
+            return "unknown"
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return "unknown"
+    return "tun" if any(
+        isinstance(item, dict) and item.get("type") == "tun"
+        for item in inbounds
+    ) else "proxy"
+
+
+def _automatic_proxy_mode() -> bool:
+    """Return whether automatic maintenance has positive proxy proof."""
+    try:
+        marker = MODE_FILE.read_text().strip()
+    except (OSError, UnicodeError):
+        return False
+    return marker == "proxy" and _generated_config_mode() == "proxy"
+
+
 def _hand_back_ownership(path: Path) -> None:
     """Chown a state file back to the user who invoked sudo.
 
@@ -460,12 +493,20 @@ def write_default_config(force: bool = False) -> int:
                     "provider": "fallback-vpn",
                 },
             ],
-            # vpn-list with an empty list is the safe default: route.final
-            # stays "direct" and nothing is tunneled unless listed.
-            "routing": {"mode": "vpn-list", "vpn_domains": []},
+            # vpn-list activates the domains represented by the bundled route
+            # table; anything outside this list remains direct.
+            "routing": {
+                "mode": "vpn-list",
+                "vpn_domains": [
+                    "opencode.ai", "whatismyip.com",
+                    "roblox.com", "rbxcdn.com", "robloxlabs.com", "rblx.com",
+                ],
+            },
             "vpn": {
                 "default_mode": "tun",
-                "capture": "ruleset",
+                # Domain-based selective TUN is the default so ordinary apps
+                # (including Hermes) use the configured route table directly.
+                "capture": "routes",
                 "address": DEFAULT_TUN_ADDRESS,
                 "mtu": DEFAULT_TUN_MTU,
                 "stack": DEFAULT_TUN_STACK,
@@ -1020,13 +1061,16 @@ def _effective_route_provider(name: str) -> str:
     return active_fallback(name) or name
 
 
-def activate_fallback(name: str, *, target: str | None = None, reason: str = "transport") -> int:
+def activate_fallback(name: str, *, target: str | None = None, reason: str = "transport",
+                      automatic: bool = False) -> int:
     """Activate one provider from ``name``'s ordered fallback chain.
 
     With no explicit target, candidates are attempted in configured order. A
     candidate with no valid profiles is skipped; a failed hard switch rolls its
     marker/configuration back before the next candidate is tried.
     """
+    if automatic and not _automatic_proxy_mode():
+        return 3
     if name not in _providers:
         return fail(f"unknown provider '{name}'")
     configured = configured_fallbacks(name)
@@ -1067,8 +1111,10 @@ def activate_fallback(name: str, *, target: str | None = None, reason: str = "tr
     return fail(f"provider '{name}': {last_error}")
 
 
-def deactivate_fallback(name: str) -> int:
+def deactivate_fallback(name: str, *, automatic: bool = False) -> int:
     """Restore primary routing for ``name`` with one in-place reload."""
+    if automatic and not _automatic_proxy_mode():
+        return 3
     if name not in _providers:
         return fail(f"unknown provider '{name}'")
     path = _fallback_state_path(name)
@@ -1507,7 +1553,7 @@ def _bounded_getaddrinfo(host: str, port: int, timeout: float) -> list[str] | No
     def _resolve() -> None:
         try:
             infos = socket.getaddrinfo(host, port, socket.AF_UNSPEC)
-        except (socket.gaierror, OSError):
+        except (socket.gaierror, OSError, RuntimeError):
             return
         for info in infos:
             resolved.append(info[4][0])
@@ -1727,11 +1773,19 @@ def rotate_due(provider: str | None = None) -> int:
     path (verify-then-switch, rollback, cooldowns); the current exit is NOT
     marked as an upstream failure — a scheduled switch is a preference, not a
     failure signal. Providers without a rotation record are seeded with now
-    (first rotation waits a full interval). Returns 0 when a provider was
-    rotated or seeded, 3 otherwise.
+    (first rotation waits a full interval). In TUN mode it returns 3 without
+    changing state so shared long-lived flows remain connected. Returns 0 when
+    a provider was rotated or seeded, 3 otherwise.
     """
     interval = scheduled_interval()
     if interval <= 0:
+        return 3
+    # A TUN engine is shared by every routed domain. Background profile
+    # rotation reloads that engine and can drop unrelated long-lived flows
+    # (notably the Discord gateway), so scheduled rotation is proxy-mode only.
+    # Explicit `rotate <provider>` remains available when an intentional TUN
+    # interruption is acceptable.
+    if current_mode() == "tun":
         return 3
     if provider is not None:
         names = [provider]
@@ -1762,7 +1816,7 @@ def rotate_due(provider: str | None = None) -> int:
         next_at = next_rotation_at(name)
         if next_at is None or now < next_at:
             continue
-        handled = rotate(name) == 0 or handled
+        handled = rotate(name, automatic=True) == 0 or handled
     return 0 if handled else 3
 
 
@@ -2118,6 +2172,110 @@ def _routes_by_health_order(routes: list[dict], selected: dict[str, Path]) -> li
     )
 
 
+def _capture_domain_name(value: object) -> str | None:
+    """Normalize one route target for destination-IP capture."""
+    if not isinstance(value, str):
+        return None
+    domain = value.strip().lower().rstrip(".")
+    while domain.startswith("*."):
+        domain = domain[2:]
+    return domain or None
+
+
+def _route_capture_cidrs(routes: list[dict], routing: dict,
+                         active: dict[str, dict]) -> list[str]:
+    """Resolve configured tunneled route targets into TUN route CIDRs.
+
+    A TUN inbound can install destination IP routes, not hostname routes. The
+    route-based capture mode therefore snapshots the currently resolved IPs of
+    configured domain routes; sing-box still sniffs those captured flows to
+    select the provider. Any unresolved explicit route domain fails the build
+    rather than silently widening or bypassing the route.
+    """
+    routing_mode = routing.get("mode", "default")
+    vpn_domains = {
+        domain for value in (routing.get("vpn_domains") or [])
+        if (domain := _capture_domain_name(value))
+    }
+    direct_domains = {
+        domain for value in (routing.get("direct_domains") or [])
+        if (domain := _capture_domain_name(value))
+    }
+    target_domains: set[str] = set()
+    raw_cidrs: list[str] = []
+
+    for route in routes:
+        route_provider = _effective_route_provider(route.get("provider", ""))
+        if route_provider not in active:
+            continue
+        for value in (route.get("domains") or []):
+            domain = _capture_domain_name(value)
+            if domain is None:
+                continue
+            if routing_mode == "vpn-list" and not any(
+                domain == vpn or domain.endswith("." + vpn) for vpn in vpn_domains
+            ):
+                continue
+            if routing_mode == "safe-list" and any(
+                domain == direct or domain.endswith("." + direct) for direct in direct_domains
+            ):
+                continue
+            try:
+                address = ipaddress.ip_address(domain)
+            except ValueError:
+                target_domains.add(domain)
+            else:
+                raw_cidrs.append(f"{address}/{address.max_prefixlen}")
+        # Keep IP routes aligned with the existing route-rule behavior: the
+        # vpn-list domain allow-list does not activate arbitrary IP routes.
+        if routing_mode != "vpn-list":
+            raw_cidrs.extend(route.get("ip_cidr") or [])
+
+    unresolved_domains: list[str] = []
+    for domain in sorted(target_domains):
+        # Use a bounded worker: a broken system resolver must not hang a
+        # config build or keepalive-triggered reload indefinitely.
+        answers = _bounded_getaddrinfo(domain, 443, timeout=3.0)
+        if not answers:
+            unresolved_domains.append(domain)
+            continue
+        resolved_domain = False
+        for host in answers:
+            try:
+                host = str(host).split("%", 1)[0]
+                address = ipaddress.ip_address(host)
+            except (IndexError, TypeError, ValueError):
+                continue
+            raw_cidrs.append(f"{address}/{address.max_prefixlen}")
+            resolved_domain = True
+        if not resolved_domain:
+            unresolved_domains.append(domain)
+
+    if unresolved_domains:
+        raise SystemExit(
+            "selective tun: could not resolve route domains: "
+            + ", ".join(unresolved_domains)
+        )
+
+    networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    for value in raw_cidrs:
+        try:
+            networks.append(ipaddress.ip_network(value, strict=False))
+        except ValueError:
+            continue
+    collapsed = list(ipaddress.collapse_addresses(
+        [network for network in networks if network.version == 4]
+    )) + list(ipaddress.collapse_addresses(
+        [network for network in networks if network.version == 6]
+    ))
+    return [
+        str(network) for network in sorted(
+            collapsed,
+            key=lambda network: (network.version, int(network.network_address), network.prefixlen),
+        )
+    ]
+
+
 def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tuple[dict, dict[str, Path]]:
     active: dict[str, dict] = {}
     selected: dict[str, Path] = {}
@@ -2312,11 +2470,26 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
             rules.insert(0, {"rule_set": [tag], "outbound": effective_provider})
         else:
             tun["auto_route"] = True
+            if capture == "routes" and _vpn.get("capture") == "routes":
+                # Hostnames are not valid TUN route entries. Snapshot the
+                # configured route domains into an inline IP rule-set so
+                # unmatched destinations bypass the TUN entirely.
+                capture_cidrs = _route_capture_cidrs(build_routes, routing, active)
+                if not capture_cidrs:
+                    raise SystemExit(
+                        "selective tun: no resolved route CIDRs; check routed domains, vpn_domains, and DNS"
+                    )
+                tag = "ruleset-routes"
+                rule_sets.append({
+                    "type": "inline",
+                    "tag": tag,
+                    "rules": [{"ip_cidr": capture_cidrs}],
+                })
+                tun["route_address_set"] = [tag]
             # Route-based TUN receives raw IP flows, so domain_suffix rules do
             # not have a hostname until sing-box sniffs TLS/HTTP metadata.
-            # Place sniff after DNS hijacking and before provider rules; this
-            # keeps the transparent listener app-independent while preserving
-            # direct fallback for unmatched traffic.
+            # Place sniff after DNS hijacking and before provider rules so
+            # captured domains still select their configured provider.
             rules.insert(0, {"action": "sniff"})
         exclude_cidr = _vpn.get("exclude_cidr") or []
         if exclude_cidr:
@@ -2327,8 +2500,8 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
             tun["route_exclude_address"] = list(exclude_cidr)
         # Keep the mixed proxy listener ALONGSIDE the TUN: apps pinned to
         # 127.0.0.1:PORT (hermes gateway, with-proxy, keepalive egress
-        # probes) must keep working while TUN captures everything else at
-        # the IP layer. Both inbound types share the same route rules, so
+        # probes) must keep working while TUN captures selected destinations
+        # at the IP layer. Both inbound types share the same route rules, so
         # no packet is processed twice.
         inbounds = [
             tun,
@@ -3419,7 +3592,7 @@ def engine_reload(active_overrides: dict[str, Path] | None = None) -> int:
 
 
 def rotate(name: str, *, reason: str | None = None, force: bool = False, probe: bool = True,
-           to: str | None = None) -> int:
+           to: str | None = None, automatic: bool = False) -> int:
     """Switch to the next healthy profile for ``name``.
 
     - Egress-aware selection: cooled-down profiles are skipped as before, and
@@ -3436,7 +3609,12 @@ def rotate(name: str, *, reason: str | None = None, force: bool = False, probe: 
     - Last-good rollback: after switching, the new exit is probed through the
       tunnel (proxy mode); if it fails to come up cleanly, the previous good
       profile is restored.
+    - ``automatic`` marks a supervisor-triggered rotation. It is rejected in
+      TUN mode so a mode change between the keepalive shell check and this
+      controller call cannot reload the shared engine.
     """
+    if automatic and not _automatic_proxy_mode():
+        return 3
     if active_fallback(name):
         return fail(f"provider '{name}': fallback active; clear it before rotating the primary")
     profiles = provider_files(name)
@@ -4346,7 +4524,8 @@ def egress_check(name: str | None = None, as_json: bool = False) -> int:
     return 1 if dead else 0
 
 
-def egress_sweep(name: str | None = None, as_json: bool = False) -> int:
+def egress_sweep(name: str | None = None, as_json: bool = False,
+                 *, allow_tun: bool = False) -> int:
     """Probe every profile once and leave the engine on the best alive one.
 
     Every profile change is an in-place SIGHUP reload: the process, TUN
@@ -4354,7 +4533,13 @@ def egress_sweep(name: str | None = None, as_json: bool = False) -> int:
     alive, the original active profile is restored when possible, so a
     diagnostic sweep cannot strand the tunnel on the last dead profile it
     tested.
+
+    TUN sweeps require the explicit ``allow_tun`` acknowledgement. The
+    keepalive path intentionally omits it, so a mode change between its shell
+    check and controller invocation cannot trigger a shared-engine sweep.
     """
+    if not allow_tun and (current_mode() == "tun" or _generated_config_mode() in ("tun", "unknown")):
+        return fail("egress sweep skipped in TUN mode; pass --allow-tun for an explicit interruption")
     # The tun config keeps the mixed listener (see egress_probe), so the
     # full-pool sweep probes through 127.0.0.1:<port> in either mode.
     if not listener_up():
@@ -5279,6 +5464,8 @@ def main() -> int:
                         help="provider name to check (egress check)")
     egress.add_argument("--json", action="store_true",
                         help="egress check/sweep: machine-readable JSON output")
+    egress.add_argument("--allow-tun", action="store_true",
+                        help="allow an explicit full-pool sweep to reload the shared TUN engine")
 
     init = sub.add_parser("init")
     init.add_argument("--force", action="store_true", help="overwrite an existing router.json")
@@ -5368,6 +5555,7 @@ def main() -> int:
                        help="ignore cooldowns and blocked-exit markers and switch anyway")
     r_rot.add_argument("--no-probe", action="store_true",
                        help="skip the post-switch egress probe")
+    r_rot.add_argument("--automatic", action="store_true", help=argparse.SUPPRESS)
 
     r_event = sub.add_parser("response-event", help="handle an observed upstream response")
     r_event.add_argument("--host", required=True, help="destination hostname observed by the proxy")
@@ -5394,6 +5582,7 @@ def main() -> int:
     failover.add_argument("--to", default=None, help="fallback provider (must match config)")
     failover.add_argument("--reason", default="transport")
     failover.add_argument("--json", action="store_true")
+    failover.add_argument("--automatic", action="store_true", help=argparse.SUPPRESS)
 
     r_count = sub.add_parser("provider-count")
     r_count.add_argument("provider")
@@ -5641,7 +5830,8 @@ def main() -> int:
         if not args.provider:
             parser.error("rotate needs a provider (or use --if-due for scheduled rotation)")
         return _with_lock(lambda: rotate(args.provider, reason=args.reason, force=args.force,
-                                         probe=not args.no_probe, to=args.to))
+                                         probe=not args.no_probe, to=args.to,
+                                         automatic=args.automatic))
     if args.cmd == "response-event":
         return _with_lock(lambda: response_event(
             args.host, args.status, provider=args.provider,
@@ -5650,9 +5840,11 @@ def main() -> int:
     if args.cmd == "failover":
         if args.action == "on":
             return _with_lock(lambda: activate_fallback(
-                args.provider, target=args.to, reason=args.reason))
+                args.provider, target=args.to, reason=args.reason,
+                automatic=args.automatic))
         if args.action == "off":
-            return _with_lock(lambda: deactivate_fallback(args.provider))
+            return _with_lock(lambda: deactivate_fallback(
+                args.provider, automatic=args.automatic))
         state = fallback_status(args.provider)
         if args.json:
             print(json.dumps(state, indent=2, sort_keys=True))
@@ -5666,7 +5858,8 @@ def main() -> int:
         if args.action == "check":
             return egress_check(args.provider_opt or args.provider, as_json=args.json)
         if args.action == "sweep":
-            return _with_lock(lambda: egress_sweep(args.provider, as_json=args.json))
+            return _with_lock(lambda: egress_sweep(
+                args.provider, as_json=args.json, allow_tun=args.allow_tun))
         return egress_show(args.provider)
     if args.cmd == "provider-count":
         print(provider_count(args.provider))
