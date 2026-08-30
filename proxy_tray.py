@@ -426,63 +426,77 @@ class RouterClient:
         return self._run("ensure")
 
     def _engine_runs_as_root(self) -> bool:
-        """True when the live engine process is owned by root.
+        """True only when a live exact engine command is root-owned.
 
-        An engine started via `sudo vpn on` keeps running as root after the
-        TUN is turned off; its pid file is root-owned mode 0600, so a
-        regular user cannot read it (that unreadable state is exactly what
-        makes plain `start`/`stop` fail with "Cannot stop because it is run
-        with sudo"). Mirrors router.py's probe: unreadable root-owned pid
-        file counts as root; a readable one is confirmed against `ps`.
+        The PID-file inode is bookkeeping and may have been handed back to the
+        user after an elevated start.  Inspect the live process UID and exact
+        binary/argv instead; ambiguous or unavailable process evidence is not
+        elevated optimistically.
         """
         if sys.platform != "darwin" or os.geteuid() == 0:
-            # Non-macOS or already-root tray: no elevation needed either way.
             return False
-        # Must match router.py's PID_FILE (ROOT / "sing-box.pid").
+        config = os.path.abspath(os.path.join(self.root, "sing-box.json"))
+        binaries = [
+            os.environ.get("SING_BOX"),
+            os.path.join(self.root, "bin", "sing-box"),
+            "/opt/homebrew/bin/sing-box",
+            "/usr/local/bin/sing-box",
+            shutil.which("sing-box"),
+        ]
+        expected = {
+            tuple(shlex.split(f"{binary} run -c {config}"))
+            for binary in dict.fromkeys(b for b in binaries if b)
+        }
+        if not expected:
+            return False
+
         pid_file = os.path.join(self.root, "sing-box.pid")
         try:
-            st = os.stat(pid_file)
-        except OSError:
-            return False
-        if st.st_uid != 0:
-            return False
+            pid_text = Path(pid_file).read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError):
+            pid_text = ""
+        commands = [
+            ["ps", "-p", pid_text, "-o", "uid=,command="]
+            if pid_text.isdigit()
+            else ["ps", "-axo", "pid=,uid=,command="],
+        ]
         try:
-            with open(pid_file, encoding="utf-8") as fh:
-                pid = int(fh.read().strip())
-        except PermissionError:
-            return True
-        except (OSError, ValueError):
-            return False
-        try:
-            probe = subprocess.run(
-                ["ps", "-o", "user=", "-p", str(pid)],
-                capture_output=True, text=True, timeout=3,
-            )
+            result = subprocess.run(
+                commands[0], capture_output=True, text=True, timeout=3)
         except (OSError, subprocess.TimeoutExpired):
             return False
-        return probe.stdout.strip() == "root"
+        if result.returncode != 0:
+            return False
+        for line in (result.stdout or "").splitlines():
+            if pid_text.isdigit():
+                parts = line.strip().split(None, 1)
+                if len(parts) != 2:
+                    continue
+                uid, command = parts
+            else:
+                parts = line.strip().split(None, 2)
+                if len(parts) != 3:
+                    continue
+                _pid, uid, command = parts
+            try:
+                command_argv = shlex.split(command)
+            except ValueError:
+                continue
+            if uid in {"0", "root"} and tuple(command_argv) in expected:
+                return True
+        return False
 
     def start(self) -> tuple[int, str]:
-        # Explicit start: clears any manual-off marker (tray Connect).
-        # A root-owned engine must be managed elevated, exactly like the
-        # TUN toggle — a user-level start would clobber its pid file.
-        if self._engine_runs_as_root():
-            return self._run_elevated("start")
+        # The router controller is the single lifecycle authority. It delegates
+        # root-owned engines to the installed helper and reports a repair hint
+        # when that helper is absent; the tray must not make a second owner
+        # decision from PID-file metadata.
         return self._run("start")
 
     def stop(self) -> tuple[int, str]:
-        # The root-owned engine (started via `sudo vpn on`) cannot be
-        # signalled by a regular user: re-run the stop as root.
-        if self._engine_runs_as_root():
-            return self._run_elevated("stop")
         return self._run("stop")
 
     def rotate(self) -> tuple[int, str]:
-        # Root-owned engine (started via `sudo vpn on`): a user-level rotate
-        # cannot signal it, so route through the elevation surface exactly
-        # like start/stop (issue #54).
-        if self._engine_runs_as_root() and self._active_provider:
-            return self._run_elevated("rotate", self._active_provider)
         return self._run("rotate", self._active_provider)
 
     def rotate_to(self, provider: str, profile: str, force: bool = False) -> tuple[int, str]:
@@ -491,8 +505,6 @@ class RouterClient:
             # Explicit pick of an offline/SSL exit: try it anyway, ignoring
             # the cooldown its failed probe left behind.
             cmd.append("--force")
-        if self._engine_runs_as_root():
-            return self._run_elevated(*cmd)
         return self._run(*cmd)
 
     def set_mode(self, mode: str, default_provider: str | None = None) -> tuple[int, str]:
@@ -579,6 +591,11 @@ class TrayApp:
         self._mutation_gate = threading.Semaphore(0)
         self._pending_mutations: list[tuple[str, Callable]] = []
         self._pending_lock = threading.Lock()
+        # Serialize the accept/reject decision with Quit.  The FIFO pump
+        # already serializes execution, but a click that passed the old
+        # quit_flag check could still append after Quit began draining.
+        self._action_accept_lock = threading.Lock()
+        self._quit_pending = False
         # Signalled whenever the mutation pump goes idle (queue drained and
         # nothing executing); action_quit waits on it, bounded.
         self._idle_cond = threading.Condition(self._pending_lock)
@@ -696,24 +713,28 @@ class TrayApp:
         # onto ONE serialized worker: clicks coalesce into pending jobs,
         # results land strictly in click order, and the "working…" line
         # shows immediately without blocking the menu callback thread.
-        if self.quit_flag.is_set():
-            return  # quitting: stop accepting mutations before they queue
-        with self.lock:
-            self.last_action_result = f"{label}: working…"
-        self._refresh_menu()
+        # Keep the quit check and queue append in one acceptance critical
+        # section.  This closes the small race where Quit could observe an
+        # empty queue, stop the engine, and then a click appends work behind it.
+        with self._action_accept_lock:
+            if self.quit_flag.is_set() or self._quit_pending:
+                return  # quitting: stop accepting mutations before they queue
+            with self.lock:
+                self.last_action_result = f"{label}: working…"
+            self._refresh_menu()
 
-        with self._pending_lock:
-            self._pending_mutations.append((label, fn))
-            worker = self._worker_thread
-            if worker is None or not worker.is_alive():
-                worker = threading.Thread(
-                    target=self._mutation_worker, daemon=True,
-                    name="tray-mutations")
-                self._worker_thread = worker
-                worker.start()
-        # One permit per queued job: the pump pops exactly one job per
-        # acquire, so FIFO order holds no matter how fast clicks arrive.
-        self._mutation_gate.release()
+            with self._pending_lock:
+                self._pending_mutations.append((label, fn))
+                worker = self._worker_thread
+                if worker is None or not worker.is_alive():
+                    worker = threading.Thread(
+                        target=self._mutation_worker, daemon=True,
+                        name="tray-mutations")
+                    self._worker_thread = worker
+                    worker.start()
+            # One permit per queued job: the pump pops exactly one job per
+            # acquire, so FIFO order holds no matter how fast clicks arrive.
+            self._mutation_gate.release()
 
     def _mutation_idle(self) -> bool:
         """True when no mutation is executing and the queue is empty."""
@@ -875,23 +896,54 @@ class TrayApp:
         # stops ACCEPTING mutations first, then waits (bounded) for any
         # in-flight mutation to finish before stopping the engine, so an
         # interrupted connect/rotate can never strand half-applied state.
-        self.quit_flag.set()
+        # Make the acceptance barrier atomic with _do(): no mutation can pass
+        # its check after Quit starts waiting for the queue to drain.
+        with self._action_accept_lock:
+            if self.quit_flag.is_set() or self._quit_pending:
+                return
+            with self.lock:
+                self._quit_pending = True
 
         def worker():
-            # Wait (bounded) for any in-flight/queued mutation to drain so
-            # the engine is never stopped out from under a half-applied
-            # action; a hung job must not make Quit unkillable, hence the
-            # timeout. The pump itself keeps running — quit does not cancel
-            # already-accepted work, it only stops accepting new work.
+            # Wait (bounded) for any in-flight/queued mutation to drain. Do
+            # not stop the engine after the deadline: the accepted mutation may
+            # still be reloading/restarting it, so stopping concurrently would
+            # recreate the exact late-writer race Quit is meant to prevent.
             with self._idle_cond:
-                self._idle_cond.wait_for(
+                drained = self._idle_cond.wait_for(
                     self._mutation_idle, timeout=self._drain_timeout)
+            if not drained:
+                with self.lock:
+                    self.last_action_result = (
+                        "quit: waiting for active action — retry when it finishes")
+                with self._action_accept_lock:
+                    with self.lock:
+                        self._quit_pending = False
+                self._refresh_menu()
+                return
             try:
                 rc, out = self.client.stop()
             except Exception as e:
                 rc, out = -1, f"{type(e).__name__}: {e}"
             if rc != 0:
                 print(f"quit: engine stop failed: {out}", file=sys.stderr)
+                # A failed Stop must not strand the user with an invisible,
+                # unmanageable engine. Keep the resident tray alive and make
+                # the failed Quit retryable. quit_flag was never set, so the
+                # existing poller remains resident throughout this recovery.
+                detail = _humanize(out)
+                with self.lock:
+                    self.last_action_result = "quit: failed" + (
+                        f" — {detail}" if detail else "")
+                with self._action_accept_lock:
+                    with self.lock:
+                        self._quit_pending = False
+                self._refresh_menu()
+                return
+            with self._action_accept_lock:
+                with self.lock:
+                    self._quit_pending = False
+                self.quit_flag.set()
             if self.tray is not None:
                 self.tray.stop()
 
@@ -1170,7 +1222,8 @@ class TrayApp:
             # Custom setup replaces pystray's default setup; explicitly show
             # the status item or the agent runs invisibly on macOS.
             icon.visible = True
-            threading.Thread(target=self.poll_loop, daemon=True).start()
+            threading.Thread(target=self.poll_loop, daemon=True,
+                             name="tray-status").start()
 
         self.tray = pystray.Icon(
             "proxy-router", self.icon_image, "proxy-router",

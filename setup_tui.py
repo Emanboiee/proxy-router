@@ -27,6 +27,7 @@ import glob
 import io
 import json
 import os
+import signal
 import time
 import re
 import select
@@ -1125,18 +1126,48 @@ def _router_command(root: Path, *args: str, timeout: float = 120.0) -> int:
     A timeout keeps a hung router.py (stuck lock, dead upstream probe) from
     freezing the TUI key loop indefinitely; long-running mutations
     (rotate/sweep with settle windows) pass an explicit larger budget.
+    Process-group timeout: when the deadline fires the router and any
+    child sing-box keepalive are terminated together (start_new_session +
+    killpg) so the TUI does not leave a detached engine behind.
     """
     script = Path(__file__).resolve().parent / "router.py"
     env = dict(os.environ, PROXY_ROUTER_ROOT=str(root))
+    cmd = [sys.executable, str(script), *args]
     try:
-        result = subprocess.run([sys.executable, str(script), *args],
-                                env=env, timeout=timeout)
-        return result.returncode
-    except subprocess.TimeoutExpired:
-        print(f"setup: {' '.join(args)} timed out after {timeout:.0f}s "
-              "(still running in the background? check `router.py status`)",
-              file=sys.stderr)
-        return 1
+        proc = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except OSError:
+                pass
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            try:
+                proc.communicate(timeout=5)
+            except Exception:
+                pass
+            print(f"setup: {' '.join(args)} timed out after {timeout:.0f}s "
+                  "(still running in the background? check `router.py status`)",
+                  file=sys.stderr)
+            return 1
+        # router.py writes diagnostics to stdout/stderr; surface them so the
+        # TUI caller can see failures inline (mirrors old subprocess.run echo).
+        if stdout:
+            print(stdout, end="")
+        if stderr:
+            print(stderr, end="", file=sys.stderr)
+        return proc.returncode if proc.returncode is not None else 1
     except OSError as exc:
         print(f"setup: could not run {script}: {exc}", file=sys.stderr)
         return 1
@@ -1149,54 +1180,6 @@ def _read_vpn_mode(root: Path) -> str:
     except OSError:
         mode = ""
     return mode if mode in ("proxy", "tun") else "proxy"
-
-
-# The tray needs pystray; the TUI may be running under a bare python
-# (framework installs, Homebrew) that lacks it. Prefer the same pinned
-# interpreter the launchd/keepalive/elevation paths use (PROXY_ROUTER_PYTHON),
-# then sys.executable, then known-good interpreters, probing each with
-# `import pystray`.
-_TRAY_PYTHON_CANDIDATES = (
-    os.environ.get("PROXY_ROUTER_PYTHON"),
-    sys.executable,
-    "/opt/anaconda3/bin/python3",
-)
-
-
-def _resolve_tray_python() -> str | None:
-    """Return the first candidate able to import pystray, else None."""
-    seen: set[str] = set()
-    for candidate in _TRAY_PYTHON_CANDIDATES:
-        if not candidate or candidate in seen or not os.path.isfile(candidate):
-            continue
-        seen.add(candidate)
-        try:
-            probe = subprocess.run(
-                [candidate, "-c", "import pystray"],
-                capture_output=True, timeout=15,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            continue
-        if probe.returncode == 0:
-            return candidate
-    return None
-
-
-def _launch_tray(root: Path) -> None:
-    """Best-effort tray autostart; never fails the action when the tray is absent."""
-    script = Path(__file__).resolve().parent / "proxy_tray.py"
-    if not script.is_file():
-        return
-    python = _resolve_tray_python()
-    if python is None:
-        return
-    env = dict(os.environ, PROXY_ROUTER_ROOT=str(root))
-    try:
-        subprocess.Popen([python, str(script)], env=env,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
-    except OSError:
-        pass
 
 
 def _read_routing_state(root: Path) -> dict:
@@ -1479,11 +1462,12 @@ def _line_wizard(root: Path) -> int:
         if choice in ("q", "quit"):
             return 0
         if choice == "1":
-            print(_style("  starting proxy-router (ensure)...", _Ansi.YELLOW))
-            rc = _router_command(root, "ensure")
+            print(_style("  starting proxy-router (start)...", _Ansi.YELLOW))
+            # Explicit start is the reconnect contract: router.py clears the
+            # manual-off marker and asks the canonical launchd tray to run.
+            rc = _router_command(root, "start")
             if rc == 0:
-                _launch_tray(root)
-                print(_style("  engine up (tray autostart)", _Ansi.GREEN))
+                print(_style("  engine up (canonical tray autostart)", _Ansi.GREEN))
             else:
                 print(_style("  engine failed to start (see router output above)", _Ansi.RED))
         elif choice == "2":
@@ -2448,10 +2432,13 @@ def _execute_action(action: tuple, root: Path) -> tuple[str, int]:
         elif kind == "check":
             rc = _cmd_check(root)
         elif kind == "engine_start":
-            rc = _router_command(root, "ensure")
+            # Do not use ensure here: it intentionally respects manual-off.
+            # The backend's explicit start clears that marker and owns the
+            # canonical launchd tray kickstart, so the TUI must not Popen a
+            # second unmanaged tray process.
+            rc = _router_command(root, "start")
             if rc == 0:
-                _launch_tray(root)
-                buf.write("engine up (tray autostart)")
+                buf.write("engine up (canonical launchd tray autostart)")
             else:
                 buf.write("engine failed to start (see output above)")
         elif kind == "engine_stop":
