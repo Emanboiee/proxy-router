@@ -2,6 +2,19 @@
 # Bridge for the Hermes opencode-server-rotation plugin.
 # The plugin calls this machine-level bridge; it forwards provider failures to
 # the existing proxy-router CLI. The router remains the only engine mutator.
+#
+# Contract (generic, fail-closed):
+#   - OPENCODE_PROVIDER, when set, is the explicit override and is used verbatim.
+#   - When absent, the bridge infers the egress provider from the router's
+#     live config/status (status --json). For opencode.ai it uses the route
+#     table's provider for that hostname; if no route matches and the router
+#     has exactly one provider, that sole provider is used. Ambiguity (zero or
+#     multiple candidates) is a hard error instead of a guess.
+#   - Inference respects an active fallback: if the route's primary has a
+#     live fallback (status.providers[primary].fallback.active), the effective
+#     fallback provider is rotated — mirroring router.py response_event.
+#   - No provider name is hardcoded except the target hostname (opencode.ai)
+#     that this bridge is bridging. Generic fallback is single-provider inference.
 set -euo pipefail
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -35,13 +48,95 @@ router_py() {
   return 1
 }
 
+# infer_provider <router> -> prints provider name or returns 1
+infer_provider() {
+  local router="$1"
+  local json provider
+  if ! json=$("$router" status --json 2>/dev/null); then
+    return 1
+  fi
+  provider=$(printf '%s' "$json" | python3 -c '
+import json, sys
+
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+
+routes = data.get("routes") or []
+providers = data.get("providers") or {}
+
+def host_matches(host, domain):
+    host = str(host or "").strip().lower().rstrip(".")
+    domain = str(domain or "").lstrip("*.").strip().lower().rstrip(".")
+    return bool(host and domain and (host == domain or host.endswith("." + domain)))
+
+target = "opencode.ai"
+candidates = []
+for r in routes:
+    prov = r.get("provider")
+    if not isinstance(prov, str) or not prov:
+        continue
+    for d in r.get("domains") or []:
+        if host_matches(target, d):
+            candidates.append(prov)
+            break
+
+# de-duplicate while preserving order
+seen = set()
+uniq = []
+for c in candidates:
+    if c not in seen:
+        seen.add(c)
+        uniq.append(c)
+candidates = uniq
+
+# Single route provider for opencode.ai -> use it (or its active fallback)
+if len(candidates) == 1:
+    cand = candidates[0]
+    # If the primary has an active fallback, rotate the effective egress
+    fb = providers.get(cand, {}).get("fallback", {}).get("active")
+    if isinstance(fb, str) and fb and fb in providers:
+        print(fb)
+    else:
+        print(cand)
+    sys.exit(0)
+
+# Generic single-provider fallback: when the router has exactly one provider
+# and no explicit opencode route, that sole provider is unambiguously the
+# egress. This keeps the bridge usable for single-provider deployments without
+# hardcoding a provider name.
+if not candidates and len(providers) == 1:
+    print(list(providers.keys())[0])
+    sys.exit(0)
+
+sys.exit(1)
+' 2>/dev/null || true)
+  if [ -n "${provider:-}" ]; then
+    # trim whitespace
+    provider=$(printf '%s' "$provider" | tr -d ' \t\r\n')
+    if [ -n "$provider" ]; then
+      printf '%s\n' "$provider"
+      return 0
+    fi
+  fi
+  return 1
+}
+
 case "${1:-}" in
   rotate)
-    ROUTER=$(router_py)
+    if ! ROUTER=$(router_py); then
+      printf 'proxy-manager: router not found (set PROXY_ROUTER_ROOT or PROXY_ROUTER_BIN, or install proxy-router)\n' >&2
+      exit 2
+    fi
     PROVIDER="${OPENCODE_PROVIDER:-}"
     if [ -z "$PROVIDER" ]; then
-      printf 'proxy-manager: OPENCODE_PROVIDER is not set (provider to rotate, see router.py status)\n' >&2
-      exit 2
+      if PROVIDER=$(infer_provider "$ROUTER"); then
+        : # inferred
+      else
+        printf 'proxy-manager: cannot infer provider (no OPENCODE_PROVIDER and router config is ambiguous or has no opencode.ai route); set OPENCODE_PROVIDER or run router.py status --json to inspect\n' >&2
+        exit 2
+      fi
     fi
     REASON="${2:-}"
     case "$REASON" in
@@ -65,6 +160,7 @@ case "${1:-}" in
     ;;
   help|-h|--help|"")
     printf 'usage: %s rotate [REASON] [PROXY_ROUTER_ROOT=PATH] [OPENCODE_PROVIDER=<name>]\n' "$0" >&2
+    printf '  OPENCODE_PROVIDER optional; when absent the provider is inferred from router config/status (opencode.ai route or sole provider). Fail-closed on ambiguity.\n' >&2
     exit 0
     ;;
   *)
