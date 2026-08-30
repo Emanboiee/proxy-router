@@ -173,31 +173,29 @@ class EngineRunsAsRootTests(unittest.TestCase):
         router.PID_FILE.write_text("4242")
         with mock.patch("os.stat") as st:
             st.return_value.st_uid = 501
+            with mock.patch.object(router, "_pid_matches", return_value=False),                  mock.patch.object(router, "_find_our_engine_pids", return_value=[]):
+                self.assertFalse(router._engine_runs_as_root())
+
+    def test_unreadable_root_pid_file_without_live_engine_is_not_root(self):
+        """An unreadable PID inode is not process-ownership evidence."""
+        router.PID_FILE.write_text("4242")
+        with mock.patch("os.stat", return_value=_root_stat(0)), _block_pid_read(), \
+             mock.patch.object(router, "_find_our_engine_pids", return_value=[]):
             self.assertFalse(router._engine_runs_as_root())
 
-    def test_unreadable_root_pid_file_counts_as_root(self):
-        """Mode-0600 root-owned pid files are unreadable for a regular user —
-        that state is exactly what makes plain `stop` fail (issue #12)."""
+    def test_readable_root_pid_confirmed_by_process_uid(self):
         router.PID_FILE.write_text("4242")
-        with mock.patch("os.stat", return_value=_root_stat(0)), _block_pid_read():
+        with mock.patch.object(router, "_find_our_engine_pids", return_value=[4242]), \
+             mock.patch.object(router.subprocess, "run") as run:
+            run.return_value.returncode = 0
+            run.return_value.stdout = "root\n"
             self.assertTrue(router._engine_runs_as_root())
-
-    def test_readable_root_pid_confirmed_by_ps(self):
-        router.PID_FILE.write_text("4242")
-        with mock.patch("os.stat") as st:
-            st.return_value.st_uid = 0
-            with mock.patch.object(router.subprocess, "run") as run:
-                run.return_value.stdout = "root\n"
-                self.assertTrue(router._engine_runs_as_root())
-        self.assertEqual(run.call_args.args[0], ["ps", "-o", "user=", "-p", "4242"])
+        self.assertEqual(run.call_args.args[0][0], "ps")
 
     def test_root_pid_but_recycled_process_is_not_root_engine(self):
         router.PID_FILE.write_text("4242")
-        with mock.patch("os.stat") as st:
-            st.return_value.st_uid = 0
-            with mock.patch.object(router.subprocess, "run") as run:
-                run.return_value.stdout = "alice\n"
-                self.assertFalse(router._engine_runs_as_root())
+        with mock.patch.object(router, "_find_our_engine_pids", return_value=[]):
+            self.assertFalse(router._engine_runs_as_root())
 
     def test_never_root_on_windows(self):
         router.PID_FILE.write_text("4242")

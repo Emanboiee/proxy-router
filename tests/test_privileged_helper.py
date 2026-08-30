@@ -617,12 +617,43 @@ class HelperLifecycleTests(unittest.TestCase):
             killer.assert_not_called()
             self.assertTrue(runtime.pid_file.exists())
 
+    def test_stop_engine_scans_and_stops_exact_orphan_when_pid_state_is_missing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = self.runtime(Path(temporary))
+            exact = f"{runtime.binary} run -c {runtime.config}"
+            runner = mock.Mock(side_effect=[
+                # The missing-PID orphan scan finds the exact root process.
+                SimpleNamespace(returncode=0, stdout=f"4242 {runtime.root_uid} {exact}\n"),
+                # Re-check identity before TERM.
+                SimpleNamespace(returncode=0, stdout=f"{runtime.root_uid} {exact}\n"),
+                # The process is gone after TERM.
+                SimpleNamespace(returncode=1, stdout=""),
+                # Final orphan scan proves no exact-config process remains.
+                SimpleNamespace(returncode=0, stdout=""),
+            ])
+            killer = mock.Mock()
+
+            result = helper.stop_engine(
+                runtime,
+                runner=runner,
+                killer=killer,
+                sleeper=lambda _seconds: None,
+                timeout=0.1,
+            )
+
+            self.assertTrue(result["stopped"])
+            self.assertEqual(result["pid"], 4242)
+            killer.assert_called_once_with(4242, signal.SIGTERM)
+
     def test_stop_engine_cleans_dead_stale_pid_without_signaling(self):
         with tempfile.TemporaryDirectory() as temporary:
             runtime = self.runtime(Path(temporary))
             runtime.pid_file.write_text("4242\n", encoding="ascii")
             runtime.pid_file.chmod(0o600)
-            runner = mock.Mock(return_value=SimpleNamespace(returncode=1, stdout=""))
+            runner = mock.Mock(side_effect=[
+                SimpleNamespace(returncode=1, stdout=""),  # stale PID query
+                SimpleNamespace(returncode=0, stdout=""),  # exact orphan scan
+            ])
             killer = mock.Mock()
 
             result = helper.stop_engine(runtime, runner=runner, killer=killer)

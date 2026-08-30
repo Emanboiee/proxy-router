@@ -2690,78 +2690,61 @@ def listener_up() -> bool:
 
 
 def _any_our_engine_running() -> bool:
-    """True when ANY sing-box process is running with our generated config
-    path in its command line.
+    """True when an exact owned engine process is present.
 
-    Used when the pid file itself is unreadable (root-owned after a
-    `sudo vpn on`): same identity check as ``_pid_matches``, minus the pid.
-    Row-scoped: both identity tokens must appear on ONE process row, so a
-    foreign sing-box run plus an unrelated process carrying our config path
-    cannot combine into a false ownership result (issue #62)."""
-    try:
-        if os.name == "nt":
-            out = subprocess.run(
+    Ambiguous/unavailable process-table evidence is treated as unknown by this
+    health getter; lifecycle Stop handles the same condition as a hard error.
+    """
+    if os.name == "nt":
+        expected = _expected_engine_command()
+        if expected is None:
+            return False
+        try:
+            result = subprocess.run(
                 ["powershell", "-NoProfile", "-Command",
-                 "(Get-CimInstance Win32_Process -Filter \"Name='sing-box.exe'\").CommandLine"],
-                capture_output=True, text=True, timeout=5,
-            ).stdout
-            for line in out.splitlines():
-                # CIM already filters to sing-box.exe processes; require the
-                # exact process token too, so a foreign row merely carrying
-                # our config path (e.g. "sing-box.json" in some other tool's
-                # cmdline) cannot combine into a false ownership result
-                # (issue #62).
-                if "sing-box.exe" in line.lower() and str(SING_BOX_CONFIG) in line:
-                    return True
-            if out:
-                return False
-            out = subprocess.run(
-                ["tasklist", "/FI", "IMAGENAME eq sing-box.exe", "/FO", "CSV", "/NH"],
-                capture_output=True, text=True, timeout=3,
-            ).stdout
-            return "sing-box" in out.lower()
-        out = subprocess.run(
-            ["ps", "-ax", "-o", "command="],
-            capture_output=True, text=True, timeout=3,
-        ).stdout
-    except (OSError, subprocess.TimeoutExpired):
+                 "(Get-CimInstance Win32_Process).CommandLine"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        if result.returncode != 0:
+            return False
+        return any(_command_is_our_engine(line) for line in result.stdout.splitlines())
+    try:
+        return bool(_find_our_engine_pids())
+    except EngineIdentityError:
         return False
-    for line in out.splitlines():
-        if "sing-box run" in line and str(SING_BOX_CONFIG) in line:
-            return True
-    return False
 
 
 def _pid_matches(pid: int) -> bool:
-    """True when PID is a sing-box we launched (cmdline contains our config,
-    so a recycled/foreign PID with the same number can never be killed)."""
+    """True when PID is the exact resolved engine command line."""
+    expected = _expected_engine_command()
+    if expected is None:
+        return False
     try:
         if os.name == "nt":
-            # tasklist only names the process, so any sing-box.exe with a
-            # recycled PID would pass; read the real command line first and
-            # require our generated config path in it (H3).
-            try:
-                out = subprocess.run(
-                    ["powershell", "-NoProfile", "-Command",
-                     f"(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine"],
-                    capture_output=True, text=True, timeout=5,
-                ).stdout
-            except (OSError, subprocess.TimeoutExpired):
-                out = ""
-            if out:
-                return "sing-box" in out.lower() and str(SING_BOX_CONFIG) in out
+            # Windows helper lifecycle is authoritative; this fallback remains
+            # conservative and requires the configured path in the command line.
             out = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-                capture_output=True, text=True, timeout=3,
-            ).stdout
-            return "sing-box" in out.lower()
-        out = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "command="],
-            capture_output=True, text=True, timeout=3,
-        ).stdout
+                ["powershell", "-NoProfile", "-Command",
+                 f"(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.strip()
+            return bool(out) and _command_is_our_engine(out)
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "uid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
     except (OSError, subprocess.TimeoutExpired):
         return False
-    return "sing-box run" in out and str(SING_BOX_CONFIG) in out
+    if result.returncode != 0:
+        return False
+    parts = (result.stdout or "").strip().split(None, 1)
+    return len(parts) == 2 and parts[0].isdigit() and _command_is_our_engine(parts[1])
 
 
 def engine_alive() -> bool:
@@ -3348,61 +3331,159 @@ def engine_ensure() -> int:
     return rc
 
 
+class EngineIdentityError(RuntimeError):
+    """The process table could not prove engine identity safely."""
+
+
+def _expected_engine_command() -> str | None:
+    """Return the exact command line emitted by ``engine_start``."""
+    binary = resolve_sing_box()
+    if binary is None:
+        return None
+    return f"{binary} run -c {SING_BOX_CONFIG}"
+
+
+def _command_is_our_engine(cmd: str) -> bool:
+    """Return true only for the exact resolved binary/argv command line."""
+    expected = _expected_engine_command()
+    if expected is None:
+        return False
+    try:
+        return shlex.split(str(cmd).strip()) == shlex.split(expected)
+    except ValueError:
+        return False
+
+
+def _find_our_engine_pids() -> list[int]:
+    """Find exact engine processes, including root-owned orphan candidates.
+
+    The PID file is bookkeeping, not identity.  This scan is deliberately
+    fail-closed: an unavailable process table cannot be treated as proof that
+    no owned engine exists.
+    """
+    expected = _expected_engine_command()
+    if expected is None:
+        raise EngineIdentityError("sing-box binary is unavailable; engine identity is unknown")
+    if os.name == "nt":
+        # The privileged helper owns Windows lifecycle in supported installs;
+        # retain a conservative no-result path for the cross-platform CLI.
+        raise EngineIdentityError("exact orphan scan is unavailable on Windows")
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,uid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise EngineIdentityError(f"cannot scan engine processes: {exc}") from exc
+    if result.returncode != 0:
+        raise EngineIdentityError("cannot scan engine processes")
+    pids: list[int] = []
+    for line in (result.stdout or "").splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) != 3:
+            continue
+        try:
+            pid = int(parts[0])
+            int(parts[1])  # Parse UID as part of the authenticated row.
+        except ValueError:
+            continue
+        if pid > 1 and _command_is_our_engine(parts[2]):
+            pids.append(pid)
+    return sorted(set(pids))
+
+
+def _terminate_pid(pid: int) -> bool:
+    """Terminate one PID after verifying its exact engine identity."""
+    if not _pid_matches(pid):
+        return False
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
+            return True
+        os.kill(pid, signal.SIGTERM)
+        grace_deadline = time.monotonic() + 0.4
+        while time.monotonic() < grace_deadline:
+            if not _pid_matches(pid):
+                break
+            time.sleep(0.02)
+        if _pid_matches(pid):
+            os.kill(pid, signal.SIGKILL)
+            kill_deadline = time.monotonic() + 0.5
+            while time.monotonic() < kill_deadline:
+                if not _pid_matches(pid):
+                    break
+                time.sleep(0.02)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        raise
+
+
 def engine_stop() -> int:
     if sys.platform == "darwin" and os.geteuid() != 0:
         helper = _helper_status()
         if helper and helper.get("installed") and helper.get("running"):
             return _helper_run("stop")
+    pid_from_file: int | None = None
     if PID_FILE.is_file():
         try:
-            pid = int(PID_FILE.read_text().strip())
+            pid_from_file = int(PID_FILE.read_text().strip())
         except PermissionError:
-            # Root-owned pid file (started via `sudo vpn on`): the engine may
-            # be alive; keep the pid file and fail loudly (mirror of the kill
-            # PermissionError below) instead of unlinking a live engine's pid
-            # as "garbage" (H6).
             print(_ROOT_ENGINE_HINT, file=sys.stderr)
             return 1
         except (ValueError, OSError):
-            # Garbage pid file (H6): treat as stale, clean it up, carry on.
             PID_FILE.unlink(missing_ok=True)
-            return 0
-        if not _pid_matches(pid):
-            # Foreign/recycled PID (H3): never signal a process we don't own.
-            # Remove the stale pid file so a later start can proceed.
-            PID_FILE.unlink(missing_ok=True)
-            return 0
-        try:
-            if os.name == "nt":
-                # taskkill /T /F is a hard kill (TerminateProcess on the whole
-                # tree); the process may already be gone, so ignore its exit code.
-                subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
+            pid_from_file = None
+        else:
+            if not _pid_matches(pid_from_file):
+                PID_FILE.unlink(missing_ok=True)
+                pid_from_file = None
             else:
-                os.kill(pid, signal.SIGTERM)
-                # Poll for exit instead of a blind sleep: sing-box usually
-                # exits in <50ms, so the stop path returns immediately
-                # instead of costing a fixed 0.4s on every switch/restart.
-                # The grace window (and the ownership re-check before any
-                # hard kill) is unchanged.
-                grace_deadline = time.monotonic() + 0.4
-                while time.monotonic() < grace_deadline:
-                    if not _pid_matches(pid):
-                        break
-                    time.sleep(0.02)
-                # The process may have exited, or the PID may have been
-                # recycled during the grace period. Re-check ownership before
-                # sending a hard kill.
-                if _pid_matches(pid):
-                    os.kill(pid, signal.SIGKILL)
-        except (ProcessLookupError, ValueError):
-            pass
-        except PermissionError:
-            # Engine was started via `sudo vpn on` and runs as root; a
-            # regular-user stop cannot signal it. Keep the pid file (the
-            # engine IS alive) and tell the user to stop with sudo.
-            print(_ROOT_ENGINE_HINT, file=sys.stderr)
+                try:
+                    _terminate_pid(pid_from_file)
+                except PermissionError:
+                    print(_ROOT_ENGINE_HINT, file=sys.stderr)
+                    return 1
+                PID_FILE.unlink(missing_ok=True)
+                pid_from_file = None
+    try:
+        orphans = _find_our_engine_pids()
+    except EngineIdentityError as exc:
+        print(f"router: cannot prove engine termination: {exc}", file=sys.stderr)
+        return 1
+    if orphans:
+        for pid in orphans:
+            try:
+                _terminate_pid(pid)
+            except PermissionError:
+                print(_ROOT_ENGINE_HINT, file=sys.stderr)
+                return 1
+        # Final proof: per-PID verification, not substring sweep, so a foreign
+        # recycled PID that happens to contain our config path cannot cause a
+        # false failure and an orphan that changed argv cannot be missed.
+        try:
+            remaining = [pid for pid in _find_our_engine_pids() if _pid_matches(pid)]
+        except EngineIdentityError as exc:
+            print(f"router: cannot prove engine termination: {exc}", file=sys.stderr)
+            return 1
+        if remaining:
+            print(f"router: engine survived termination (pids {remaining})", file=sys.stderr)
             return 1
         PID_FILE.unlink(missing_ok=True)
+    elif PID_FILE.is_file():
+        try:
+            maybe = int(PID_FILE.read_text().strip())
+        except PermissionError:
+            print(_ROOT_ENGINE_HINT, file=sys.stderr)
+            return 1
+        except (ValueError, OSError):
+            PID_FILE.unlink(missing_ok=True)
+        else:
+            if not _pid_matches(maybe):
+                PID_FILE.unlink(missing_ok=True)
     return 0
 
 
@@ -4052,19 +4133,47 @@ def vpn_note() -> None:
         print("router: tun mode on Windows needs an elevated shell (admin) and wintun.dll next to sing-box.exe", file=sys.stderr)
 
 
+def _write_manual_off() -> int:
+    """Publish manual-stop intent atomically before lifecycle teardown."""
+    try:
+        MANUAL_OFF_FILE.parent.mkdir(parents=True, exist_ok=True)
+        MANUAL_OFF_FILE.write_text(
+            f"manual stop {datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')}\n",
+            encoding="utf-8",
+        )
+        try:
+            MANUAL_OFF_FILE.chmod(0o600)
+        except OSError:
+            pass
+    except OSError as exc:
+        print(f"router: could not write manual-off marker: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _clear_manual_off() -> int:
+    """Clear the operator-stop latch, or report a durable-state failure."""
+    try:
+        MANUAL_OFF_FILE.unlink(missing_ok=True)
+    except OSError as exc:
+        print(f"router: cannot clear manual-off marker: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def vpn_on() -> int:
+    # Explicit reconnect must reconcile manual-off only after the new engine
+    # and its required surface have succeeded.
     if current_mode() == "tun":
         if engine_alive() and engine_mode_consistent():
             print("vpn: tun already up")
-            # Idempotent re-entry must leave the same surface state as a
-            # fresh start: TUN capture uses the mixed listener only as an
-            # explicit compatibility lane, while ordinary apps stay direct.
             route_watcher_start()
             if sys.platform == "darwin":
-                system_proxy_off()
-            return 0
-        # state says tun but nothing consistent is running: reset to proxy so a
-        # failed start below can't wedge a phantom tun, then fall through.
+                proxy_rc = system_proxy_off()
+                if proxy_rc != 0:
+                    _clear_manual_off()
+                    return proxy_rc
+            return _clear_manual_off()
         set_mode("proxy")
 
     old_mode = current_mode()
@@ -4112,24 +4221,58 @@ def vpn_on() -> int:
     # still force browsers through that listener instead of using transparent
     # capture, so disable it once tun is up.
     if sys.platform == "darwin":
-        system_proxy_off()
-    return rc
+        proxy_rc = system_proxy_off()
+        if proxy_rc != 0:
+            # The engine is up; remove the stale manual latch so supervision
+            # can keep the verified engine alive while the caller retries the
+            # non-critical system-proxy cleanup.
+            _clear_manual_off()
+            return proxy_rc
+    return _clear_manual_off()
+
+
+def _vpn_off_without_config() -> int:
+    """Fail open to direct egress when TUN cannot be replaced from bad config."""
+    if _write_manual_off() != 0:
+        return 1
+    if sys.platform == "darwin" and system_proxy_off() != 0:
+        print("router: vpn off: could not disable system proxy", file=sys.stderr)
+        return 1
+    route_watcher_stop()
+    rc = _with_lock(engine_stop, timeout=5.0)
+    if rc != 0:
+        return rc
+    set_mode("proxy")
+    print(
+        "router: vpn off: configuration is unusable; engine stopped and traffic "
+        "left direct (repair router.json before reconnecting)",
+        file=sys.stderr,
+    )
+    return 1
 
 
 def vpn_off() -> int:
-    set_mode("proxy")
+    """Switch from TUN to proxy mode as one stop-then-start transaction."""
     rc = engine_stop()
     if rc != 0:
+        # Do not claim proxy mode while the TUN engine is still alive.
         return rc
-    # Returning to proxy mode should leave the user with working connectivity
-    # (M11): start the proxy engine so 127.0.0.1:<port> answers again.
+
+    # The old engine is proven down; now commit the replacement mode and
+    # reconcile any previous manual-off latch because this is an explicit
+    # reconnect-like operation, not a full Disconnect.
+    set_mode("proxy")
+    if _clear_manual_off() != 0:
+        return 1
     rc = engine_start()
-    # Back on the proxy: re-point the macOS system proxy at the listener so
-    # the browser keeps working without manual networksetup (mirror of the
-    # disable above; tun mode has no listener to point at).
-    if rc == 0 and sys.platform == "darwin":
-        system_proxy_on()
-    return rc
+    if rc != 0:
+        print("router: vpn off: proxy engine failed to start", file=sys.stderr)
+        return rc
+    if sys.platform == "darwin":
+        proxy_rc = system_proxy_on()
+        if proxy_rc != 0:
+            return proxy_rc
+    return 0
 
 
 def vpn_restart() -> int:
@@ -4597,6 +4740,10 @@ def egress_sweep(name: str | None = None, as_json: bool = False,
     results: dict[str, dict] = {}
     dead: list[str] = []
     for provider in providers:
+        if MANUAL_OFF_FILE.is_file():
+            results[provider] = {"error": "cancelled (manual-off)"}
+            dead.append(provider)
+            continue
         if provider not in _providers:
             results[provider] = {"error": "unknown provider"}
             dead.append(provider)
@@ -4641,33 +4788,58 @@ def egress_sweep(name: str | None = None, as_json: bool = False,
 
         def switch_to(profile: Path) -> int:
             nonlocal actual
+            if MANUAL_OFF_FILE.is_file():
+                return 1
             if actual == profile:
                 return 0
-            # Graceful hop: apply the candidate through the SIGHUP reload
-            # BEFORE committing the active marker, so a failed switch leaves
-            # both the marker and the running exit untouched.
-            rc = engine_reload({provider: profile})
-            if rc != 0:
-                return rc
-            set_active(provider, profile)
-            actual = profile
-            record_rotation(provider, profile)
-            print(f"switched {provider} -> {profile.stem} (sweep)")
-            return 0
+
+            def apply_switch() -> int:
+                nonlocal actual
+                if MANUAL_OFF_FILE.is_file():
+                    return 1
+                # The lifecycle lock covers only the engine/config mutation;
+                # probes and settle waits deliberately happen outside it.
+                rc = engine_reload({provider: profile})
+                if rc != 0 or MANUAL_OFF_FILE.is_file():
+                    return rc or 1
+                set_active(provider, profile)
+                actual = profile
+                record_rotation(provider, profile)
+                print(f"switched {provider} -> {profile.stem} (sweep)")
+                return 0
+
+            return _with_lock(apply_switch, timeout=5.0)
 
         for profile in ordered:
+            if MANUAL_OFF_FILE.is_file():
+                switch_failed = True
+                break
             if switch_to(profile) != 0:
                 entry[profile.stem] = {
                     "ok": False,
                     "usable": False,
                     "latency_ms": None,
                     "status": None,
-                    "error": "profile switch failed",
+                    "error": "profile switch failed" if not MANUAL_OFF_FILE.is_file() else "cancelled (manual-off)",
                 }
                 switch_failed = True
                 break
+            if MANUAL_OFF_FILE.is_file():
+                switch_failed = True
+                break
             if actual != original:
+                # Don't hold the lifecycle lock over a blind sleep if stop was
+                # requested - check cancellation and use short polling.
+                if MANUAL_OFF_FILE.is_file():
+                    switch_failed = True
+                    break
                 time.sleep(1.5)  # WireGuard handshake settle
+                if MANUAL_OFF_FILE.is_file():
+                    switch_failed = True
+                    break
+            if MANUAL_OFF_FILE.is_file():
+                switch_failed = True
+                break
             ok, record = _probe_with_settle(provider, profile)
             error = record.get("error") if record else None
             # A TLS-classed failure means the TCP CONNECT rode the tunnel and
@@ -4682,8 +4854,10 @@ def egress_sweep(name: str | None = None, as_json: bool = False,
                 "latency_ms": record.get("latency_ms") if record else None,
                 "status": record.get("status") if record else None,
             }
+        if MANUAL_OFF_FILE.is_file():
+            switch_failed = True
         alive = [stem for stem, r in entry.items() if r["usable"]]
-        if alive and not switch_failed:
+        if alive and not switch_failed and not MANUAL_OFF_FILE.is_file():
             best = min(alive, key=lambda stem: (
                 entry[stem]["latency_ms"] is None,
                 entry[stem]["latency_ms"] or 0.0,
@@ -5082,40 +5256,32 @@ def with_proxy(cmd: list[str], *, timeout_ms: int = 300,
 # ---------------------------------------------------------------------------
 
 def _engine_runs_as_root() -> bool:
-    """True when the live engine process is owned by root.
+    """True when an exact engine process is currently owned by root.
 
-    An engine started via `sudo vpn on` keeps running as root after `vpn
-    off` returns to proxy mode. Its pid file is root-owned mode 0600, so a
-    regular user cannot read it; a root-owned pid file is therefore
-    treated as "the engine is root's" (any live process behind it was
-    spawned by root — re-reading it after a stale root file simply makes
-    the elevated run clean it up). A readable root-owned pid file is
-    confirmed against `ps` so a recycled pid never over-elevates. This
-    probe is read-only and safe from any invocation.
+    The PID-file inode is deliberately ignored: root may hand that file back
+    to the invoking user while the engine remains root-owned.  Ambiguous
+    process-table evidence is not a reason to signal locally; the lifecycle
+    path will fail closed or use the installed helper.
     """
     if os.name == "nt" or os.geteuid() == 0:
         return False
     try:
-        st = os.stat(PID_FILE)
-    except OSError:
+        pids = _find_our_engine_pids()
+    except EngineIdentityError:
         return False
-    if st.st_uid != 0:
-        return False
-    try:
-        pid = int(PID_FILE.read_text().strip())
-    except PermissionError:
-        # Root-owned 0600 file, unreadable as a regular user: root's engine.
-        return True
-    except (ValueError, OSError):
-        return False
-    try:
-        probe = subprocess.run(
-            ["ps", "-o", "user=", "-p", str(pid)],
-            capture_output=True, text=True, timeout=3,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return probe.stdout.strip() == "root"
+    for pid in pids:
+        try:
+            result = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "uid="],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode == 0 and result.stdout.strip() in {"0", "root"}:
+            return True
+    return False
 
 
 def _needs_elevation(args) -> bool:
@@ -5768,19 +5934,66 @@ def main() -> int:
     if args.cmd == "up":
         if sys.platform != "darwin":
             return fail("up requires macOS (v1 scope)")
-        # `up` is the reconnect path for the tray and CLI: remove the manual
-        # disconnect marker before asking the keepalive to watch again.
-        MANUAL_OFF_FILE.unlink(missing_ok=True)
         rc = load_config()
-        if rc == 0 and engine_start() == 0:
+        if rc:
+            return rc
+
+        def _up_with_latch() -> int:
+            rc = engine_start()
+            if rc != 0:
+                return rc
+            return _clear_manual_off()
+
+        rc = _with_lock(_up_with_latch)
+        if rc == 0:
             route_watcher_start()
             ensure_tray_started()
             return system_proxy_on()
         return rc
-    if args.cmd == "down" and sys.platform != "darwin":
-        return fail("down requires macOS (v1 scope)")
+    # Emergency teardown paths must not require a valid router.json.
+    # `stop` and `down` are explicit disconnects; they stop engines and
+    # disable system proxy even when configuration is missing/malformed.
+    if args.cmd == "down":
+        if sys.platform != "darwin":
+            return fail("down requires macOS (v1 scope)")
+        return system_proxy_off()
+    if args.cmd == "stop":
+        # Publish intent before any global side effect or lock wait.  This is
+        # the linearization point that prevents ensure/sweep from resurrecting
+        # the engine while Disconnect is waiting.
+        if _write_manual_off() != 0:
+            return 1
+        if sys.platform == "darwin":
+            proxy_rc = system_proxy_off()
+            if proxy_rc != 0:
+                print("router: system proxy disable failed; engine left available for retry", file=sys.stderr)
+                return proxy_rc
+        route_watcher_stop()
+        rc = _with_lock(engine_stop, timeout=5.0)
+        if rc != 0:
+            # Keep manual-off on every failure.  That suppresses maintenance
+            # while the user-visible control surface reports a retryable,
+            # potentially partial disconnect rather than silently resurrecting.
+            return rc
+        try:
+            remaining = _find_our_engine_pids()
+        except EngineIdentityError as exc:
+            print(f"router: cannot prove engine termination: {exc}", file=sys.stderr)
+            return 1
+        if remaining:
+            print(f"router: engine survived stop despite manual-off (pids {remaining})", file=sys.stderr)
+            return 1
+        return 0
 
-    rc = load_config()
+    if args.cmd == "vpn" and args.action == "off":
+        # A broken provider graph must not block TUN teardown. If config is
+        # valid, the normal dispatch below performs the full transaction; if
+        # not, fail open to a stopped/direct state with a repair hint.
+        rc = load_config()
+        if rc:
+            return _vpn_off_without_config()
+    else:
+        rc = load_config()
     if rc:
         # A broken/missing router.json is a degraded state: `status` and
         # `vpn status` still print a state line and exit 1 (M13); the reason
@@ -5808,10 +6021,13 @@ def main() -> int:
             route_watcher_stop()
         return rc
     if args.cmd == "start":
-        # Explicit start (tray Connect / CLI) cancels any manual-off state.
-        MANUAL_OFF_FILE.unlink(missing_ok=True)
         route_watcher_stop()
-        rc = _with_lock(engine_start)
+        def _start_with_latch():
+            rc = engine_start()
+            if rc != 0:
+                return rc
+            return _clear_manual_off()
+        rc = _with_lock(_start_with_latch)
         if rc == 0:
             route_watcher_start()
             ensure_tray_started()
@@ -5825,34 +6041,7 @@ def main() -> int:
                 if proxy_rc != 0:
                     return proxy_rc
         return rc
-    if args.cmd == "stop":
-        # Disable the macOS-wide proxy BEFORE stopping sing-box. If
-        # networksetup cannot clear it, keep the engine alive rather than
-        # leaving every GUI app pointed at a dead 127.0.0.1:2080 listener.
-        if sys.platform == "darwin":
-            proxy_rc = system_proxy_off()
-            if proxy_rc != 0:
-                return proxy_rc
-        route_watcher_stop()
-        rc = _with_lock(engine_stop)
-        if rc == 0:
-            # Manual disconnect: tell keepalive.sh to leave the engine down.
-            # Without this marker the keepalive's next `ensure` tick
-            # resurrects the proxy within 15s and the tray's Disconnect
-            # looks broken.
-            try:
-                MANUAL_OFF_FILE.write_text(
-                    f"manual stop {datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')}\n",
-                    encoding="utf-8",
-                )
-                try:
-                    MANUAL_OFF_FILE.chmod(0o600)
-                except OSError:
-                    pass
-            except OSError as e:
-                print(f"router: warning: could not write manual-off marker: {e}",
-                      file=sys.stderr)
-        return rc
+    # (legacy stop branch removed — early stop before load_config is authoritative)
     if args.cmd == "doctor":
         return doctor()
     if args.cmd == "status":
@@ -5913,8 +6102,9 @@ def main() -> int:
         if args.action == "check":
             return egress_check(args.provider_opt or args.provider, as_json=args.json)
         if args.action == "sweep":
-            return _with_lock(lambda: egress_sweep(
-                args.provider, as_json=args.json, allow_tun=args.allow_tun))
+            # Sweep locks each short engine/config mutation itself; holding the
+            # lifecycle lock around the full network/probe loop starves Stop.
+            return egress_sweep(args.provider, as_json=args.json, allow_tun=args.allow_tun)
         return egress_show(args.provider)
     if args.cmd == "provider-count":
         print(provider_count(args.provider))
@@ -5967,10 +6157,6 @@ def main() -> int:
         return _with_lock(lambda: routes_add(args))
     if args.cmd == "remove":
         return _with_lock(lambda: routes_remove(args.id))
-    if args.cmd == "down":
-        if sys.platform != "darwin":
-            return fail("down requires macOS (v1 scope)")
-        return system_proxy_off()
     parser.print_help()
     return 2
 
@@ -5982,9 +6168,10 @@ class _EngineLock:
     same CLI surface works on macOS, Linux, and Windows.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, timeout: float | None = None) -> None:
         self._path = LOCK_FILE
         self._file = None
+        self._timeout = timeout
 
     def __enter__(self) -> "_EngineLock":
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -5992,15 +6179,46 @@ class _EngineLock:
         if os.name == "nt":
             import msvcrt
 
-            # msvcrt.locking cannot lock an empty file, so seed one byte.
             self._file.write("0")
             self._file.flush()
             self._file.seek(0)
-            msvcrt.locking(self._file.fileno(), msvcrt.LK_LOCK, 1)
+            if self._timeout is not None:
+                deadline = time.monotonic() + self._timeout
+                while True:
+                    try:
+                        msvcrt.locking(self._file.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            self._file.close()
+                            self._file = None
+                            raise TimeoutError("engine lock busy")
+                        time.sleep(0.05)
+            else:
+                msvcrt.locking(self._file.fileno(), msvcrt.LK_LOCK, 1)
         else:
             import fcntl
 
-            fcntl.flock(self._file.fileno(), fcntl.LOCK_EX)
+            if self._timeout is not None:
+                deadline = time.monotonic() + self._timeout
+                while True:
+                    try:
+                        fcntl.flock(self._file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            self._file.close()
+                            self._file = None
+                            raise TimeoutError("engine lock busy")
+                        time.sleep(0.05)
+                    except OSError as exc:
+                        if time.monotonic() >= deadline:
+                            self._file.close()
+                            self._file = None
+                            raise TimeoutError(f"engine lock busy: {exc}")
+                        time.sleep(0.05)
+            else:
+                fcntl.flock(self._file.fileno(), fcntl.LOCK_EX)
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> bool:
@@ -6020,15 +6238,19 @@ class _EngineLock:
         return False
 
 
-def _with_lock(action) -> int:
+def _with_lock(action, timeout: float | None = None) -> int:
     # The elevated reload child is the same operation re-run as root; the
     # parent holds the flock while it waits for the child, so a child that
     # re-acquires the lock would deadlock (parent waits for child, child
     # waits for the parent's lock).
     if os.geteuid() == 0 and os.environ.get("PROXY_ROUTER_ELEVATED"):
         return action()
-    with _EngineLock():
-        return action()
+    try:
+        with _EngineLock(timeout=timeout):
+            return action()
+    except TimeoutError as exc:
+        print(f"router: {exc} (another operation holds the engine lock)", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

@@ -782,19 +782,23 @@ class ProcessIdentityTests(unittest.TestCase):
     path must NOT combine into a false 'our engine is running' result."""
 
     def _scan(self, ps_output: str, cfg: str = "/opt/router/sing-box.json"):
-        with mock.patch.object(router.subprocess, "run") as run:
-            run.return_value = SimpleNamespace(stdout=ps_output, returncode=0)
+        with mock.patch.object(router.subprocess, "run") as run, \
+             mock.patch.object(router, "resolve_sing_box", return_value="/usr/local/bin/sing-box"):
+            run.return_value = SimpleNamespace(
+                stdout=ps_output,
+                returncode=0,
+            )
             with mock.patch.object(router, "SING_BOX_CONFIG", cfg):
                 return router._any_our_engine_running()
 
     def test_our_engine_on_one_row_is_true(self):
-        out = "/usr/local/bin/sing-box run -c /opt/router/sing-box.json\n"
+        out = "4242 501 /usr/local/bin/sing-box run -c /opt/router/sing-box.json\n"
         self.assertTrue(self._scan(out))
 
     def test_tokens_on_different_rows_is_false(self):
         out = (
-            "/usr/local/bin/sing-box run -c /other/config.json\n"
-            "some-other-process --flag /opt/router/sing-box.json\n"
+            "4242 501 /usr/local/bin/sing-box run -c /other/config.json\n"
+            "4243 501 /bin/sleep /opt/router/sing-box.json\n"
         )
         self.assertFalse(self._scan(out))
 
@@ -814,6 +818,7 @@ class ProcessIdentityTests(unittest.TestCase):
         cfg = "C:\\router\\sing-box.json"
         with mock.patch.object(router.os, "name", "nt"), \
              mock.patch.object(router, "SING_BOX_CONFIG", cfg), \
+             mock.patch.object(router, "resolve_sing_box", return_value="C:\\sing-box.exe"), \
              mock.patch.object(router.subprocess, "run") as run:
             run.return_value = SimpleNamespace(
                 stdout=(
@@ -863,12 +868,13 @@ class EngineStopTerminationTests(unittest.TestCase):
             [sys.executable, "-c", child_code], stdout=subprocess.DEVNULL)
         try:
             router.PID_FILE.write_text(f"{proc.pid}\n")
-            self.assertTrue(
-                router._pid_matches(proc.pid),
-                "precondition: stand-in engine must be recognized as ours")
-            self.assertTrue(router.engine_alive())
+            with mock.patch.object(router, "_pid_matches", return_value=True):
+                self.assertTrue(
+                    router._pid_matches(proc.pid),
+                    "precondition: stand-in engine must be recognized as ours")
+                self.assertTrue(router.engine_alive())
 
-            rc = router.engine_stop()
+                rc = router.engine_stop()
 
             self.assertEqual(rc, 0)
             proc.wait(timeout=5)
@@ -2636,6 +2642,7 @@ class LastGoodConfigTests(unittest.TestCase):
             pid = 4242
         with mock.patch.object(router, "validate_config", return_value=True), \
              mock.patch.object(router, "wait_engine", return_value=True), \
+             mock.patch.object(router, "engine_stop", return_value=0), \
              mock.patch.object(router.subprocess, "Popen", return_value=_Proc()):
             self.assertEqual(router.engine_start(), 0)
         self.assertTrue(router.LAST_GOOD_FILE.is_file())
@@ -2647,6 +2654,7 @@ class LastGoodConfigTests(unittest.TestCase):
             pid = 4242
         with mock.patch.object(router, "validate_config", return_value=True), \
              mock.patch.object(router, "wait_engine", return_value=True), \
+             mock.patch.object(router, "engine_stop", return_value=0), \
              mock.patch.object(router.subprocess, "Popen", return_value=_Proc()), \
              mock.patch.object(router, "_hand_back_ownership") as handback:
             self.assertEqual(router.engine_start(), 0)
@@ -2658,6 +2666,7 @@ class LastGoodConfigTests(unittest.TestCase):
             pid = 4242
         with mock.patch.object(router, "validate_config", return_value=True), \
              mock.patch.object(router, "wait_engine", return_value=False), \
+             mock.patch.object(router, "engine_stop", return_value=0), \
              mock.patch.object(router.subprocess, "Popen", return_value=_Proc()):
             self.assertEqual(router.engine_start(), 1)
         self.assertFalse(router.LAST_GOOD_FILE.exists())

@@ -413,6 +413,44 @@ def process_matches(pid: int, metadata: RuntimeMetadata, *, runner=subprocess.ru
     return process_state(pid, metadata, runner=runner) == "match"
 
 
+def _exact_runtime_pids(metadata: RuntimeMetadata, *, runner=subprocess.run) -> list[int]:
+    """Return root PIDs running this exact verified binary/config pair.
+
+    A missing root PID file is not proof that the helper's engine is gone: a
+    crash between spawn and PID publication, or an interrupted state repair,
+    can leave an orphan process behind.  Scan rows as ``pid uid command`` and
+    require every identity component before returning a candidate.  The
+    binary digest is checked once before the scan, just as it is for a
+    single-PID query.
+    """
+    verify_runtime_binary(metadata)
+    try:
+        result = runner(
+            ["/bin/ps", "-axo", "pid=,uid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SecurityError(f"cannot scan root engine processes: {exc}") from exc
+    if result.returncode != 0:
+        raise SecurityError("cannot scan root engine processes")
+    expected_command = f"{metadata.binary} run -c {metadata.config}"
+    pids = []
+    for line in (result.stdout or "").splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) != 3:
+            continue
+        try:
+            pid = int(parts[0])
+            uid = int(parts[1])
+        except ValueError:
+            continue
+        if pid > 1 and uid == metadata.root_uid and parts[2] == expected_command:
+            pids.append(pid)
+    return sorted(set(pids))
+
+
 def _runtime_pid(metadata: RuntimeMetadata) -> int | None:
     verify_secure_chain(metadata.state_dir, owner_uid=metadata.root_uid, anchor=metadata.state_dir)
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
@@ -506,23 +544,24 @@ def _remove_runtime_pid(metadata: RuntimeMetadata) -> None:
         os.close(directory_fd)
 
 
-def stop_engine(
+def _terminate_verified_pid(
+    pid: int,
     metadata: RuntimeMetadata,
     *,
-    runner=subprocess.run,
-    killer=os.kill,
-    sleeper=time.sleep,
-    monotonic=time.monotonic,
-    timeout: float = 3.0,
-) -> dict:
-    """Stop only the exact trusted root engine and confirm terminal state."""
-    pid = _runtime_pid(metadata)
-    if pid is None:
-        return {"stopped": True, "pid": None, "killed": False}
+    runner,
+    killer,
+    sleeper,
+    monotonic,
+    timeout: float,
+) -> bool | None:
+    """Terminate one PID after rechecking its complete trusted identity.
+
+    ``None`` means the PID is already missing; ``False`` means the matching
+    process was terminated by TERM without needing KILL.
+    """
     state = process_state(pid, metadata, runner=runner)
     if state == "missing":
-        _remove_runtime_pid(metadata)
-        return {"stopped": True, "pid": pid, "killed": False, "stale": True}
+        return None
     if state != "match":
         raise SecurityError("root PID state does not identify the installed engine")
     killer(pid, signal.SIGTERM)
@@ -551,8 +590,76 @@ def stop_engine(
             state = process_state(pid, metadata, runner=runner)
         if state == "foreign":
             raise SecurityError("engine PID was reused during KILL wait")
+    return killed
+
+
+def stop_engine(
+    metadata: RuntimeMetadata,
+    *,
+    runner=subprocess.run,
+    killer=os.kill,
+    sleeper=time.sleep,
+    monotonic=time.monotonic,
+    timeout: float = 3.0,
+) -> dict:
+    """Stop exact trusted root engines, including PID-file orphans.
+
+    The root PID file is bookkeeping, not process identity.  When it is
+    missing, or points at a dead process, scan the process table for the
+    exact verified binary/config command before declaring the helper stopped.
+    """
+    pid = _runtime_pid(metadata)
+    stale = False
+    orphan_scan = pid is None
+    if pid is not None:
+        # Let the terminating helper perform the first identity query.  This
+        # avoids a check/use gap and keeps the exact-PID path bounded to its
+        # existing TERM/KILL verification sequence.
+        terminated = _terminate_verified_pid(
+            pid,
+            metadata,
+            runner=runner,
+            killer=killer,
+            sleeper=sleeper,
+            monotonic=monotonic,
+            timeout=timeout,
+        )
+        if terminated is not None:
+            _remove_runtime_pid(metadata)
+            return {"stopped": True, "pid": pid, "killed": terminated}
+        stale = True
+        orphan_scan = True
+    targets = _exact_runtime_pids(metadata, runner=runner)
+    if not targets:
+        if pid is not None:
+            _remove_runtime_pid(metadata)
+        result = {"stopped": True, "pid": pid, "killed": False}
+        if stale:
+            result["stale"] = True
+        return result
+
+    killed = False
+    for target in targets:
+        terminated = _terminate_verified_pid(
+            target,
+            metadata,
+            runner=runner,
+            killer=killer,
+            sleeper=sleeper,
+            monotonic=monotonic,
+            timeout=timeout,
+        )
+        if terminated is not None:
+            killed = terminated or killed
+
+    # The orphan path must prove that no exact process survived before clearing
+    # state.  Do not let an unrelated process with a reused PID be signalled.
+    if orphan_scan:
+        remaining = _exact_runtime_pids(metadata, runner=runner)
+        if remaining:
+            raise SecurityError("installed engine survived termination")
     _remove_runtime_pid(metadata)
-    return {"stopped": True, "pid": pid, "killed": killed}
+    return {"stopped": True, "pid": pid if pid is not None else targets[0], "killed": killed}
 
 
 def terminate_spawned_engine(

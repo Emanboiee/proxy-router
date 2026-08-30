@@ -27,6 +27,7 @@ def load_router(tmp_path):
     module.LOG_FILE = tmp_path / "sing-box.log"
     module.LOCK_FILE = tmp_path / "state" / "engine.lock"
     module.MODE_FILE = tmp_path / "state" / "mode"
+    module.MANUAL_OFF_FILE = tmp_path / "state" / "manual-off"
     return module
 
 
@@ -1491,6 +1492,41 @@ def test_vpn_restart_stops_then_brings_tun_up(tmp_path, monkeypatch):
     assert calls == ["stop"]
 
 
+def test_stop_bypasses_invalid_config_and_publishes_manual_off_before_lock(tmp_path, monkeypatch):
+    router = load_router(tmp_path)
+    monkeypatch.setattr(router.sys, "argv", ["router.py", "stop"])
+    monkeypatch.setattr(router.sys, "platform", "linux")
+    monkeypatch.setattr(router, "load_config", lambda: (_ for _ in ()).throw(
+        AssertionError("stop must not load semantic configuration")))
+    monkeypatch.setattr(router, "route_watcher_stop", lambda: None)
+    monkeypatch.setattr(router, "engine_stop", lambda: 0)
+    observed = []
+
+    def locked(action, timeout=None):
+        observed.append(router.MANUAL_OFF_FILE.is_file())
+        return action()
+
+    monkeypatch.setattr(router, "_with_lock", locked)
+
+    assert router.main() == 0
+    assert observed == [True]
+    assert router.MANUAL_OFF_FILE.read_text(encoding="utf-8").startswith("manual stop ")
+
+
+def test_down_bypasses_invalid_config_and_only_disables_system_proxy(tmp_path, monkeypatch):
+    router = load_router(tmp_path)
+    monkeypatch.setattr(router.sys, "argv", ["router.py", "down"])
+    monkeypatch.setattr(router.sys, "platform", "darwin")
+    monkeypatch.setattr(router, "load_config", lambda: (_ for _ in ()).throw(
+        AssertionError("down must not load semantic configuration")))
+    calls = []
+    monkeypatch.setattr(router, "system_proxy_off", lambda: calls.append("proxy-off") or 0)
+    monkeypatch.setattr(router, "engine_stop", lambda: calls.append("engine-stop") or 0)
+
+    assert router.main() == 0
+    assert calls == ["proxy-off"]
+
+
 class _UnreadablePidFile:
     """Pid file a regular user cannot read (root-owned, mode 0600 after a
     `sudo vpn on` batch)."""
@@ -1554,22 +1590,63 @@ def test_engine_alive_unreadable_pid_uses_ps_scan_fallback(tmp_path, monkeypatch
 
 
 def test_any_our_engine_running_scans_posix_process_table(tmp_path, monkeypatch):
-    """_any_our_engine_running matches a live sing-box by our generated
-    config path in its command line, so a foreign/unrelated process can
-    never claim liveness."""
+    """Only an exact resolved binary/argv row counts as our engine."""
     router = load_router(tmp_path)
+    monkeypatch.setattr(router, "resolve_sing_box", lambda: "sing-box")
 
     class _RunResult:
+        returncode = 0
+
         def __init__(self, stdout):
             self.stdout = stdout
 
-    router.os = type("_Os", (), {"name": "posix"})()
-    dead_cmd = "some other process -c /etc/sing-box/config.json"
-    live_cmd = f"sing-box run -c {router.SING_BOX_CONFIG}"
-    monkeypatch.setattr(router.subprocess, "run", lambda *a, **k: _RunResult(live_cmd))
+    live_row = f"4242 501 sing-box run -c {router.SING_BOX_CONFIG}"
+    dead_row = "4243 501 /usr/bin/other run -c " + str(router.SING_BOX_CONFIG)
+    monkeypatch.setattr(
+        router.subprocess,
+        "run",
+        lambda *a, **k: _RunResult(live_row + "\n" + dead_row + "\n"),
+    )
     assert router._any_our_engine_running() is True
-    monkeypatch.setattr(router.subprocess, "run", lambda *a, **k: _RunResult(dead_cmd))
+
+    monkeypatch.setattr(
+        router.subprocess,
+        "run",
+        lambda *a, **k: _RunResult(dead_row + "\n"),
+    )
     assert router._any_our_engine_running() is False
+
+
+def test_find_our_engine_pids_rejects_foreign_substring_rows(tmp_path, monkeypatch):
+    router = load_router(tmp_path)
+    monkeypatch.setattr(router, "resolve_sing_box", lambda: "/trusted/sing-box")
+
+    class _RunResult:
+        returncode = 0
+        stdout = (
+            f"100 501 /trusted/sing-box run -c {router.SING_BOX_CONFIG}\n"
+            f"101 501 /trusted/sing-box run -c {router.SING_BOX_CONFIG}.evil\n"
+            f"102 501 /usr/bin/other run -c {router.SING_BOX_CONFIG}\n"
+        )
+
+    monkeypatch.setattr(router.subprocess, "run", lambda *a, **k: _RunResult())
+    assert router._find_our_engine_pids() == [100]
+
+
+def test_engine_stop_scans_exact_config_orphan_when_pid_file_is_missing(tmp_path, monkeypatch):
+    router = load_router(tmp_path)
+    router._helper_status = lambda: None
+    find = mock.Mock(side_effect=[[4242], []])
+    monkeypatch.setattr(router, "_find_our_engine_pids", find)
+    monkeypatch.setattr(router, "_pid_matches", mock.Mock(side_effect=[True, False, False]))
+    killer = mock.Mock()
+    monkeypatch.setattr(router.os, "kill", killer)
+
+    assert not router.PID_FILE.exists()
+    assert router.engine_stop() == 0
+    killer.assert_called_once_with(4242, router.signal.SIGTERM)
+    assert find.call_count == 2
+
 
 
 def test_engine_reload_permission_error_on_sighup_only(tmp_path, monkeypatch):
