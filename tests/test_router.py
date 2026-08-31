@@ -167,6 +167,16 @@ class ConfigBuildTests(unittest.TestCase):
         self.assertIn({"outbound": "proton", "domain_suffix": ["example.com"]}, rules)
         self.assertNotIn({"outbound": "cloudflare", "domain_suffix": ["roblox.com"]}, rules)
 
+    def test_build_retains_persisted_profile_when_every_profile_is_cooled(self):
+        profile = self.root / "providers" / "cloudflare" / "warp.conf"
+        _write_conf(profile)
+        router.set_active("cloudflare", profile)
+        router.mark_cooldown("cloudflare", profile, 600)
+        config, active = router.build_singbox_config()
+        self.assertEqual(active["cloudflare"], profile.resolve())
+        self.assertIn("cloudflare", [endpoint["tag"] for endpoint in config["endpoints"]])
+        self.assertIn({"outbound": "cloudflare", "domain_suffix": ["roblox.com"]}, config["route"]["rules"])
+
 
 class RoutesTests(unittest.TestCase):
     def setUp(self):
@@ -1939,7 +1949,9 @@ class EgressLiveCheckTests(unittest.TestCase):
         self.assertEqual(status, "degraded")
         self.assertFalse(router.is_cooled_down("proton", self.profile))
 
-    def test_alive_probe_does_not_cooldown(self):
+    def test_alive_probe_clears_prior_cooldown(self):
+        router.mark_cooldown("proton", self.profile, 600)
+        self.assertTrue(router.is_cooled_down("proton", self.profile))
         with mock.patch.object(router, "probe_egress", return_value=self._probe(
                 ok=True, status=200)):
             status, _ = router.check_egress_live("proton", self.profile)
