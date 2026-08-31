@@ -10,7 +10,8 @@ cooldowns, and keepalive semantics stay exactly where they are.
 Design rules:
 - Reads: `router.py status --json` polled in a background thread (2.5s).
 - Actions: `ensure` / `stop` / `routing set --mode` / `rotate` via the CLI.
-- macOS: runs as an accessory (menu-bar only, no Dock icon).
+- macOS: runs as an accessory (menu-bar only, no Dock icon); left-click opens
+  a custom dark Cocoa dashboard and right-click opens the existing action menu.
 - Windows: pystray falls back to the taskbar notification area automatically.
 
 Usage:
@@ -1593,7 +1594,11 @@ class TrayApp:
 
     def _show_native_dashboard(self):
         """Open or focus the custom macOS dashboard without engine changes."""
-        self.dashboard.show(self._snapshot())
+        shown = self.dashboard.show(self._snapshot())
+        if not shown:
+            self._dashboard_update_action(
+                "dashboard unavailable; use Open Dashboard from the menu")
+        return shown
 
     def action_setup(self):
         """Open the existing setup wizard without duplicating its logic."""
@@ -2088,6 +2093,22 @@ def selftest(root: str) -> int:
     if st.error:
         print(f"status parse FAIL: {st.error}")
         return 1
+    model = DashboardViewModel.from_status(st)
+    if not model.title or not model.primary_action:
+        print("dashboard model FAIL: incomplete status projection")
+        return 1
+    click_probe = []
+    _route_macos_click(
+        "left", lambda: click_probe.append("dashboard"),
+        lambda: click_probe.append("menu"))
+    _route_macos_click(
+        "right", lambda: click_probe.append("dashboard"),
+        lambda: click_probe.append("menu"))
+    if click_probe != ["dashboard", "menu"]:
+        print(f"dashboard click routing FAIL: {click_probe}")
+        return 1
+    print(f"dashboard: model={model.title!r} cocoa={_COCOA_AVAILABLE} "
+          "left=window right=menu")
     # verify every menu action's CLI entry exists (--help exits 0)
     for label, args in [
         ("ensure", ["ensure", "--help"]),
