@@ -21,6 +21,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import router
 
 
+@pytest.fixture(autouse=True)
+def _restore_egress_settings():
+    """Snapshot/restore the module-global effective egress settings.
+
+    Several test classes assign ``router._egress_settings`` directly (and
+    some call ``_load_egress_settings``) without restoring it; under random
+    orderings that leaks bounded thresholds or zero settle windows into
+    unrelated classes (observed: EgressLiveCheckTests rank flips on merged
+    main). Restoring around every test keeps each one hermetic.
+    """
+    original = router._egress_settings
+    yield
+    router._egress_settings = original
+
+
 def _relocate(module, root: Path) -> None:
     """Point every module-level runtime path at ``root`` for test isolation."""
     module.ROOT = Path(root).resolve()
