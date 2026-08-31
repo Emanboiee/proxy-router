@@ -3358,6 +3358,9 @@ def engine_reload(active_overrides: dict[str, Path] | None = None) -> int:
             print("router: engine failed to start with new config; restoring last-good", file=sys.stderr)
             return restore_last_good()
         return 0
+        # Fresh start succeeded with the new config; snapshot it as last-good
+        # so future restores target this config (parity with SIGHUP success).
+        write_last_good()
     try:
         pid = int(PID_FILE.read_text().strip())
     except (ValueError, OSError):
@@ -3366,12 +3369,18 @@ def engine_reload(active_overrides: dict[str, Path] | None = None) -> int:
             print("router: engine failed to start with new config; restoring last-good", file=sys.stderr)
             return restore_last_good()
         return 0
+        # Fresh start succeeded with the new config; snapshot it as last-good
+        # so future restores target this config (parity with SIGHUP success).
+        write_last_good()
     if not _pid_matches(pid):
         PID_FILE.unlink(missing_ok=True)
         if engine_start(recover=False) != 0:
             print("router: engine failed to start with new config; restoring last-good", file=sys.stderr)
             return restore_last_good()
         return 0
+        # Fresh start succeeded with the new config; snapshot it as last-good
+        # so future restores target this config (parity with SIGHUP success).
+        write_last_good()
     if os.name == "nt":
         # Windows has no SIGHUP; stop+start applies the fresh config.
         if engine_stop() != 0:
@@ -3380,6 +3389,9 @@ def engine_reload(active_overrides: dict[str, Path] | None = None) -> int:
             print("router: engine failed to start with new config; restoring last-good", file=sys.stderr)
             return restore_last_good()
         return 0
+        # Fresh start succeeded with the new config; snapshot it as last-good
+        # so future restores target this config (parity with SIGHUP success).
+        write_last_good()
     reload_log_from = log_offset()
     try:
         os.kill(pid, signal.SIGHUP)  # SIGHUP: sing-box hot-reloads the config in place
@@ -3399,6 +3411,9 @@ def engine_reload(active_overrides: dict[str, Path] | None = None) -> int:
             print("router: engine failed to start with new config; restoring last-good", file=sys.stderr)
             return restore_last_good()
         return 0
+        # Fresh start succeeded with the new config; snapshot it as last-good
+        # so future restores target this config (parity with SIGHUP success).
+        write_last_good()
     # In tun mode a fresh WireGuard handshake routinely needs >2s before an
     # end-to-end egress probe can succeed; a 2s budget almost always failed
     # here and degraded every tun-mode reload into a full stop/start
@@ -3415,6 +3430,10 @@ def engine_reload(active_overrides: dict[str, Path] | None = None) -> int:
     if engine_start(recover=False) != 0:
         print("router: engine failed to start with new config; restoring last-good", file=sys.stderr)
         return restore_last_good()
+    # The restart path applies the new config just like a clean SIGHUP
+    # would; snapshot it so the next failure restores THIS config, not an
+    # older one (parity with the SIGHUP success path).
+    write_last_good()
     return 0
 
 
@@ -4986,6 +5005,12 @@ PRIVILEGED_HELPER = Path(
 )
 PRIVILEGED_STATE_BASE = Path("/private/var/db/proxy-router")
 PRIVILEGED_ENV = "/usr/bin/env"
+# The helper deliberately runs under the SYSTEM python via `env -i` (minimal
+# environment): sudoers grants an exact interpreter path, and pointing it at a
+# user-managed interpreter (e.g. /opt/anaconda3/bin/python3) would couple root
+# elevation to that install. Launchd plists that invoke router.py directly must
+# still keep their interpreter FIRST in PATH to match the legacy grant — do not
+# "unify" these two interpreter identities; they are separate contracts.
 PRIVILEGED_PYTHON = "/usr/bin/python3"
 PRIVILEGED_OPERATIONS = frozenset({"status", "start", "stop", "reload", "uninstall"})
 

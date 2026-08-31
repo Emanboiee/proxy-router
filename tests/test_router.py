@@ -3555,3 +3555,77 @@ class DnsServerDedupeTests(unittest.TestCase):
             (router.ROOT, router.CONFIG_FILE, router._providers,
              router._routes, router._vpn, router._routing,
              router._port) = old
+
+
+class FallbackRotationContractTests(unittest.TestCase):
+    """Pin the fallback-vs-rotate safety contract (post-merge audit watch-item).
+
+    Contract: rotate() on a provider whose runtime fallback is ACTIVE must stay
+    blocked with a clear message; `failover <provider> off` clears the marker;
+    only then does rotate proceed. This prevents keepalive storms from rotating
+    a primary out from under an active fallback.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(router, self.root)
+        for name in ("proton", "warp"):
+            (self.root / "providers" / name).mkdir(parents=True)
+            for prof in ("a", "b"):
+                _write_conf(self.root / "providers" / name / f"{prof}.conf")
+        router._providers = {
+            "proton": {"directory": "providers/proton", "cooldown_seconds": 60,
+                       "fallback_providers": ["warp"]},
+            "warp": {"directory": "providers/warp", "cooldown_seconds": 60},
+        }
+        router._routes = [{"id": "example-com", "domains": ["example.com"], "provider": "proton"}]
+        router._port = 2080
+        router._vpn = {"address": ["172.19.0.1/30"], "mtu": 1500, "stack": "system"}
+        router._rotation = dict(router.DEFAULT_ROTATION_SETTINGS)
+        self._probe = mock.patch.object(router, "probe_profile", return_value=(True, {"ok": True}))
+        self._probe.start()
+        self._listener = mock.patch.object(router, "listener_up", return_value=True)
+        self._listener.start()
+        # Hard-switch internals must never touch a real engine in unit tests.
+        self._switch = mock.patch.object(router, "engine_switch", return_value=0)
+        self._switch.start()
+        self._reload = mock.patch.object(router, "engine_reload", return_value=0)
+        self._reload.start()
+
+    def tearDown(self):
+        self._probe.stop()
+        self._listener.stop()
+        self._switch.stop()
+        self._reload.stop()
+        self._tmp.cleanup()
+
+    def _activate_warp_fallback(self):
+        state = self.root / "state" / "fallback" / "proton.json"
+        state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text(json.dumps({"provider": "warp"}), encoding="utf-8")
+
+    def test_rotate_blocked_while_fallback_active(self):
+        router.set_active("proton", self.root / "providers" / "proton" / "a.conf")
+        self._activate_warp_fallback()
+        self.assertEqual(router.active_fallback("proton"), "warp")
+        rc = router.rotate("proton")
+        self.assertNotEqual(rc, 0)
+
+    def test_failover_off_clears_marker_then_rotate_succeeds(self):
+        router.set_active("proton", self.root / "providers" / "proton" / "a.conf")
+        router.set_active("warp", self.root / "providers" / "warp" / "a.conf")
+        self._activate_warp_fallback()
+        self.assertEqual(router.deactivate_fallback("proton"), 0)
+        self.assertIsNone(router.active_fallback("proton"))
+        with mock.patch.object(router, "engine_reload", return_value=0), \
+                mock.patch.object(router, "engine_switch", return_value=0):
+            self.assertEqual(router.rotate("proton"), 0)
+
+    def test_rotate_unblocked_when_no_fallback_configured_or_active(self):
+        router.set_active("proton", self.root / "providers" / "proton" / "a.conf")
+        # No marker written at all.
+        self.assertIsNone(router.active_fallback("proton"))
+        with mock.patch.object(router, "engine_reload", return_value=0), \
+                mock.patch.object(router, "engine_switch", return_value=0):
+            self.assertEqual(router.rotate("proton"), 0)
