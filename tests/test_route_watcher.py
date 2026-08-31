@@ -567,3 +567,31 @@ class ProviderForHostTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.assertIsNone(w.provider_for_host(Path(tmp.name), "x.com"))
+
+    def test_provider_for_host_follows_active_fallback(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / "state" / "fallback").mkdir(parents=True)
+        (root / "router.json").write_text(json.dumps({
+            "providers": {
+                "proton": {"fallback_providers": ["cloudflare"]},
+                "cloudflare": {},
+            },
+            "routes": [{"id": "discord", "domains": ["discord.com"], "provider": "proton"}],
+        }))
+        (root / "state" / "fallback" / "proton.json").write_text(
+            json.dumps({"provider": "cloudflare"})
+        )
+        assert w.provider_for_host(root, "discord.com") == "cloudflare"
+
+    def test_provider_for_host_rejects_path_like_provider_names(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / "router.json").write_text(json.dumps({
+            "providers": {"../../outside": {}},
+            "routes": [{"id": "bad", "domains": ["discord.com"],
+                        "provider": "../../outside"}],
+        }))
+        assert w.provider_for_host(root, "discord.com") is None

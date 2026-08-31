@@ -99,6 +99,7 @@ PROVIDER_RE = re.compile(
     r"(?:endpoint|using outbound)/wireguard\[(?P<provider>[A-Za-z0-9_.-]{1,64})\]",
     re.IGNORECASE,
 )
+PROVIDER_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 
 
 def _provider_from_line(line: str) -> str | None:
@@ -381,8 +382,47 @@ def confirm_context_cancellation(root: Path, event: dict) -> bool:
     return bool(result.get("transport_failure"))
 
 
+def _effective_provider(root: Path, provider: str, providers: dict) -> str:
+    """Follow active fallback markers for watcher attribution.
+
+    A connection log without an outbound tag identifies only the destination,
+    so the configured primary would otherwise be returned even while its
+    traffic is served by a fallback. Follow only configured, active markers and
+    stop on malformed state or cycles; attribution must never guess.
+    """
+    current = provider
+    seen: set[str] = set()
+    while current not in seen:
+        if not PROVIDER_NAME_RE.fullmatch(current):
+            return current
+        seen.add(current)
+        entry = providers.get(current)
+        if not isinstance(entry, dict):
+            return current
+        raw = entry.get("fallback_providers")
+        if raw is None:
+            raw = entry.get("fallback_provider")
+        targets = raw if isinstance(raw, list) else [raw]
+        targets = [target for target in targets
+                   if isinstance(target, str) and PROVIDER_NAME_RE.fullmatch(target)
+                   and target != current and target in providers]
+        if not targets:
+            return current
+        try:
+            marker = json.loads(
+                (Path(root) / "state" / "fallback" / f"{current}.json").read_text()
+            )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return current
+        active = marker.get("provider") if isinstance(marker, dict) else None
+        if active not in targets:
+            return current
+        current = active
+    return current
+
+
 def provider_for_host(root: Path, host: str) -> str | None:
-    """Map a failing host to the first active route provider.
+    """Map a failing host to the effective active route provider.
 
     The lookup mirrors sing-box's route order and ``vpn-list`` scope. Log lines
     that name an outbound provider take precedence in the worker because they
@@ -393,6 +433,9 @@ def provider_for_host(root: Path, host: str) -> str | None:
         config = json.loads((Path(root) / "router.json").read_text())
     except (OSError, ValueError, TypeError):
         return None
+    providers = config.get("providers") or {}
+    if not isinstance(providers, dict):
+        providers = {}
     normalized = normalize_host(str(host))
     routing = config.get("routing") or {}
     mode = routing.get("mode") if isinstance(routing, dict) else None
@@ -409,7 +452,9 @@ def provider_for_host(root: Path, host: str) -> str | None:
         ):
             continue
         provider = route.get("provider")
-        return str(provider) if provider else None
+        if not isinstance(provider, str) or not PROVIDER_NAME_RE.fullmatch(provider):
+            return None
+        return _effective_provider(Path(root), provider, providers)
     return None
 
 

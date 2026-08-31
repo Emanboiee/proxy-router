@@ -38,6 +38,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
+from typing import Any
 
 import domain_autodetect
 
@@ -4383,9 +4384,20 @@ def apply_network_preset(*, reload_engine: bool = True, root: Path | None = None
 
 def cmd_network_check() -> int:
     """Auto-switch the routing preset for the current network (SSID)."""
-    if load_config() != 0:
-        return 1
-    result = apply_network_preset()
+    def apply() -> dict | int:
+        # Read the config under the same lock as the preset write/reload. This
+        # prevents a concurrent route or fallback edit from leaving the
+        # in-memory provider table out of sync with the file being applied.
+        if load_config() != 0:
+            return 1
+        return apply_network_preset()
+
+    # Network-aware preset application rewrites router.json and may reload the
+    # engine. It is also invoked by the route watcher, so it must share the
+    # lifecycle lock with stop/reload/rotate rather than racing them.
+    result = _with_lock(apply)
+    if not isinstance(result, dict):
+        return int(result) if isinstance(result, int) else 1
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if result.get("reload_rc", 0) == 0 else 1
 
@@ -7871,7 +7883,7 @@ class _EngineLock:
         return False
 
 
-def _with_lock(action, timeout: float | None = None) -> int:
+def _with_lock(action, timeout: float | None = None) -> Any:
     # The elevated reload child is the same operation re-run as root; the
     # parent holds the flock while it waits for the child, so a child that
     # re-acquires the lock would deadlock (parent waits for child, child
