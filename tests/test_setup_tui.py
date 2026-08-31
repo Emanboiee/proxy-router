@@ -212,6 +212,15 @@ class CustomPresetTests(unittest.TestCase):
         data = json.loads(self.config.read_text())
         self.assertEqual(data["routing"]["mode"], "vpn-list")
         self.assertIn("discord.com", data["routing"]["vpn_domains"])
+        for domain in (
+            "wayground.com",
+            "quizizz.com",
+            "joinmyquiz.com",
+            "quizizz.app.link",
+            "challenges.cloudflare.com",
+            "pro.ip-api.com",
+        ):
+            self.assertIn(domain, data["routing"]["vpn_domains"])
         school = next(r for r in data["routes"] if r["id"] == "school")
         self.assertEqual(school["provider"], "cloudflare")
         self.assertIn("cloudflare", data["providers"])
