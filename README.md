@@ -733,12 +733,22 @@ so it keeps working without the tunnel — useful when the Proton egress is
 rate-limited and you just want opencode to work. Rotation on failure resumes
 automatically once the proxy is back up.
 
-The Hermes `opencode_server_rotation` plugin expects a rotation manager at
-`tools/opencode-zen-vpn/proxy-manager.sh` (its `rotate` subcommand). That
-directory was retired; ship `examples/proxy-manager.sh` to that exact path to
-bridge the plugin onto this router's `rotate` command (which provider is
-rotated is `OPENCODE_PROVIDER`, defaulting to `proton`). No plugin or Hermes
-config changes are needed.
+The Hermes `opencode-server-rotation` plugin looks for
+`$OPENCODE_ZEN_VPN_ROOT/proxy-manager.sh` (its `rotate` subcommand). Set
+`OPENCODE_ZEN_VPN_ROOT` to one canonical per-user directory for both Hermes
+and this install, for example `~/.local/share/opencode-zen-vpn`, then place
+`examples/proxy-manager.sh` there with `router.py setup --bridge-install`.
+Do not rely on the plugin's retired historical default path; the bridge check
+must report the same root that the plugin process receives.
+
+Contract: `OPENCODE_PROVIDER`, when set, is the explicit provider to rotate.
+When absent, `proxy-manager.sh` infers the egress from the router's live
+config/status (`router.py status --json`): the `opencode.ai` route's provider
+(or its active fallback — mirroring `router.py response-event`), or the sole
+configured provider on single-provider routers. Ambiguity (no route and
+multiple providers) fails closed with exit 2 instead of guessing. Set
+`OPENCODE_PROVIDER` to force a specific provider; otherwise ensure
+`PROXY_ROUTER_ROOT`/`PROXY_ROUTER_BIN` lets the bridge locate `router.py`.
 
 ## Troubleshooting
 
