@@ -93,44 +93,74 @@ def domain_matches(host: str, domain: str) -> bool:
     return host == domain or host.endswith("." + domain)
 
 
+PROVIDER_RE = re.compile(
+    r"(?:endpoint|using outbound)/wireguard\[(?P<provider>[A-Za-z0-9_.-]{1,64})\]",
+    re.IGNORECASE,
+)
+
+
+def _provider_from_line(line: str) -> str | None:
+    match = PROVIDER_RE.search(line)
+    return match.group("provider") if match else None
+
+
 def parse_line(line: str) -> dict | None:
-    """Parse a sing-box connection line without retaining ANSI decoration."""
+    """Parse a sing-box connection line, including a safe provider tag."""
     clean = ANSI_RE.sub("", line).strip()
+    provider = _provider_from_line(clean)
     target = TARGET_RE.search(clean)
     if target:
-        return {
+        event = {
             "kind": "target",
             "host": normalize_host(target.group("host")),
             "port": int(target.group("port") or 443),
             "failure": bool("open connection to" in clean.lower() and FAILURE_RE.search(clean)),
             "line": clean[-400:],
         }
+        if provider:
+            event["provider"] = provider
+        return event
     client = CLIENT_RE.search(clean)
     if client:
-        return {"kind": "client", "source": client.group("host"), "line": clean[-300:]}
+        event = {"kind": "client", "source": client.group("host"), "line": clean[-300:]}
+        if provider:
+            event["provider"] = provider
+        return event
     return None
 
 
 def critical_domains(root: Path) -> tuple[str, ...]:
-    """Read all configured routed domains for transparent-mode observation.
+    """Read configured *tunneled* domains for transparent-mode observation.
 
-    The watcher started as an OpenCode-only guard, but route-based TUN mode
-    exists specifically so the router can observe and selectively divert any
-    configured target without requiring an app-level proxy setting. Keep the
-    fallback for a fresh/partial config so OpenCode remains observable by
-    default.
+    In ``vpn-list`` mode route declarations can be broader than the active
+    allow-list. Observing those direct domains could trigger an unrelated
+    provider rotation, so only domains covered by ``vpn_domains`` are watched.
     """
     domains: list[str] = []
+    mode: str | None = None
     try:
         config = json.loads((Path(root) / "router.json").read_text())
+        routing = config.get("routing") or {}
+        mode = routing.get("mode") if isinstance(routing, dict) else None
+        vpn_domains = routing.get("vpn_domains") or [] if isinstance(routing, dict) else []
+        vpn_domains = [normalize_host(str(domain)) for domain in vpn_domains if str(domain).strip()]
+
+        def allowed(domain: str) -> bool:
+            if mode != "vpn-list":
+                return True
+            return any(domain_matches(domain, vpn) or domain_matches(vpn, domain)
+                       for vpn in vpn_domains)
+
         for route in config.get("routes", []):
             for domain in route.get("domains", []):
                 domain = normalize_host(str(domain))
-                if domain:
+                if domain and allowed(domain):
                     domains.append(domain)
     except (OSError, ValueError, TypeError):
         pass
-    return tuple(dict.fromkeys(domains or ["opencode.ai"]))
+    if domains:
+        return tuple(dict.fromkeys(domains))
+    return () if mode == "vpn-list" else ("opencode.ai",)
 
 
 def _owned_pid(root: Path) -> int | None:
@@ -305,23 +335,34 @@ def probe_target(root: Path, host: str, *, runner: Callable = subprocess.run) ->
 
 
 def provider_for_host(root: Path, host: str) -> str | None:
-    """Map a failing host to the route provider that serves it.
+    """Map a failing host to the first active route provider.
 
-    Reads router.json's routes (first matching route wins, mirroring
-    sing-box rule evaluation) so rotation targets the exit actually carrying
-    the failing domain instead of a hardcoded default. Returns None when no
-    configured route matches (caller keeps its previous behavior).
+    The lookup mirrors sing-box's route order and ``vpn-list`` scope. Log lines
+    that name an outbound provider take precedence in the worker because they
+    prove what actually carried the connection; this is the fallback path for
+    inbound/probe lines without an outbound tag.
     """
     try:
         config = json.loads((Path(root) / "router.json").read_text())
     except (OSError, ValueError, TypeError):
         return None
     normalized = normalize_host(str(host))
+    routing = config.get("routing") or {}
+    mode = routing.get("mode") if isinstance(routing, dict) else None
+    vpn_domains = [normalize_host(str(domain)) for domain in
+                   (routing.get("vpn_domains") or [] if isinstance(routing, dict) else [])
+                   if str(domain).strip()]
     for route in config.get("routes", []):
-        for domain in route.get("domains", []):
-            if domain_matches(normalized, normalize_host(str(domain))):
-                provider = route.get("provider")
-                return str(provider) if provider else None
+        domains = [normalize_host(str(domain)) for domain in (route.get("domains") or [])]
+        if not any(domain_matches(normalized, domain) for domain in domains):
+            continue
+        if mode == "vpn-list" and not any(
+            domain_matches(normalized, vpn) or domain_matches(vpn, normalized)
+            for vpn in vpn_domains
+        ):
+            continue
+        provider = route.get("provider")
+        return str(provider) if provider else None
     return None
 
 
@@ -401,6 +442,7 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
     clients: list[dict] = []
     clients_at = 0.0
     guard = RotationGuard()
+    last_provider: dict[str, str] = {}
     last_network_check = -NETWORK_CHECK_EVERY_SECONDS
     engine_down_ticks = 0
     try:
@@ -437,8 +479,11 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
                     append_event(root, event)
                     if is_critical:
                         last_target[host] = now
+                        provider = event.get("provider") or provider_for_host(root, host)
+                        if provider:
+                            last_provider[host] = provider
                         if event.get("failure") and guard.record_transport_failure(now, host):
-                            target = provider_for_host(root, host) or "proton"
+                            target = last_provider.get(host) or "proton"
                             result = rotate_provider(root, target)
                             append_event(root, {"kind": "rotation", "observed_at": time.time(), **result})
                 elif event["kind"] == "client":
@@ -459,7 +504,7 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
                 result = probe_target(root, host)
                 append_event(root, {"kind": "probe", "observed_at": time.time(), **result})
                 if result.get("transport_failure") and guard.record_transport_failure(now, host):
-                    target = provider_for_host(root, host) or "proton"
+                    target = last_provider.get(host) or provider_for_host(root, host) or "proton"
                     rotation = rotate_provider(root, target)
                     append_event(root, {"kind": "rotation", "observed_at": time.time(), **rotation})
             sleep(max(0.5, float(interval)))
