@@ -566,8 +566,6 @@ class KeepaliveManualOffTests(unittest.TestCase):
     the agent without a reload."""
 
     def test_manual_off_suppresses_all_maintenance_and_resumes_after_clear(self):
-        # Seed the marker BEFORE the harness spawns the loop, so the very
-        # first tick sees it and never calls router.py at all.
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
@@ -575,13 +573,19 @@ class KeepaliveManualOffTests(unittest.TestCase):
         (root / "state" / "manual-off").write_text("manual stop\n")
         h = KeepaliveHarness(interval="1", root=root)
         try:
-            time.sleep(1.5)
+            # Deterministic wait: loop ticks every 1s; quiescence should suppress
+            # all router calls within 2.5s.  Poll with short sleeps instead of a
+            # single blind sleep so the test is not flaky on slow CI.
+            deadline = time.time() + 2.5
+            while time.time() < deadline:
+                if h.lines():
+                    break
+                time.sleep(0.1)
             lines = h.lines()
             self.assertEqual(lines, [],
                              f"manual-off must suppress ALL router calls: {lines}")
-            # Removing the marker resumes maintenance on the next tick.
             h.root.joinpath("state", "manual-off").unlink()
-            h.wait_lines(2)
+            h.wait_lines(2, timeout=5.0)
             self.assertNotEqual(h.lines(), [],
                                 "maintenance must resume after marker clears")
         finally:
