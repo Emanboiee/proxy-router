@@ -1,6 +1,7 @@
 """Unit tests for proxy_tray.py (stdlib only, no GUI deps — the
 module's pystray/PIL imports are guarded)."""
 import importlib.util
+import signal
 import subprocess
 import sys
 import tempfile
@@ -38,31 +39,34 @@ class RouterClientEngineOwnerTests(unittest.TestCase):
     def test_missing_pid_file_is_not_root(self):
         self.assertFalse(self.client._engine_runs_as_root())
 
-    def test_user_owned_pid_file_is_not_root(self):
+    def test_pid_file_alone_does_not_prove_root(self):
         self.pid.write_text("4242")
-        with mock.patch("os.stat") as st:
-            st.return_value.st_uid = 501
+        with mock.patch.object(tray.subprocess, "run", return_value=SimpleNamespace(
+                returncode=1, stdout="")):
             self.assertFalse(self.client._engine_runs_as_root())
 
-    def test_unreadable_root_pid_file_counts_as_root(self):
+    def test_unreadable_pid_file_without_live_root_process_is_not_root(self):
         self.pid.write_text("4242")
         with mock.patch.object(tray.sys, "platform", "darwin"), \
              mock.patch("os.geteuid", return_value=501), \
-             mock.patch("os.stat") as st:
-            st.return_value.st_uid = 0
-            with mock.patch("builtins.open", side_effect=PermissionError):
-                self.assertTrue(self.client._engine_runs_as_root())
+             mock.patch.object(tray.Path, "read_text", side_effect=PermissionError), \
+             mock.patch.object(tray.subprocess, "run", return_value=SimpleNamespace(
+                 returncode=0, stdout="")):
+            self.assertFalse(self.client._engine_runs_as_root())
 
-    def test_readable_root_pid_confirmed_by_ps(self):
+    def test_readable_root_pid_confirmed_by_live_exact_process(self):
         self.pid.write_text("4242")
+        config = str(Path(self.tmp.name) / "sing-box.json")
         with mock.patch.object(tray.sys, "platform", "darwin"), \
              mock.patch("os.geteuid", return_value=501), \
-             mock.patch("os.stat") as st:
-            st.return_value.st_uid = 0
-            with mock.patch.object(tray.subprocess, "run") as run:
-                run.return_value.stdout = "root\n"
-                self.assertTrue(self.client._engine_runs_as_root())
-        self.assertEqual(run.call_args.args[0], ["ps", "-o", "user=", "-p", "4242"])
+             mock.patch.dict(tray.os.environ, {"SING_BOX": "/trusted/sing-box"}), \
+             mock.patch.object(tray.subprocess, "run") as run:
+            run.return_value = SimpleNamespace(
+                returncode=0,
+                stdout=f"0 /trusted/sing-box run -c {config}\n",
+            )
+            self.assertTrue(self.client._engine_runs_as_root())
+        self.assertEqual(run.call_args.args[0], ["ps", "-p", "4242", "-o", "uid=,command="])
 
     def test_never_root_outside_macos(self):
         self.pid.write_text("4242")
@@ -73,99 +77,35 @@ class RouterClientEngineOwnerTests(unittest.TestCase):
                 self.assertFalse(self.client._engine_runs_as_root())
 
 
-class RouterClientStartStopElevationTests(unittest.TestCase):
+class RouterClientLifecycleDelegationTests(unittest.TestCase):
+    """Lifecycle ownership belongs to router.py, not duplicated tray probes."""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.client = tray.RouterClient(self.tmp.name)
+        self.client._active_provider = "proton"
         self.addCleanup(self.tmp.cleanup)
 
-    def test_stop_elevates_when_engine_root_owned(self):
-        with mock.patch.object(self.client, "_engine_runs_as_root", return_value=True), \
-             mock.patch.object(self.client, "_run_elevated", return_value=(0, "elev")) as elev, \
-             mock.patch.object(self.client, "_run", return_value=(0, "plain")) as plain:
-            rc, out = self.client.stop()
-        self.assertEqual((rc, out), (0, "elev"))
-        elev.assert_called_once_with("stop")
-        plain.assert_not_called()
-
-    def test_start_elevates_when_engine_root_owned(self):
-        with mock.patch.object(self.client, "_engine_runs_as_root", return_value=True), \
-             mock.patch.object(self.client, "_run_elevated", return_value=(0, "elev")) as elev, \
-             mock.patch.object(self.client, "_run", return_value=(0, "plain")) as plain:
-            rc, out = self.client.start()
-        self.assertEqual((rc, out), (0, "elev"))
-        elev.assert_called_once_with("start")
-        plain.assert_not_called()
-
-    def test_stop_stays_user_level_when_engine_user_owned(self):
-        with mock.patch.object(self.client, "_engine_runs_as_root", return_value=False), \
-             mock.patch.object(self.client, "_run_elevated", return_value=(0, "elev")) as elev, \
-             mock.patch.object(self.client, "_run", return_value=(0, "plain")) as plain:
-            rc, out = self.client.stop()
-        self.assertEqual((rc, out), (0, "plain"))
-        plain.assert_called_once_with("stop")
-        elev.assert_not_called()
-
-    def test_start_stays_user_level_when_engine_user_owned(self):
-        with mock.patch.object(self.client, "_engine_runs_as_root", return_value=False), \
-             mock.patch.object(self.client, "_run_elevated", return_value=(0, "elev")) as elev, \
-             mock.patch.object(self.client, "_run", return_value=(0, "plain")) as plain:
-            rc, out = self.client.start()
-        self.assertEqual((rc, out), (0, "plain"))
-        plain.assert_called_once_with("start")
-        elev.assert_not_called()
-
-    def test_rotate_elevates_when_engine_root_owned(self):
-        # Issue #54: switching servers from the tray failed against a
-        # root-owned engine because rotate stayed user-level.
-        self.client._active_provider = "proton"
-        with mock.patch.object(self.client, "_engine_runs_as_root", return_value=True), \
-             mock.patch.object(self.client, "_run_elevated", return_value=(0, "elev")) as elev, \
-             mock.patch.object(self.client, "_run", return_value=(0, "plain")) as plain:
-            rc, out = self.client.rotate()
-        self.assertEqual((rc, out), (0, "elev"))
-        elev.assert_called_once_with("rotate", "proton")
-        plain.assert_not_called()
-
-    def test_rotate_to_elevates_when_engine_root_owned(self):
-        self.client._active_provider = "proton"
-        with mock.patch.object(self.client, "_engine_runs_as_root", return_value=True), \
-             mock.patch.object(self.client, "_run_elevated", return_value=(0, "elev")) as elev, \
-             mock.patch.object(self.client, "_run", return_value=(0, "plain")) as plain:
-            rc, out = self.client.rotate_to("proton", "06-SG-FREE-4")
-        self.assertEqual((rc, out), (0, "elev"))
-        elev.assert_called_once_with("rotate", "proton", "--to", "06-SG-FREE-4")
-        plain.assert_not_called()
-
-    def test_rotate_to_force_elevates_with_force_flag(self):
-        with mock.patch.object(self.client, "_engine_runs_as_root", return_value=True), \
-             mock.patch.object(self.client, "_run_elevated", return_value=(0, "elev")) as elev, \
-             mock.patch.object(self.client, "_run", return_value=(0, "plain")) as plain:
-            rc, out = self.client.rotate_to("proton", "06-SG-FREE-4", force=True)
-        self.assertEqual((rc, out), (0, "elev"))
-        elev.assert_called_once_with("rotate", "proton", "--to", "06-SG-FREE-4", "--force")
-        plain.assert_not_called()
-
-    def test_rotate_stays_user_level_when_engine_user_owned(self):
-        self.client._active_provider = "proton"
-        with mock.patch.object(self.client, "_engine_runs_as_root", return_value=False), \
-             mock.patch.object(self.client, "_run_elevated", return_value=(0, "elev")) as elev, \
-             mock.patch.object(self.client, "_run", return_value=(0, "plain")) as plain:
-            rc, out = self.client.rotate()
-        self.assertEqual((rc, out), (0, "plain"))
-        plain.assert_called_once_with("rotate", "proton")
-        elev.assert_not_called()
-
-    def test_rotate_without_active_provider_stays_user_level(self):
-        # _active_provider is None (no status seen yet): do not invent an
-        # elevated call with a None provider argument.
-        with mock.patch.object(self.client, "_engine_runs_as_root", return_value=True), \
-             mock.patch.object(self.client, "_run_elevated", return_value=(0, "elev")) as elev, \
-             mock.patch.object(self.client, "_run", return_value=(0, "plain")) as plain:
-            rc, out = self.client.rotate()
-        self.assertEqual((rc, out), (0, "plain"))
-        plain.assert_called_once()
-        elev.assert_not_called()
+    def test_lifecycle_commands_delegate_once_without_local_owner_probe(self):
+        with mock.patch.object(self.client, "_engine_runs_as_root",
+                               side_effect=AssertionError("tray must not decide owner")), \
+             mock.patch.object(self.client, "_run", return_value=(0, "ok")) as run:
+            self.assertEqual(self.client.start(), (0, "ok"))
+            self.assertEqual(self.client.stop(), (0, "ok"))
+            self.assertEqual(self.client.rotate(), (0, "ok"))
+            self.assertEqual(
+                self.client.rotate_to("proton", "06-SG-FREE-4", force=True),
+                (0, "ok"),
+            )
+        self.assertEqual(
+            [call.args for call in run.call_args_list],
+            [
+                ("start",),
+                ("stop",),
+                ("rotate", "proton"),
+                ("rotate", "proton", "--to", "06-SG-FREE-4", "--force"),
+            ],
+        )
 
 
 class HumanizeTests(unittest.TestCase):
@@ -513,10 +453,12 @@ class QuitActionTests(unittest.TestCase):
         self.assertEqual(calls, ["engine", "tray"])
         self.assertTrue(app.quit_flag.is_set())
 
-    def test_quit_stops_tray_even_when_engine_stop_fails(self):
+    def test_quit_keeps_tray_resident_when_engine_stop_fails(self):
         tray_stopped = threading.Event()
 
         class FakeClient:
+            root = "/tmp"
+
             def stop(self):
                 return 1, "engine not running"
 
@@ -527,7 +469,88 @@ class QuitActionTests(unittest.TestCase):
         app = self._make_app(FakeClient(), 2)
         app.tray = FakeTray()
         app.action_quit()
-        self.assertTrue(tray_stopped.wait(2))
+        deadline = time.time() + 2
+        while app._quit_pending and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(tray_stopped.is_set(), "failed Stop must not close the tray")
+        self.assertFalse(app.quit_flag.is_set(), "failed Quit must reconcile quit state")
+        self.assertIn("failed", app.last_action_result or "")
+
+    def test_failed_quit_allows_a_later_disconnect_retry(self):
+        calls = []
+        results = iter([(1, "engine busy"), (0, "stopped")])
+        tray_stopped = threading.Event()
+
+        class FakeClient:
+            root = "/tmp"
+
+            def stop(self):
+                calls.append("stop")
+                return next(results)
+
+            def status(self):
+                return tray.RouterStatus(up=True)
+
+        class FakeTray:
+            def stop(self):
+                tray_stopped.set()
+
+        app = self._make_app(FakeClient(), 2)
+        app.tray = FakeTray()
+        app.action_quit()
+        deadline = time.time() + 2
+        while app._quit_pending and time.time() < deadline:
+            time.sleep(0.01)
+        app.action_disconnect()
+        deadline = time.time() + 2
+        while len(calls) < 2 and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(calls, ["stop", "stop"])
+        self.assertFalse(tray_stopped.is_set(), "Disconnect must not close the tray")
+
+    def test_quit_drain_timeout_does_not_stop_active_mutation(self):
+        mutation_started = threading.Event()
+        release_mutation = threading.Event()
+        stop_calls = []
+        tray_stopped = threading.Event()
+
+        class FakeClient:
+            root = "/tmp"
+
+            def mutate(self):
+                mutation_started.set()
+                release_mutation.wait(2)
+                return 0, "mutation complete"
+
+            def status(self):
+                return tray.RouterStatus(up=True)
+
+            def stop(self):
+                stop_calls.append("stop")
+                return 0, "stopped"
+
+        class FakeTray:
+            def stop(self):
+                tray_stopped.set()
+
+        app = self._make_app(FakeClient(), 0.05)
+        app.tray = FakeTray()
+        app._do(app.client.mutate, "mutate")
+        self.assertTrue(mutation_started.wait(2))
+        app.action_quit()
+
+        deadline = time.time() + 2
+        while app._quit_pending and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(app._quit_pending)
+        self.assertEqual(stop_calls, [], "Quit must not stop under an active mutation")
+        self.assertFalse(tray_stopped.is_set(), "timed-out Quit must keep the tray resident")
+
+        release_mutation.set()
+        deadline = time.time() + 2
+        while not app._mutation_idle() and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(app._mutation_idle())
 
     def test_quit_drains_in_flight_mutation_before_engine_stop(self):
         # Issue #60: quit used to race the per-click daemon threads. The
@@ -654,10 +677,6 @@ class QuitActionTests(unittest.TestCase):
         self.assertIn("mutate", calls)
         self.assertLess(calls.index("mutate"),
                         calls.index("engine-stop"))
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class PermissionErrorMappingTests(unittest.TestCase):
@@ -934,3 +953,7 @@ class PresetApplyReloadTests(unittest.TestCase):
             bound("school-warp")
         run.assert_called_once_with("setup", "--preset", "school-warp")
         self.assertEqual(captured["rc"], (1, "boom"))
+
+
+if __name__ == "__main__":
+    unittest.main()

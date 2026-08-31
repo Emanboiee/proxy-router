@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import stat
+import signal
 import subprocess
 import sys
 import tempfile
@@ -856,8 +857,6 @@ class RoutingTuiTests(unittest.TestCase):
             self.assertEqual(data["routing"]["direct_domains"], ["youtube.com"])
             self.assertIn("NOT reloaded", text)
 
-if __name__ == "__main__":
-    unittest.main()
 
 class RouterCommandTimeoutTests(unittest.TestCase):
     def test_hung_command_returns_within_budget(self):
@@ -874,13 +873,71 @@ class RouterCommandTimeoutTests(unittest.TestCase):
     def test_timeout_returns_nonzero_with_message(self):
         root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, root, ignore_errors=True)
-        with mock.patch.object(setup_tui.subprocess, "run",
-                               side_effect=subprocess.TimeoutExpired(cmd=["x"], timeout=1)):
-            err = io.StringIO()
-            with mock.patch("sys.stderr", err):
-                rc = setup_tui._router_command(root, "rotate", "proton", timeout=180.0)
+
+        class TimedProcess:
+            pid = 4242
+            args = ["router.py", "rotate", "proton"]
+            returncode = 1
+
+            def communicate(self, input=None, timeout=None):
+                raise subprocess.TimeoutExpired(self.args, timeout)
+
+            def kill(self):
+                pass
+
+        process = TimedProcess()
+        err = io.StringIO()
+        with mock.patch.object(setup_tui.subprocess, "Popen", return_value=process), \
+             mock.patch.object(setup_tui.os, "killpg"), \
+             mock.patch("sys.stderr", err):
+            rc = setup_tui._router_command(root, "rotate", "proton", timeout=180.0)
         self.assertEqual(rc, 1)
         self.assertIn("timed out after 180s", err.getvalue())
+
+    def test_timeout_cancels_the_router_process_group(self):
+        class TimedProcess:
+            pid = 4242
+            args = ["router.py", "rotate", "proton"]
+            returncode = -15
+
+            def __init__(self):
+                self.calls = []
+
+            def communicate(self, input=None, timeout=None):
+                self.calls.append((input, timeout))
+                if len(self.calls) == 1:
+                    raise subprocess.TimeoutExpired(self.args, timeout)
+                return "partial output", ""
+
+            def kill(self):
+                self.calls.append(("kill", None))
+
+        process = TimedProcess()
+        with mock.patch.object(setup_tui.subprocess, "Popen", return_value=process) as popen, \
+             mock.patch.object(setup_tui.os, "killpg") as killpg, \
+             mock.patch("sys.stderr", io.StringIO()):
+            rc = setup_tui._router_command(Path(tempfile.mkdtemp()), "rotate", "proton", timeout=1.0)
+        self.assertEqual(rc, 1)
+        self.assertTrue(popen.call_args.kwargs.get("start_new_session"))
+        killpg.assert_called_once_with(process.pid, signal.SIGTERM)
+
+
+class TuiLifecycleContractTests(unittest.TestCase):
+    """Explicit TUI lifecycle actions delegate ownership to router.py."""
+
+    def test_engine_start_uses_backend_start_without_spawning_tray(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with mock.patch.object(setup_tui, "_router_command", return_value=0) as command, \
+                 mock.patch.object(setup_tui, "_launch_tray", create=True) as launch:
+                text, rc = setup_tui._execute_action(("engine_start",), root)
+        self.assertEqual(rc, 0, text)
+        command.assert_called_once_with(root, "start")
+        launch.assert_not_called()
+        self.assertIn("canonical", text)
+
+    def test_tui_has_no_unmanaged_tray_launcher(self):
+        self.assertFalse(hasattr(setup_tui, "_launch_tray"))
 
 
 class AtomicImportSecurityTests(unittest.TestCase):
@@ -989,3 +1046,7 @@ class AtomicImportSecurityTests(unittest.TestCase):
         module_source = inspect.getsource(setup_tui.import_profiles)
         self.assertIn("_open_conf_exclusive", module_source)
         self.assertNotIn("shutil.copyfile(", module_source)
+
+
+if __name__ == "__main__":
+    unittest.main()
