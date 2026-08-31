@@ -320,7 +320,7 @@ class VpnModeTests(unittest.TestCase):
         config, _ = router.build_singbox_config()
         inbounds = config["inbounds"]
         # Mixed proxy listener stays alongside the TUN so apps pinned to
-        # 127.0.0.1:PORT keep working while TUN captures everything else.
+        # 127.0.0.1:PORT keep working while TUN captures selected destinations.
         self.assertEqual(len(inbounds), 2)
         self.assertEqual(inbounds[0]["type"], "tun")
         self.assertEqual(inbounds[0]["address"], ["172.19.0.1/30"])
@@ -394,6 +394,13 @@ class InitTests(unittest.TestCase):
                 (Path(__file__).resolve().parent.parent / "router.example.json").read_text()
             )
             self.assertEqual(written, example)
+            self.assertEqual(written["vpn"]["default_mode"], "tun")
+            self.assertEqual(written["vpn"]["capture"], "routes")
+            self.assertEqual(written["routing"]["mode"], "vpn-list")
+            route_domains = {
+                domain for route in written["routes"] for domain in route["domains"]
+            }
+            self.assertEqual(set(written["routing"]["vpn_domains"]), route_domains)
 
     def test_init_refuses_overwrite_without_force(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1563,6 +1570,22 @@ class RotationEgressTests(unittest.TestCase):
         probe.assert_called_once()
         self.assertEqual(self._active(), "c")
 
+    def test_automatic_rotate_is_noop_in_tun_mode(self):
+        router.set_mode("tun")
+        self.assertEqual(router.rotate("proton", automatic=True), 3)
+        self.engine_reload.assert_not_called()
+        self.assertFalse((self.root / "state" / "proton.active").exists())
+
+        router.set_mode("proxy")
+        router.SING_BOX_CONFIG.write_text(json.dumps({"inbounds": [{"type": "tun"}]}))
+        self.assertEqual(router.rotate("proton", automatic=True), 3)
+        self.engine_reload.assert_not_called()
+
+        router.MODE_FILE.write_text("garbage")
+        router.SING_BOX_CONFIG.write_text(json.dumps({"inbounds": [{"type": "mixed"}]}))
+        self.assertEqual(router.rotate("proton", automatic=True), 3)
+        self.engine_reload.assert_not_called()
+
     def test_rotate_records_last_rotation(self):
         router.set_active("proton", self._profile("a"))
         self.assertEqual(router.rotate("proton"), 0)
@@ -2265,8 +2288,15 @@ class EgressSweepTests(unittest.TestCase):
         # probe through it in either mode.
         router.set_mode("tun")
         with mock.patch("sys.stdout.write"):
-            rc = router.egress_sweep()
+            rc = router.egress_sweep(allow_tun=True)
         self.assertEqual(rc, 0)
+
+    def test_implicit_tun_sweep_is_rejected(self):
+        router.set_mode("tun")
+        rc = router.egress_sweep()
+        self.assertEqual(rc, 1)
+        self.engine_reload.assert_not_called()
+        self.probe.assert_not_called()
 
     def test_probes_every_profile_once_in_wrap_order(self):
         router.set_active("proton", self._profile("a"))
@@ -3158,6 +3188,8 @@ class ScheduledRotationTests(unittest.TestCase):
         router._providers = {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}}
         router._rotation = {"interval_seconds": 3600, "jitter_seconds": 300}
         router._routes = []
+        router.set_mode("proxy")
+        router.SING_BOX_CONFIG.write_text(json.dumps({"inbounds": [{"type": "mixed"}]}))
         self.listener_patch = mock.patch.object(router, "listener_up", return_value=True)
         self.listener_patch.start()
         self.addCleanup(self.listener_patch.stop)
@@ -3196,6 +3228,17 @@ class ScheduledRotationTests(unittest.TestCase):
             json.dumps({"profile": "a", "at": int(time.time())}), encoding="utf-8")
         with mock.patch.object(router, "rotate", side_effect=AssertionError("must not rotate when not due")):
             self.assertEqual(router.rotate_due("proton"), 3)
+
+    def test_rotate_due_skips_tun_mode(self):
+        # Background profile changes reload the shared TUN engine and can drop
+        # unrelated long-lived flows such as the Discord gateway.
+        router.set_mode("tun")
+        backdated = int(time.time()) - 7200
+        (self.root / "state" / "proton.rotation").write_text(
+            json.dumps({"profile": "a", "at": backdated}), encoding="utf-8")
+        with mock.patch.object(router, "rotate", side_effect=AssertionError("must not rotate in TUN mode")):
+            self.assertEqual(router.rotate_due("proton"), 3)
+        self.assertEqual(self._rotation_record(), backdated)
 
     def test_rotate_due_rotates_when_interval_elapsed(self):
         router.set_active("proton", self.root / "providers" / "proton" / "a.conf")

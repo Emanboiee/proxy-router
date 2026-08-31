@@ -122,7 +122,7 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py start / stop / status
 ./router.py doctor                # read-only health audit: config, profiles, listener, egress summary
 ./router.py routes               # list route table
-./router.py vpn on               # full TUN mode: route everything via the engines' rules
+./router.py vpn on               # default selective TUN: configured routes tunnel, rest stays direct
 ./router.py vpn off              # stop the TUN, back to proxy mode
 ./router.py vpn restart          # stop + re-enter TUN through the installed helper
 ./router.py vpn status           # show current mode and liveness
@@ -143,7 +143,7 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py rotate <provider> --reason 503|429|timeout|1010  # mark CURRENT exit failed upstream, prefer a different one
 ./router.py rotate <provider> --force   # switch anyway, ignoring cooldowns and blocked exits
 ./router.py rotate <provider> --no-probe # skip the post-switch egress probe
-./router.py rotate --if-due      # scheduled rotation: only when the interval elapsed (exit 3 = not due)
+./router.py rotate --if-due      # scheduled rotation: proxy mode only; TUN returns 3 to preserve live flows
 ./router.py rotate <provider> --to 01-NL-FREE-140  # switch to this exact exit profile (used by the tray's Provider picker)
 ./router.py response-event --host example.com --status 429 [--provider proton]
                                  # feed an observed upstream status into cooldown/error-policy handling
@@ -165,7 +165,7 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py egress probe [provider]  # probe current exit(s) through the tunnel, persist health
 ./router.py egress show [provider]   # print persisted egress records (JSON)
 ./router.py egress check [--provider <name>] [--json]  # read-only live check: exit 1 ONLY when an active exit is DEAD
-./router.py egress sweep [provider] [--json]  # full-pool sweep: probe EVERY profile, end on the best alive exit
+./router.py egress sweep [provider] [--json] [--allow-tun]  # full-pool sweep; --allow-tun acknowledges a TUN interruption
 ./router.py status --json         # machine-readable status for scripts/Hermes
 ./router.py setup                  # custom setup TUI
 ./router.py setup --guide all      # print Proton + WARP guides
@@ -235,7 +235,13 @@ Rotation is then egress-aware instead of blind round-robin:
   nothing is alive the tunnel stays on the current profile and exit code 1
   signals a provider with zero alive exits (`--json` names them under
   `dead`). A sweep reloads the engine only when a strictly better exit was
-  found, so a healthy sweep is cheap.
+  found, so a healthy sweep is cheap. In TUN mode this command requires
+  `--allow-tun` because each profile hop reloads the shared engine.
+- The launchd keepalive leaves `egress check` read-only in TUN mode: it skips
+  scheduled rotation, dead-exit recovery, full-pool sweeps, and fallback
+  changes because every provider shares one engine. Explicit `rotate`,
+  `egress sweep`, and `failover` commands remain available for intentional
+  operator-controlled interruptions.
 - `egress check` is the read-only liveness view used by the keepalive self-heal
   loop: it probes the ACTIVE exit(s) through the running tunnel and classifies
   each one `alive` (HTTP response rode the tunnel), `degraded` (an HTTP status
@@ -353,11 +359,14 @@ Where it is consumed:
 ## VPN (TUN) mode
 
 `vpn on` switches the engine from a local mixed proxy (`127.0.0.1:2080`) to a
-system TUN interface. sing-box `auto_route` then captures **all** traffic at
-the IP layer — including apps that ignore system proxy settings — while the
-same route rules still decide which domains go through which provider and
-everything else exits `direct`. `vpn off` returns to proxy mode; `ensure`,
-`reload`, `add`/`remove` and `rotate` all respect whatever mode is active.
+system TUN interface. In the default `capture: routes` mode, proxy-router
+resolves the configured tunneled route domains at build/reload time and gives
+sing-box those destination IPs as a `route_address_set`; unmatched traffic
+bypasses the TUN and remains direct. This is destination-IP selective, not
+process-aware, and a DNS change needs `router.py reload` to refresh the set.
+Explicit `capture: ruleset` still uses a static IP-CIDR ruleset (for example,
+Roblox). `vpn off` returns to proxy mode; `ensure`, `reload`, `add`/`remove`
+and `rotate` all respect whatever mode is active.
 
 Platform notes:
 

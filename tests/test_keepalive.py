@@ -118,7 +118,8 @@ class KeepaliveHarness:
 
     def __init__(self, *, interval="1", fail_ensures="", egress="alive",
                  probe_every="4", dead_strikes="2", storm_window="600",
-                 max_rotations="2", fallback="", root=None, pinned_python=""):
+                 max_rotations="2", fallback="", root=None, pinned_python="",
+                 mode="proxy"):
         self._tmp = None
         if root is None:
             self._tmp = tempfile.TemporaryDirectory()
@@ -126,6 +127,13 @@ class KeepaliveHarness:
         self.root = Path(root)
         self.pinned_python = pinned_python
         (self.root / "bin").mkdir()
+        if mode is not None:
+            (self.root / "state").mkdir(parents=True, exist_ok=True)
+            (self.root / "state" / "mode").write_text(mode)
+        if mode == "proxy":
+            (self.root / "sing-box.json").write_text(
+                json.dumps({"inbounds": [{"type": "mixed"}]})
+            )
         sleep_bin = self.root / "bin" / "sleep"
         sleep_bin.write_text(FAKE_SLEEP)
         sleep_bin.chmod(0o755)
@@ -389,6 +397,53 @@ class KeepaliveEgressCheckTests(unittest.TestCase):
 class KeepaliveSweepStaggerTests(unittest.TestCase):
     """A sweep defers when the newest rotation is inside the stagger window."""
 
+    def test_tun_mode_skips_background_rotation_and_sweep(self):
+        h = KeepaliveHarness(interval="1", probe_every="1", mode="tun")
+        try:
+            lines = h.wait_lines(20)
+            self.assertIn("egress check", lines)
+            self.assertNotIn("rotate --if-due", lines,
+                             f"scheduled rotation ran in TUN mode: {lines}")
+            self.assertNotIn("egress sweep --json", lines,
+                             f"background sweep ran in TUN mode: {lines}")
+        finally:
+            h.close()
+
+    def test_tun_mode_skips_automatic_dead_exit_rotation(self):
+        h = KeepaliveHarness(interval="1", probe_every="1", dead_strikes="1",
+                             egress="dead", mode="tun")
+        try:
+            lines = h.wait_lines(8)
+            self.assertNotIn("rotate proton", lines,
+                             f"dead-exit recovery rotated in TUN mode: {lines}")
+        finally:
+            h.close()
+
+    def test_invalid_mode_fails_safe_and_skips_background_rotation(self):
+        h = KeepaliveHarness(interval="1", probe_every="1", mode="corrupt")
+        try:
+            lines = h.wait_lines(20)
+            self.assertNotIn("rotate --if-due", lines,
+                             f"invalid mode enabled scheduled rotation: {lines}")
+            self.assertNotIn("egress sweep --json", lines,
+                             f"invalid mode enabled background sweep: {lines}")
+        finally:
+            h.close()
+
+    def test_stale_proxy_marker_with_tun_config_skips_background_rotation(self):
+        h = KeepaliveHarness(interval="1", probe_every="1", mode="proxy")
+        try:
+            (h.root / "sing-box.json").write_text(
+                json.dumps({"inbounds": [{"type": "tun"}]})
+            )
+            lines = h.wait_lines(20)
+            self.assertNotIn("rotate --if-due", lines,
+                             f"stale proxy marker enabled scheduled rotation: {lines}")
+            self.assertNotIn("egress sweep --json", lines,
+                             f"stale proxy marker enabled background sweep: {lines}")
+        finally:
+            h.close()
+
     def test_sweep_defers_right_after_rotation(self):
         import time as _time
         h = KeepaliveHarness(interval="2")
@@ -429,9 +484,9 @@ class KeepaliveFallbackRestoreTests(unittest.TestCase):
         try:
             h.wait_lines(7)
             lines = h.lines()
-            self.assertIn("failover proton off", lines,
-                          f"expected failover off: {lines}")
-            self.assertNotIn("failover proton on --reason timeout", lines,
+            self.assertTrue(any(line.startswith("failover proton off") for line in lines),
+                            f"expected failover off: {lines}")
+            self.assertFalse(any(line.startswith("failover proton on") for line in lines),
                              f"re-activated a live primary: {lines}")
             h.close()
             self.assertIn("'proton' primary is alive again; fallback cleared", h.err,
@@ -444,10 +499,10 @@ class KeepaliveFallbackRestoreTests(unittest.TestCase):
         try:
             h.wait_lines(9)
             lines = h.lines()
-            self.assertIn("failover proton off", lines,
-                          f"expected failover off: {lines}")
-            self.assertIn("failover proton on --reason timeout", lines,
-                          f"expected fallback re-activation: {lines}")
+            self.assertTrue(any(line.startswith("failover proton off") for line in lines),
+                            f"expected failover off: {lines}")
+            self.assertTrue(any(line.startswith("failover proton on --reason timeout") for line in lines),
+                            f"expected fallback re-activation: {lines}")
             h.close()
             self.assertIn("'proton' primary still dead; re-activating fallback", h.err,
                           f"re-activation message missing: {h.err!r}")

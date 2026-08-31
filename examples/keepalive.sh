@@ -20,22 +20,27 @@
 # checks (a single transient blip never rotates), and never more than
 # PROXY_KEEPALIVE_MAX_ROTATIONS times per PROXY_KEEPALIVE_STORM_WINDOW
 # seconds, so a broken pool cannot storm. A boot self-test runs once on the
-# first successful ensure (one early rotation, same storm guard).
+# first successful ensure (one early rotation in proxy mode, same storm
+# guard). TUN mode still permits read-only checks, but never performs an
+# automatic profile or fallback change.
 #
 # Scheduled rotation: when router.json has a "rotation" block, the loop also
-# calls `router.py rotate --if-due` on every healthy tick - the CLI reads the
-# configured interval/jitter and only rotates once the interval has elapsed
-# (exit 3 = not due, nothing logged), so the active exit churns on a cadence
-# and upstream rate limits see a fresh egress IP. The verify-then-switch
-# rollback path and per-provider cooldowns apply exactly as for a manual
-# rotate; `state/<provider>.rotation` tracks the last switch time.
+# calls `router.py rotate --if-due` on every healthy tick in proxy mode - the
+# CLI reads the configured interval/jitter and only rotates once the interval
+# has elapsed (exit 3 = not due, nothing logged). TUN mode skips this shared
+# engine interruption so long-lived connections such as Discord stay up. The
+# verify-then-switch rollback path and per-provider cooldowns apply exactly as
+# for a manual rotate; `state/<provider>.rotation` tracks the last switch time.
+# TUN mode skips this and all other automatic profile changes.
 #
 # Full-pool egress sweep: nothing above probes the non-active exits, so a pool
 # could sit on a stale-but-alive lane forever. Every
 # PROXY_KEEPALIVE_SWEEP_EVERY seconds (default 1800 = 30 min) the loop runs
 # `router.py egress sweep`, which probes EVERY profile of every provider
 # through the tunnel, persists health/cooldown/block markers, and ends on the
-# best alive exit (no reload when the current exit already is best).
+# best alive exit (no reload when the current exit already is best). TUN mode
+# skips the background sweep because all providers share one engine. Explicit
+# CLI sweep/rotate commands remain operator-controlled interruptions.
 #
 # Manual-off quiescence: when `state/manual-off` exists (user disconnected via
 # tray/CLI), the loop performs NO maintenance at all - no ensure, no probe, no
@@ -75,6 +80,14 @@ controller() {
     "$PROXY_ROUTER_PYTHON" "$ROOT/router.py" "$@"
   else
     "$ROOT/router.py" "$@"
+  fi
+}
+
+python_runner() {
+  if [ -n "${PROXY_ROUTER_PYTHON:-}" ]; then
+    "$PROXY_ROUTER_PYTHON" "$@"
+  else
+    python3 "$@"
   fi
 }
 
@@ -156,11 +169,66 @@ rotation_allowed() {
   [ "$rotations" -lt "$MAX_ROTATIONS" ]
 }
 
-# One bounded auto-rotation for the provider `egress check` reported dead.
+# TUN shares one sing-box process across every provider. Background profile
+# changes reload that process and can drop unrelated long-lived connections
+# such as Hermes' Discord gateway. Keep the automatic rotation/sweep lane in
+# proxy mode; explicit router commands still work in either mode.
+is_tun_mode() {
+  local marker=""
+  local generated="unknown"
+  if [ -r "$ROOT/state/mode" ]; then
+    marker=$(tr -d '[:space:]' < "$ROOT/state/mode" 2>/dev/null || true)
+  fi
+  if [ "$marker" = "tun" ]; then
+    return 0
+  fi
+
+  # A stale marker must not authorize disruptive maintenance. The generated
+  # config is the second source of truth: if it contains a TUN inbound, skip
+  # maintenance even when state/mode still says proxy. Only a valid proxy
+  # marker plus a readable config that contains no TUN is positive proxy proof.
+  if [ -r "$ROOT/sing-box.json" ]; then
+    generated=$(python_runner - "$ROOT/sing-box.json" 2>/dev/null <<'PY'
+import json
+import sys
+
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError
+    inbounds = data.get("inbounds")
+    if not isinstance(inbounds, list):
+        raise ValueError
+    print("tun" if any(isinstance(item, dict) and item.get("type") == "tun"
+                         for item in inbounds) else "proxy")
+except (OSError, TypeError, ValueError, json.JSONDecodeError):
+    print("unknown")
+PY
+)
+  fi
+  if [ "$generated" = "tun" ]; then
+    return 0
+  fi
+  if [ "$marker" = "proxy" ] && [ "$generated" = "proxy" ]; then
+    return 1
+  fi
+
+  # Unknown or unreadable state is fail-closed: skip disruptive maintenance.
+  return 0
+}
+
+# One bounded auto-rotation for the provider `egress check` reported dead in
+# proxy mode. TUN mode only reports the dead path; it does not reload the
+# shared engine automatically.
 # `egress check` prints "dead: <provider>" as its last stdout line (and exits
 # 1) when an active exit is dead; without that line nothing is rotated.
 rotate_dead() {
   provider="$1"
+  if is_tun_mode; then
+    echo "router: automatic dead-exit rotation skipped in TUN mode" >&2
+    strikes=0
+    return
+  fi
   if [ -z "$provider" ]; then
     # egress check failed before it could name a dead provider (e.g. TUN
     # mode, or the engine itself is down): never rotate on an ambiguous
@@ -179,9 +247,14 @@ rotate_dead() {
   rotations=$((rotations + 1))
   strikes=0
   echo "router: rotating '$provider' after dead tunnel checks" >&2
-  if controller rotate "$provider" --reason timeout; then
+  if controller rotate "$provider" --reason timeout --automatic; then
     :
   else
+    rotate_rc=$?
+    if [ "$rotate_rc" -eq 3 ]; then
+      echo "router: automatic dead-exit rotation skipped in TUN mode" >&2
+      return
+    fi
     echo "router: rotate '$provider' failed; checking configured fallback" >&2
     fallback_state=$(controller failover "$provider" status 2>/dev/null || true)
     configured_fallback=$(printf '%s\n' "$fallback_state" | sed -n 's/.* configured=\([^ ]*\).*/\1/p')
@@ -200,7 +273,7 @@ rotate_dead() {
         return
         ;;
     esac
-    if ! controller failover "$provider" on --reason timeout >/dev/null 2>&1; then
+    if ! controller failover "$provider" on --reason timeout --automatic >/dev/null 2>&1; then
       echo "router: fallback for '$provider' failed; will retry after the next dead check" >&2
       return
     fi
@@ -213,17 +286,20 @@ rotate_dead() {
 # primary is still dead. The sweep cadence throttles the restore, so a
 # genuinely dead primary never causes a failover off/on storm.
 restore_fallbacks() {
+  if is_tun_mode; then
+    return
+  fi
   out=$(controller egress check 2>&1 || true)
   printf '%s\n' "$out" | sed -n 's/^\([A-Za-z0-9._-]*\): fallback (.*)$/\1/p' | while IFS= read -r provider; do
     [ -n "$provider" ] || continue
-    if ! controller failover "$provider" off >/dev/null 2>&1; then
+    if ! controller failover "$provider" off --automatic >/dev/null 2>&1; then
       continue
     fi
     if controller egress check --provider "$provider" >/dev/null 2>&1; then
       echo "router: '$provider' primary is alive again; fallback cleared" >&2
     else
       echo "router: '$provider' primary still dead; re-activating fallback" >&2
-      controller failover "$provider" on --reason timeout >/dev/null 2>&1 || true
+      controller failover "$provider" on --reason timeout --automatic >/dev/null 2>&1 || true
     fi
   done
 }
@@ -286,8 +362,11 @@ while true; do
       fi
       # Scheduled rotation: `rotate --if-due` self-gates on the configured
       # interval (exit 0 = rotated, 3 = not due); never logs when quiet.
-      if controller rotate --if-due >/dev/null 2>&1; then
-        echo "router: scheduled rotation: rotated provider(s)" >&2
+      # TUN mode skips this shared-engine interruption.
+      if ! is_tun_mode; then
+        if controller rotate --if-due >/dev/null 2>&1; then
+          echo "router: scheduled rotation: rotated provider(s)" >&2
+        fi
       fi
     fi
     # Time-based full-pool sweep: on the first successful ensure, and every
@@ -308,7 +387,9 @@ while true; do
       case "$rotated_at" in ''|*[!0-9]*) rotated_at=0 ;; esac
       [ "$rotated_at" -gt "$newest_rotation" ] && newest_rotation="$rotated_at"
     done
-    if [ "$newest_rotation" -gt 0 ] && [ $((sweep_now - newest_rotation)) -lt "$STAGGER" ]; then
+    if is_tun_mode; then
+      :
+    elif [ "$newest_rotation" -gt 0 ] && [ $((sweep_now - newest_rotation)) -lt "$STAGGER" ]; then
       echo "router: sweep deferred (rotation ${STAGGER}s stagger window)" >&2
     elif [ "$last_sweep" -eq 0 ] || [ $((sweep_now - last_sweep)) -ge "$SWEEP_EVERY" ]; then
       if controller egress sweep --json >/dev/null 2>&1; then

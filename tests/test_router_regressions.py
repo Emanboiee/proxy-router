@@ -7,6 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -53,6 +55,54 @@ def test_vpn_list_filters_provider_routes_to_vpn_domains(tmp_path):
     provider_rules = [r for r in config["route"]["rules"] if r.get("outbound") == "proton"]
     assert provider_rules == [{"outbound": "proton", "domain_suffix": ["blocked.example"]}]
     assert config["route"]["final"] == "direct"
+
+
+def test_route_capture_uses_resolved_destination_cidrs(tmp_path):
+    router = load_router(tmp_path)
+    profile = tmp_path / "cloudflare.conf"
+    router._providers = {"cloudflare": {}}
+    router._routes = [{
+        "id": "discord", "domains": ["discord.com"], "provider": "cloudflare",
+    }]
+    router._routing = {"mode": "vpn-list", "vpn_domains": ["discord.com"]}
+    router._vpn = {"capture": "routes", "address": ["172.19.0.1/30"]}
+    router._port = 2080
+    router.current_mode = lambda: "tun"
+    router._usable_profile = lambda name, preferred=None: profile
+    router.parse_wireguard = lambda path: {
+        "type": "wireguard", "tag": "", "address": ["10.0.0.2/32"],
+        "private_key": "secret", "peers": [{"address": "192.0.2.1", "port": 1,
+        "public_key": "public", "allowed_ips": ["0.0.0.0/0"]}],
+    }
+    router.dns_server_for = lambda path: "1.1.1.1"
+    answers = [
+        (router.socket.AF_INET, router.socket.SOCK_STREAM, 6, "", ("162.159.135.232", 443)),
+        (router.socket.AF_INET6, router.socket.SOCK_STREAM, 6, "", ("2606:4700::1", 443, 0, 0)),
+    ]
+
+    with mock.patch.object(router.socket, "getaddrinfo", return_value=answers) as resolve:
+        config, _active = router.build_singbox_config()
+
+    tun = config["inbounds"][0]
+    assert tun["route_address_set"] == ["ruleset-routes"]
+    assert config["route"]["rule_set"] == [{
+        "type": "inline",
+        "tag": "ruleset-routes",
+        "rules": [{"ip_cidr": ["162.159.135.232/32", "2606:4700::1/128"]}],
+    }]
+    assert resolve.call_args.args[:2] == ("discord.com", 443)
+
+    router._routes[0]["domains"] = ["discord.com", "cdn.discord.com"]
+    router._routing["vpn_domains"] = ["discord.com", "cdn.discord.com"]
+
+    def partial_resolve(host, *args, **kwargs):
+        if host == "discord.com":
+            return answers
+        raise router.socket.gaierror("no DNS")
+
+    with mock.patch.object(router.socket, "getaddrinfo", side_effect=partial_resolve):
+        with pytest.raises(SystemExit, match="could not resolve route domains"):
+            router.build_singbox_config()
 
 
 def test_primary_routes_use_runtime_fallback_provider(tmp_path):
@@ -144,6 +194,33 @@ def test_activate_fallback_writes_marker_and_reloads_once(tmp_path, monkeypatch)
     assert router.deactivate_fallback("proton") == 0
     assert not (tmp_path / "state" / "fallback" / "proton.json").exists()
     assert reloads == [True, True]
+
+
+def test_automatic_fallback_change_is_noop_in_tun(tmp_path, monkeypatch):
+    router = load_router(tmp_path)
+    for provider in ("proton", "cloudflare"):
+        directory = tmp_path / "providers" / provider
+        directory.mkdir(parents=True)
+        (directory / "active.conf").write_text("profile")
+    router._providers = {
+        "proton": {"directory": "providers/proton", "fallback_provider": "cloudflare"},
+        "cloudflare": {"directory": "providers/cloudflare"},
+    }
+    router.set_mode("tun")
+    reloads = []
+    monkeypatch.setattr(router, "engine_reload", lambda *a, **k: reloads.append(True) or 0)
+
+    assert router.activate_fallback("proton", automatic=True) == 3
+    assert router.deactivate_fallback("proton", automatic=True) == 3
+    assert reloads == []
+    assert not (tmp_path / "state" / "fallback" / "proton.json").exists()
+
+
+def test_generated_config_mode_fails_closed_for_non_object(tmp_path):
+    router = load_router(tmp_path)
+    router.SING_BOX_CONFIG.write_text("[]")
+
+    assert router._generated_config_mode() == "unknown"
 
 
 def test_activate_fallback_restores_marker_when_reload_fails(tmp_path, monkeypatch):
@@ -393,7 +470,12 @@ def test_tun_exclude_cidr_pins_destinations_outside_engine(tmp_path):
     router.current_mode = lambda: "tun"
     router._usable_profile = lambda name, preferred=None: profile
     router.parse_wireguard = lambda path: {}
-    config, _ = router.build_singbox_config()
+    with mock.patch.object(
+        router.socket,
+        "getaddrinfo",
+        return_value=[(router.socket.AF_INET, router.socket.SOCK_STREAM, 6, "", ("198.51.100.10", 443))],
+    ):
+        config, _ = router.build_singbox_config()
     tun = next(i for i in config["inbounds"] if i.get("type") == "tun")
     assert tun["route_exclude_address"] == ["203.0.113.0/24"]
 
