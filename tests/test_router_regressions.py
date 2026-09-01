@@ -1500,6 +1500,7 @@ def test_stop_bypasses_invalid_config_and_publishes_manual_off_before_lock(tmp_p
         AssertionError("stop must not load semantic configuration")))
     monkeypatch.setattr(router, "route_watcher_stop", lambda: None)
     monkeypatch.setattr(router, "engine_stop", lambda: 0)
+    monkeypatch.setattr(router, "_find_our_engine_pids", lambda: [])
     observed = []
 
     def locked(action, timeout=None):

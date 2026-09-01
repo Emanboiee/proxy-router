@@ -868,7 +868,8 @@ class EngineStopTerminationTests(unittest.TestCase):
             [sys.executable, "-c", child_code], stdout=subprocess.DEVNULL)
         try:
             router.PID_FILE.write_text(f"{proc.pid}\n")
-            with mock.patch.object(router, "_pid_matches", return_value=True):
+            with mock.patch.object(router, "_pid_matches", return_value=True), \
+                 mock.patch.object(router, "_find_our_engine_pids", return_value=[]):
                 self.assertTrue(
                     router._pid_matches(proc.pid),
                     "precondition: stand-in engine must be recognized as ours")
