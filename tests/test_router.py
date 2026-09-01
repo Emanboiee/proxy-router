@@ -134,6 +134,7 @@ class ConfigBuildTests(unittest.TestCase):
             {"id": "roblox", "domains": ["roblox.com"], "provider": "cloudflare"},
         ]
         router._port = 2080
+        router._vpn = {}
 
     def tearDown(self):
         self._tmp.cleanup()
