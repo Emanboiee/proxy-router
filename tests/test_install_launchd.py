@@ -128,6 +128,7 @@ class InstallLaunchdTests(unittest.TestCase):
         finally:
             h.close()
 
+    @unittest.skipUnless(sys.platform == "darwin", "macOS plutil")
     def test_plist_passes_plutil_lint(self):
         h = InstallLaunchdHarness(pinned_python="/usr/bin/python3")
         try:

@@ -3035,7 +3035,7 @@ def engine_start(use_existing_config: bool = False, *, recover: bool = True) -> 
     if _privileged_helper_supported() and os.geteuid() != 0 and current_mode() == "tun":
         helper = _helper_status()
         if not (helper and helper.get("installed")):
-            return fail(_HELPER_NOT_INSTALLED)
+            return fail(_helper_not_installed_message())
     active: dict[str, Path] = {}
     if use_existing_config:
         # restore_last_good path: boot the sing-box.json file as it now
@@ -3493,7 +3493,7 @@ def _elevated_reload() -> int:
     if not status or not status.get("installed"):
         # Issue #76: same actionable wording as the start path — this fires
         # from the tray's preset-apply/reload when only elevation is missing.
-        return fail(_HELPER_NOT_INSTALLED)
+        return fail(_helper_not_installed_message())
     return _helper_run("reload")
 
 # ---------------------------------------------------------------------------
@@ -5510,16 +5510,21 @@ def _helper_denied_reason(stderr: str) -> str | None:
 
 
 _HELPER_FIX = "run `router.py elevate install` once in a terminal (admin password), then Connect again"
-if sys.platform.startswith("linux"):
-    _HELPER_NOT_INSTALLED = (
-        "startup permission not set up yet: Linux TUN needs the root-owned "
-        "lifecycle helper; " + _HELPER_FIX
-    )
-else:
-    _HELPER_NOT_INSTALLED = (
+
+
+def _helper_not_installed_message() -> str:
+    if sys.platform.startswith("linux"):
+        return (
+            "startup permission not set up yet: Linux TUN needs the root-owned "
+            "lifecycle helper; " + _HELPER_FIX
+        )
+    return (
         "startup permission not set up yet: the automatic (launchd) app cannot "
         "control the VPN engine without it; " + _HELPER_FIX
     )
+
+
+_HELPER_NOT_INSTALLED = _helper_not_installed_message()
 
 
 def _helper_run(operation: str) -> int:

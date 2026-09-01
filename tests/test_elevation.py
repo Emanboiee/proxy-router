@@ -75,7 +75,7 @@ class PrivilegedHelperCommandTests(unittest.TestCase):
                 "/usr/bin/env", "-i", "HOME=/var/empty",
                 "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LANG=C",
                 "/usr/bin/python3", "-I", "-S",
-                "/Library/PrivilegedHelperTools/com.proxy-router/current/privileged_helper.py",
+                str(router.PRIVILEGED_HELPER),
                 "reload", "501",
             ],
         )
@@ -494,7 +494,7 @@ class HelperPermissionUxTests(unittest.TestCase):
         elevation = data["elevation"]
         self.assertFalse(elevation["root_engine"])
         self.assertTrue(elevation["sudo_grant"])
-        # Non-macOS: helper probe skipped -> installed flag stays False.
+        # The helper probe has no installed helper in this isolated test.
         self.assertFalse(elevation["helper_installed"])
         self.assertIn("elevate install", elevation["fix_hint"])
 
