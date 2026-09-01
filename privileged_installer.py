@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Authenticated installer for proxy-router's root-owned macOS helper."""
+"""Authenticated installer for proxy-router's root-owned macOS/Linux helper."""
 from __future__ import annotations
 
 import hashlib

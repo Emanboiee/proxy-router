@@ -2751,7 +2751,7 @@ def engine_alive() -> bool:
     """True when a sing-box started by us is still running (tun mode has no
     TCP listener to probe, so process liveness is the health check). Also
     refuses foreign/recycled PIDs so a stale pid file can't claim liveness."""
-    if sys.platform == "darwin" and os.geteuid() != 0:
+    if _privileged_helper_supported() and os.geteuid() != 0:
         helper = _helper_status()
         if helper and helper.get("installed") and helper.get("running"):
             return True
@@ -2791,7 +2791,7 @@ def engine_mode_consistent() -> bool:
 
     Prevents the H2 false-positive: a proxy-mode engine running while
     state/mode says 'tun' (or vice versa) is NOT the state we claim."""
-    if sys.platform == "darwin" and os.geteuid() != 0:
+    if _privileged_helper_supported() and os.geteuid() != 0:
         helper = _helper_status()
         if helper and helper.get("installed") and helper.get("running"):
             return helper.get("mode") == current_mode()
@@ -3032,7 +3032,7 @@ def engine_start(use_existing_config: bool = False, *, recover: bool = True) -> 
     # made the gap look like a broken engine instead of the one-time fix.
     # Scoped to TUN like the helper consult below: plain proxy-mode starts
     # work unprivileged and must never depend on helper state (issue #62).
-    if sys.platform == "darwin" and os.geteuid() != 0 and current_mode() == "tun":
+    if _privileged_helper_supported() and os.geteuid() != 0 and current_mode() == "tun":
         helper = _helper_status()
         if not (helper and helper.get("installed")):
             return fail(_HELPER_NOT_INSTALLED)
@@ -3092,7 +3092,7 @@ def engine_start(use_existing_config: bool = False, *, recover: bool = True) -> 
             # support; a non-root verdict is the safe fallback.
             helper_relevant = False
 
-    if sys.platform == "darwin" and os.geteuid() != 0 and helper_relevant:
+    if _privileged_helper_supported() and os.geteuid() != 0 and helper_relevant:
         # Issue #76: the missing-grant case was already surfaced (with the
         # actionable message) by the early permission gate above, so reaching
         # this point means the helper is installed and authorized.
@@ -3423,7 +3423,7 @@ def _terminate_pid(pid: int) -> bool:
 
 
 def engine_stop() -> int:
-    if sys.platform == "darwin" and os.geteuid() != 0:
+    if _privileged_helper_supported() and os.geteuid() != 0:
         helper = _helper_status()
         if helper and helper.get("installed") and helper.get("running"):
             return _helper_run("stop")
@@ -3628,7 +3628,7 @@ def engine_reload(active_overrides: dict[str, Path] | None = None) -> int:
         # not leave the proxy dead while a known-good config exists).
         print("router: new sing-box config failed validation; restoring last-good", file=sys.stderr)
         return restore_last_good()
-    if sys.platform == "darwin" and os.geteuid() != 0:
+    if _privileged_helper_supported() and os.geteuid() != 0:
         helper = _helper_status()
         if helper and helper.get("installed") and helper.get("running"):
             rc = _helper_run("reload")
@@ -4129,6 +4129,8 @@ def vpn_note() -> None:
     if sys.platform == "darwin":
         print("router: tun mode on macOS needs root (create utun interface); run with sudo", file=sys.stderr)
         print("router: tun mode on macOS is NOT a System Settings VPN entry (requires a signed NE app); it is a utun interface", file=sys.stderr)
+    elif sys.platform.startswith("linux"):
+        print("router: tun mode on Linux uses the installed root-owned helper; run `router.py elevate install` once before `vpn on`", file=sys.stderr)
     elif os.name == "nt":
         print("router: tun mode on Windows needs an elevated shell (admin) and wintun.dll next to sing-box.exe", file=sys.stderr)
 
@@ -4517,7 +4519,7 @@ def status_json() -> dict:
     # dashboard) can tell a permission gap apart from a broken engine and
     # offer the one-click repair instead of a generic failure.
     helper = None
-    if sys.platform == "darwin" and os.geteuid() != 0:
+    if _privileged_helper_supported() and os.geteuid() != 0:
         try:
             helper = _helper_status()
         except Exception:
@@ -5265,6 +5267,10 @@ def _engine_runs_as_root() -> bool:
     """
     if os.name == "nt" or os.geteuid() == 0:
         return False
+    if _privileged_helper_supported():
+        helper = _helper_status()
+        if helper and helper.get("installed") and helper.get("running"):
+            return True
     try:
         pids = _find_our_engine_pids()
     except EngineIdentityError:
@@ -5328,14 +5334,14 @@ def profile_copy(provider: str, sources: list[str]) -> int:
     return 0 if imported else 1
 
 
-def _elevate_macos() -> int:
-    """Authenticate one hash-pinned installer snapshot through macOS."""
+def _prepare_privileged_install(temp_dir: str) -> tuple[list[str], Path]:
+    """Build a digest-checked bootstrap command for one interactive install."""
     if sys.argv[1:3] != ["elevate", "install"]:
-        return fail("administrator dialog is reserved for `elevate install`")
+        raise RuntimeError("administrator elevation is reserved for `elevate install`")
     owner_uid = os.getuid()
     owner_gid = os.getgid()
     members = ("router.py", "privileged_helper.py", "privileged_installer.py", "sing-box-release.json")
-    archive_path = None
+    archive_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
             prefix="proxy-router-bootstrap-", suffix=".zip", delete=False
@@ -5356,7 +5362,7 @@ def _elevate_macos() -> int:
             "names={'router.py','privileged_helper.py','privileged_installer.py','sing-box-release.json'}\n"
             "z=zipfile.ZipFile(io.BytesIO(data),'r')\n"
             "if set(z.namelist())!=names or not all(not i.is_dir() and i.file_size<=1024*1024 for i in z.infolist()): raise SystemExit('bootstrap archive shape mismatch')\n"
-            "with tempfile.TemporaryDirectory(prefix='proxy-router-install-',dir='/private/var/tmp') as d:\n"
+            f"with tempfile.TemporaryDirectory(prefix='proxy-router-install-',dir={temp_dir!r}) as d:\n"
             "  for n in names:\n"
             "    p=os.path.join(d,n); f=open(p,'xb'); f.write(z.read(n)); f.close(); os.chmod(p,0o600)\n"
             "  os.environ.clear(); os.environ.update({'PROXY_ROUTER_ROOT':user_root,'PROXY_ROUTER_INSTALL_SOURCE':d,'PROXY_ROUTER_LEGACY_PYTHON':legacy_python,'PROXY_ROUTER_LEGACY_ROUTER':legacy_router,'SUDO_UID':uid,'SUDO_GID':gid})\n"
@@ -5367,6 +5373,18 @@ def _elevate_macos() -> int:
             str(archive_path), digest, str(ROOT), sys.executable,
             os.path.abspath(__file__), str(owner_uid), str(owner_gid),
         ]
+        return command, archive_path
+    except BaseException:
+        if archive_path is not None:
+            archive_path.unlink(missing_ok=True)
+        raise
+
+
+def _elevate_macos() -> int:
+    """Authenticate one hash-pinned installer snapshot through macOS."""
+    archive_path: Path | None = None
+    try:
+        command, archive_path = _prepare_privileged_install("/private/var/tmp")
         content = shlex.join(command).replace("\\", "\\\\").replace('"', '\\"')
         script = f'do shell script "{content}" with administrator privileges'
         proc = subprocess.run(["osascript", "-e", script], text=True)
@@ -5380,11 +5398,40 @@ def _elevate_macos() -> int:
     return proc.returncode
 
 
-SUDOERS_FILE = Path("/private/etc/sudoers.d/91-proxy-router")
-PRIVILEGED_HELPER = Path(
-    "/Library/PrivilegedHelperTools/com.proxy-router/current/privileged_helper.py"
+def _elevate_linux() -> int:
+    """Authenticate one hash-pinned installer snapshot through interactive sudo."""
+    archive_path: Path | None = None
+    try:
+        command, archive_path = _prepare_privileged_install("/var/tmp")
+        proc = subprocess.run(
+            ["/usr/bin/sudo", "-p", "proxy-router administrator password: ", *command],
+            text=True,
+        )
+    except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
+        return fail(f"could not prepare privileged helper installer: {exc}")
+    finally:
+        if archive_path is not None:
+            archive_path.unlink(missing_ok=True)
+    if proc.returncode != 0:
+        print("router: privileged helper installation canceled or failed", file=sys.stderr)
+    return proc.returncode
+
+
+SUDOERS_FILE = (
+    Path("/etc/sudoers.d/91-proxy-router")
+    if sys.platform.startswith("linux")
+    else Path("/private/etc/sudoers.d/91-proxy-router")
 )
-PRIVILEGED_STATE_BASE = Path("/private/var/db/proxy-router")
+PRIVILEGED_HELPER = (
+    Path("/usr/local/libexec/proxy-router/current/privileged_helper.py")
+    if sys.platform.startswith("linux")
+    else Path("/Library/PrivilegedHelperTools/com.proxy-router/current/privileged_helper.py")
+)
+PRIVILEGED_STATE_BASE = (
+    Path("/var/lib/proxy-router")
+    if sys.platform.startswith("linux")
+    else Path("/private/var/db/proxy-router")
+)
 PRIVILEGED_ENV = "/usr/bin/env"
 # The helper deliberately runs under the SYSTEM python via `env -i` (minimal
 # environment): sudoers grants an exact interpreter path, and pointing it at a
@@ -5394,6 +5441,11 @@ PRIVILEGED_ENV = "/usr/bin/env"
 # "unify" these two interpreter identities; they are separate contracts.
 PRIVILEGED_PYTHON = "/usr/bin/python3"
 PRIVILEGED_OPERATIONS = frozenset({"status", "start", "stop", "reload", "uninstall"})
+
+
+def _privileged_helper_supported() -> bool:
+    """True when the immutable root-helper backend is available on this OS."""
+    return sys.platform == "darwin" or sys.platform.startswith("linux")
 
 
 def _helper_command(operation: str, uid: int | None = None) -> list[str]:
@@ -5458,9 +5510,16 @@ def _helper_denied_reason(stderr: str) -> str | None:
 
 
 _HELPER_FIX = "run `router.py elevate install` once in a terminal (admin password), then Connect again"
-_HELPER_NOT_INSTALLED = (
-    "startup permission not set up yet: the automatic (launchd) app cannot "
-    "control the VPN engine without it; " + _HELPER_FIX)
+if sys.platform.startswith("linux"):
+    _HELPER_NOT_INSTALLED = (
+        "startup permission not set up yet: Linux TUN needs the root-owned "
+        "lifecycle helper; " + _HELPER_FIX
+    )
+else:
+    _HELPER_NOT_INSTALLED = (
+        "startup permission not set up yet: the automatic (launchd) app cannot "
+        "control the VPN engine without it; " + _HELPER_FIX
+    )
 
 
 def _helper_run(operation: str) -> int:
@@ -5516,7 +5575,12 @@ def _sudoers_rules(user: str, uid: int) -> str:
     """Render only exact root-owned helper operations; never checkout code."""
     import privileged_installer
 
-    return privileged_installer.render_sudoers(user, uid, PRIVILEGED_HELPER)
+    return privileged_installer.render_sudoers(
+        user,
+        uid,
+        PRIVILEGED_HELPER,
+        system_python=Path(PRIVILEGED_PYTHON),
+    )
 
 
 def _sudoers_installed() -> bool:
@@ -5578,8 +5642,13 @@ def _install_privileged_helper_root() -> int:
         manifest_source = _safe_source_bytes(manifest_path, source_owner)
         machine = platform.machine().lower()
         architecture = "arm64" if machine == "arm64" else "x86_64" if machine in {"x86_64", "amd64"} else machine
-        layout = privileged_installer.InstallLayout()
-        policy = privileged_installer.render_sudoers(username, owner_uid)
+        layout = privileged_installer.InstallLayout.for_platform(sys.platform)
+        policy = privileged_installer.render_sudoers(
+            username,
+            owner_uid,
+            layout.helper_path,
+            system_python=layout.system_python,
+        )
 
         def stop_legacy() -> None:
             route_watcher_stop()
@@ -5592,6 +5661,7 @@ def _install_privileged_helper_root() -> int:
                 architecture,
                 owner_uid=source_owner,
                 anchor=source_root,
+                platform_name=sys.platform,
             )
             request = urllib.request.Request(release["url"], headers={"User-Agent": "proxy-router-installer/2"})
             with urllib.request.urlopen(request, timeout=60) as response:
@@ -5623,6 +5693,8 @@ def _install_privileged_helper_root() -> int:
             legacy_router=os.environ.get("PROXY_ROUTER_LEGACY_ROUTER", os.path.abspath(__file__)),
             stop_legacy=stop_legacy,
             stage=stage,
+            helper_path=layout.helper_path,
+            system_python=layout.system_python,
         )
     except (OSError, ValueError, RuntimeError, urllib.error.URLError) as exc:
         return fail(f"privileged helper install failed: {exc}")
@@ -5646,7 +5718,11 @@ def cmd_elevate(action: str) -> int:
     if os.geteuid() != 0:
         if not sys.stdin.isatty():
             return fail("elevate install needs an interactive terminal for administrator approval")
-        return _elevate_macos()
+        if sys.platform == "darwin":
+            return _elevate_macos()
+        if sys.platform.startswith("linux"):
+            return _elevate_linux()
+        return fail(f"elevate install is unsupported on {sys.platform}")
     return _install_privileged_helper_root()
 
 
