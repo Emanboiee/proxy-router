@@ -117,6 +117,33 @@ class BundleInstallTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(version.stat().st_mode), 0o555)
             self.assertEqual(stat.S_IMODE((version / "sing-box").stat().st_mode), 0o555)
 
+    def test_stage_bundle_creates_one_missing_helper_parent_safely(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            parent = root / "usr-local"
+            parent.mkdir(mode=0o700)
+            helper_parent = parent / "libexec"
+            layout = installer.InstallLayout(
+                helper_parent=helper_parent,
+                helper_base=helper_parent / "proxy-router",
+                state_base=root / "var-db",
+                sudoers_file=root / "sudoers.d" / "91-proxy-router",
+            )
+
+            installer.stage_bundle(
+                layout,
+                helper_bytes=b"helper\n",
+                installer_bytes=b"installer\n",
+                manifest_bytes=b"{}\n",
+                binary_bytes=b"trusted-sing-box",
+                owner_uid=os.getuid(),
+                owner_gid=os.getgid(),
+            )
+
+            self.assertTrue(helper_parent.is_dir())
+            self.assertEqual(stat.S_IMODE(helper_parent.stat().st_mode), 0o755)
+            self.assertEqual(helper_parent.stat().st_uid, os.getuid())
+
     def test_stage_failure_removes_all_partial_bundle_artifacts(self):
         with tempfile.TemporaryDirectory() as temporary:
             parent = Path(temporary) / "PrivilegedHelperTools"

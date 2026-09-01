@@ -169,6 +169,31 @@ def _verify_directory(path: Path, owner_uid: int) -> None:
         raise RuntimeError(f"insecure installer directory: {path}")
 
 
+def _ensure_directory(path: Path, owner_uid: int, owner_gid: int) -> None:
+    """Create one missing root-owned directory beneath a verified parent."""
+    try:
+        _verify_directory(path, owner_uid)
+        return
+    except FileNotFoundError:
+        pass
+    _verify_directory(path.parent, owner_uid)
+    try:
+        os.mkdir(path, 0o755)
+    except FileExistsError:
+        pass
+    info = os.lstat(path)
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_uid != owner_uid
+        or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise RuntimeError(f"insecure installer directory: {path}")
+    if info.st_gid != owner_gid:
+        os.chown(path, owner_uid, owner_gid)
+    os.chmod(path, 0o755)
+
+
 def _secure_child_directory(parent_fd: int, name: str, mode: int, owner_uid: int, owner_gid: int) -> int:
     try:
         os.mkdir(name, mode, dir_fd=parent_fd)
@@ -274,7 +299,7 @@ def stage_bundle(
     owner_gid: int = 0,
 ) -> dict:
     """Install one immutable content-addressed bundle and atomically select it."""
-    _verify_directory(layout.helper_parent, owner_uid)
+    _ensure_directory(layout.helper_parent, owner_uid, owner_gid)
     digest = hashlib.sha256()
     files = (
         ("privileged_helper.py", helper_bytes, 0o555),
