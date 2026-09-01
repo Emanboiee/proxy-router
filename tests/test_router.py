@@ -728,7 +728,10 @@ class VpnOnRollbackTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(router.current_mode(), "tun")
         start.assert_called_once()
-        proxy_off.assert_called_once()
+        if router.sys.platform == "darwin":
+            proxy_off.assert_called_once()
+        else:
+            proxy_off.assert_not_called()
 
 
 class WaitEngineTests(unittest.TestCase):
