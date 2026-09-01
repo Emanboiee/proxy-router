@@ -600,11 +600,9 @@ def is_cooled_down(name: str, profile: Path) -> bool:
 def mark_cooldown(name: str, profile: Path, seconds: int) -> None:
     path = ROOT / "state" / "cooldowns" / name / f"{profile.stem}.until"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(str(int(time.time()) + seconds))
-    os.chmod(path, 0o600)
+    _atomic_write(path, f"{int(time.time()) + seconds}\n", 0o600)
     # Elevated (root) rotations write these markers; the user-level
     # keepalive/CLI must stay able to read and re-write them.
-    _hand_back_ownership(path)
     _hand_back_ownership(path.parent)
 
 
