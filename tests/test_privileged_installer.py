@@ -42,6 +42,34 @@ class SudoersPolicyTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_linux_layout_uses_canonical_system_paths(self):
+        layout = installer.InstallLayout.for_platform("linux")
+
+        self.assertEqual(layout.helper_parent, Path("/usr/local/libexec"))
+        self.assertEqual(layout.helper_base, Path("/usr/local/libexec/proxy-router"))
+        self.assertEqual(layout.state_base, Path("/var/lib/proxy-router"))
+        self.assertEqual(layout.sudoers_file, Path("/etc/sudoers.d/91-proxy-router"))
+        self.assertEqual(
+            layout.helper_path,
+            Path("/usr/local/libexec/proxy-router/current/privileged_helper.py"),
+        )
+
+    def test_linux_policy_uses_only_the_canonical_linux_helper(self):
+        helper_path = installer.LINUX_EXPECTED_HELPER
+        policy = installer.render_sudoers("alice", 501, helper_path)
+
+        self.assertIn(str(helper_path), policy)
+        self.assertNotIn(str(installer.EXPECTED_HELPER), policy)
+        self.assertEqual(
+            installer.classify_policy(
+                policy,
+                "/opt/anaconda3/bin/python3",
+                "/Users/alice/proxy-router/router.py",
+                helper_path=helper_path,
+            ),
+            "v2",
+        )
+
     def test_policy_classifier_distinguishes_legacy_v2_and_foreign_content(self):
         python = "/opt/anaconda3/bin/python3"
         router = "/Users/alice/proxy-router/router.py"

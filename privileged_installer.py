@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 import stat
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -18,6 +19,10 @@ SYSTEM_PYTHON = Path("/usr/bin/python3")
 EXPECTED_HELPER = Path(
     "/Library/PrivilegedHelperTools/com.proxy-router/current/privileged_helper.py"
 )
+LINUX_EXPECTED_HELPER = Path(
+    "/usr/local/libexec/proxy-router/current/privileged_helper.py"
+)
+SUPPORTED_HELPERS = frozenset({EXPECTED_HELPER, LINUX_EXPECTED_HELPER})
 V2_MARKER = "# Managed by proxy-router privileged helper v2; remove with `elevate uninstall`."
 V2_DEFAULTS = {
     "Defaults!/usr/bin/env env_reset",
@@ -36,20 +41,54 @@ class InstallLayout:
     state_base: Path = Path("/private/var/db/proxy-router")
     sudoers_file: Path = Path("/private/etc/sudoers.d/91-proxy-router")
 
+    @classmethod
+    def for_platform(cls, platform_name: str | None = None) -> "InstallLayout":
+        """Return the canonical immutable-helper paths for one OS family."""
+        platform_name = sys.platform if platform_name is None else str(platform_name)
+        if platform_name == "darwin":
+            return cls()
+        if platform_name.startswith("linux"):
+            return cls(
+                helper_parent=Path("/usr/local/libexec"),
+                helper_base=Path("/usr/local/libexec/proxy-router"),
+                state_base=Path("/var/lib/proxy-router"),
+                sudoers_file=Path("/etc/sudoers.d/91-proxy-router"),
+            )
+        raise ValueError(f"unsupported privileged helper platform: {platform_name}")
 
-def render_sudoers(username: str, uid: int, helper_path: Path = EXPECTED_HELPER) -> str:
-    """Render exact no-wildcard sudo commands for one installed helper owner."""
+    @property
+    def helper_path(self) -> Path:
+        """Canonical helper entrypoint inside the atomic current selector."""
+        return self.helper_base / "current" / "privileged_helper.py"
+
+    @property
+    def system_python(self) -> Path:
+        """System interpreter named by the exact sudoers command."""
+        return SYSTEM_PYTHON
+
+
+def render_sudoers(
+    username: str,
+    uid: int,
+    helper_path: Path = EXPECTED_HELPER,
+    *,
+    system_python: Path = SYSTEM_PYTHON,
+) -> str:
+    """Render exact no-wildcard sudo commands for one helper path."""
     if not isinstance(username, str) or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", username) is None:
         raise ValueError("unsafe sudoers username")
     if isinstance(uid, bool) or not isinstance(uid, int) or uid <= 0:
         raise ValueError("unsafe sudoers uid")
     helper_path = Path(helper_path)
-    if helper_path != EXPECTED_HELPER:
-        raise ValueError("helper path must be the canonical root-owned location")
+    system_python = Path(system_python)
+    if helper_path not in SUPPORTED_HELPERS:
+        raise ValueError("helper path must be a canonical root-owned location")
+    if system_python != SYSTEM_PYTHON:
+        raise ValueError("system python must be the canonical system interpreter")
     command_prefix = (
         "/usr/bin/env -i HOME=/var/empty "
         "PATH=/usr/bin\\:/bin\\:/usr/sbin\\:/sbin LANG=C "
-        f"/usr/bin/python3 -I -S {helper_path}"
+        f"{system_python} -I -S {helper_path}"
     )
     lines = [
         V2_MARKER,
@@ -67,8 +106,19 @@ def render_sudoers(username: str, uid: int, helper_path: Path = EXPECTED_HELPER)
     return "\n".join(lines) + "\n"
 
 
-def classify_policy(content: str, legacy_python: str, legacy_router: str) -> str:
+def classify_policy(
+    content: str,
+    legacy_python: str,
+    legacy_router: str,
+    *,
+    helper_path: Path = EXPECTED_HELPER,
+    system_python: Path = SYSTEM_PYTHON,
+) -> str:
     """Classify only exact managed legacy/v2 policy; never guess foreign text."""
+    helper_path = Path(helper_path)
+    system_python = Path(system_python)
+    if helper_path not in SUPPORTED_HELPERS or system_python != SYSTEM_PYTHON:
+        raise ValueError("helper policy path must be canonical")
     if not content:
         return "absent"
     lines = content.strip().splitlines()
@@ -80,8 +130,9 @@ def classify_policy(content: str, legacy_python: str, legacy_router: str) -> str
         pattern = re.compile(
             r"^(?P<user>[A-Za-z_][A-Za-z0-9_.-]*) ALL=\(root\) NOPASSWD: "
             r"/usr/bin/env -i HOME=/var/empty PATH=/usr/bin\\:/bin\\:/usr/sbin\\:/sbin LANG=C "
-            r"/usr/bin/python3 -I -S "
-            + re.escape(os.fspath(EXPECTED_HELPER))
+            + re.escape(os.fspath(system_python))
+            + r" -I -S "
+            + re.escape(os.fspath(helper_path))
             + r" (?P<operation>status|start|stop|reload|uninstall) (?P<uid>[1-9][0-9]*)$"
         )
         matches = [pattern.fullmatch(line) for line in commands]
@@ -524,11 +575,19 @@ def migrate_install(
     stop_legacy,
     stage,
     owner_uid: int = 0,
+    helper_path: Path = EXPECTED_HELPER,
+    system_python: Path = SYSTEM_PYTHON,
 ):
     """Revoke recognized legacy privilege before any fallible v2 staging."""
     content, directory_fd = _read_policy(layout, owner_uid)
     try:
-        classification = classify_policy(content, legacy_python, legacy_router)
+        classification = classify_policy(
+            content,
+            legacy_python,
+            legacy_router,
+            helper_path=helper_path,
+            system_python=system_python,
+        )
         if classification == "foreign":
             raise RuntimeError("managed sudoers path contains foreign content")
         if classification == "legacy":
