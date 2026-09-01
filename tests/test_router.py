@@ -2813,9 +2813,13 @@ class ErrorPolicyTests(unittest.TestCase):
     def test_seconds_override_honored_by_rotate_reason(self):
         router.set_active("proton", self.profile)
         router._providers["proton"]["error_policy"] = {"503": {"action": "cooldown", "seconds": 45}}
+        before = int(time.time())
         with mock.patch.object(router, "probe_profile", return_value=(True, {"ok": True})):
             self.assertEqual(router.rotate("proton", reason="503"), 0)
-        self.assertEqual(self._cooldown_until(), int(time.time()) + 45)  # exact policy seconds
+        after = int(time.time())
+        cooldown_until = self._cooldown_until()
+        self.assertGreaterEqual(cooldown_until, before + 45)
+        self.assertLessEqual(cooldown_until, after + 45)  # exact policy seconds
         record = router.read_egress("proton", self.profile)
         self.assertEqual(record["upstream_error"], "503")
         self.assertFalse(record.get("exhausted"))
