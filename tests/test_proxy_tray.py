@@ -29,6 +29,35 @@ def _load_tray():
 tray = _load_tray()
 
 
+class DefaultRootTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+
+    def _root_for(self, tray_path: Path) -> str:
+        with mock.patch.object(tray, "__file__", str(tray_path)):
+            return tray._default_root()
+
+    def test_canonical_root_level_tray_uses_its_directory(self):
+        (self.base / "router.py").touch()
+        got = self._root_for(self.base / "proxy_tray.py")
+        self.assertEqual(got, str(self.base.resolve()))
+
+    def test_legacy_examples_tray_uses_repository_parent(self):
+        (self.base / "router.py").touch()
+        examples = self.base / "examples"
+        examples.mkdir()
+        got = self._root_for(examples / "proxy_tray.py")
+        self.assertEqual(got, str(self.base.resolve()))
+
+    def test_environment_override_wins(self):
+        override = self.base / "selected-root"
+        with mock.patch.dict(tray.os.environ, {"PROXY_ROUTER_ROOT": str(override)}):
+            got = self._root_for(self.base / "proxy_tray.py")
+        self.assertEqual(got, str(override))
+
+
 class RouterClientEngineOwnerTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

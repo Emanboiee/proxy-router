@@ -1237,6 +1237,25 @@ class TrayApp:
         self.tray.run(setup=on_ready)
 
 
+def _default_root() -> str:
+    """Resolve the runtime root for canonical and legacy bundle layouts."""
+    override = os.environ.get("PROXY_ROUTER_ROOT")
+    if override:
+        return override
+
+    here = Path(__file__).resolve().parent
+    if (here / "router.py").is_file():
+        return str(here)
+
+    # Older checkouts kept the tray under examples/ while router.py lived at
+    # the repository root. Keep that layout usable without weakening an
+    # explicit --root or PROXY_ROUTER_ROOT override.
+    legacy_root = here.parent
+    if (legacy_root / "router.py").is_file():
+        return str(legacy_root)
+    return str(here)
+
+
 def selftest(root: str) -> int:
     """CLI-contract check: status parses, dispatch targets exist, no GUI."""
     print(f"selftest root: {root}")
@@ -1267,9 +1286,7 @@ def selftest(root: str) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="proxy-router tray agent")
-    ap.add_argument("--root", default=os.environ.get(
-        "PROXY_ROUTER_ROOT",
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    ap.add_argument("--root", default=_default_root())
     ap.add_argument("--selftest", action="store_true",
                     help="validate CLI contract, no GUI")
     args = ap.parse_args()
