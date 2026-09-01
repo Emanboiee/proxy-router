@@ -969,6 +969,44 @@ class PresetApplyReloadTests(unittest.TestCase):
         self.assertEqual(captured["rc"], (1, "boom"))
 
 
+class PresetMenuCallbackTests(unittest.TestCase):
+    def test_preset_activation_keeps_captured_name_instead_of_icon(self):
+        calls = []
+
+        class FakeClient:
+            root = "/tmp"
+
+            def status(self):
+                return tray.RouterStatus(
+                    up=True,
+                    providers={"proton": {"active": "nl", "profiles": ["nl"], "egress": {}}},
+                    preset="school-warp",
+                )
+
+            def setup_preset(self, name):
+                calls.append(("setup", name))
+                return 0, "preset applied"
+
+            def reload(self):
+                calls.append(("reload",))
+                return 0, "reloaded"
+
+        app = tray.TrayApp(FakeClient(), None)
+        captured = {}
+
+        def fake_do(fn, label):
+            captured["label"] = label
+            captured["result"] = fn()
+
+        app._do = fake_do
+        menu = app.build_menu()
+        presets = next(item for item in menu if item.text == "Presets").submenu
+        preset = next(item for item in presets if "school-warp" in item.text)
+        preset(object())
+        self.assertEqual(captured["label"], "preset school-warp")
+        self.assertEqual(calls, [("setup", "school-warp"), ("reload",)])
+
+
 class DashboardViewModelTests(unittest.TestCase):
     def test_disconnected_model_binds_primary_connect_and_route_health(self):
         status = tray.RouterStatus(

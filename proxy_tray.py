@@ -1929,12 +1929,12 @@ class TrayApp:
         preset_items = []
         for name, label in _BUILTIN_PRESETS:
             preset_items.append(pystray.MenuItem(
-                label, lambda n=name: self.action_apply_preset(n),
+                label, lambda *_, n=name: self.action_apply_preset(n),
                 checked=lambda item, n=name: st.preset == n))
         for name in self._custom_preset_names():
             preset_items.append(pystray.MenuItem(
                 self._custom_preset_label(name),
-                lambda n=name: self.action_apply_preset(n),
+                lambda *_, n=name: self.action_apply_preset(n),
                 checked=lambda item, n=name: st.preset == n))
         items.append(pystray.MenuItem("Presets", pystray.Menu(*preset_items),
                                       enabled=not mutation_active))
