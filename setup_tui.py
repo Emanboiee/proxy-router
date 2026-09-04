@@ -128,6 +128,8 @@ _PRESET_ROUTES = {
             "discord.com",
             "discord.gg",
             "discordapp.com",
+            "discordapp.net",
+            "discord.media",
             "twitch.tv",
             "facebook.com",
             "fbcdn.net",
@@ -138,6 +140,8 @@ _PRESET_ROUTES = {
             "ytimg.com",
             "x.com",
             "twitter.com",
+            "twimg.com",
+            "t.co",
             "cdn.sstatic.net",
             # Wayground/Quizizz requires these first-party and challenge hosts;
             # apex entries cover all subdomains through domain-suffix matching.

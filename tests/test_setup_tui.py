@@ -214,6 +214,10 @@ class CustomPresetTests(unittest.TestCase):
         self.assertEqual(data["routing"]["mode"], "vpn-list")
         self.assertIn("discord.com", data["routing"]["vpn_domains"])
         for domain in (
+            "discordapp.net",
+            "discord.media",
+            "twimg.com",
+            "t.co",
             "wayground.com",
             "quizizz.com",
             "joinmyquiz.com",
@@ -224,6 +228,8 @@ class CustomPresetTests(unittest.TestCase):
             self.assertIn(domain, data["routing"]["vpn_domains"])
         school = next(r for r in data["routes"] if r["id"] == "school")
         self.assertEqual(school["provider"], "cloudflare")
+        for domain in ("discordapp.net", "discord.media", "twimg.com", "t.co"):
+            self.assertIn(domain, school["domains"])
         self.assertIn("cloudflare", data["providers"])
 
     def test_school_warp_enables_doh_and_default_restores_udp(self):
