@@ -777,11 +777,15 @@ class WaitEngineTests(unittest.TestCase):
 
 
 class SystemProxyScopeTests(unittest.TestCase):
-    """Reconnect speed: the proxy toggle must hit the active service only.
+    """Reconnect speed without stranding traffic: the proxy toggle must hit
+    the active service only, while off() sweeps stale ON states elsewhere.
 
     Toggling all 9 services is 63 sequential networksetup spawns (~5s)
     on every connect. Only the default route's service is used by macOS
     clients; an unknown active service falls back to all (old behavior).
+    The sweep exists because stale 127.0.0.1:2080 ON states (e.g. on the
+    ProtonVPN/Tailscale services) strand traffic at a dead listener with
+    ERR_PROXY_CONNECTION_FAILED once the engine stops.
     """
 
     def setUp(self):
@@ -791,35 +795,61 @@ class SystemProxyScopeTests(unittest.TestCase):
     def tearDown(self):
         router._port = self._port
 
-    def _toggled_services(self, func, active):
-        seen = []
+    def _run_toggle(self, func, active, stale=()):
+        sets = []
 
         def fake_run(command, **kwargs):
-            seen.append(command[2])
-            return SimpleNamespace(returncode=0)
+            if command[1].startswith("-set"):
+                sets.append((command[1], command[2]))
+            return SimpleNamespace(returncode=0, stdout="")
 
         with mock.patch.object(router, "active_service_name", return_value=active), \
              mock.patch.object(router, "network_services", return_value=["Wi-Fi", "Ethernet"]) as all_fn, \
+             mock.patch.object(router, "_proxy_points_at_us", side_effect=lambda s: s in stale), \
              mock.patch("subprocess.run", side_effect=fake_run), \
              io.StringIO() as buf, \
              mock.patch("sys.stdout", buf):
             self.assertEqual(func(), 0)
-        return set(seen), all_fn
+        return sets, all_fn
 
     def test_proxy_on_targets_active_service_only(self):
-        services, all_fn = self._toggled_services(router.system_proxy_on, "Wi-Fi")
-        self.assertEqual(services, {"Wi-Fi"})
+        sets, all_fn = self._run_toggle(router.system_proxy_on, "Wi-Fi")
+        self.assertTrue(sets)
+        self.assertEqual({service for _, service in sets}, {"Wi-Fi"})
         all_fn.assert_not_called()
 
     def test_proxy_off_targets_active_service_only(self):
-        services, all_fn = self._toggled_services(router.system_proxy_off, "Wi-Fi")
-        self.assertEqual(services, {"Wi-Fi"})
-        all_fn.assert_not_called()
+        sets, all_fn = self._run_toggle(router.system_proxy_off, "Wi-Fi")
+        self.assertEqual({service for _, service in sets}, {"Wi-Fi"})
+        all_fn.assert_called_once()  # the stale-endpoint sweep ran
+
+    def test_proxy_off_sweeps_stale_other_service(self):
+        sets, _ = self._run_toggle(router.system_proxy_off, "Wi-Fi", stale=("Ethernet",))
+        self.assertIn(("-setwebproxystate", "Ethernet"), sets)
+        self.assertIn(("-setsecurewebproxystate", "Ethernet"), sets)
 
     def test_proxy_falls_back_to_all_services_when_active_unknown(self):
-        services, all_fn = self._toggled_services(router.system_proxy_on, None)
-        self.assertEqual(services, {"Wi-Fi", "Ethernet"})
+        sets, all_fn = self._run_toggle(router.system_proxy_on, None)
+        self.assertEqual({service for _, service in sets}, {"Wi-Fi", "Ethernet"})
         all_fn.assert_called_once()
+
+    def _points_at_us(self, stdout):
+        with mock.patch("subprocess.run", return_value=SimpleNamespace(stdout=stdout)):
+            return router._proxy_points_at_us("Ethernet")
+
+    def test_stale_detector_matches_our_endpoint(self):
+        self.assertTrue(self._points_at_us(
+            "Enabled: Yes\nServer: 127.0.0.1\nPort: 2080\n"
+            "Authenticated Proxy Enabled: 0\n"
+        ))
+
+    def test_stale_detector_ignores_foreign_proxy(self):
+        self.assertFalse(self._points_at_us(
+            "Enabled: Yes\nServer: 10.0.0.5\nPort: 8080\n"
+        ))
+
+    def test_stale_detector_ignores_switched_off(self):
+        self.assertFalse(self._points_at_us("Enabled: No\nServer: 127.0.0.1\nPort: 2080\n"))
 
 
 class ProcessIdentityTests(unittest.TestCase):

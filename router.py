@@ -5150,6 +5150,37 @@ def system_proxy_on() -> int:
     return 0
 
 
+def _proxy_points_at_us(service: str) -> bool:
+    """True when ``service`` has our 127.0.0.1 proxy still switched on.
+
+    Stale ON states strand traffic at a dead listener with
+    ERR_PROXY_CONNECTION_FAILED once the engine stops (seen live on the
+    ProtonVPN and Tailscale services after the all-services fan-out era).
+    Only our own endpoint counts: a foreign proxy is never touched.
+    """
+    try:
+        for flag in ("-getwebproxy", "-getsecurewebproxy"):
+            out = getattr(subprocess.run(
+                ["networksetup", flag, service],
+                capture_output=True, text=True, timeout=10,
+            ), "stdout", "") or ""
+            enabled = server = port = None
+            for line in out.splitlines():
+                key, _, value = line.partition(":")
+                key, value = key.strip(), value.strip()
+                if key == "Enabled":
+                    enabled = value
+                elif key == "Server":
+                    server = value
+                elif key == "Port":
+                    port = value
+            if enabled == "Yes" and server == "127.0.0.1" and port == str(_port):
+                return True
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return False
+
+
 def system_proxy_off() -> int:
     services = _proxy_target_services()
     if not services:
@@ -5177,7 +5208,26 @@ def system_proxy_off() -> int:
             )
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         return fail(f"could not disable system proxy: {exc}")
+    swept = 0
+    for other in network_services():
+        if other in services:
+            continue
+        if _proxy_points_at_us(other):
+            try:
+                subprocess.run(
+                    ["networksetup", "-setwebproxystate", other, "off"],
+                    check=True, capture_output=True, timeout=10,
+                )
+                subprocess.run(
+                    ["networksetup", "-setsecurewebproxystate", other, "off"],
+                    check=True, capture_output=True, timeout=10,
+                )
+            except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                continue
+            swept += 1
     print(f"system proxy disabled on {len(services)} network service(s)")
+    if swept:
+        print(f"system proxy cleared stale endpoint on {swept} other service(s)")
     return 0
 
 
