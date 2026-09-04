@@ -94,6 +94,29 @@ class ImportProfilesTests(unittest.TestCase):
         self.assertEqual(result["imported"], 2)
         self.assertEqual(result["rejected"], 0)
 
+    def test_import_stamps_roam_keepalive_when_missing(self):
+        # Roaming fix: an idle client never re-advertises its address
+        # after a Wi-Fi switch, so every imported profile gets the
+        # keepalive default unless it already sets one.
+        src = self.root / "roam.conf"
+        _write_valid_conf(src)
+        result = setup_tui.import_profiles(src, self.dest)
+        self.assertEqual(result["imported"], 1)
+        text = (self.dest / "roam.conf").read_text()
+        self.assertIn("PersistentKeepalive = 25", text)
+        self.assertTrue(setup_tui.validate_profile(self.dest / "roam.conf"))
+
+    def test_import_preserves_explicit_roam_keepalive(self):
+        src = self.root / "custom.conf"
+        _write_valid_conf(src)
+        with open(src, "a") as handle:
+            handle.write("PersistentKeepalive = 15\n")
+        result = setup_tui.import_profiles(src, self.dest)
+        self.assertEqual(result["imported"], 1)
+        text = (self.dest / "custom.conf").read_text()
+        self.assertIn("PersistentKeepalive = 15", text)
+        self.assertNotIn("PersistentKeepalive = 25", text)
+
     def test_reject_missing_file(self):
         result = setup_tui.import_profiles(self.root / "nope.conf", self.dest)
         self.assertEqual(result["imported"], 0)
@@ -968,7 +991,12 @@ class AtomicImportSecurityTests(unittest.TestCase):
         result = setup_tui.import_profiles(src, self.dest)
         self.assertEqual(result["imported"], 1)
         written = self.dest / "new.conf"
-        self.assertEqual(written.read_text(), src.read_text())
+        # Import stamps the roaming keepalive default, so byte identity
+        # holds against the stamped source, not the raw one.
+        self.assertEqual(
+            written.read_text(),
+            setup_tui._stamp_roam_keepalive(src.read_text()),
+        )
         mode = stat.S_IMODE(written.stat().st_mode)
         self.assertEqual(mode, 0o600)
 
