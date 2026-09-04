@@ -776,6 +776,52 @@ class WaitEngineTests(unittest.TestCase):
             self.assertTrue(router.wait_engine(timeout=2.0))
 
 
+class SystemProxyScopeTests(unittest.TestCase):
+    """Reconnect speed: the proxy toggle must hit the active service only.
+
+    Toggling all 9 services is 63 sequential networksetup spawns (~5s)
+    on every connect. Only the default route's service is used by macOS
+    clients; an unknown active service falls back to all (old behavior).
+    """
+
+    def setUp(self):
+        self._port = router._port
+        router._port = 2080
+
+    def tearDown(self):
+        router._port = self._port
+
+    def _toggled_services(self, func, active):
+        seen = []
+
+        def fake_run(command, **kwargs):
+            seen.append(command[2])
+            return SimpleNamespace(returncode=0)
+
+        with mock.patch.object(router, "active_service_name", return_value=active), \
+             mock.patch.object(router, "network_services", return_value=["Wi-Fi", "Ethernet"]) as all_fn, \
+             mock.patch("subprocess.run", side_effect=fake_run), \
+             io.StringIO() as buf, \
+             mock.patch("sys.stdout", buf):
+            self.assertEqual(func(), 0)
+        return set(seen), all_fn
+
+    def test_proxy_on_targets_active_service_only(self):
+        services, all_fn = self._toggled_services(router.system_proxy_on, "Wi-Fi")
+        self.assertEqual(services, {"Wi-Fi"})
+        all_fn.assert_not_called()
+
+    def test_proxy_off_targets_active_service_only(self):
+        services, all_fn = self._toggled_services(router.system_proxy_off, "Wi-Fi")
+        self.assertEqual(services, {"Wi-Fi"})
+        all_fn.assert_not_called()
+
+    def test_proxy_falls_back_to_all_services_when_active_unknown(self):
+        services, all_fn = self._toggled_services(router.system_proxy_on, None)
+        self.assertEqual(services, {"Wi-Fi", "Ethernet"})
+        all_fn.assert_called_once()
+
+
 class ProcessIdentityTests(unittest.TestCase):
     """Issue #62: whole-process-table liveness/ownership must be row-scoped.
     A foreign sing-box run plus an unrelated process carrying our config

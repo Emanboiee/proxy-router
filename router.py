@@ -5110,8 +5110,22 @@ def active_service_name() -> str | None:
     return None
 
 
+def _proxy_target_services() -> list[str]:
+    """Services whose proxy to toggle: the active one when known, else all.
+
+    Each networksetup call costs ~0.1-0.2s; toggling all 9 services is 63
+    spawns (~5s) on every connect. Only the default route's service is
+    actually used by macOS clients, so target it and fall back to all
+    services when detection fails (previous behavior, never fail-closed).
+    """
+    active = active_service_name()
+    if active:
+        return [active]
+    return network_services()
+
+
 def system_proxy_on() -> int:
-    services = network_services()
+    services = _proxy_target_services()
     if not services:
         return fail("could not determine any macOS network services")
     try:
@@ -5137,7 +5151,7 @@ def system_proxy_on() -> int:
 
 
 def system_proxy_off() -> int:
-    services = network_services()
+    services = _proxy_target_services()
     if not services:
         return fail("could not determine any macOS network services")
     try:
