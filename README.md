@@ -148,6 +148,9 @@ logs/                       sing-box runtime logs and rotations (gitignored)
 ./router.py response-event --host example.com --status 429 [--provider proton]
                                  # feed an observed upstream status into cooldown/error-policy handling
 ./router.py autodetect [source] [--quiet] [--no-reload]  # discover routed web-app dependency hostnames
+./router.py response-event --host example.com --status 0 --reason timeout|tls|connection
+                                 # report a real-traffic stall with no usable response: rotates the exit
+                                 # through error-policy handling (for throttled exits that still pass probes)
 ./router.py profile copy <path...> --provider proton
                                  # copy validated .conf file(s)/directory into a provider
 ./router.py watcher status       # routed-connection watcher state (JSON)
