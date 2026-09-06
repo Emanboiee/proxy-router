@@ -441,6 +441,31 @@ def load_config() -> int:
         for key in ("domains", "ip_cidr"):
             if key in route and (not isinstance(route[key], list) or not all(isinstance(v, str) for v in route[key])):
                 return fail(f"bad {CONFIG_FILE.name}: route '{route.get('id', '<unnamed>')}' {key} must be a string list")
+    for name, entry in providers.items():
+        probe_route_id = entry.get("probe_route_id")
+        if probe_route_id is None:
+            continue
+        if not isinstance(probe_route_id, str) or not probe_route_id.strip():
+            return fail(
+                f"bad {CONFIG_FILE.name}: provider '{name}' probe_route_id must be a non-empty route id"
+            )
+        matches = [route for route in routes if route.get("id") == probe_route_id]
+        if len(matches) != 1:
+            return fail(
+                f"bad {CONFIG_FILE.name}: provider '{name}' probe_route_id '{probe_route_id}' "
+                "must name exactly one route"
+            )
+        probe_route = matches[0]
+        if probe_route.get("provider") != name:
+            return fail(
+                f"bad {CONFIG_FILE.name}: provider '{name}' probe_route_id '{probe_route_id}' "
+                "must reference a route owned by that provider"
+            )
+        if not probe_route.get("domains"):
+            return fail(
+                f"bad {CONFIG_FILE.name}: provider '{name}' probe_route_id '{probe_route_id}' "
+                "must reference a route with domains"
+            )
     # Routing modes (safe-list / vpn-list): validated eagerly so a malformed
     # section fails load with a precise message, never a silent guess. Shared
     # with the `routing` CLI writer so both paths enforce the same rules.
@@ -472,7 +497,8 @@ def write_default_config(force: bool = False) -> int:
             "port": DEFAULT_PORT,
             "providers": {
                 "primary-vpn": {"directory": "providers/primary-vpn", "cooldown_seconds": 60,
-                                "fallback_providers": ["fallback-vpn"]},
+                                "fallback_providers": ["fallback-vpn"],
+                                "probe_route_id": "opencode-zen"},
                 "fallback-vpn": {"directory": "providers/fallback-vpn", "cooldown_seconds": 60,
                                  "error_policy": {"429": {"action": "cooldown", "seconds": 300}}},
             },
@@ -1276,8 +1302,25 @@ def probe_url_for(name: str) -> str | None:
                 return True
         return False
 
+    def route_probe_url(route: dict) -> str | None:
+        for raw_host in route.get("domains", []):
+            host = str(raw_host).lstrip("*.").strip().lower()
+            if not host or "." not in host or host.startswith(".") or is_direct(host):
+                continue
+            if is_tunneled(host):
+                return f"https://{host}{_PROBE_DOMAIN_PATHS.get(host, '')}"
+        return None
+
     entry = _providers.get(name)
     if isinstance(entry, dict):
+        probe_route_id = entry.get("probe_route_id")
+        if probe_route_id is not None:
+            for route in _routes:
+                if route.get("id") == probe_route_id and route.get("provider") == name:
+                    # An explicit route is fail-closed: do not silently fall
+                    # back to another route if its target is no longer tunneled.
+                    return route_probe_url(route)
+            return None
         pinned = entry.get("probe_url")
         if isinstance(pinned, str) and pinned.startswith("https://"):
             host = urllib.parse.urlsplit(pinned).hostname

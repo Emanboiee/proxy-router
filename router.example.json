@@ -6,7 +6,8 @@
       "cooldown_seconds": 60,
       "fallback_providers": [
         "fallback-vpn"
-      ]
+      ],
+      "probe_route_id": "opencode-zen"
     },
     "fallback-vpn": {
       "directory": "providers/fallback-vpn",
