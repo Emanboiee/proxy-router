@@ -1179,13 +1179,25 @@ def write_egress(name: str, profile: Path, record: dict) -> None:
 
 def record_egress(name: str, profile: Path, *, ok: bool, latency_ms: float | None = None,
                   status: int | None = None, error: str | None = None,
-                  dns_ok: bool | None = None) -> dict:
+                  dns_ok: bool | None = None, target: str | None = None) -> dict:
     """Merge one probe outcome into the profile's egress record. A passing
     probe clears the fail streak and any blocked marker; a failure bumps the
     streak so rotation deprioritizes the exit. ``dns_ok`` (True/False from the
     tunnel-DNS companion check) is persisted when it could be determined."""
     record = read_egress(name, profile)
     now = int(time.time())
+    # Keep TLS evidence separate from generic failures: a profile can have
+    # historical HTTP errors without those counting as transport death. Scope
+    # the streak to the exact target so different routed services cannot poison
+    # one another. Store only a digest; probe URLs may contain sensitive paths.
+    target_key = hashlib.sha256(target.encode()).hexdigest() if target else None
+    tls_failure = not ok and status is None and _transport_reason(error) == "tls"
+    record["tls_fails"] = (
+        (int(record.get("tls_fails") or 0)
+         if record.get("tls_target") == target_key else 0) + 1
+        if tls_failure and target_key else 0
+    )
+    record["tls_target"] = target_key
     record["ok"] = bool(ok)
     record["checked_at"] = now
     if ok:
@@ -1946,7 +1958,19 @@ def probe_egress(*, port: int | None = None, url: str | None = None, timeout: fl
             close()
 
 
-def probe_profile(name: str, profile: Path, *, port: int | None = None) -> tuple[bool, dict | None]:
+def _tls_failed(record: dict) -> bool:
+    """Return whether repeated TLS failures crossed the configured strike gate."""
+    return int(record.get("tls_fails") or 0) >= int(egress_settings()["fail_threshold"])
+
+
+def _cool_tls_failure(name: str, profile: Path, record: dict) -> None:
+    """Quarantine repeated no-HTTP TLS failures using the effective TLS policy."""
+    if _tls_failed(record) and not is_cooled_down(name, profile):
+        _apply_upstream_failure(name, profile, "tls", 300)
+
+
+def probe_profile(name: str, profile: Path, *, port: int | None = None,
+                  _defer_tls_cooldown: bool = False) -> tuple[bool, dict | None]:
     """Probe egress for ``profile`` (the provider's active exit) through the
     tunnel, persist the outcome, and add a blocked marker when the probe itself
     hit a Cloudflare reputation block. Returns (ok, record); record is None
@@ -1958,12 +1982,15 @@ def probe_profile(name: str, profile: Path, *, port: int | None = None) -> tuple
     dns_ok = None
     if (not result["ok"] and result["status"] is None
             and _transport_reason(result["error"]) != "tls"):
-        # TLS failures prove the tunnel path (CONNECT rode it); for every
-        # other connection-level failure ask whether resolution still works.
+        # TLS has progressed beyond resolution, but has NOT proved HTTPS
+        # works. Other connection failures still need the DNS distinction.
         host = urllib.parse.urlsplit(url).hostname or ""
         dns_ok = egress_dns_probe(host, port=port) if host else None
     record = record_egress(name, profile, ok=result["ok"], latency_ms=result["latency_ms"],
-                           status=result["status"], error=result["error"], dns_ok=dns_ok)
+                           status=result["status"], error=result["error"], dns_ok=dns_ok,
+                           target=url)
+    if not _defer_tls_cooldown:
+        _cool_tls_failure(name, profile, record)
     if result["block_reason"]:
         mark_blocked(name, profile, result["block_reason"])
     elif result["error"] == "rate-limit-429":
@@ -1993,6 +2020,9 @@ def probe_profile(name: str, profile: Path, *, port: int | None = None) -> tuple
         # TLS-classified failures (SSL EOF / SSL_ERROR_SYSCALL / TLS alert)
         # are deliberately excluded: the TCP CONNECT already rode the tunnel,
         # so the path works and the upstream is throttling — never a cooldown.
+        # TLS uses its separate target-scoped streak above, never HTTP fails.
+        # dns_ok False is excluded too: resolution rides the direct path, so
+        # a DNS flake never proves the tunnel dead (degraded, not dead).
         # Only a positive DNS signal permits cooldown. False means the direct
         # resolver failed; None is inconclusive. Neither proves the tunnel
         # dead, so DNS failures/flakes never trigger rotation.
@@ -2004,23 +2034,20 @@ def probe_profile(name: str, profile: Path, *, port: int | None = None) -> tuple
 
 
 def _probe_with_settle(name: str, profile: Path, *, port: int | None = None) -> tuple[bool, dict | None]:
-    """Probe once, and on failure retry once after the settle window.
+    """Probe once, then quarantine repeated TLS failures after settling.
 
-    Used only for switch-adjacent probes (``rotate``/``egress sweep``): a
-    freshly switched WireGuard exit routinely completes its handshake but
-    blackholes inner TLS for its first seconds of life, so a single
-    immediate probe false-marks healthy exits dead and triggers rollback
-    churn. Steady-state probes (``egress check``) keep their single-shot,
-    multi-strike semantics. Set ``egress.probe_settle_seconds`` to 0 to
-    disable the retry."""
-    ok, record = probe_profile(name, profile, port=port)
-    if ok:
-        return ok, record
+    A freshly switched WireGuard exit can briefly blackhole inner TLS, so the
+    first failure is deferred through the configured settle window. Steady
+    probes keep their normal multi-strike behavior; setting the window to zero
+    applies the TLS threshold immediately.
+    """
     try:
         settle = max(0.0, float(egress_settings().get("probe_settle_seconds", 20.0)))
     except (TypeError, ValueError):
         settle = 20.0
-    if settle <= 0:
+    ok, record = probe_profile(name, profile, port=port,
+                               _defer_tls_cooldown=settle > 0)
+    if ok or settle <= 0:
         return ok, record
     print(f"router: probe failed for {profile.stem}; retrying once after {settle:.0f}s settle",
           file=sys.stderr)
@@ -2032,9 +2059,12 @@ def _probe_with_settle(name: str, profile: Path, *, port: int | None = None) -> 
     deadline = time.monotonic() + settle
     while time.monotonic() < deadline:
         time.sleep(min(poll_step, max(0.0, deadline - time.monotonic())))
-        ok, record = probe_profile(name, profile, port=port)
+        ok, record = probe_profile(name, profile, port=port,
+                                   _defer_tls_cooldown=True)
         if ok:
             return ok, record
+    if record is not None:
+        _cool_tls_failure(name, profile, record)
     return ok, record
 
 
@@ -2107,13 +2137,12 @@ def check_egress_live(name: str, profile: Path, *, port: int | None = None,
 
     - ``alive``: the HTTPS probe got an HTTP response through the tunnel.
     - ``degraded``: an HTTP response arrived but was not ok (e.g. Cloudflare
-      1010/403 reputation block or 5xx), OR the failure is TLS-classified
-      (SSL EOF / SSL_ERROR_SYSCALL / TLS alert): the TCP CONNECT rode the
-      tunnel, so the path demonstrably works and the upstream endpoint is
-      throttling — never a dead tunnel, so keepalive must not rotate on it.
+      1010/403 reputation block or 5xx), or a TLS failure below
+      ``egress.fail_threshold``. A completed HTTP response always proves
+      transport, unlike CONNECT alone.
     - ``dead``: the probe failed at connection level (no HTTP status at all,
-      no TLS handshake), i.e. the tunnel path itself is broken. The DNS
-      signal sharpens the reason: ``dns_ok is True`` means the later
+      including repeated TLS failure), i.e. this exit cannot serve the target.
+      The DNS signal sharpens the reason: ``dns_ok is True`` means the later
       dial/read stage through the tunnel failed; ``dns_ok is False`` means
       resolution failed on the DIRECT DNS path (DNS is pinned direct by
       design) — the tunnel was never dialed, so the exit is ``degraded``,
@@ -2139,11 +2168,8 @@ def check_egress_live(name: str, profile: Path, *, port: int | None = None,
     elif probe["status"] is not None:
         status, dns_ok = "degraded", True  # HTTP response rode the tunnel
     elif _transport_reason(probe["error"]) == "tls":
-        # TLS-handshake failure (SSL EOF / SSL_ERROR_SYSCALL / TLS alert)
-        # happens AFTER the TCP CONNECT rode the tunnel: the path demonstrably
-        # works and the upstream endpoint is throttling (Proton free tier
-        # resets inner TLS ~1s in while real traffic still succeeds). That is
-        # a degraded exit, never a dead tunnel — no cooldown, no rotation.
+        # A single TLS handshake blip is degraded; the persisted target-scoped
+        # streak below decides when repeated failures warrant failover.
         status, dns_ok = "degraded", True
     else:
         host = urllib.parse.urlsplit(url).hostname or ""
@@ -2161,7 +2187,11 @@ def check_egress_live(name: str, profile: Path, *, port: int | None = None,
     if status == "alive":
         _clear_cooldown(name, profile)
     record = record_egress(name, profile, ok=probe["ok"], latency_ms=probe["latency_ms"],
-                           status=probe["status"], error=probe["error"], dns_ok=dns_ok)
+                           status=probe["status"], error=probe["error"], dns_ok=dns_ok,
+                           target=url)
+    if _tls_failed(record):
+        status = "dead"
+        _cool_tls_failure(name, profile, record)
     if probe["block_reason"]:
         mark_blocked(name, profile, probe["block_reason"])
     elif probe["error"] == "rate-limit-429":
@@ -4515,6 +4545,16 @@ def rotate(name: str, *, reason: str | None = None, force: bool = False, probe: 
             print(f"already on {name} -> {chosen.stem}")
             return 0
     if reason is not None:
+        # Keep an established TLS quarantine intact when keepalive reports the
+        # same failure through its generic timeout channel. Only borrow the TLS
+        # policy when profile, target, and recorded failure all match.
+        if automatic and reason == "timeout" and current is not None:
+            record = read_egress(name, current)
+            target = probe_url_for(name)
+            if (target and _tls_failed(record) and is_cooled_down(name, current)
+                    and record.get("upstream_error") == "tls"
+                    and record.get("tls_target") == hashlib.sha256(target.encode()).hexdigest()):
+                reason = "tls"
         _apply_upstream_failure(name, current, reason, seconds)
     elif current is not None and not is_cooled_down(name, current) and not force:
         mark_cooldown(name, current, seconds)
