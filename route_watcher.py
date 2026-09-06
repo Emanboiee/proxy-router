@@ -366,12 +366,28 @@ def provider_for_host(root: Path, host: str) -> str | None:
     return None
 
 
-def rotate_provider(root: Path, provider: str = "proton", *, runner: Callable = subprocess.run) -> dict:
+def _classify_reason(text: str) -> str:
+    """Map failure evidence to the router error-policy reason it warrants.
+
+    Mirrors ``router._transport_reason``: TLS/SSL/handshake/certificate/EOF
+    failures are ``tls``, every other transport failure is ``connection``
+    (both quarantine 300s). The worker previously hardcoded ``timeout``
+    (60s) for every rotation, so a TLS-dead exit returned to eligibility
+    long before policy intends and egress records mislabeled the cause.
+    """
+    lowered = str(text or "").lower()
+    if any(token in lowered for token in ("tls", "ssl", "handshake", "certificate", "eof", "alert")):
+        return "tls"
+    return "connection"
+
+
+def rotate_provider(root: Path, provider: str = "proton", *, reason: str = "timeout",
+                    runner: Callable = subprocess.run) -> dict:
     """Ask proxy-router itself to rotate; Hermes is not involved."""
     try:
         result = runner(
             [sys.executable, str(Path(root) / "router.py"), "rotate", provider,
-             "--reason", "timeout"],
+             "--reason", reason],
             cwd=str(root), capture_output=True, text=True, timeout=50,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -484,7 +500,7 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
                             last_provider[host] = provider
                         if event.get("failure") and guard.record_transport_failure(now, host):
                             target = last_provider.get(host) or "proton"
-                            result = rotate_provider(root, target)
+                            result = rotate_provider(root, target, reason=_classify_reason(event.get("line") or ""))
                             append_event(root, {"kind": "rotation", "observed_at": time.time(), **result})
                 elif event["kind"] == "client":
                     # Client lines are retained only as a bounded observation;
@@ -505,7 +521,7 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
                 append_event(root, {"kind": "probe", "observed_at": time.time(), **result})
                 if result.get("transport_failure") and guard.record_transport_failure(now, host):
                     target = last_provider.get(host) or provider_for_host(root, host) or "proton"
-                    rotation = rotate_provider(root, target)
+                    rotation = rotate_provider(root, target, reason=_classify_reason(result.get("error") or ""))
                     append_event(root, {"kind": "rotation", "observed_at": time.time(), **rotation})
             sleep(max(0.5, float(interval)))
     finally:
