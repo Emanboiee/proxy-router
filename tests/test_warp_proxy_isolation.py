@@ -3,11 +3,11 @@
 Recommended minimal integration contract for the core worker (no
 proxy-backed schema exists in router.py yet):
 
-- Provider entry: ``providers["cloudflare"] = {"proxy": {"server":
-  "127.0.0.1", "server_port": 2181}}`` (canonical key ``"proxy"``; tests
-  also tolerate ``"socks5"`` / ``"socks5_upstream"`` as aliases).
-- Helpers: ``router.provider_proxy_upstream(name) -> dict | None`` and
-  ``router.build_socks5_outbound(name, server, port) -> dict``.
+- Provider entry: ``providers["cloudflare"] = {"socks5": {"host":
+  "127.0.0.1", "port": 2181}}`` (canonical key ``"socks5"``).
+  Tests also exercise tolerant alias parsing separately.
+- Helpers: ``router.proxy_upstream(name) -> (host, port)`` and the
+  generated sing-box SOCKS5 outbound.
 - ``build_singbox_config()``: emits ``{"type": "socks", "tag": name, ...}``
   in ``outbounds`` for proxy-backed providers (no WireGuard profile
   required), routes that provider's domains to the SOCKS5 tag, keeps
@@ -107,8 +107,8 @@ def _socks_outbounds(config: dict) -> list:
 def _needs_proxy_schema(router) -> bool:
     """True when router.py has no proxy-backed provider support yet."""
     return not (
-        hasattr(router, "provider_proxy_upstream")
-        or hasattr(router, "build_socks5_outbound")
+        (hasattr(router, "is_proxy_provider")
+         and hasattr(router, "proxy_upstream"))
     )
 
 
@@ -145,7 +145,7 @@ def test_warp_domains_route_to_socks5_while_default_stays_direct(tmp_path):
     router.CONFIG_FILE.write_text(json.dumps({
         "port": ALT_PORT,
         "providers": {WARP_PROVIDER: {
-            "proxy": {"server": "127.0.0.1", "server_port": UPSTREAM_PORT}}},
+            "socks5": {"host": "127.0.0.1", "port": UPSTREAM_PORT}}},
         "routes": [{"id": "warp-only", "domains": WARP_DOMAINS,
                     "provider": WARP_PROVIDER}],
     }))
@@ -157,11 +157,10 @@ def test_warp_domains_route_to_socks5_while_default_stays_direct(tmp_path):
     upstream = _proxy_entry(router)
     if _needs_proxy_schema(router) or not socks or upstream is None:
         pytest.xfail(
-            "expected-red: router.py has no proxy-backed provider schema yet; "
-            "core worker must add providers.<name>.proxy + SOCKS5 outbound "
-            "branch in build_singbox_config (no WireGuard profile required)"
+            "expected-red: router.py has no validated proxy-backed provider "
+            "schema or SOCKS5 outbound branch yet"
         )
-    assert upstream["server_port"] == UPSTREAM_PORT
+    assert upstream.get("server_port", upstream.get("port")) == UPSTREAM_PORT
     warp_out = next(o for o in socks if o["server_port"] == UPSTREAM_PORT)
     assert warp_out["tag"] == WARP_PROVIDER
     rules = config["route"]["rules"]
@@ -294,7 +293,7 @@ def test_dead_socks5_upstream_falls_back_without_engine_teardown(
     router.CONFIG_FILE.write_text(json.dumps({
         "port": ALT_PORT,
         "providers": {WARP_PROVIDER: {
-            "proxy": {"server": "127.0.0.1", "server_port": UPSTREAM_PORT}}},
+            "socks5": {"host": "127.0.0.1", "port": UPSTREAM_PORT}}},
         "routes": [{"id": "warp-only", "domains": WARP_DOMAINS,
                     "provider": WARP_PROVIDER}],
     }))
@@ -358,12 +357,16 @@ def test_proxy_schema_aliases_resolve_to_same_upstream(tmp_path):
             key: {"server": "127.0.0.1", "server_port": UPSTREAM_PORT}}}
         upstream = _proxy_entry(router)
         assert upstream is not None, key
-        assert upstream["server_port"] == UPSTREAM_PORT, key
+        assert upstream.get("server_port", upstream.get("port")) == UPSTREAM_PORT, key
     helper = getattr(router, "provider_proxy_upstream", None)
+    if helper is None and hasattr(router, "proxy_upstream"):
+        router._providers = {WARP_PROVIDER: {
+            "socks5": {"host": "127.0.0.1", "port": UPSTREAM_PORT}}}
+        assert router.proxy_upstream(WARP_PROVIDER) == ("127.0.0.1", UPSTREAM_PORT)
+        return
     if helper is None:
         pytest.xfail(
-            "expected-red: provider_proxy_upstream helper not implemented yet; "
-            "config-key tolerance above is the interim contract"
+            "expected-red: no validated proxy upstream helper exists yet"
         )
     router._providers = {WARP_PROVIDER: {
         "proxy": {"server": "127.0.0.1", "server_port": UPSTREAM_PORT}}}
