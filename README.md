@@ -112,7 +112,7 @@ examples/proxy-manager.sh   bridge for the Hermes opencode-server-rotation plugi
 tests/                       unit tests (unittest, no deps)
 providers/<provider>/        WireGuard configs, one file per profile (chmod 600)
 state/                       active profile + cooldown markers (gitignored)
-sing-box.json / .pid / .log  runtime state (gitignored)
+logs/                       sing-box runtime logs and rotations (gitignored)
 ```
 
 ## Usage
@@ -627,9 +627,10 @@ Linux/Windows: run `examples/keepalive.sh` under a supervisor of your choice
 The keepalive waits `PROXY_KEEPALIVE_INTERVAL` (default 15s) between checks,
 but while `ensure` keeps failing the wait grows exponentially (15, 30, 60, ...)
 up to `PROXY_KEEPALIVE_MAX_BACKOFF` (default 300s), so a dead engine is not
-hammered; one successful check resets the wait. `sing-box.log` is also rotated
-to `sing-box.log.1` once it exceeds 10 MB (at engine start, when no engine
+hammered; one successful check resets the wait. `logs/sing-box.log` is also rotated
+to `logs/sing-box.log.1` once it exceeds 10 MB (at engine start, when no engine
 holds the log).
+A fresh engine start creates `logs/`; existing root-level logs are copied there once for compatibility.
 
 `ensure` only proves the process is alive, so the keepalive ALSO self-heals a
 dead-but-listening tunnel (WireGuard handshake/route dead while the port still

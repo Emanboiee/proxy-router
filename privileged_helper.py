@@ -769,9 +769,11 @@ def _promote_runtime_candidate(metadata: RuntimeMetadata) -> None:
 
 
 def _open_user_log(metadata: InstallMetadata) -> int:
+    """Open the private logs/sing-box.log inode without following user-controlled links."""
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
     log_flags = os.O_WRONLY | os.O_APPEND | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
     root_fd = os.open(metadata.user_root, directory_flags)
+    logs_fd = None
     try:
         root_info = os.fstat(root_fd)
         if (
@@ -782,44 +784,79 @@ def _open_user_log(metadata: InstallMetadata) -> int:
             or root_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
         ):
             raise SecurityError("pinned user root identity changed before log open")
-        created = False
+        created_dir = False
         try:
-            fd = os.open("sing-box.log", log_flags, dir_fd=root_fd)
+            logs_fd = os.open("logs", directory_flags, dir_fd=root_fd)
         except FileNotFoundError:
             try:
-                fd = os.open(
-                    "sing-box.log",
-                    log_flags | os.O_CREAT | os.O_EXCL,
-                    0o600,
-                    dir_fd=root_fd,
-                )
-                created = True
+                os.mkdir("logs", 0o700, dir_fd=root_fd)
+                created_dir = True
+            except FileExistsError:
+                pass
+            try:
+                logs_fd = os.open("logs", directory_flags, dir_fd=root_fd)
             except OSError as exc:
-                raise SecurityError(f"cannot create user log safely: {exc}") from exc
+                raise SecurityError(f"cannot open user log directory safely: {exc}") from exc
         except OSError as exc:
-            raise SecurityError(f"cannot open user log safely: {exc}") from exc
+            raise SecurityError(f"cannot open user log directory safely: {exc}") from exc
+        logs_info = os.fstat(logs_fd)
+        if not stat.S_ISDIR(logs_info.st_mode):
+            raise SecurityError("user log directory must be a directory")
+        if created_dir:
+            if logs_info.st_uid != os.geteuid():
+                raise SecurityError("new user log directory has an unexpected owner")
+            os.fchown(logs_fd, metadata.uid, metadata.gid)
+            os.fchmod(logs_fd, 0o700)
+        elif (
+            logs_info.st_uid != metadata.uid
+            or logs_info.st_gid != metadata.gid
+            or stat.S_IMODE(logs_info.st_mode) != 0o700
+        ):
+            raise SecurityError("existing user log directory owner/mode is unsafe")
+        created = False
         try:
-            info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-                raise SecurityError("user log must be one unlinked regular inode")
-            if created:
-                if info.st_uid != os.geteuid():
-                    raise SecurityError("new user log has an unexpected owner")
-                os.fchown(fd, metadata.uid, metadata.gid)
-                os.fchmod(fd, 0o600)
-            elif (
-                info.st_uid != metadata.uid
-                or info.st_gid != metadata.gid
-                or stat.S_IMODE(info.st_mode) != 0o600
-            ):
-                raise SecurityError("existing user log owner/mode is unsafe")
-            current_flags = fcntl.fcntl(fd, fcntl.F_GETFL)
-            fcntl.fcntl(fd, fcntl.F_SETFL, current_flags & ~os.O_NONBLOCK)
-            return fd
-        except BaseException:
-            os.close(fd)
-            raise
+            try:
+                fd = os.open("sing-box.log", log_flags, dir_fd=logs_fd)
+            except FileNotFoundError:
+                try:
+                    fd = os.open(
+                        "sing-box.log",
+                        log_flags | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                        dir_fd=logs_fd,
+                    )
+                    created = True
+                except OSError as exc:
+                    raise SecurityError(f"cannot create user log safely: {exc}") from exc
+            except OSError as exc:
+                raise SecurityError(f"cannot open user log safely: {exc}") from exc
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise SecurityError("user log must be one unlinked regular inode")
+                if created:
+                    if info.st_uid != os.geteuid():
+                        raise SecurityError("new user log has an unexpected owner")
+                    os.fchown(fd, metadata.uid, metadata.gid)
+                    os.fchmod(fd, 0o600)
+                elif (
+                    info.st_uid != metadata.uid
+                    or info.st_gid != metadata.gid
+                    or stat.S_IMODE(info.st_mode) != 0o600
+                ):
+                    raise SecurityError("existing user log owner/mode is unsafe")
+                current_flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+                fcntl.fcntl(fd, fcntl.F_SETFL, current_flags & ~os.O_NONBLOCK)
+                return fd
+            except BaseException:
+                os.close(fd)
+                raise
+        finally:
+            os.close(logs_fd)
+            logs_fd = None
     finally:
+        if logs_fd is not None:
+            os.close(logs_fd)
         os.close(root_fd)
 
 

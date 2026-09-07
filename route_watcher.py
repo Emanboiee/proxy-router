@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 ROOT = Path(os.environ.get("PROXY_ROUTER_ROOT") or Path(__file__).resolve().parent).resolve()
-LOG_FILE_NAME = "sing-box.log"
+LOG_FILE_NAME = "logs/sing-box.log"
 STATE_DIR_NAME = "state/route-watcher"
 PID_NAME = "pid"
 ENABLED_NAME = "enabled"
