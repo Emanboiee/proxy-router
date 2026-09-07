@@ -156,6 +156,8 @@ logs/                       sing-box runtime logs and rotations (gitignored)
 ./router.py network-check        # auto-apply the preset mapped to the current Wi-Fi (run by the route watcher every 30s)
 ./router.py failover <provider> on [--to <fallback>]  # route the provider's domains through its configured fallback chain (first valid entry, or the named member)
 ./router.py failover <provider> off    # clear fallback and restore the provider's routes
+./router.py failover <provider> recover --host <domain>  # confirm a stalled route, then try VPN fallbacks and opt-in direct
+./router.py failover <provider> restore --host <domain>  # test a direct fallback's primary VPN and restore it after two wins
 ./router.py failover <provider> status --json   # configured chain + active fallback
 ./router.py provider-count proton # rotation candidates (retry budget)
 ./router.py providers check [provider] [--json]  # offline validity preflight: which providers can carry traffic at all (exit 1 = some invalid)
@@ -242,6 +244,7 @@ Rotation is then egress-aware instead of blind round-robin:
   changes because every provider shares one engine. Explicit `rotate`,
   `egress sweep`, and `failover` commands remain available for intentional
   operator-controlled interruptions.
+- For proxy-mode recovery, set `"fail_open_direct": true` in a provider's configuration to permit its routes to leave the VPN when configured VPN fallbacks also fail. This is off by default and never applies to TUN mode. The watcher confirms the failing hostname, tries up to two configured VPN alternatives, then direct. Each provider has a 120-second recovery cooldown. Once direct is serving, the watcher tests the primary VPN at most every five minutes and keeps direct until two consecutive HTTP responses succeed; a failed check immediately reinstates direct. Recovery takes seconds plus reload time, and existing connections may need a refresh.
 - `egress check` is the read-only liveness view used by the keepalive self-heal
   loop: it probes the ACTIVE exit(s) through the running tunnel and classifies
   each one `alive` (HTTP response rode the tunnel), `degraded` (an HTTP status

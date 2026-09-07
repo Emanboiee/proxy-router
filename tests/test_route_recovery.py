@@ -129,6 +129,38 @@ def test_watcher_probes_without_waiting_for_error_logs(tmp_path):
          mock.patch.object(w, "_read_new_lines", return_value=(0, [])), \
          mock.patch.object(w, "_network_check_hop"), \
          mock.patch.object(w, "probe_target", probe), \
+         mock.patch.object(w, "restore_provider", return_value={"returncode": 3, "restored": False}) as restore, \
          mock.patch.object(w.signal, "signal"):
         assert w.worker(tmp_path, sleep=stop) == 0
     probe.assert_called_once_with(tmp_path.resolve(), "discord.com")
+    restore.assert_called_once_with(tmp_path.resolve(), "warp", "discord.com")
+
+
+def test_direct_fallback_returns_to_vpn_after_two_primary_checks(controller):
+    r = controller
+    assert r.activate_fallback("warp", target="direct") == 0
+    r.probe_egress.return_value = {"status": 200}
+    assert r.restore_fallback("warp", "discord.com") == 1
+    assert r.active_fallback("warp") == "direct"
+    marker = r.ROOT / "state" / "recovery" / "warp-restore.json"
+    marker.write_text(json.dumps({"attempted_at": 0, "successes": 1}))
+    assert r.restore_fallback("warp", "discord.com") == 0
+    assert r.active_fallback("warp") is None
+    assert not marker.exists()
+
+
+def test_restore_keeps_direct_when_primary_is_still_dead(controller):
+    r = controller
+    assert r.activate_fallback("warp", target="direct") == 0
+    r.probe_egress.return_value = {"status": None, "error": "timeout"}
+    assert r.restore_fallback("warp", "discord.com") == 1
+    assert r.active_fallback("warp") == "direct"
+    marker = r.ROOT / "state" / "recovery" / "warp-restore.json"
+    assert json.loads(marker.read_text())["successes"] == 0
+
+
+def test_watcher_can_request_primary_restore(tmp_path):
+    runner = mock.Mock(return_value=mock.Mock(returncode=0, stderr="", stdout="restored"))
+    route_watcher.restore_provider(tmp_path, "warp", "discord.com", runner=runner)
+    assert runner.call_args.args[0][2:] == [
+        "failover", "warp", "restore", "--host", "discord.com"]

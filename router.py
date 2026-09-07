@@ -116,6 +116,10 @@ DEFAULT_ERROR_POLICY = {
 # Rotate logs/sing-box.log once it outgrows this (mirrors monitor.py sample
 # rotation); the live log grows a line per connection and is unbounded.
 LOG_MAX_BYTES = 10_000_000
+# Confirmed direct fallbacks are retried on a slow cadence to avoid flapping.
+RECOVERY_COOLDOWN_SECONDS = 120.0
+RESTORE_COOLDOWN_SECONDS = 300.0
+RESTORE_SUCCESS_THRESHOLD = 2
 
 _sing_box_cache: str | None = None
 _sing_box_resolved = False
@@ -1156,7 +1160,7 @@ def recover_route(name: str, host: str) -> int:
     marker = ROOT / "state" / "recovery" / f"{name}.json"
     now = time.time()
     try:
-        if now - float(json.loads(marker.read_text())["attempted_at"]) < 120:
+        if now - float(json.loads(marker.read_text())["attempted_at"]) < RECOVERY_COOLDOWN_SECONDS:
             return 3
     except (OSError, ValueError, KeyError, TypeError):
         pass
@@ -1200,6 +1204,72 @@ def recover_route(name: str, host: str) -> int:
     if candidates and not MANUAL_OFF_FILE.exists():
         engine_reload()
     return fail(f"no working fallback for '{name}'")
+
+
+def restore_fallback(name: str, host: str) -> int:
+    """Probe a primary provider and remove a direct fallback after two wins.
+
+    Direct fallback remains the serving path while the primary is checked. A
+    failed check immediately reinstates direct routing; a single successful
+    check is retained as evidence and the second consecutive success commits
+    the return to the VPN. Attempts are cooldown-limited to prevent flapping.
+    """
+    if MANUAL_OFF_FILE.exists() or not _automatic_proxy_mode():
+        return 3
+    if name not in _providers or response_provider_for_host(host) != name:
+        return 3
+    if not _diagnostic_host_is_routed(host):
+        return 3
+    routing = routing_state()
+    if routing["mode"] == "vpn-list" and not any(
+            _response_host_matches(host, domain) for domain in routing["vpn_domains"]):
+        return 3
+    url = f"https://{host}/"
+    if urllib.parse.urlsplit(url).hostname != host or unsafe_probe_target(url):
+        return fail("unsafe restore target")
+    if active_fallback(name) != "direct":
+        return 3
+    marker = ROOT / "state" / "recovery" / f"{name}-restore.json"
+    now = time.time()
+    previous: dict = {}
+    try:
+        loaded = json.loads(marker.read_text())
+        if isinstance(loaded, dict):
+            previous = loaded
+        if now - float(previous.get("attempted_at", 0)) < RESTORE_COOLDOWN_SECONDS:
+            return 3
+    except (OSError, ValueError, TypeError):
+        previous = {}
+    successes = int(previous.get("successes", 0) or 0)
+    # Temporarily restore the primary so this probe cannot accidentally measure
+    # the already-selected direct path.
+    rc = deactivate_fallback(name, automatic=True)
+    if rc != 0:
+        return rc
+    result = probe_egress(url=url, timeout=3.0)
+    status = result.get("status") if isinstance(result, dict) else None
+    healthy = isinstance(status, int) and 100 <= status < 600
+    if healthy:
+        successes += 1
+        if successes >= RESTORE_SUCCESS_THRESHOLD:
+            marker.unlink(missing_ok=True)
+            print(f"primary restored: {name} after {successes} successful checks")
+            return 0
+        _atomic_write(marker, json.dumps({
+            "attempted_at": now, "host": host, "successes": successes,
+        }, sort_keys=True) + "\n", 0o600)
+        if activate_fallback(name, target="direct", reason="restore-pending", automatic=True) == 0:
+            print(f"primary check passed for {name}; awaiting one more check")
+            return 1
+        return fail(f"provider '{name}' restore pending but direct fallback could not be reinstated")
+    # Keep service available through direct while the VPN is still unhealthy.
+    _atomic_write(marker, json.dumps({
+        "attempted_at": now, "host": host, "successes": 0,
+    }, sort_keys=True) + "\n", 0o600)
+    if activate_fallback(name, target="direct", reason="primary-unhealthy", automatic=True) != 0:
+        return fail(f"provider '{name}' primary is still unhealthy and direct fallback failed")
+    print(f"primary still unhealthy: {name}; direct fallback retained", file=sys.stderr)
+    return 1
 
 
 def deactivate_fallback(name: str, *, automatic: bool = False) -> int:
@@ -6609,7 +6679,7 @@ def main() -> int:
 
     failover = sub.add_parser("failover", help="activate or clear a provider fallback")
     failover.add_argument("provider")
-    failover.add_argument("action", choices=["on", "off", "status", "recover"])
+    failover.add_argument("action", choices=["on", "off", "status", "recover", "restore"])
     failover.add_argument("--host", help="failing routed hostname for confirmed recovery")
     failover.add_argument("--to", default=None, help="fallback provider (must match config)")
     failover.add_argument("--reason", default="transport")
@@ -6893,10 +6963,11 @@ def main() -> int:
             dedupe_seconds=args.dedupe_seconds,
         ))
     if args.cmd == "failover":
-        if args.action == "recover":
+        if args.action in ("recover", "restore"):
             if not args.host:
-                parser.error("failover recover requires --host")
-            return _with_lock(lambda: recover_route(args.provider, args.host))
+                parser.error(f"failover {args.action} requires --host")
+            handler = recover_route if args.action == "recover" else restore_fallback
+            return _with_lock(lambda: handler(args.provider, args.host))
         if args.action == "on":
             return _with_lock(lambda: activate_fallback(
                 args.provider, target=args.to, reason=args.reason,
