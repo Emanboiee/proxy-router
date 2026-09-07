@@ -632,6 +632,19 @@ to `logs/sing-box.log.1` once it exceeds 10 MB (at engine start, when no engine
 holds the log).
 A fresh engine start creates `logs/`; existing root-level logs are copied there once for compatibility.
 
+
+For proxy-mode recovery, set `"fail_open_direct": true` in a provider's
+configuration to permit its routes to leave the VPN when fallback providers
+also fail. This is off by default and never applies to TUN mode. Direct traffic
+uses local DNS and can still be blocked by the network. The watcher confirms
+the failing hostname, tries up to two configured VPN alternatives, then direct.
+Each provider has a 120-second recovery cooldown; HTTP responses and DNS
+failures do not trigger failover. Recovery takes seconds plus reload time,
+and existing connections may need a refresh. Direct fallback stays active
+until restored with `failover <provider> off` or existing maintenance.
+Use `router.py failover <provider> recover --host <routed-host>` for the same
+confirmed recovery from the CLI.
+
 `ensure` only proves the process is alive, so the keepalive ALSO self-heals a
 dead-but-listening tunnel (WireGuard handshake/route dead while the port still
 accepts): every `PROXY_KEEPALIVE_PROBE_EVERY` successful ensures (default 4,

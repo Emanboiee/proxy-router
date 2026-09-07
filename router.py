@@ -375,6 +375,8 @@ def load_config() -> int:
                for name, entry in providers.items()):
         return fail(f"bad {CONFIG_FILE.name}: provider names/entries are invalid")
     for name, entry in providers.items():
+        if "fail_open_direct" in entry and not isinstance(entry["fail_open_direct"], bool):
+            return fail(f"bad {CONFIG_FILE.name}: fail_open_direct must be a boolean")
         directory = entry.get("directory", f"providers/{name}")
         if not isinstance(directory, str):
             return fail(f"bad {CONFIG_FILE.name}: provider '{name}' directory must be a string")
@@ -1024,7 +1026,7 @@ def fallback_chain(name: str) -> list[str]:
     if raw is None:
         raw = entry.get("fallback_provider")
     if raw is None:
-        return []
+        raw = []
     items = raw if isinstance(raw, list) else [raw]
     seen: set[str] = set()
     chain: list[str] = []
@@ -1033,6 +1035,8 @@ def fallback_chain(name: str) -> list[str]:
             continue
         seen.add(target)
         chain.append(target)
+    if entry.get("fail_open_direct") is True:
+        chain.append("direct")
     return chain
 
 
@@ -1061,6 +1065,8 @@ def active_fallback(name: str) -> str | None:
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return None
     active = data.get("provider") if isinstance(data, dict) else None
+    if active == "direct" and current_mode() != "proxy":
+        return None
     return active if active in targets else None
 
 
@@ -1108,8 +1114,10 @@ def activate_fallback(name: str, *, target: str | None = None, reason: str = "tr
     previous = path.read_text() if path.is_file() else None
     last_error = "no fallback candidate has a valid profile"
     for candidate in candidates:
-        profiles = provider_files(candidate)
-        if not profiles or not any(_profile_error(profile) is None for profile in profiles):
+        if candidate == "direct" and current_mode() != "proxy":
+            continue
+        profiles = [] if candidate == "direct" else provider_files(candidate)
+        if candidate != "direct" and (not profiles or not any(_profile_error(profile) is None for profile in profiles)):
             print(f"router: skipping fallback '{candidate}': no valid profiles", file=sys.stderr)
             continue
         _atomic_write(path, json.dumps({
@@ -1127,6 +1135,71 @@ def activate_fallback(name: str, *, target: str | None = None, reason: str = "tr
         else:
             _atomic_write(path, previous, 0o600)
     return fail(f"provider '{name}': {last_error}")
+
+
+def recover_route(name: str, host: str) -> int:
+    """Confirm a stalled route, then try configured alternatives and opt-in direct."""
+    if MANUAL_OFF_FILE.exists() or not _automatic_proxy_mode():
+        return 3
+    if name not in _providers or response_provider_for_host(host) != name:
+        return fail("recovery target does not belong to the configured provider")
+    if not _diagnostic_host_is_routed(host):
+        return 3
+    routing = routing_state()
+    if routing["mode"] == "vpn-list" and not any(
+            _response_host_matches(host, domain) for domain in routing["vpn_domains"]):
+        return 3
+    url = f"https://{host}/"
+    if urllib.parse.urlsplit(url).hostname != host or unsafe_probe_target(url):
+        return fail("unsafe recovery target")
+    # Ignore old log bursts after a recent recovery; one provider owns the budget.
+    marker = ROOT / "state" / "recovery" / f"{name}.json"
+    now = time.time()
+    try:
+        if now - float(json.loads(marker.read_text())["attempted_at"]) < 120:
+            return 3
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    def reachable() -> bool:
+        result = probe_egress(url=url, timeout=3.0)
+        status = result.get("status")
+        return isinstance(status, int) and 100 <= status < 600
+    # Require a fresh confirmation and positive DNS, not merely old error lines.
+    if reachable():
+        return 0
+    if egress_dns_probe(host, timeout=2.0) is not True:
+        return fail("recovery deferred: direct DNS is unavailable or unknown")
+    _atomic_write(marker, json.dumps({"attempted_at": now}) + "\n", 0o600)
+    original = _fallback_state_path(name)
+    previous = original.read_text() if original.is_file() else None
+    active = active_fallback(name)
+    # Try at most two VPN alternatives per attempt, keeping direct last.
+    configured = configured_fallbacks(name)
+    candidates = [item for item in configured if item != "direct" and item != active][:2]
+    if not configured:
+        rc = rotate(name, reason="timeout", automatic=True)
+        return 0 if rc == 0 and reachable() else 1
+    if "direct" in configured and active != "direct":
+        candidates.append("direct")
+    for candidate in candidates:
+        if MANUAL_OFF_FILE.exists() or not _automatic_proxy_mode():
+            return 3
+        rc = activate_fallback(name, target=candidate, reason="confirmed-stall", automatic=True)
+        if rc == 0 and reachable():
+            print(f"route recovered: {name} -> {candidate}")
+            return 0
+        if rc == 0 and candidate == "direct":
+            print(f"direct fallback active for {name}; {host} remains unreachable", file=sys.stderr)
+            return 1
+    # No working replacement: restore the previous policy rather than leave a
+    # failed candidate selected while reporting an unsuccessful recovery.
+    if previous is None:
+        original.unlink(missing_ok=True)
+    else:
+        _atomic_write(original, previous, 0o600)
+    if candidates and not MANUAL_OFF_FILE.exists():
+        engine_reload()
+    return fail(f"no working fallback for '{name}'")
 
 
 def deactivate_fallback(name: str, *, automatic: bool = False) -> int:
@@ -2408,7 +2481,7 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
     vpn_domains = frozenset(routing["vpn_domains"])
     for route in build_routes:
         route_provider = _effective_route_provider(route["provider"])
-        if route_provider not in active or not route.get("domains"):
+        if (route_provider != "direct" and route_provider not in active) or not route.get("domains"):
             continue
         domains = route["domains"]
         if routing_mode == "vpn-list":
@@ -2418,7 +2491,7 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
             ]
         if domains:
             dns_rules.append({"domain_suffix": domains,
-                              "server": dns_alias.get(route_provider, f"dns-{route_provider}")})
+                              "server": "dns-local" if route_provider == "direct" else dns_alias.get(route_provider, f"dns-{route_provider}")})
 
     # Route rules: safe-list direct-domain pins first (a trusted domain is
     # never tunneled even if a provider route also mentions it), then the
@@ -2428,7 +2501,7 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
     provider_rules = []
     for route in build_routes:
         route_provider = _effective_route_provider(route["provider"])
-        if route_provider not in active:
+        if route_provider != "direct" and route_provider not in active:
             continue
         rule = {"outbound": route_provider}
         if route.get("domains"):
@@ -2566,7 +2639,7 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
         # error when that provider has no active profile - never emit a
         # dangling final.
         default_provider = _effective_route_provider(routing["default_provider"])
-        if default_provider not in active:
+        if default_provider != "direct" and default_provider not in active:
             raise SystemExit(
                 f"routing mode 'safe-list': default_provider '{default_provider}' has no active profile; "
                 "cannot emit a dangling route.final (drop *.conf into providers/<name>/ first)"
@@ -6536,7 +6609,8 @@ def main() -> int:
 
     failover = sub.add_parser("failover", help="activate or clear a provider fallback")
     failover.add_argument("provider")
-    failover.add_argument("action", choices=["on", "off", "status"])
+    failover.add_argument("action", choices=["on", "off", "status", "recover"])
+    failover.add_argument("--host", help="failing routed hostname for confirmed recovery")
     failover.add_argument("--to", default=None, help="fallback provider (must match config)")
     failover.add_argument("--reason", default="transport")
     failover.add_argument("--json", action="store_true")
@@ -6819,6 +6893,10 @@ def main() -> int:
             dedupe_seconds=args.dedupe_seconds,
         ))
     if args.cmd == "failover":
+        if args.action == "recover":
+            if not args.host:
+                parser.error("failover recover requires --host")
+            return _with_lock(lambda: recover_route(args.provider, args.host))
         if args.action == "on":
             return _with_lock(lambda: activate_fallback(
                 args.provider, target=args.to, reason=args.reason,

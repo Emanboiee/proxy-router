@@ -366,13 +366,15 @@ def provider_for_host(root: Path, host: str) -> str | None:
     return None
 
 
-def rotate_provider(root: Path, provider: str = "proton", *, runner: Callable = subprocess.run) -> dict:
-    """Ask proxy-router itself to rotate; Hermes is not involved."""
+def rotate_provider(root: Path, provider: str = "proton", *, host: str | None = None,
+                    runner: Callable = subprocess.run) -> dict:
+    """Ask the controller to confirm failures and recover the affected route."""
+    command = (["failover", provider, "recover", "--host", host] if host else
+               ["rotate", provider, "--reason", "timeout", "--automatic"])
     try:
         result = runner(
-            [sys.executable, str(Path(root) / "router.py"), "rotate", provider,
-             "--reason", "timeout"],
-            cwd=str(root), capture_output=True, text=True, timeout=50,
+            [sys.executable, str(Path(root) / "router.py"), *command],
+            cwd=str(root), capture_output=True, text=True, timeout=180 if host else 50,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"rotated": False, "error": type(exc).__name__}
@@ -459,6 +461,17 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
             # target set each tick so transparent capture starts observing a
             # newly configured domain without requiring a router restart.
             domains = critical_domains(root)
+            # Probe one representative per configured lane even before a slow
+            # connection timeout produces its first log line.
+            representatives: set[str] = set()
+            for host in domains:
+                provider = provider_for_host(root, host)
+                if provider and provider not in representatives:
+                    representatives.add(provider)
+                    last_target[host] = time.monotonic()
+                    last_provider[host] = provider
+                if len(representatives) >= 3:
+                    break
             offset, lines = _read_new_lines(log_path, offset)
             for line in lines:
                 event = parse_line(line)
@@ -484,7 +497,7 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
                             last_provider[host] = provider
                         if event.get("failure") and guard.record_transport_failure(now, host):
                             target = last_provider.get(host) or "proton"
-                            result = rotate_provider(root, target)
+                            result = rotate_provider(root, provider_for_host(root, host) or target, host=host)
                             append_event(root, {"kind": "rotation", "observed_at": time.time(), **result})
                 elif event["kind"] == "client":
                     # Client lines are retained only as a bounded observation;
@@ -502,10 +515,12 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
                     continue
                 last_probe[host] = now
                 result = probe_target(root, host)
+                if result.get("ok"):
+                    guard.failure_times.pop(normalize_host(host), None)
                 append_event(root, {"kind": "probe", "observed_at": time.time(), **result})
                 if result.get("transport_failure") and guard.record_transport_failure(now, host):
                     target = last_provider.get(host) or provider_for_host(root, host) or "proton"
-                    rotation = rotate_provider(root, target)
+                    rotation = rotate_provider(root, provider_for_host(root, host) or target, host=host)
                     append_event(root, {"kind": "rotation", "observed_at": time.time(), **rotation})
             sleep(max(0.5, float(interval)))
     finally:
