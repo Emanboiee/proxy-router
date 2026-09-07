@@ -52,6 +52,9 @@ MODE_FILE = ROOT / "state" / "mode"
 # keepalive.sh so a manual disconnect is NOT resurrected on the next
 # ensure tick. Removed by `router.py start` / tray Connect.
 MANUAL_OFF_FILE = ROOT / "state" / "manual-off"
+# Written automatically when Wi-Fi disappears; unlike manual-off, keepalive
+# clears it and reconnects after the network returns.
+NETWORK_OFF_FILE = ROOT / "state" / "network-off"
 # Versioned ownership record for system proxy changes.  It records only the
 # endpoint proxy-router installed (never proxy credentials or full settings),
 # so Disconnect can clear stale copies after a network/VPN handoff without
@@ -3447,7 +3450,7 @@ def _config_drifted() -> bool:
     return drifted
 
 
-def engine_ensure() -> int:
+def engine_ensure(*, allow_network_off: bool = False) -> int:
     if MANUAL_OFF_FILE.is_file():
         # The user disconnected manually (tray Disconnect / `router.py
         # stop`). keepalive.sh also skips its maintenance while the marker
@@ -3458,6 +3461,10 @@ def engine_ensure() -> int:
         # disconnected tunnel (manual-off is quiescent, not healthy).
         print("router: manually disconnected (manual-off marker present); "
               "run 'router.py start' to reconnect", file=sys.stderr)
+        return 3
+    if network_off_marker().is_file() and not allow_network_off:
+        print("router: Wi-Fi unavailable (network-off marker present); waiting for reconnect",
+              file=sys.stderr)
         return 3
     if current_mode() == "tun":
         # A proxy engine running while state/mode says tun is NOT healthy
@@ -3695,6 +3702,106 @@ def current_ssid() -> str | None:
                 ssid = value.strip()
                 return ssid or None
     return None
+
+
+def network_status() -> dict:
+    """Return the current physical Wi-Fi state without touching the engine.
+
+    The guard is implemented for macOS, where ``ipconfig getsummary`` is the
+    same read-only source already used by network-aware presets. Other
+    platforms report ``supported: false`` and stay connected so keepalive
+    cannot tear down a VPN based on an unavailable platform probe.
+    """
+    checked_at = int(time.time())
+    if sys.platform != "darwin":
+        return {"connected": True, "ssid": None, "supported": False,
+                "checked_at": checked_at}
+    ssid = current_ssid()
+    return {"connected": bool(ssid), "ssid": ssid, "supported": True,
+            "checked_at": checked_at}
+
+
+def network_off_marker(root: Path | None = None) -> Path:
+    return (Path(root) if root is not None else ROOT) / "state" / "network-off"
+
+
+def _write_network_off() -> int:
+    """Publish an automatic network-stop latch before teardown."""
+    try:
+        _atomic_write(
+            network_off_marker(),
+            f"network unavailable {datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')}\n",
+        )
+    except OSError as exc:
+        print(f"router: could not write network-off marker: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _clear_network_off() -> int:
+    """Clear the automatic latch, or report a durable-state failure."""
+    try:
+        network_off_marker().unlink(missing_ok=True)
+    except OSError as exc:
+        print(f"router: cannot clear network-off marker: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_network_status(as_json: bool = False) -> int:
+    result = network_status()
+    if as_json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        state = "connected" if result["connected"] else "disconnected"
+        ssid = f" ({result['ssid']})" if result.get("ssid") else ""
+        print(f"network: {state}{ssid}")
+    return 0 if result["connected"] else 1
+
+
+def cmd_network_disconnect() -> int:
+    """Stop proxy-router after Wi-Fi loss while allowing later auto-reconnect."""
+    if MANUAL_OFF_FILE.is_file():
+        return 3
+    if _write_network_off() != 0:
+        return 1
+    route_watcher_stop()
+    proxy_rc = system_proxy_off() if sys.platform == "darwin" else 0
+    engine_rc = _with_lock(engine_stop, timeout=5.0)
+    if proxy_rc != 0 or engine_rc != 0:
+        if proxy_rc != 0:
+            print("router: network disconnect could not disable system proxy", file=sys.stderr)
+        if engine_rc != 0:
+            print("router: network disconnect could not prove engine stopped; retrying", file=sys.stderr)
+        return proxy_rc or engine_rc
+    print("router: Wi-Fi unavailable; proxy-router disconnected until the network returns")
+    return 0
+
+
+def cmd_network_reconnect() -> int:
+    """Re-arm proxy-router after the Wi-Fi network returns."""
+    if MANUAL_OFF_FILE.is_file():
+        return 3
+    if not network_off_marker().is_file():
+        return 0
+    if sys.platform == "darwin" and not current_ssid():
+        return 2
+    if load_config() != 0:
+        return 1
+    rc = _with_lock(lambda: engine_ensure(allow_network_off=True), timeout=5.0)
+    if rc != 0:
+        return rc
+    route_watcher_start()
+    if sys.platform == "darwin":
+        proxy_rc = system_proxy_on() if current_mode() == "proxy" else system_proxy_off()
+        if proxy_rc != 0:
+            route_watcher_stop()
+            _with_lock(engine_stop, timeout=5.0)
+            return proxy_rc
+    if _clear_network_off() != 0:
+        return 1
+    print("router: Wi-Fi returned; proxy-router reconnected")
+    return 0
 
 
 def network_preset_map() -> dict[str, str]:
@@ -4315,11 +4422,12 @@ def _write_manual_off() -> int:
 
 
 def _clear_manual_off() -> int:
-    """Clear the operator-stop latch, or report a durable-state failure."""
+    """Clear both explicit and automatic disconnect latches."""
     try:
         MANUAL_OFF_FILE.unlink(missing_ok=True)
+        network_off_marker().unlink(missing_ok=True)
     except OSError as exc:
-        print(f"router: cannot clear manual-off marker: {exc}", file=sys.stderr)
+        print(f"router: cannot clear disconnect marker: {exc}", file=sys.stderr)
         return 1
     return 0
 
@@ -6719,12 +6827,24 @@ def main() -> int:
     elevate.add_argument("action", choices=["install", "uninstall", "status"])
 
     sub.add_parser("network-check", help="auto-switch routing preset for the current Wi-Fi network")
+    network_status_parser = sub.add_parser(
+        "network-status", help="report whether the current Wi-Fi network is available"
+    )
+    network_status_parser.add_argument("--json", action="store_true", help="machine-readable JSON")
+    sub.add_parser("network-disconnect", help="stop proxy-router until Wi-Fi returns")
+    sub.add_parser("network-reconnect", help="reconnect after Wi-Fi returns")
 
     args, passthrough = parser.parse_known_args()
     if args.cmd == "elevate":
         return cmd_elevate(args.action)
     if args.cmd == "network-check":
         return cmd_network_check()
+    if args.cmd == "network-status":
+        return cmd_network_status(as_json=args.json)
+    if args.cmd == "network-disconnect":
+        return cmd_network_disconnect()
+    if args.cmd == "network-reconnect":
+        return cmd_network_reconnect()
     if _needs_elevation(args):
         return _elevate()
     def _delegated_setup_argv() -> list[str]:

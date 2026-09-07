@@ -48,6 +48,12 @@
 # state, not an engine failure; the tunnel stays down until `router.py start`
 # clears the marker. The agent polls only its own enabled flag while quiescent.
 #
+# Network-loss guard: on macOS the loop checks the active Wi-Fi SSID before
+# supervision. After NETWORK_GRACE consecutive misses it disables the system
+# proxy and stops sing-box, then reconnects only after the SSID returns. The
+# network-off latch is separate from manual-off, so an operator disconnect still
+# remains quiescent and never gets auto-resurrected.
+#
 # Runtime reconfiguration: the enabled flag is re-read from router.json on
 # every tick (env override wins), so `keepalive.enabled: false` stops the
 # agent without a launchctl reload, and true resumes it.
@@ -60,6 +66,7 @@
 #   PROXY_KEEPALIVE_STORM_WINDOW   rotation-guard window in seconds    (600)
 #   PROXY_KEEPALIVE_MAX_ROTATIONS  max keepalive rotations per window  (2)
 #   PROXY_KEEPALIVE_SWEEP_EVERY    full-pool egress sweep every N seconds (1800)
+#   PROXY_KEEPALIVE_NETWORK_GRACE consecutive Wi-Fi misses before stop (1)
 #   PROXY_KEEPALIVE_ENABLED        temporary on/off override               (config)
 set -uo pipefail
 
@@ -150,6 +157,7 @@ DEAD_STRIKES="${PROXY_KEEPALIVE_DEAD_STRIKES:-$(config_setting dead_strikes 2)}"
 STORM_WINDOW="${PROXY_KEEPALIVE_STORM_WINDOW:-$(config_setting storm_window 600)}"
 MAX_ROTATIONS="${PROXY_KEEPALIVE_MAX_ROTATIONS:-$(config_setting max_rotations 2)}"
 SWEEP_EVERY="${PROXY_KEEPALIVE_SWEEP_EVERY:-$(config_setting sweep_every 1800)}"
+NETWORK_GRACE="${PROXY_KEEPALIVE_NETWORK_GRACE:-$(config_setting network_grace 1)}"
 
 backoff="$INTERVAL"
 boot=1
@@ -158,6 +166,8 @@ strikes=0
 rotations=0
 window_start=0
 last_sweep=0
+network_lost=0
+network_quiet=0
 
 # Allow at most MAX_ROTATIONS keepalive rotations per STORM_WINDOW seconds.
 rotation_allowed() {
@@ -330,6 +340,42 @@ while true; do
     continue
   fi
   manual_quiet=0
+  # Network guard runs before ensure so a stale proxy cannot strand browsers
+  # while Wi-Fi is off. `network-status` is read-only; the controller commands
+  # own the durable marker and the teardown/reconnect transaction.
+  if controller network-status >/dev/null 2>&1; then
+    network_lost=0
+    if [ -f "$ROOT/state/network-off" ]; then
+      if controller network-reconnect >/dev/null 2>&1; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') router: Wi-Fi returned; supervision resumed" >&2
+        network_quiet=0
+        boot=1
+        checks=0
+        strikes=0
+        backoff="$INTERVAL"
+      else
+        echo "$(date '+%Y-%m-%d %H:%M:%S') router: Wi-Fi returned but reconnect failed; retrying" >&2
+        backoff="$INTERVAL"
+        sleep "$backoff"
+        continue
+      fi
+    fi
+  else
+    network_lost=$((network_lost + 1))
+    if [ "$network_lost" -ge "$NETWORK_GRACE" ]; then
+      if controller network-disconnect >/dev/null 2>&1; then
+        if [ "$network_quiet" -ne 1 ]; then
+          echo "$(date '+%Y-%m-%d %H:%M:%S') router: Wi-Fi unavailable; proxy-router disconnected" >&2
+        fi
+      elif [ "$network_quiet" -ne 1 ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') router: Wi-Fi unavailable; disconnect retry pending" >&2
+      fi
+      network_quiet=1
+    fi
+    backoff="$INTERVAL"
+    sleep "$backoff"
+    continue
+  fi
   if ensure_out=$(controller ensure 2>&1); then
     if [ "$backoff" -ne "$INTERVAL" ]; then
       echo "$(date '+%Y-%m-%d %H:%M:%S') router: ensure ok; backoff reset to ${INTERVAL}s" >&2

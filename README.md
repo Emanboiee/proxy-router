@@ -635,6 +635,24 @@ to `logs/sing-box.log.1` once it exceeds 10 MB (at engine start, when no engine
 holds the log).
 A fresh engine start creates `logs/`; existing root-level logs are copied there once for compatibility.
 
+On macOS the keepalive also guards the physical Wi-Fi link. It runs
+`router.py network-status` before supervision; after one missed SSID check
+(`PROXY_KEEPALIVE_NETWORK_GRACE`, default `1`) it disables only proxy-router's
+owned system-proxy settings, stops the engine, and writes `state/network-off`.
+While that latch exists, `ensure` stays quiescent. Once Wi-Fi returns,
+keepalive runs `router.py network-reconnect`, verifies the engine and proxy
+surface, then clears the latch. This automatic latch is separate from
+`state/manual-off`: `router.py stop` still requires an explicit `start` and is
+never auto-reconnected.
+
+The lifecycle commands are also available for diagnostics:
+
+```sh
+proxy-router network-status --json
+proxy-router network-disconnect
+proxy-router network-reconnect
+```
+
 
 For proxy-mode recovery, set `"fail_open_direct": true` in a provider's
 configuration to permit its routes to leave the VPN when fallback providers

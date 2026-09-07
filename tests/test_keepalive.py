@@ -28,6 +28,25 @@ cmd="${1:-}"
 logger="${FAKE_ROUTER_LOG:-}"
 if [ -n "$logger" ]; then printf '%s\n' "$*" >> "$logger"; fi
 case "$cmd" in
+  network-status)
+    state="${FAKE_ROUTER_NETWORK:-connected}"
+    if [ -n "${FAKE_ROUTER_NETWORK_FILE:-}" ] && [ -f "$FAKE_ROUTER_NETWORK_FILE" ]; then
+      state=$(cat "$FAKE_ROUTER_NETWORK_FILE")
+    fi
+    [ "$state" = "disconnected" ] && exit 1
+    exit 0
+    ;;
+  network-disconnect)
+    if [ -n "${FAKE_ROUTER_NETWORK_OFF_FILE:-}" ]; then
+      mkdir -p "$(dirname "$FAKE_ROUTER_NETWORK_OFF_FILE")"
+      : > "$FAKE_ROUTER_NETWORK_OFF_FILE"
+    fi
+    exit 0
+    ;;
+  network-reconnect)
+    rm -f "${FAKE_ROUTER_NETWORK_OFF_FILE:-/dev/null}"
+    exit 0
+    ;;
   ensure)
     n=$(cat "${FAKE_ROUTER_ENSURE_COUNT:-/dev/null}" 2>/dev/null || echo 0)
     n=$((n + 1))
@@ -119,7 +138,7 @@ class KeepaliveHarness:
     def __init__(self, *, interval="1", fail_ensures="", egress="alive",
                  probe_every="4", dead_strikes="2", storm_window="600",
                  max_rotations="2", fallback="", root=None, pinned_python="",
-                 mode="proxy"):
+                 mode="proxy", network="connected"):
         self._tmp = None
         if root is None:
             self._tmp = tempfile.TemporaryDirectory()
@@ -156,6 +175,9 @@ class KeepaliveHarness:
         self.fallback_file = self.root / "fallback.state"
         if fallback:
             self.fallback_file.write_text(fallback)
+        self.network_file = self.root / "network.state"
+        self.network_file.write_text(network)
+        self.network_off_file = self.root / "state" / "network-off"
         env = dict(os.environ)
         env["PATH"] = f"{self.root / 'bin'}:" + env["PATH"]
         env["PROXY_KEEPALIVE_INTERVAL"] = interval
@@ -169,6 +191,8 @@ class KeepaliveHarness:
         env["FAKE_ROUTER_ENSURE_COUNT"] = str(self.count)
         env["FAKE_ROUTER_EGRESS_FILE"] = str(self.egress_file)
         env["FAKE_ROUTER_FALLBACK_FILE"] = str(self.fallback_file)
+        env["FAKE_ROUTER_NETWORK_FILE"] = str(self.network_file)
+        env["FAKE_ROUTER_NETWORK_OFF_FILE"] = str(self.network_off_file)
         if pinned_python:
             pinned_bin = self.root / "bin" / "pinned-python"
             env["PROXY_ROUTER_PYTHON"] = str(pinned_bin)
@@ -187,6 +211,9 @@ class KeepaliveHarness:
 
     def set_egress(self, state: str) -> None:
         self.egress_file.write_text(state)
+
+    def set_network(self, state: str) -> None:
+        self.network_file.write_text(state)
 
     def wait_lines(self, count: int, timeout: float = 20.0) -> list[str]:
         deadline = time.time() + timeout
@@ -321,7 +348,7 @@ class KeepaliveEgressCheckTests(unittest.TestCase):
             }
             ticks = [line for i, line in enumerate(lines)
                      if i not in restore_probes
-                     and line not in {"rotate --if-due", "egress sweep --json"}]
+                     and line not in {"network-status", "rotate --if-due", "egress sweep --json"}]
             check_lines = [i for i, line in enumerate(ticks) if line == "egress check"]
             gaps = [b - a for a, b in zip(check_lines, check_lines[1:])]
             # every PROBE_EVERY ensures triggers a check; log distance is
@@ -506,6 +533,33 @@ class KeepaliveFallbackRestoreTests(unittest.TestCase):
             h.close()
             self.assertIn("'proton' primary still dead; re-activating fallback", h.err,
                           f"re-activation message missing: {h.err!r}")
+        finally:
+            h.close()
+
+
+class KeepaliveNetworkGuardTests(unittest.TestCase):
+    def test_wifi_loss_disconnects_and_return_reconnects(self):
+        h = KeepaliveHarness(interval="1", network="disconnected")
+        try:
+            h.wait_lines(4)
+            lines = h.lines()
+            self.assertIn("network-status", lines)
+            self.assertIn("network-disconnect", lines)
+            self.assertNotIn("ensure", lines)
+            self.assertTrue(h.network_off_file.is_file())
+
+            h.set_network("connected")
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                lines = h.lines()
+                if "network-reconnect" in lines and "ensure" in lines:
+                    break
+                time.sleep(0.05)
+            self.assertIn("network-reconnect", lines)
+            self.assertIn("ensure", lines)
+            self.assertFalse(h.network_off_file.exists())
+            h.close()
+            self.assertIn("Wi-Fi returned; supervision resumed", h.err)
         finally:
             h.close()
 
