@@ -22,7 +22,11 @@
 # seconds, so a broken pool cannot storm. A boot self-test runs once on the
 # first successful ensure (one early rotation in proxy mode, same storm
 # guard). TUN mode still permits read-only checks, but never performs an
-# automatic profile or fallback change.
+# automatic profile or fallback change. A single-profile pool with no viable
+# rotation candidate parks once on its configured fallback and stays sticky
+# (restore rides the sweep cadence); base-route gaps ("missing default
+# interface", "no route to internet", "WireGuard is not ready") defer
+# without consuming strike/rotation budget.
 #
 # Scheduled rotation: when router.json has a "rotation" block, the loop also
 # calls `router.py rotate --if-due` on every healthy tick in proxy mode - the
@@ -227,13 +231,147 @@ PY
   return 0
 }
 
+# LIFECYCLE-HELPERS-START (extracted verbatim by lifecycle unit tests; keep
+# these functions side-effect free and free of top-level state).
+# Base-route / network-loss signals are a deferral, never rotation budget:
+# reloading the engine while the base route is gone only produces "missing
+# default interface" / "no route to internet" / "WireGuard is not ready"
+# noise and drops long-lived flows (Discord). Case-insensitive.
+is_network_gap() {
+  printf '%s' "${1:-}" | grep -iq -e 'missing default' -e 'no route to' -e 'wireguard is not ready' -e 'no default route' -e 'network unreachable' -e 'network is down' -e 'no internet' -e 'tunnel is down' -e 'engine not listening'
+}
+
+# Lowercase + trim + strip brackets/quotes/parens, for inactive-marker
+# comparison only (provider-name spelling is preserved by
+# fallback_active_name).
+normalize_fallback_token() {
+  printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | tr -d "[]()\"'" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+# True (0) for inactive markers: empty, none, no, false, 0, off, null,
+# nil, -, n/a, na, [], etc. Anything else is a candidate name. Never
+# mistakes an inactive marker for an active fallback.
+fallback_value_is_inactive() {
+  _fvi_stripped=$(printf '%s' "${1:-}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+  case "$_fvi_stripped" in
+    ""|"[]"|"["|"]") return 0 ;;
+  esac
+  _fvi_norm=$(normalize_fallback_token "${1:-}")
+  case "$_fvi_norm" in
+    ""|none|no|n|false|0|off|null|nil|-|n/a|na) return 0 ;;
+  esac
+  return 1
+}
+
+# True (0) when the raw configured value names at least one candidate:
+# plain names, comma lists, and Python list reprs (['proton'],
+# ["proton", "direct"]). Inactive markers and empty lists do not count.
+fallback_configured_has_candidate() {
+  _fcc_cleaned=$(printf '%s' "${1:-}" | tr ',;' ' ' | tr -d "[]()\"'")
+  for _fcc_tok in $_fcc_cleaned; do
+    if fallback_value_is_inactive "$_fcc_tok"; then
+      continue
+    fi
+    case "$_fcc_tok" in
+      *[!A-Za-z0-9._-]* ) continue ;;
+      *) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# Echo the active fallback provider name, or nothing when the raw value is
+# an inactive marker. Lenient toward sticky (first valid token wins) so a
+# malformed status line can never trigger a reload storm; a status that
+# reads inactive simply retries within the storm guard.
+fallback_active_name() {
+  _fan_cleaned=$(printf '%s' "${1:-}" | tr ',;' ' ' | tr -d "[]()\"'")
+  for _fan_tok in $_fan_cleaned; do
+    _fan_trimmed=$(printf '%s' "$_fan_tok" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    [ -n "$_fan_trimmed" ] || continue
+    if fallback_value_is_inactive "$_fan_trimmed"; then
+      continue
+    fi
+    case "$_fan_trimmed" in
+      *[!A-Za-z0-9._-]* ) continue ;;
+      *) printf '%s\n' "$_fan_trimmed"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# Split `failover status` text into FB_CONFIGURED / FB_ACTIVE globals.
+# Handles extra whitespace, any-case keys, and list-valued configured
+# fields containing spaces. Returns 1 when no configured field is found.
+fallback_split_status_text() {
+  _fst_line=$(printf '%s\n' "${1:-}" | grep -i 'configured[[:space:]]*=' | tail -n 1)
+  [ -n "$_fst_line" ] || return 1
+  _fst_rest=$(printf '%s\n' "$_fst_line" | sed -n 's/.*[Cc][Oo][Nn][Ff][Ii][Gg][Uu][Rr][Ee][Dd][[:space:]]*=[[:space:]]*//p')
+  [ -n "$_fst_rest" ] || return 1
+  if printf '%s\n' "$_fst_rest" | grep -iq '[[:space:]]active[[:space:]]*='; then
+    FB_ACTIVE=$(printf '%s\n' "$_fst_rest" | sed -n 's/.*[[:space:]][Aa][Cc][Tt][Ii][Vv][Ee][[:space:]]*=[[:space:]]*//p' | sed -e 's/[[:space:]]*$//')
+    FB_CONFIGURED=$(printf '%s\n' "$_fst_rest" | sed 's/[[:space:]][Aa][Cc][Tt][Ii][Vv][Ee][[:space:]]*=[[:space:]]*.*$//' | sed -e 's/[[:space:]]*$//')
+  else
+    FB_CONFIGURED=$(printf '%s' "$_fst_rest" | sed -e 's/[[:space:]]*$//')
+    FB_ACTIVE=""
+  fi
+  return 0
+}
+
+# Set FB_CONFIGURED / FB_ACTIVE for a provider. Prefers `status --json`
+# (list-safe); falls back to text parsing. Returns 1 when unavailable.
+get_fallback_state() {
+  FB_CONFIGURED=""; FB_ACTIVE=""
+  _gfs_provider="$1"
+  if _gfs_json=$(controller failover "$_gfs_provider" status --json 2>/dev/null); then
+    if _gfs_parsed=$(python_runner - "$_gfs_json" 2>/dev/null <<'PY'
+import json
+import sys
+
+try:
+    data = json.loads(sys.argv[1])
+except Exception:
+    raise SystemExit(1)
+if not isinstance(data, dict):
+    raise SystemExit(1)
+conf = data.get("configured", "")
+if isinstance(conf, list):
+    conf = ",".join(str(x) for x in conf)
+elif conf is None:
+    conf = ""
+else:
+    conf = str(conf)
+act = data.get("active", "")
+if act is None:
+    act = ""
+else:
+    act = str(act)
+print(conf)
+print(act)
+PY
+); then
+      FB_CONFIGURED=$(printf '%s\n' "$_gfs_parsed" | sed -n '1p')
+      FB_ACTIVE=$(printf '%s\n' "$_gfs_parsed" | sed -n '2p')
+      return 0
+    fi
+  fi
+  _gfs_state=$(controller failover "$_gfs_provider" status 2>/dev/null || true)
+  [ -n "$_gfs_state" ] || return 1
+  fallback_split_status_text "$_gfs_state"
+}
+# LIFECYCLE-HELPERS-END
+
 # One bounded auto-rotation for the provider `egress check` reported dead in
 # proxy mode. TUN mode only reports the dead path; it does not reload the
 # shared engine automatically.
 # `egress check` prints "dead: <provider>" as its last stdout line (and exits
 # 1) when an active exit is dead; without that line nothing is rotated.
+# Single-profile pools with a configured fallback park once and stay sticky;
+# base-route gaps defer without budget. $2 carries the full egress output
+# for gap detection.
 rotate_dead() {
   provider="$1"
+  egress_out="${2:-}"
   if is_tun_mode; then
     echo "router: automatic dead-exit rotation skipped in TUN mode" >&2
     strikes=0
@@ -246,6 +384,24 @@ rotate_dead() {
     echo "router: egress check dead but no provider identified; skipping rotation" >&2
     strikes=0
     return
+  fi
+  # Base-route gap: defer without consuming strike/rotation budget.
+  if [ -n "$egress_out" ] && is_network_gap "$egress_out"; then
+    echo "router: network gap detected for '$provider'; deferring rotation (no budget consumed)" >&2
+    strikes=0
+    return
+  fi
+  # If the egress checker already identifies a fallback path, do not spend
+  # a rotation/status round-trip on the parked primary. This keeps normal
+  # non-fallback rotation cadence unchanged while making the sticky path
+  # completely quiet.
+  if printf '%s\n' "$egress_out" | grep -Eiq 'fallback[[:space:]]*\('; then
+    parked=$(printf '%s\n' "$egress_out" | sed -n 's/.*fallback[[:space:]]*(\([^)]*\)).*/\1/p' | tail -n 1)
+    if [ -n "$parked" ]; then
+      echo "router: fallback '$parked' already active for '$provider'; staying parked (no rotation)" >&2
+      strikes=0
+      return
+    fi
   fi
   if ! rotation_allowed; then
     echo "router: rotation skipped (storm guard: $rotations rotations in the last ${STORM_WINDOW}s)" >&2
@@ -266,27 +422,24 @@ rotate_dead() {
       return
     fi
     echo "router: rotate '$provider' failed; checking configured fallback" >&2
-    fallback_state=$(controller failover "$provider" status 2>/dev/null || true)
-    configured_fallback=$(printf '%s\n' "$fallback_state" | sed -n 's/.* configured=\([^ ]*\).*/\1/p')
-    active_fallback=$(printf '%s\n' "$fallback_state" | sed -n 's/.* active=\([^ ]*\).*/\1/p')
-    case "$active_fallback" in
-      ""|none|no|false|0|off|OFF)
-        ;;
-      *)
-        echo "router: fallback '$active_fallback' already active; waiting for the next dead check" >&2
-        return
-        ;;
-    esac
-    case "$configured_fallback" in
-      ""|none|no|false|0|off|OFF)
-        echo "router: no configured fallback for '$provider'; backing off" >&2
-        return
-        ;;
-    esac
+    if ! get_fallback_state "$provider"; then
+      echo "router: fallback status unavailable for '$provider'; backing off" >&2
+      return
+    fi
+    parked=$(fallback_active_name "$FB_ACTIVE" || true)
+    if [ -n "$parked" ]; then
+      echo "router: fallback '$parked' already active for '$provider'; staying parked (no rotation)" >&2
+      return
+    fi
+    if ! fallback_configured_has_candidate "$FB_CONFIGURED"; then
+      echo "router: no configured fallback for '$provider'; backing off" >&2
+      return
+    fi
     if ! controller failover "$provider" on --reason timeout --automatic >/dev/null 2>&1; then
       echo "router: fallback for '$provider' failed; will retry after the next dead check" >&2
       return
     fi
+    echo "router: parked '$provider' on fallback (sticky; restore rides the sweep cadence)" >&2
   fi
 }
 
@@ -388,9 +541,12 @@ while true; do
       # healthy one is logged and the normal loop continues.
       if out=$(controller egress check 2>&1); then
         echo "router: boot self-test ok"
+      elif is_network_gap "$out"; then
+        echo "router: boot self-test: network gap detected - deferring rotation ($(printf '%s\n' "$out" | tail -n 1))" >&2
+        strikes=0
       else
         echo "router: boot self-test: active tunnel is dead - rotating once ($(printf '%s\n' "$out" | tail -n 1))" >&2
-        rotate_dead "$(printf '%s\n' "$out" | sed -n 's/^dead: //p')"
+        rotate_dead "$(printf '%s\n' "$out" | sed -n 's/^dead: //p')" "$out"
       fi
     else
       checks=$((checks + 1))
@@ -398,11 +554,14 @@ while true; do
         checks=0
         if out=$(controller egress check 2>&1); then
           strikes=0
+        elif is_network_gap "$out"; then
+          echo "router: egress check: network gap detected - deferring (no strike, no rotation): $(printf '%s\n' "$out" | tail -n 1)" >&2
+          strikes=0
         else
           strikes=$((strikes + 1))
           echo "router: egress check: dead exit ($strikes/$DEAD_STRIKES strikes): $(printf '%s\n' "$out" | tail -n 1)" >&2
           if [ "$strikes" -ge "$DEAD_STRIKES" ]; then
-            rotate_dead "$(printf '%s\n' "$out" | sed -n 's/^dead: //p')"
+            rotate_dead "$(printf '%s\n' "$out" | sed -n 's/^dead: //p')" "$out"
           fi
         fi
       fi
