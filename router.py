@@ -238,6 +238,123 @@ _error_policy: dict | None = None
 _PROVIDER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 
 
+# ---------------------------------------------------------------------------
+# proxy-backed providers (local SOCKS5 upstream, e.g. `warp-cli mode proxy`)
+# ---------------------------------------------------------------------------
+# A proxy-backed provider routes its assigned domains through a local SOCKS5
+# upstream instead of a WireGuard endpoint in the shared engine:
+#   "providers": {"warp-proxy": {"socks5": {"host": "127.0.0.1", "port": 40000}}}
+# Only loopback upstreams are accepted: a remote proxy would silently move
+# trust to a third party, and any other hostname is ambiguous (DNS may mix
+# loopback and public answers over time). The upstream port must never equal
+# the router's own listener port (proxy loop).
+_PROXY_PROFILE_STEM = "socks"
+
+
+def is_proxy_provider(name: str) -> bool:
+    """True when ``name`` is a proxy-backed (SOCKS5) provider, not a WireGuard pool."""
+    entry = _providers.get(name)
+    return isinstance(entry, dict) and isinstance(entry.get("socks5"), dict)
+
+
+def _normalize_proxy_host(host: object) -> str:
+    return str(host or "").strip().strip("[]").lower().replace("localhost", "127.0.0.1")
+
+
+def proxy_upstream(name: str) -> tuple[str, int]:
+    """Validated (host, port) for a proxy-backed provider. Raises ValueError."""
+    entry = _providers.get(name)
+    if not isinstance(entry, dict) or not isinstance(entry.get("socks5"), dict):
+        raise ValueError(f"provider '{name}' is not a proxy-backed (socks5) provider")
+    spec = entry["socks5"]
+    host = _normalize_proxy_host(spec.get("host"))
+    if host not in ("127.0.0.1", "::1"):
+        raise ValueError(
+            f"provider '{name}' socks5.host must be a local loopback "
+            f"('127.0.0.1', '::1', or 'localhost'); got {spec.get('host')!r}"
+        )
+    try:
+        port = int(spec.get("port"))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        raise ValueError(f"provider '{name}' socks5.port must be an integer 1-65535") from None
+    if not 1 <= port <= 65535:
+        raise ValueError(f"provider '{name}' socks5.port must be between 1 and 65535")
+    if port == _port:
+        raise ValueError(
+            f"provider '{name}' socks5 upstream {host}:{port} is the router's own "
+            "listener (proxy loop)"
+        )
+    return host, port
+
+
+def proxy_profile_key(name: str) -> Path:
+    """Synthetic egress/cooldown key for a proxy-backed provider.
+
+    The health machinery (records, cooldowns, blocks) is keyed by profile
+    stem; a SOCKS5 upstream has no *.conf, so it reuses one fixed stem that
+    satisfies the _PROVIDER_NAME traversal guard."""
+    return Path(f"{_PROXY_PROFILE_STEM}.conf")
+
+
+def provider_has_valid_exit(name: str) -> bool:
+    """True when ``name`` can carry traffic right now (static, no probes)."""
+    if is_proxy_provider(name):
+        try:
+            proxy_upstream(name)
+        except ValueError:
+            return False
+        return True
+    try:
+        profiles = provider_files(name)
+    except ValueError:
+        return False
+    return any(_profile_error(profile) is None for profile in profiles)
+
+
+def active_proxy_providers() -> dict[str, tuple[str, int]]:
+    """Validated proxy-backed providers that are live in the current build.
+
+    A provider under an active fallback is parked (its routes follow the
+    fallback target), mirroring the WireGuard path in build_singbox_config."""
+    live: dict[str, tuple[str, int]] = {}
+    for name in _providers:
+        if not is_proxy_provider(name) or active_fallback(name):
+            continue
+        try:
+            live[name] = proxy_upstream(name)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+    return live
+
+
+def _tun_proxy_blockers(build_routes: list[dict], routing: dict,
+                         proxy_live: dict[str, tuple[str, int]]) -> list[str]:
+    """Proxy-backed providers that a TUN build would have to carry.
+
+    A local SOCKS5 hop speaks TCP; it cannot serve the arbitrary UDP/IP
+    flows a TUN captures. Callers fail the build naming these instead of
+    silently half-routing UDP around the proxy."""
+    if not proxy_live:
+        return []
+    blockers: list[str] = []
+    for route in build_routes:
+        effective = _effective_route_provider(route.get("provider", ""))
+        if effective in proxy_live and effective not in blockers:
+            blockers.append(effective)
+    selective = _vpn.get("selective")
+    if isinstance(selective, str):
+        effective = _effective_route_provider(selective)
+        if effective in proxy_live and effective not in blockers:
+            blockers.append(effective)
+    if routing.get("mode") == "safe-list":
+        default = routing.get("default_provider")
+        if isinstance(default, str):
+            effective = _effective_route_provider(default)
+            if effective in proxy_live and effective not in blockers:
+                blockers.append(effective)
+    return blockers
+
+
 def fail(message: str) -> int:
     print(f"router: {message}", file=sys.stderr)
     return 1
@@ -387,6 +504,32 @@ def load_config() -> int:
         directory = entry.get("directory", f"providers/{name}")
         if not isinstance(directory, str):
             return fail(f"bad {CONFIG_FILE.name}: provider '{name}' directory must be a string")
+        socks_spec = entry.get("socks5")
+        if socks_spec is not None:
+            # Proxy-backed provider (local SOCKS5 upstream): an explicit lane
+            # with no WireGuard pool. Reject anything ambiguous at load so a
+            # bad upstream can never reach the generated config at runtime.
+            if not isinstance(socks_spec, dict):
+                return fail(f"bad {CONFIG_FILE.name}: provider '{name}' socks5 must be an object with host/port")
+            if "directory" in entry:
+                return fail(f"bad {CONFIG_FILE.name}: provider '{name}' cannot define both directory and socks5")
+            socks_host = _normalize_proxy_host(socks_spec.get("host"))
+            if socks_host not in ("127.0.0.1", "::1"):
+                return fail(
+                    f"bad {CONFIG_FILE.name}: provider '{name}' socks5.host must be a local "
+                    f"loopback ('127.0.0.1', '::1', or 'localhost'); got {socks_spec.get('host')!r}"
+                )
+            try:
+                socks_port = int(socks_spec.get("port"))
+            except (TypeError, ValueError):
+                return fail(f"bad {CONFIG_FILE.name}: provider '{name}' socks5.port must be an integer 1-65535")
+            if not 1 <= socks_port <= 65535:
+                return fail(f"bad {CONFIG_FILE.name}: provider '{name}' socks5.port must be between 1 and 65535")
+            if socks_port == port:
+                return fail(
+                    f"bad {CONFIG_FILE.name}: provider '{name}' socks5 upstream {socks_host}:{socks_port} "
+                    "is the router's own listener (proxy loop)"
+                )
         legacy_fallback = entry.get("fallback_provider")
         fallback_list = entry.get("fallback_providers")
         if fallback_list is not None and legacy_fallback is not None:
@@ -1123,9 +1266,11 @@ def activate_fallback(name: str, *, target: str | None = None, reason: str = "tr
     for candidate in candidates:
         if candidate == "direct" and current_mode() != "proxy":
             continue
-        profiles = [] if candidate == "direct" else provider_files(candidate)
-        if candidate != "direct" and (not profiles or not any(_profile_error(profile) is None for profile in profiles)):
-            print(f"router: skipping fallback '{candidate}': no valid profiles", file=sys.stderr)
+        # Proxy-backed candidates have a SOCKS5 upstream instead of *.conf
+        # files; WireGuard candidates need at least one parseable profile.
+        if candidate != "direct" and not provider_has_valid_exit(candidate):
+            print(f"router: skipping fallback '{candidate}': no valid exit "
+                  "(no parseable profile or bad socks5 upstream)", file=sys.stderr)
             continue
         _atomic_write(path, json.dumps({
             "provider": candidate,
@@ -2530,6 +2675,26 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
     # Rewrite provisional per-provider resolver tags to the canonical entry.
     for name in active:
         active[name]["domain_resolver"] = dns_alias.get(name, f"dns-{name}")
+    # Proxy-backed providers (local SOCKS5 upstream, e.g. warp-cli mode
+    # proxy): no WireGuard endpoint in the shared engine. Each live one gets
+    # a socks outbound; its assigned domains route to that tag exactly like
+    # a WireGuard lane. Revalidated here (not just at load) so a
+    # programmatically-set provider table gets the same loop rejection.
+    proxy_live = active_proxy_providers()
+    proxy_outbounds: list[dict] = []
+    for name, (upstream_host, upstream_port) in proxy_live.items():
+        if upstream_port == _port:
+            raise SystemExit(
+                f"proxy provider '{name}': upstream {upstream_host}:{upstream_port} "
+                "is the router's own listener (proxy loop)"
+            )
+        proxy_outbounds.append({
+            "type": "socks",
+            "tag": name,
+            "server": upstream_host,
+            "server_port": upstream_port,
+            "version": "5",
+        })
     # sing-box 1.12+: any dial without an explicit resolver needs
     # route.default_domain_resolver; the system (local) transport keeps
     # non-routed domains away from the tunnels and silences the deprecated
@@ -2557,7 +2722,9 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
     vpn_domains = frozenset(routing["vpn_domains"])
     for route in build_routes:
         route_provider = _effective_route_provider(route["provider"])
-        if (route_provider != "direct" and route_provider not in active) or not route.get("domains"):
+        if ((route_provider != "direct" and route_provider not in active
+                and route_provider not in proxy_live)
+                or not route.get("domains")):
             continue
         domains = route["domains"]
         if routing_mode == "vpn-list":
@@ -2566,8 +2733,14 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
                 if any(domain == vpn or domain.endswith("." + vpn) for vpn in vpn_domains)
             ]
         if domains:
-            dns_rules.append({"domain_suffix": domains,
-                              "server": "dns-local" if route_provider == "direct" else dns_alias.get(route_provider, f"dns-{route_provider}")})
+            if route_provider == "direct" or route_provider in proxy_live:
+                # Direct and SOCKS5-hopped traffic share the local resolver:
+                # there is no tunnel DNS to pin to, and pinning to a
+                # provider resolver would leak direct-path queries.
+                dns_rules.append({"domain_suffix": domains, "server": "dns-local"})
+            else:
+                dns_rules.append({"domain_suffix": domains,
+                                  "server": dns_alias.get(route_provider, f"dns-{route_provider}")})
 
     # Route rules: safe-list direct-domain pins first (a trusted domain is
     # never tunneled even if a provider route also mentions it), then the
@@ -2577,7 +2750,8 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
     provider_rules = []
     for route in build_routes:
         route_provider = _effective_route_provider(route["provider"])
-        if route_provider != "direct" and route_provider not in active:
+        if (route_provider != "direct" and route_provider not in active
+                and route_provider not in proxy_live):
             continue
         rule = {"outbound": route_provider}
         if route.get("domains"):
@@ -2605,6 +2779,16 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
     ]
 
     mode = current_mode()
+    if mode == "tun":
+        blockers = _tun_proxy_blockers(build_routes, routing, proxy_live)
+        if blockers:
+            raise SystemExit(
+                "tun mode cannot carry proxy-backed provider(s) "
+                + ", ".join(f"'{name}'" for name in blockers) +
+                " through a local SOCKS5 hop (TCP-only; arbitrary TUN UDP would bypass "
+                "it silently). Use proxy mode for these routes, or move their domains "
+                "to a WireGuard provider."
+            )
     rule_sets: list[dict] = []
     if mode == "tun":
         tun: dict = {
@@ -2715,7 +2899,8 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
         # error when that provider has no active profile - never emit a
         # dangling final.
         default_provider = _effective_route_provider(routing["default_provider"])
-        if default_provider != "direct" and default_provider not in active:
+        if (default_provider != "direct" and default_provider not in active
+                and default_provider not in proxy_live):
             raise SystemExit(
                 f"routing mode 'safe-list': default_provider '{default_provider}' has no active profile; "
                 "cannot emit a dangling route.final (drop *.conf into providers/<name>/ first)"
@@ -2729,7 +2914,7 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
         "log": {"level": "warn"},
         "inbounds": inbounds,
         "endpoints": list(active.values()),
-        "outbounds": [{"type": "direct", "tag": "direct"}],
+        "outbounds": [{"type": "direct", "tag": "direct"}, *proxy_outbounds],
         # Without dns.final, unmatched queries hit the FIRST server (tunnel-riding
         # provider DNS); pin them to the always-present local resolver instead.
         "dns": {"servers": dns_servers, "rules": dns_rules, "strategy": dns_strategy(), "final": "dns-local"},
@@ -2745,7 +2930,9 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
 
 
 def write_sing_box(config: dict) -> None:
-    if not any(endpoint.get("type") == "wireguard" for endpoint in config.get("endpoints", [])):
+    has_wireguard = any(endpoint.get("type") == "wireguard" for endpoint in config.get("endpoints", []))
+    has_proxy_hop = any(outbound.get("type") == "socks" for outbound in config.get("outbounds", []))
+    if not has_wireguard and not has_proxy_hop:
         print("router: refusing to write an egress-less sing-box config; keeping existing file",
               file=sys.stderr)
         return
@@ -3367,7 +3554,7 @@ def engine_switch() -> int:
         config, active = build_singbox_config(active_overrides=active_overrides)
     except (SystemExit, KeyError, ValueError, OSError, configparser.Error) as exc:
         return fail(f"could not build sing-box config: {exc}")
-    if not active:
+    if not active and not active_proxy_providers():
         return fail("no provider endpoint available")
     write_sing_box(config)
     if not validate_config():
@@ -3899,7 +4086,7 @@ def engine_reload(active_overrides: dict[str, Path] | None = None) -> int:
         # Nothing was written or reloaded, so the running engine keeps its
         # old in-memory config; fail cleanly (no last-good restore needed).
         return fail(f"could not build sing-box config: {exc}")
-    if not active:
+    if not active and not active_proxy_providers():
         return fail("no provider endpoint available")
     write_sing_box(config)
     if not validate_config():
@@ -4017,6 +4204,9 @@ def rotate(name: str, *, reason: str | None = None, force: bool = False, probe: 
         return 3
     if active_fallback(name):
         return fail(f"provider '{name}': fallback active; clear it before rotating the primary")
+    if is_proxy_provider(name):
+        return fail(f"provider '{name}' is proxy-backed (a SOCKS5 hop has no profiles to rotate); "
+                      "use its fallback to move routes instead")
     profiles = provider_files(name)
     if not profiles:
         return fail(f"provider '{name}' has no profiles")
@@ -4904,6 +5094,16 @@ def _provider_status(name: str) -> dict:
     active_profile = persisted_active(name)
     active_stem = active_profile.stem if active_profile is not None else None
     entry = {"profiles": profiles, "active": active_stem}
+    if is_proxy_provider(name):
+        try:
+            upstream_host, upstream_port = proxy_upstream(name)
+        except ValueError as exc:
+            entry["upstream_error"] = str(exc)
+        else:
+            entry["upstream"] = f"{upstream_host}:{upstream_port}"
+        proxy_record = read_egress(name, proxy_profile_key(name))
+        if proxy_record:
+            entry["egress"] = {_PROXY_PROFILE_STEM: proxy_record}
     fallback = fallback_status(name)
     if fallback["configured"] or fallback["active"]:
         entry["fallback"] = fallback
@@ -5051,6 +5251,18 @@ def status_json() -> dict:
 
 def _check_active_fallback(primary: str, fallback: str) -> tuple[Path | None, str, dict | None]:
     """Check the live fallback endpoint while preserving primary-route attribution."""
+    if is_proxy_provider(fallback):
+        try:
+            proxy_upstream(fallback)
+        except ValueError:
+            return None, "dead", None
+        key = proxy_profile_key(fallback)
+        status, record = check_egress_live(
+            fallback,
+            key,
+            url=probe_url_for(primary),
+        )
+        return key, status, record
     profile = persisted_active(fallback) or resolve_active(fallback)
     if profile is None:
         return None, "dead", None
@@ -5080,7 +5292,16 @@ def egress_probe(name: str | None = None) -> int:
             results[provider] = {"error": "unknown provider"}
             any_failed = True
             continue
-        active = persisted_active(provider) or resolve_active(provider)
+        if is_proxy_provider(provider):
+            try:
+                proxy_upstream(provider)
+            except ValueError as exc:
+                results[provider] = {"error": f"bad socks5 upstream: {exc}"}
+                any_failed = True
+                continue
+            active: Path | None = proxy_profile_key(provider)
+        else:
+            active = persisted_active(provider) or resolve_active(provider)
         fallback = active_fallback(provider)
         if fallback:
             fallback_profile, status, record = _check_active_fallback(provider, fallback)
@@ -5145,7 +5366,15 @@ def egress_check(name: str | None = None, as_json: bool = False) -> int:
         not once per provider in sequence (3 providers x 8s timeout used to
         serialize into ~24s+ per check cycle).
         """
-        active = persisted_active(provider) or resolve_active(provider)
+        if is_proxy_provider(provider):
+            try:
+                proxy_upstream(provider)
+            except ValueError as exc:
+                return provider, {"profile": None, "ok": False, "status": "dead",
+                                  "detail": f"bad socks5 upstream: {exc}"}, True
+            active = proxy_profile_key(provider)
+        else:
+            active = persisted_active(provider) or resolve_active(provider)
         fallback = active_fallback(provider)
         if fallback:
             fallback_profile, status, record = _check_active_fallback(provider, fallback)
@@ -5265,6 +5494,28 @@ def egress_sweep(name: str | None = None, as_json: bool = False,
             continue
         # Keep only parseable profiles so one bad *.conf cannot wedge the
         # sweep (F6); log every skipped filename (F2), same as rotate.
+        # Proxy-backed providers have no profiles to hop across: one liveness
+        # probe of the SOCKS5 hop, reported under the fixed "socks" key.
+        if is_proxy_provider(provider):
+            try:
+                proxy_upstream(provider)
+            except ValueError:
+                results[provider] = {"error": "bad socks5 upstream"}
+                dead.append(provider)
+                continue
+            key = proxy_profile_key(provider)
+            ok, record = _probe_with_settle(provider, key)
+            error = record.get("error") if record else None
+            usable = ok or _transport_reason(error) == "tls"
+            results[provider] = {key.stem: {
+                "ok": ok,
+                "usable": usable,
+                "latency_ms": record.get("latency_ms") if record else None,
+                "status": record.get("status") if record else None,
+            }}
+            if not usable:
+                dead.append(provider)
+            continue
         valid: list[Path] = []
         for profile in provider_files(provider):
             error = _profile_error(profile)
@@ -5457,6 +5708,20 @@ def _check_provider_validity(name: str) -> dict:
     if not isinstance(entry, dict):
         result["valid"] = False
         issues.append("not a configured provider object")
+        return result
+
+    if is_proxy_provider(name):
+        # No profile directory: the lane is one validated SOCKS5 hop.
+        result["profiles"] = 0
+        try:
+            upstream_host, upstream_port = proxy_upstream(name)
+        except ValueError as exc:
+            result["valid"] = False
+            issues.append(str(exc))
+            return result
+        result["upstream"] = f"{upstream_host}:{upstream_port}"
+        result["active"] = _PROXY_PROFILE_STEM
+        issues.extend(_provider_config_errors(name, entry))
         return result
 
     try:
