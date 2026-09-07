@@ -1240,7 +1240,10 @@ def restore_fallback(name: str, host: str) -> int:
             return 3
     except (OSError, ValueError, TypeError):
         previous = {}
-    successes = int(previous.get("successes", 0) or 0)
+    try:
+        successes = max(0, int(previous.get("successes", 0) or 0))
+    except (TypeError, ValueError):
+        successes = 0
     # Temporarily restore the primary so this probe cannot accidentally measure
     # the already-selected direct path.
     rc = deactivate_fallback(name, automatic=True)
