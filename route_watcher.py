@@ -535,7 +535,7 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
                 provider = last_provider.get(host) or provider_for_host(root, host)
                 if result.get("ok"):
                     guard.failure_times.pop(normalize_host(host), None)
-                    if provider and now - last_restore.get(provider, 0.0) >= RESTORE_COOLDOWN_SECONDS:
+                    if provider and now - last_restore.get(provider, -RESTORE_COOLDOWN_SECONDS) >= RESTORE_COOLDOWN_SECONDS:
                         restore = restore_provider(root, provider, host)
                         last_restore[provider] = now
                         if restore.get("returncode") is not None:
