@@ -218,6 +218,67 @@ class RoutesTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(router.CONFIG_FILE.stat().st_mode), 0o600)
 
 
+class ResponseEventStallTests(unittest.TestCase):
+    """response-event --reason: real-traffic stalls must rotate the exit.
+
+    Small egress probes cannot see an exit that answers probes yet
+    throttles long streams (observed live: opencode.ai stalled 23s while
+    probes stayed green). A stall report flows through the error-policy
+    table into cooldown + rotate, falling back when the pool is empty --
+    the same transaction 429 uses.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(router, self.root)
+        (self.root / "providers" / "proton").mkdir(parents=True)
+        router.CONFIG_FILE.write_text(json.dumps({
+            "port": 2080,
+            "providers": {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}},
+            "routes": [{"id": "zen", "domains": ["opencode.ai"], "provider": "proton"}],
+        }))
+        self.assertEqual(router.load_config(), 0)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _event(self, **kwargs):
+        params = {"host": "opencode.ai", "status": 0, "dedupe_seconds": 0}
+        params.update(kwargs)
+        with mock.patch.object(router, "rotate", return_value=0) as rotate_fn, \
+             mock.patch.object(router, "active_fallback", return_value=None), \
+             io.StringIO() as buf, \
+             mock.patch("sys.stdout", buf):
+            rc = router.response_event(**params)
+        return rc, rotate_fn
+
+    def test_stall_reason_rotates_exit(self):
+        rc, rotate_fn = self._event(reason="timeout")
+        self.assertEqual(rc, 0)
+        rotate_fn.assert_called_once_with("proton", reason="timeout")
+
+    def test_unknown_reason_fails_closed(self):
+        rc, rotate_fn = self._event(reason="bogus")
+        self.assertNotEqual(rc, 0)
+        rotate_fn.assert_not_called()
+
+    def test_non_429_without_reason_still_ignored(self):
+        rc, rotate_fn = self._event(status=503)
+        self.assertEqual(rc, 0)
+        rotate_fn.assert_not_called()
+
+    def test_unrouted_host_with_reason_fails(self):
+        rc, rotate_fn = self._event(host="example.com", reason="timeout")
+        self.assertNotEqual(rc, 0)
+        rotate_fn.assert_not_called()
+
+    def test_429_path_unchanged(self):
+        rc, rotate_fn = self._event(status=429)
+        self.assertEqual(rc, 0)
+        rotate_fn.assert_called_once_with("proton", reason="429")
+
+
 class ConfigValidationTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

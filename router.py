@@ -1596,19 +1596,41 @@ def _response_event_marker(provider: str) -> Path:
     return ROOT / "state" / "response-events" / f"{provider}.json"
 
 
+# Real-traffic stall reasons accepted by response-event --reason. These are
+# the failures small egress probes cannot see: an exit that answers probes
+# yet throttles long streams. Each flows through the error-policy table
+# (_normalize_reason) into cooldown/rotate/fallback like 429 does.
+STALL_REASONS = ("timeout", "tls", "connection")
+
+
 def response_event(host: str, status: int, *, provider: str | None = None,
+                   reason: str | None = None,
                    dedupe_seconds: int = 5) -> int:
     """Handle a response-aware proxy event and rotate the effective route.
 
-    This is intentionally a narrow event sink: only HTTP 429 responses for a
-    configured routed host can mutate provider state. The caller owns request
-    replay; this command only performs the hard switch/fallback transaction.
+    Two event kinds can mutate provider state for a configured routed host:
+    HTTP 429 responses, and explicit stall reports (``--reason
+    timeout|tls|connection``) for traffic that connected but never produced
+    a usable response. The caller owns request replay; this command only
+    performs the hard switch/fallback transaction.
     """
     try:
         status = int(status)
     except (TypeError, ValueError):
         return fail("response-event: status must be an integer")
-    if status != 429:
+    label: str | None = None
+    if status == 429:
+        label, reason = "HTTP 429", "429"
+    elif reason is not None:
+        reason = str(reason).strip().lower()
+        if reason not in STALL_REASONS:
+            return fail(
+                "response-event: unknown reason "
+                f"'{reason}' (expected HTTP 429 status or --reason "
+                f"{'|'.join(STALL_REASONS)})"
+            )
+        label = reason
+    else:
         print(f"response-event: ignored HTTP {status} for {host}")
         return 0
     route_provider = response_provider_for_host(host)
@@ -1625,23 +1647,23 @@ def response_event(host: str, status: int, *, provider: str | None = None,
     except (OSError, ValueError, TypeError):
         last_at = 0
     if dedupe_seconds > 0 and now - last_at < dedupe_seconds:
-        print(f"response-event: suppressed duplicate 429 for {host}")
+        print(f"response-event: suppressed duplicate {label} for {host}")
         return 0
     marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text(json.dumps({"at": now, "host": str(host).lower(), "status": status}) + "\n")
+    marker.write_text(json.dumps({"at": now, "host": str(host).lower(), "status": status, "reason": reason}) + "\n")
     try:
         marker.chmod(0o600)
     except OSError:
         pass
 
     effective = active_fallback(route_provider) or route_provider
-    print(f"response-event: HTTP 429 for {host}; rotating {effective}")
-    rc = rotate(effective, reason=str(status))
+    print(f"response-event: {label} for {host}; rotating {effective}")
+    rc = rotate(effective, reason=reason)
     if rc == 0:
         return 0
     if effective != route_provider:
         return rc
-    return activate_fallback(route_provider, reason=str(status))
+    return activate_fallback(route_provider, reason=reason)
 
 
 def autodetect_source(source: str = "twitch", *, reload: bool = True,
@@ -7367,8 +7389,10 @@ def main() -> int:
 
     r_event = sub.add_parser("response-event", help="handle an observed upstream response")
     r_event.add_argument("--host", required=True, help="destination hostname observed by the proxy")
-    r_event.add_argument("--status", required=True, type=int, help="HTTP response status")
+    r_event.add_argument("--status", required=True, type=int, help="HTTP response status (0 when no response was received)")
     r_event.add_argument("--provider", default=None, help="expected route provider")
+    r_event.add_argument("--reason", default=None, choices=["timeout", "tls", "connection"],
+                         help="real-traffic stall class: rotates the exit through error-policy handling even without an HTTP status")
     r_event.add_argument("--dedupe-seconds", type=int, default=5,
                          help="suppress duplicate events for this many seconds")
 
@@ -7683,7 +7707,7 @@ def main() -> int:
     if args.cmd == "response-event":
         return _with_lock(lambda: response_event(
             args.host, args.status, provider=args.provider,
-            dedupe_seconds=args.dedupe_seconds,
+            reason=args.reason, dedupe_seconds=args.dedupe_seconds,
         ))
     if args.cmd == "failover":
         if args.action in ("recover", "restore"):
