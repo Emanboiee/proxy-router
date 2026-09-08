@@ -208,6 +208,39 @@ def test_build_emits_socks_outbound_and_scoped_rules(tmp_path):
     assert {"domain_suffix": ["opencode.ai"], "server": "dns-proton"} in config["dns"]["rules"]
 
 
+def test_proxy_provider_ignores_stale_wireguard_profiles(tmp_path):
+    """Switching a provider to SOCKS must not emit its old .conf endpoint."""
+    router = load_router(tmp_path)
+    proton_conf = write_conf(tmp_path / "providers" / "proton")
+    write_conf(tmp_path / "providers" / "warp-proxy", "stale")
+    router.CONFIG_FILE.write_text(json.dumps(proxy_config()))
+    assert router.load_config() == 0
+    mock_wireguard(router, {"proton": proton_conf, "warp-proxy": tmp_path / "providers" / "warp-proxy" / "stale.conf"})
+
+    config, _selected = router.build_singbox_config()
+
+    assert [e["tag"] for e in config["endpoints"]] == ["proton"]
+    assert [o["tag"] for o in config["outbounds"] if o.get("type") == "socks"] == ["warp-proxy"]
+
+
+def test_status_reports_synthetic_socks_lane_not_stale_wireguard_state(tmp_path):
+    router = load_router(tmp_path)
+    write_conf(tmp_path / "providers" / "warp-proxy", "stale")
+    router.CONFIG_FILE.write_text(json.dumps(proxy_config()))
+    assert router.load_config() == 0
+    egress_dir = tmp_path / "state" / "egress" / "warp-proxy"
+    egress_dir.mkdir(parents=True)
+    (egress_dir / "socks.json").write_text(json.dumps({"ok": True, "status": 200}))
+    (egress_dir / "stale.json").write_text(json.dumps({"ok": False}))
+
+    status = router._provider_status("warp-proxy")
+
+    assert status["profiles"] == []
+    assert status["active"] == "socks"
+    assert set(status["egress"]) == {"socks"}
+    assert "last_rotation" not in status
+
+
 def test_build_never_routes_loopback_to_proxy(tmp_path):
     router = load_router(tmp_path)
     proton_conf = write_conf(tmp_path / "providers" / "proton")

@@ -2614,6 +2614,12 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
     selected: dict[str, Path] = {}
     dns_map: dict[str, str] = {}
     for name in _providers:
+        # SOCKS-backed providers are supplied by an external local client
+        # (for example official WARP proxy mode), not by WireGuard profiles.
+        # Ignore any stale *.conf files left in the old provider directory so
+        # the provider gets exactly one outbound and never duplicate tags.
+        if is_proxy_provider(name):
+            continue
         # A failed primary must not remain as a second live WireGuard tunnel
         # underneath its fallback; that recreates concurrent-session and
         # endpoint-contention failures.
@@ -5087,14 +5093,19 @@ def vpn_status() -> int:
 def _provider_status(name: str) -> dict:
     """Machine-readable view of one provider: profiles, active, cooldowns,
     last rotation, and persisted egress records."""
-    profiles = [p.stem for p in provider_files(name)]
+    proxy_backed = is_proxy_provider(name)
+    profiles = [] if proxy_backed else [p.stem for p in provider_files(name)]
     # Report the PERSISTED active profile (what the engine is configured with)
     # rather than resolve_active(), which skips a cooled-down active when
-    # picking the next candidate.
-    active_profile = persisted_active(name)
-    active_stem = active_profile.stem if active_profile is not None else None
+    # picking the next candidate. Proxy-backed providers have one synthetic
+    # SOCKS lane; stale WireGuard markers/files must not shadow its status.
+    if proxy_backed:
+        active_stem = _PROXY_PROFILE_STEM
+    else:
+        active_profile = persisted_active(name)
+        active_stem = active_profile.stem if active_profile is not None else None
     entry = {"profiles": profiles, "active": active_stem}
-    if is_proxy_provider(name):
+    if proxy_backed:
         try:
             upstream_host, upstream_port = proxy_upstream(name)
         except ValueError as exc:
@@ -5107,29 +5118,32 @@ def _provider_status(name: str) -> dict:
     fallback = fallback_status(name)
     if fallback["configured"] or fallback["active"]:
         entry["fallback"] = fallback
-    cooldowns = {}
-    for stem in profiles:
-        path = ROOT / "state" / "cooldowns" / name / f"{stem}.until"
+    if not proxy_backed:
+        cooldowns = {}
+        for stem in profiles:
+            path = ROOT / "state" / "cooldowns" / name / f"{stem}.until"
+            try:
+                if path.is_file():
+                    cooldowns[stem] = int(path.read_text().strip())
+            except (ValueError, OSError):
+                pass
+        if cooldowns:
+            entry["cooldown_until"] = cooldowns
+    if not proxy_backed:
+        rotation = ROOT / "state" / f"{name}.rotation"
         try:
-            if path.is_file():
-                cooldowns[stem] = int(path.read_text().strip())
-        except (ValueError, OSError):
+            if rotation.is_file():
+                entry["last_rotation"] = json.loads(rotation.read_text())
+        except (json.JSONDecodeError, OSError):
             pass
-    if cooldowns:
-        entry["cooldown_until"] = cooldowns
-    rotation = ROOT / "state" / f"{name}.rotation"
-    try:
-        if rotation.is_file():
-            entry["last_rotation"] = json.loads(rotation.read_text())
-    except (json.JSONDecodeError, OSError):
-        pass
-    egress = {}
-    for stem in profiles:
-        record = read_egress(name, Path(stem + ".conf"))
-        if record:
-            egress[stem] = record
-    if egress:
-        entry["egress"] = egress
+    if not proxy_backed:
+        egress = {}
+        for stem in profiles:
+            record = read_egress(name, Path(stem + ".conf"))
+            if record:
+                egress[stem] = record
+        if egress:
+            entry["egress"] = egress
     return entry
 
 
