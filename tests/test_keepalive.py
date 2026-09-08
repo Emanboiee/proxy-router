@@ -238,7 +238,12 @@ class KeepaliveHarness:
         if self.clock_file is None:
             raise AssertionError("clock simulation is not enabled")
         current = int(self.clock_file.read_text())
-        self.clock_file.write_text(str(current + seconds))
+        with tempfile.NamedTemporaryFile(
+                mode="w", dir=self.clock_file.parent,
+                prefix=f".{self.clock_file.name}.", delete=False) as tmp:
+            tmp.write(str(current + seconds))
+            replacement = Path(tmp.name)
+        replacement.replace(self.clock_file)
 
     def wait_lines(self, count: int, timeout: float = 20.0) -> list[str]:
         deadline = time.time() + timeout

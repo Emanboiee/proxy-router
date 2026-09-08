@@ -226,6 +226,8 @@ def test_harness_mutates_neither_system_proxy_nor_live_root(tmp_path, monkeypatc
     import router as live_router
 
     live_root = live_router.ROOT
+    live_config = live_router.CONFIG_FILE
+    live_config_before = live_config.read_bytes() if live_config.is_file() else None
     assert Path(tmp_path).resolve() != Path(live_root).resolve()
     monkeypatch.delenv("PROXY_ROUTER_ROOT", raising=False)
 
@@ -250,6 +252,10 @@ def test_harness_mutates_neither_system_proxy_nor_live_root(tmp_path, monkeypatc
     assert "PROXY_ROUTER_ROOT" not in __import__("os").environ
     for cmd in runner.commands:
         assert str(live_root) not in " ".join(cmd)
+    if live_config_before is None:
+        assert not live_config.exists()
+    else:
+        assert live_config.read_bytes() == live_config_before
 
 
 # 5. Dead SOCKS5 upstream -> bounded fallback, no shared-engine teardown.
