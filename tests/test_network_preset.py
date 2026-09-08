@@ -201,6 +201,7 @@ def test_network_reconnect_clears_latch_after_engine_and_proxy_are_ready(tmp_pat
 
 def test_engine_ensure_stays_quiescent_while_network_latch_exists(tmp_path):
     router = load_router(tmp_path)
+    router.MANUAL_OFF_FILE = tmp_path / "state" / "manual-off"
     router.network_off_marker().parent.mkdir(parents=True)
     router.network_off_marker().write_text("network unavailable\\n")
     assert router.engine_ensure() == 3

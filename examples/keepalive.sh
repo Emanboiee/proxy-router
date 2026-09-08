@@ -71,6 +71,7 @@
 #   PROXY_KEEPALIVE_MAX_ROTATIONS  max keepalive rotations per window  (2)
 #   PROXY_KEEPALIVE_SWEEP_EVERY    full-pool egress sweep every N seconds (1800)
 #   PROXY_KEEPALIVE_NETWORK_GRACE consecutive Wi-Fi misses before stop (1)
+#   PROXY_KEEPALIVE_WAKE_GAP       sleep/wake gap forcing recovery (2x interval)
 #   PROXY_KEEPALIVE_ENABLED        temporary on/off override               (config)
 set -uo pipefail
 
@@ -191,6 +192,26 @@ PY
   fi
 }
 
+
+# Return every configured autodetection source for periodic refresh.
+autodetect_sources() {
+  python_runner - "$ROOT/router.json" <<'PY' 2>/dev/null
+import json
+import sys
+
+try:
+    data = json.loads(open(sys.argv[1], encoding="utf-8").read())
+    sources = (data.get("autodetect") or {}).get("sources") or {}
+    if not isinstance(sources, dict):
+        raise ValueError
+    for source in sorted(sources):
+        if isinstance(source, str) and source:
+            print(source)
+except (OSError, TypeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+PY
+}
+
 ENABLED="${PROXY_KEEPALIVE_ENABLED:-$(config_setting enabled 1)}"
 case "$ENABLED" in
   0|false|False|off|OFF)
@@ -208,6 +229,11 @@ SWEEP_EVERY="${PROXY_KEEPALIVE_SWEEP_EVERY:-$(config_setting sweep_every 1800)}"
 NETWORK_GRACE="${PROXY_KEEPALIVE_NETWORK_GRACE:-$(config_setting network_grace 1)}"
 AUTODETECT_ENABLED="${PROXY_AUTODETECT_ENABLED:-$(autodetect_setting enabled 0)}"
 AUTODETECT_INTERVAL="${PROXY_AUTODETECT_INTERVAL:-$(autodetect_setting interval_seconds 300)}"
+WAKE_GAP="${PROXY_KEEPALIVE_WAKE_GAP:-$((INTERVAL * 2))}"
+case "$WAKE_GAP" in
+  ''|*[!0-9]*) WAKE_GAP=$((INTERVAL * 2)) ;;
+esac
+((WAKE_GAP < 1)) && WAKE_GAP=1
 
 backoff="$INTERVAL"
 boot=1
@@ -219,6 +245,7 @@ last_sweep=0
 last_autodetect=0
 network_lost=0
 network_quiet=0
+last_tick=0
 
 # Allow at most MAX_ROTATIONS keepalive rotations per STORM_WINDOW seconds.
 rotation_allowed() {
@@ -515,6 +542,16 @@ restore_fallbacks() {
 }
 
 while true; do
+  tick_now=$(date +%s 2>/dev/null || echo 0)
+  case "$tick_now" in ''|*[!0-9]*) tick_now=0 ;; esac
+  wake_detected=0
+  wake_elapsed=0
+  if [ "$last_tick" -gt 0 ] && [ "$tick_now" -ge "$last_tick" ] \
+     && [ $((tick_now - last_tick)) -ge "$WAKE_GAP" ]; then
+    wake_detected=1
+    wake_elapsed=$((tick_now - last_tick))
+  fi
+  last_tick="$tick_now"
   # Re-read the enabled flag every tick so a runtime config flip takes effect
   # without waiting for an agent restart (env override still wins for
   # temporary ops changes).
@@ -542,6 +579,26 @@ while true; do
     continue
   fi
   manual_quiet=0
+  if [ "$wake_detected" -eq 1 ]; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') router: wake gap detected (${wake_elapsed}s); forcing network recovery" >&2
+    if controller network-status >/dev/null 2>&1; then
+      if controller network-disconnect >/dev/null 2>&1 \
+         && controller network-reconnect >/dev/null 2>&1; then
+        network_lost=0
+        network_quiet=0
+        boot=1
+        checks=0
+        strikes=0
+        backoff="$INTERVAL"
+      else
+        echo "$(date '+%Y-%m-%d %H:%M:%S') router: wake recovery failed; retrying" >&2
+        network_quiet=1
+        backoff="$INTERVAL"
+        sleep "$backoff"
+        continue
+      fi
+    fi
+  fi
   # Network guard runs before ensure so a stale proxy cannot strand browsers
   # while Wi-Fi is off. `network-status` is read-only; the controller commands
   # own the durable marker and the teardown/reconnect transaction.
@@ -626,11 +683,15 @@ while true; do
     autodetect_now=$(date +%s)
     if [ "$AUTODETECT_ENABLED" != "0" ] && ! is_tun_mode \
        && { [ "$last_autodetect" -eq 0 ] || [ $((autodetect_now - last_autodetect)) -ge "$AUTODETECT_INTERVAL" ]; }; then
-      if controller autodetect twitch --quiet; then
-        :
-      else
-        echo "router: autodetect twitch failed; keeping existing learned routes" >&2
-      fi
+      sources=$(autodetect_sources 2>/dev/null || printf '%s\n' twitch)
+      while IFS= read -r source; do
+        [ -n "$source" ] || continue
+        if controller autodetect "$source" --quiet; then
+          :
+        else
+          echo "router: autodetect $source failed; keeping existing learned routes" >&2
+        fi
+      done <<< "$sources"
       last_autodetect="$autodetect_now"
     fi
     # Time-based full-pool sweep: on the first successful ensure, and every

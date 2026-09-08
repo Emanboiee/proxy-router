@@ -1430,10 +1430,9 @@ def main() -> int:
         return 2
 
     client = RouterClient(args.root)
-    initial_status = client.status()
-    initial_color = _status_icon_color(initial_status)
+    # Let the first poll publish real state; status can block for COMMAND_TIMEOUT.
+    initial_color = _status_icon_color(RouterStatus())
     app = TrayApp(client, make_icon(initial_color))
-    app.latest = initial_status
     app._icon_sig = initial_color
     app.run()
     return 0

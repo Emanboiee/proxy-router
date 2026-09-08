@@ -147,6 +147,7 @@ logs/                       sing-box runtime logs and rotations (gitignored)
 ./router.py rotate <provider> --to 01-NL-FREE-140  # switch to this exact exit profile (used by the tray's Provider picker)
 ./router.py response-event --host example.com --status 429 [--provider proton]
                                  # feed an observed upstream status into cooldown/error-policy handling
+./router.py autodetect [source] [--quiet] [--no-reload]  # discover routed web-app dependency hostnames
 ./router.py profile copy <path...> --provider proton
                                  # copy validated .conf file(s)/directory into a provider
 ./router.py watcher status       # routed-connection watcher state (JSON)

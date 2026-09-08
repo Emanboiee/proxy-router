@@ -60,10 +60,8 @@ class DefaultRootTests(unittest.TestCase):
 
 
 class MainInitializationTests(unittest.TestCase):
-    def test_main_installs_initial_status_on_tray_app(self):
-        status = tray.RouterStatus(up=True, mode="proxy", port=2080)
+    def test_main_starts_tray_before_initial_status_fetch(self):
         client = mock.Mock()
-        client.status.return_value = status
         created = {}
 
         class FakeApp:
@@ -84,10 +82,10 @@ class MainInitializationTests(unittest.TestCase):
             self.assertEqual(tray.main(), 0)
 
         self.assertIs(created["client"], client)
-        self.assertIs(created["client"].status.return_value, status)
-        self.assertIs(created["app"].latest, status)
-        self.assertEqual(created["app"]._icon_sig, "#4caf50")
-        make_icon.assert_called_once_with("#4caf50")
+        client.status.assert_not_called()
+        self.assertFalse(created["app"].latest.up)
+        self.assertEqual(created["app"]._icon_sig, "#e53935")
+        make_icon.assert_called_once_with("#e53935")
 
 
 class RouterClientEngineOwnerTests(unittest.TestCase):

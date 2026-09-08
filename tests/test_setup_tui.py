@@ -13,7 +13,6 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -437,15 +436,30 @@ class DashboardSafetyTests(unittest.TestCase):
             config = root / "sing-box.json"
             config.write_text("{}")
             (root / "sing-box.pid").write_text("4242")
-            expected = f"/opt/homebrew/bin/sing-box run -c {config.resolve()}"
-            with mock.patch.object(setup_tui.subprocess, "run", return_value=SimpleNamespace(
-                    returncode=0, stdout=f"{expected}\n")) as run:
+            with mock.patch.object(
+                    setup_tui, "_tui_process_argv",
+                    return_value=["/opt/homebrew/bin/sing-box", "run", "-c",
+                                  str(config.resolve())]) as argv:
                 self.assertTrue(setup_tui._tui_engine_up(root))
-            self.assertEqual(run.call_args.args[0],
-                             ["ps", "-p", "4242", "-o", "command="])
-            with mock.patch.object(setup_tui.subprocess, "run", return_value=SimpleNamespace(
-                    returncode=0, stdout="/other/sing-box run -c /other/sing-box.json\n")):
+            argv.assert_called_once_with(4242)
+            with mock.patch.object(
+                    setup_tui, "_tui_process_argv",
+                    return_value=["/other/sing-box", "run", "-c",
+                                  "/other/sing-box.json"]):
                 self.assertFalse(setup_tui._tui_engine_up(root))
+
+    def test_engine_up_preserves_config_paths_with_spaces(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "root with space"
+            root.mkdir()
+            config = root / "sing-box.json"
+            config.write_text("{}")
+            (root / "sing-box.pid").write_text("4242")
+            argv = ["/opt/homebrew/bin/sing-box", "run", "-c",
+                    str(config.resolve())]
+            with mock.patch.object(setup_tui, "_tui_process_argv",
+                                   return_value=argv):
+                self.assertTrue(setup_tui._tui_engine_up(root))
 
     def test_active_blocked_exit_is_not_counted_healthy(self):
         with tempfile.TemporaryDirectory() as tmp:

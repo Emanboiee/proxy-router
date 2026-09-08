@@ -32,7 +32,6 @@ import time
 import re
 import select
 import shutil
-import shlex
 import subprocess
 import sys
 import tempfile
@@ -1696,13 +1695,58 @@ def _tui_active(root: Path, provider: str) -> str:
         return ""
 
 
-def _tui_engine_up(root: Path) -> bool:
-    """Prove the PID belongs to sing-box running this checkout's config.
+def _tui_process_argv(pid: int) -> list[str] | None:
+    """Read one process's argument vector without shell-style reconstruction.
 
-    A PID file and signal-0 alone are not ownership proof: PIDs get recycled,
-    and a stale file can point at an unrelated process. This read-only check
-    avoids sending a signal and keeps the renderer fail-closed.
+    macOS exposes original argv through KERN_PROCARGS2; errors return None.
     """
+    if sys.platform != "darwin":
+        return None
+    try:
+        import ctypes
+        import struct
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        sysctl = libc.sysctl
+        sysctl.restype = ctypes.c_int
+        mib = (ctypes.c_int * 3)(1, 49, pid)
+        size = ctypes.c_size_t(0)
+        if sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0:
+            return None
+        if not 4 < size.value <= 65536:
+            return None
+        buffer = ctypes.create_string_buffer(size.value)
+        if sysctl(mib, 3, buffer, ctypes.byref(size), None, 0) != 0:
+            return None
+        payload = bytes(buffer.raw[:size.value])
+        argc = struct.unpack_from("i", payload)[0]
+        if argc < 1 or argc > 256:
+            return None
+        values = payload[4:].split(b"\\0")
+        if len(values) < argc + 1:
+            return None
+        return [value.decode("utf-8", "surrogateescape") for value in values[:argc + 1]]
+    except (AttributeError, OSError, UnicodeError, ValueError, struct.error):
+        return None
+
+
+def _tui_argv_matches_config(argv: list[str], config: Path) -> bool:
+    if not argv or not Path(argv[0]).name.startswith("sing-box"):
+        return False
+    if "run" not in argv:
+        return False
+    for index, arg in enumerate(argv[:-1]):
+        if arg in ("-c", "--config"):
+            try:
+                if Path(argv[index + 1]).resolve() == config:
+                    return True
+            except (OSError, RuntimeError):
+                pass
+    return False
+
+
+def _tui_engine_up(root: Path) -> bool:
+    """Prove PID belongs to sing-box running this checkout's config."""
     root = Path(root)
     try:
         pid = int((root / "sing-box.pid").read_text().strip())
@@ -1711,32 +1755,8 @@ def _tui_engine_up(root: Path) -> bool:
     except (OSError, ValueError, UnicodeError):
         return False
     config = (root / "sing-box.json").resolve()
-    try:
-        result = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "command="],
-            capture_output=True, text=True, timeout=2,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    if result.returncode != 0:
-        return False
-    for line in (result.stdout or "").splitlines():
-        try:
-            argv = shlex.split(line.strip())
-        except ValueError:
-            continue
-        if not argv or not Path(argv[0]).name.startswith("sing-box"):
-            continue
-        if "run" not in argv:
-            continue
-        for index, arg in enumerate(argv[:-1]):
-            if arg in ("-c", "--config"):
-                try:
-                    if Path(argv[index + 1]).resolve() == config:
-                        return True
-                except (OSError, RuntimeError):
-                    pass
-    return False
+    argv = _tui_process_argv(pid)
+    return argv is not None and _tui_argv_matches_config(argv, config)
 
 
 def _tui_generated_mode(root: Path) -> str | None:

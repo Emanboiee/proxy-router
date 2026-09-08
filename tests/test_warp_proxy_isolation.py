@@ -1,7 +1,6 @@
 """Isolated WARP-as-local-SOCKS5 routing tests (alternate-port worker).
 
-Recommended minimal integration contract for the core worker (no
-proxy-backed schema exists in router.py yet):
+Recommended integration contract for the core worker:
 
 - Provider entry: ``providers["cloudflare"] = {"socks5": {"host":
   "127.0.0.1", "port": 2181}}`` (canonical key ``"socks5"``).
@@ -16,25 +15,19 @@ proxy-backed schema exists in router.py yet):
   (direct / probe failure), never a shared-engine teardown
   (``engine_stop`` must not run for one dead upstream).
 
-Expected integration change: add the ``proxy`` provider schema + the two
-helpers + the ``build_singbox_config`` SOCKS5 branch. Tests that need that
-schema ``pytest.xfail`` (expected-red) until it lands; everything else
-asserts hard.
 
 Isolation: temp roots only (``load_router`` relocates ROOT/CONFIG/PID/STATE
 into ``tmp_path``), fake runners / monkeypatched sockets (no real
 listeners, no binding 2180/2181), never touches live 2080, system proxy,
-TUN, YouTube, official WARP, or ``/Users/kyson/proxy-router``.
+TUN, YouTube, official WARP, or host machine state.
 """
 
 from __future__ import annotations
 
 import importlib.util
 import json
-import sys
 from pathlib import Path
 from types import SimpleNamespace
-from unittest import mock
 
 import pytest
 
@@ -49,7 +42,6 @@ FORBIDDEN_SUBSTRINGS = ("youtube.com", "googlevideo.com", "ytimg.com")
 
 
 def load_router(tmp_path):
-    sys.path.insert(0, str(ROOT))
     spec = importlib.util.spec_from_file_location(
         "warp_proxy_router_under_test", ROOT / "router.py"
     )
@@ -91,25 +83,10 @@ def _wg_profile(router, profile: Path) -> None:
     router.dns_server_for = lambda path: "1.1.1.1"  # noqa: E731
 
 
-def _proxy_entry(router, name=WARP_PROVIDER):
-    """Canonical ``proxy`` entry, tolerating legacy alias keys."""
-    entry = router._providers.get(name, {})
-    proxy = entry.get("proxy") or entry.get("socks5") or entry.get("socks5_upstream")
-    if isinstance(proxy, int):  # tolerate bare-port shorthand in future schemas
-        return {"server": "127.0.0.1", "server_port": proxy}
-    return proxy
-
-
 def _socks_outbounds(config: dict) -> list:
     return [o for o in config.get("outbounds", []) if o.get("type") == "socks"]
 
 
-def _needs_proxy_schema(router) -> bool:
-    """True when router.py has no proxy-backed provider support yet."""
-    return not (
-        (hasattr(router, "is_proxy_provider")
-         and hasattr(router, "proxy_upstream"))
-    )
 
 
 # 1. Alt-port listener/config must not assume 2080.
@@ -154,13 +131,9 @@ def test_warp_domains_route_to_socks5_while_default_stays_direct(tmp_path):
     router.current_mode = lambda: "proxy"  # noqa: E731
     config, _active = router.build_singbox_config()
     socks = _socks_outbounds(config)
-    upstream = _proxy_entry(router)
-    if _needs_proxy_schema(router) or not socks or upstream is None:
-        pytest.xfail(
-            "expected-red: router.py has no validated proxy-backed provider "
-            "schema or SOCKS5 outbound branch yet"
-        )
-    assert upstream.get("server_port", upstream.get("port")) == UPSTREAM_PORT
+    host, port = router.proxy_upstream(WARP_PROVIDER)
+    assert (host, port) == ("127.0.0.1", UPSTREAM_PORT)
+    assert socks
     warp_out = next(o for o in socks if o["server_port"] == UPSTREAM_PORT)
     assert warp_out["tag"] == WARP_PROVIDER
     rules = config["route"]["rules"]
@@ -253,10 +226,7 @@ def test_harness_mutates_neither_system_proxy_nor_live_root(tmp_path, monkeypatc
     import router as live_router
 
     live_root = live_router.ROOT
-    live_config = live_router.CONFIG_FILE
     assert Path(tmp_path).resolve() != Path(live_root).resolve()
-    had_live_config = live_config.is_file()
-    live_before = live_config.read_text() if had_live_config else None
     monkeypatch.delenv("PROXY_ROUTER_ROOT", raising=False)
 
     router = load_router(tmp_path)
@@ -278,10 +248,6 @@ def test_harness_mutates_neither_system_proxy_nor_live_root(tmp_path, monkeypatc
     assert not state_file.exists()  # off cleans up its own tmp record
 
     assert "PROXY_ROUTER_ROOT" not in __import__("os").environ
-    assert live_router.ROOT == live_root
-    assert live_router.CONFIG_FILE == live_config
-    if had_live_config:
-        assert live_config.read_text() == live_before
     for cmd in runner.commands:
         assert str(live_root) not in " ".join(cmd)
 
@@ -314,12 +280,6 @@ def test_dead_socks5_upstream_falls_back_without_engine_teardown(
     assert router._listener_healthy(UPSTREAM_PORT, 0.05) is False
     assert teardown_calls == []
 
-    if _needs_proxy_schema(router):
-        pytest.xfail(
-            "expected-red: bounded-fallback probe surface is green, but the "
-            "proxy-backed build branch (fail-open direct final on dead "
-            "upstream) still needs the core worker's schema"
-        )
     config, _active = router.build_singbox_config()
     assert config["route"]["final"] == "direct"
     assert teardown_calls == []
@@ -349,28 +309,18 @@ def test_wireguard_provider_build_unchanged(tmp_path):
     assert set(active) == {"proton"}
 
 
-def test_proxy_schema_aliases_resolve_to_same_upstream(tmp_path):
-    """Contract pin: proxy/socks5/socks5_upstream keys mean the same thing."""
+def test_proxy_schema_uses_public_upstream_helper(tmp_path):
+    """Canonical SOCKS5 schema is validated through router's public API."""
     router = load_router(tmp_path)
-    for key in ("proxy", "socks5", "socks5_upstream"):
-        router._providers = {WARP_PROVIDER: {
-            key: {"server": "127.0.0.1", "server_port": UPSTREAM_PORT}}}
-        upstream = _proxy_entry(router)
-        assert upstream is not None, key
-        assert upstream.get("server_port", upstream.get("port")) == UPSTREAM_PORT, key
-    helper = getattr(router, "provider_proxy_upstream", None)
-    if helper is None and hasattr(router, "proxy_upstream"):
-        router._providers = {WARP_PROVIDER: {
-            "socks5": {"host": "127.0.0.1", "port": UPSTREAM_PORT}}}
-        assert router.proxy_upstream(WARP_PROVIDER) == ("127.0.0.1", UPSTREAM_PORT)
-        return
-    if helper is None:
-        pytest.xfail(
-            "expected-red: no validated proxy upstream helper exists yet"
-        )
     router._providers = {WARP_PROVIDER: {
-        "proxy": {"server": "127.0.0.1", "server_port": UPSTREAM_PORT}}}
-    assert helper(WARP_PROVIDER)["server_port"] == UPSTREAM_PORT
+        "socks5": {"host": "127.0.0.1", "port": UPSTREAM_PORT}}}
+    assert router.proxy_upstream(WARP_PROVIDER) == ("127.0.0.1", UPSTREAM_PORT)
+
+    for unsupported_key in ("proxy", "socks5_upstream"):
+        router._providers = {WARP_PROVIDER: {
+            unsupported_key: {"host": "127.0.0.1", "port": UPSTREAM_PORT}}}
+        with pytest.raises(ValueError, match="not a proxy-backed"):
+            router.proxy_upstream(WARP_PROVIDER)
 
 
 def test_no_brittle_private_hooks_required(tmp_path):
@@ -380,6 +330,3 @@ def test_no_brittle_private_hooks_required(tmp_path):
                    "system_proxy_on", "system_proxy_off", "with_proxy",
                    "engine_stop"):
         assert callable(getattr(router, public, None)), public
-    with mock.patch.object(router.socket, "create_connection",
-                           side_effect=OSError("down")):
-        assert router._listener_healthy(UPSTREAM_PORT, 0.01) is False

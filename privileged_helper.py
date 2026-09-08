@@ -852,8 +852,9 @@ def _open_user_log(metadata: InstallMetadata) -> int:
                 os.close(fd)
                 raise
         finally:
-            os.close(logs_fd)
-            logs_fd = None
+            if logs_fd is not None:
+                os.close(logs_fd)
+                logs_fd = None
     finally:
         if logs_fd is not None:
             os.close(logs_fd)
