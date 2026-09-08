@@ -1413,19 +1413,18 @@ class ProbeEgressTests(unittest.TestCase):
         self.assertIs(record["dns_ok"], False)
         self.assertFalse(router.is_cooled_down("proton", self.profile))
 
-    def test_probe_tls_throttle_never_cools_even_repeated(self):
-        # TLS-handshake EOF (SSL_ERROR_SYSCALL / UNEXPECTED_EOF) happens AFTER
-        # the TCP CONNECT rode the tunnel: the path works, the upstream is
-        # throttling. Even two consecutive TLS failures must NOT cool — this
-        # is the GLM "all exits work" reality vs probe false-death gap.
+    def test_probe_repeated_tls_failure_cools_after_threshold(self):
+        # A server closing mid-handshake is not proof of throttling; repeated
+        # TLS errors with no HTTP response use the TLS quarantine policy.
         with mock.patch.object(router, "probe_egress", return_value=self._tls_fail()):
             _, record = router.probe_profile("proton", self.profile)
             self.assertEqual(record["fails"], 1)
+            self.assertFalse(router.is_cooled_down("proton", self.profile))
             _, record = router.probe_profile("proton", self.profile)
             self.assertEqual(record["fails"], 2)
-        self.assertFalse(router.is_cooled_down("proton", self.profile))
+        self.assertTrue(router.is_cooled_down("proton", self.profile))
 
-    def test_check_egress_live_tls_throttle_is_degraded_not_dead(self):
+    def test_check_egress_live_first_tls_strike_is_degraded_not_dead(self):
         with mock.patch.object(router, "probe_egress", return_value=self._tls_fail()), \
              mock.patch.object(router.time, "sleep"):
             status, record = router.check_egress_live("proton", self.profile)
@@ -2053,7 +2052,6 @@ class EgressLiveCheckTests(unittest.TestCase):
     def test_transport_death_with_unknown_dns_never_cools(self):
         # Connection-level failure with an unknown direct DNS signal is not
         # enough evidence to cool the exit. The explicit network diagnostic
-        # reports the DNS condition separately.
         with mock.patch.object(router, "probe_egress", return_value=self._probe(
                 error="URLError: <urlopen error [Errno 61] Connection refused>")), \
              mock.patch.object(router, "egress_dns_probe", return_value=None), \
@@ -2099,10 +2097,9 @@ class EgressLiveCheckTests(unittest.TestCase):
         self.assertTrue(router.is_cooled_down("proton", self.profile))
         self.assertNotIn("block_reason", record or {})
 
-    def test_probe_profile_tls_throttle_never_cools(self):
-        # TLS-handshake failure (TCP CONNECT rode the tunnel, server closed
-        # mid-handshake = upstream throttle): must not cool even on repeated
-        # strikes through the probe_profile path either.
+    def test_probe_profile_repeated_tls_failure_cools(self):
+        # A server closing mid-handshake is not proof of throttling; repeated
+        # TLS alerts with no HTTP response use the TLS quarantine policy.
         with mock.patch.object(router, "probe_egress", return_value=self._probe(
                 error="URLError: <urlopen error [SSL: TLSV1_ALERT_INTERNAL_ERROR]>")), \
              mock.patch.object(router, "record_egress", wraps=router.record_egress):
@@ -2110,7 +2107,7 @@ class EgressLiveCheckTests(unittest.TestCase):
             self.assertEqual(record["fails"], 1)
             _, record = router.probe_profile("proton", self.profile)
             self.assertEqual(record["fails"], 2)
-        self.assertFalse(router.is_cooled_down("proton", self.profile))
+        self.assertTrue(router.is_cooled_down("proton", self.profile))
         self.assertNotIn("block_reason", record or {})
 
     def test_probe_profile_http_failure_does_not_cooldown(self):
