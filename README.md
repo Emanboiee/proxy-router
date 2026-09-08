@@ -292,6 +292,14 @@ error). New configurations should use `"fallback_providers"`.
 
 Tunables live in `router.json` under `"egress"` (see `router.example.json`).
 
+When a provider serves multiple routes, set `providers.<name>.probe_route_id`
+to the route that represents the real client path (for example,
+`"opencode-zen"`). The router validates that the route exists, belongs to the
+provider, and has a tunneled domain, then probes that route instead of silently
+using the first route in the table. If the explicitly pinned route is no longer
+eligible for tunneling, selection returns no probe rather than measuring an
+unrelated target.
+
 ## Error policy table (`error_policy`)
 
 What happens to a lane after an upstream failure is configurable per reason via
