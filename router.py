@@ -39,6 +39,8 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+import domain_autodetect
+
 ROOT = Path(os.environ.get("PROXY_ROUTER_ROOT") or Path(__file__).resolve().parent).resolve()
 CONFIG_FILE = ROOT / "router.json"
 SING_BOX_CONFIG = ROOT / "sing-box.json"
@@ -233,6 +235,7 @@ _routes: list = []
 _port: int = DEFAULT_PORT
 _vpn: dict = {}
 _routing: dict = {}
+_autodetect: dict = {}
 _egress_settings: dict = {}
 _error_policy: dict | None = None
 _PROVIDER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
@@ -463,8 +466,81 @@ def _atomic_write(path: Path, text: str, mode: int = 0o600) -> None:
             temporary.unlink(missing_ok=True)
 
 
+def _load_autodetect(data: dict, routes: list, providers: dict) -> dict:
+    """Validate bounded hostname autodetection settings."""
+    raw = data.get("autodetect", {}) if isinstance(data, dict) else {}
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("'autodetect' must be an object")
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("'autodetect.enabled' must be a boolean")
+    try:
+        interval = int(raw.get("interval_seconds", 300))
+        timeout = int(raw.get("timeout_seconds", 12))
+    except (TypeError, ValueError):
+        raise ValueError("'autodetect' interval/timeout must be integers") from None
+    if interval < 30:
+        raise ValueError("'autodetect.interval_seconds' must be at least 30")
+    if not 3 <= timeout <= 60:
+        raise ValueError("'autodetect.timeout_seconds' must be between 3 and 60")
+    sources = raw.get("sources", {})
+    if not isinstance(sources, dict):
+        raise ValueError("'autodetect.sources' must be an object")
+    route_ids = {route.get("id") for route in routes if isinstance(route.get("id"), str)}
+    cleaned_sources: dict[str, dict] = {}
+    for source, supplied in sources.items():
+        if not isinstance(source, str) or not _PROVIDER_NAME.fullmatch(source):
+            raise ValueError("'autodetect.sources' names must be valid identifiers")
+        if not isinstance(supplied, dict):
+            raise ValueError(f"'autodetect.sources.{source}' must be an object")
+        seed = supplied.get("seed")
+        if not isinstance(seed, str) or not seed.startswith("https://"):
+            raise ValueError(f"'autodetect.sources.{source}.seed' must be an https URL")
+        seed_host = domain_autodetect.normalize_host(urllib.parse.urlsplit(seed).hostname)
+        if seed_host is None:
+            raise ValueError(f"'autodetect.sources.{source}.seed' has no valid hostname")
+        route_id = supplied.get("route_id")
+        provider = supplied.get("provider")
+        if not isinstance(route_id, str) or route_id not in route_ids:
+            raise ValueError(f"'autodetect.sources.{source}.route_id' must name a configured route")
+        if not isinstance(provider, str) or provider not in providers:
+            raise ValueError(f"'autodetect.sources.{source}.provider' must name a configured provider")
+        try:
+            ttl = int(supplied.get("ttl_seconds", 1800))
+        except (TypeError, ValueError):
+            raise ValueError(f"'autodetect.sources.{source}.ttl_seconds' must be an integer") from None
+        if not 60 <= ttl <= 7 * 24 * 60 * 60:
+            raise ValueError(f"'autodetect.sources.{source}.ttl_seconds' must be between 60 and 604800")
+        roots = supplied.get("roots", [])
+        if not isinstance(roots, list) or not roots:
+            raise ValueError(f"'autodetect.sources.{source}.roots' must be a non-empty string list")
+        normalized_roots = []
+        for root in roots:
+            normalized = domain_autodetect.normalize_host(root)
+            if normalized is None:
+                raise ValueError(f"'autodetect.sources.{source}.roots' contains an invalid hostname")
+            normalized_roots.append(normalized)
+        if not any(domain_autodetect.host_matches_root(seed_host, root) for root in normalized_roots):
+            raise ValueError(f"'autodetect.sources.{source}.seed' must be under one of its roots")
+        cleaned_sources[source] = {
+            "seed": seed,
+            "route_id": route_id,
+            "provider": provider,
+            "roots": sorted(set(normalized_roots)),
+            "ttl_seconds": ttl,
+        }
+    return {
+        "enabled": enabled,
+        "interval_seconds": interval,
+        "timeout_seconds": timeout,
+        "sources": cleaned_sources,
+    }
+
+
 def load_config() -> int:
-    global _providers, _routes, _port, _vpn, _routing
+    global _providers, _routes, _port, _vpn, _routing, _autodetect
     if not CONFIG_FILE.is_file():
         return fail(f"missing {CONFIG_FILE.name}; run 'router.py init' first")
     try:
@@ -612,6 +688,7 @@ def load_config() -> int:
     try:
         _load_error_policy(data, providers)
         _load_rotation_settings(data)
+        autodetect = _load_autodetect(data, routes, providers)
     except ValueError as exc:
         return fail(f"bad {CONFIG_FILE.name}: {exc}")
     _load_egress_settings(data)
@@ -620,6 +697,7 @@ def load_config() -> int:
     _routes = routes
     _vpn = vpn
     _routing = dict(routing)
+    _autodetect = autodetect
     return 0
 
 
@@ -690,6 +768,12 @@ def write_default_config(force: bool = False) -> int:
                 "fail_threshold": 2,
                 "slow_latency_ms": 1200,
                 "ok_window": 86400,
+            },
+            "autodetect": {
+                "enabled": False,
+                "interval_seconds": 300,
+                "timeout_seconds": 12,
+                "sources": {},
             },
             # Scheduled rotation: churn the active exits every 2h (with
             # ±150s jitter) so upstream rate limits see a fresh egress IP.
@@ -1520,6 +1604,73 @@ def response_event(host: str, status: int, *, provider: str | None = None,
     if effective != route_provider:
         return rc
     return activate_fallback(route_provider, reason=str(status))
+
+
+def autodetect_source(source: str = "twitch", *, reload: bool = True,
+                      quiet: bool = False) -> int:
+    """Discover routed dependency hosts from one configured HTTPS seed page."""
+    if not _autodetect.get("enabled"):
+        return 0 if quiet else fail("autodetection is disabled")
+    settings = (_autodetect.get("sources") or {}).get(source)
+    if not isinstance(settings, dict):
+        return 0 if quiet else fail(f"autodetection source '{source}' is not configured")
+    proxy = f"http://127.0.0.1:{_port}"
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+    )
+    request = urllib.request.Request(
+        settings["seed"],
+        headers={"Accept-Encoding": "identity", "User-Agent": "proxy-router-autodetect/1.0"},
+    )
+    try:
+        with opener.open(request, timeout=float(_autodetect.get("timeout_seconds", 12))) as response:
+            document = response.read(4 * 1024 * 1024 + 1)
+    except (OSError, urllib.error.URLError, urllib.error.HTTPError) as exc:
+        if not quiet:
+            print(f"router: autodetect {source}: seed fetch failed: {exc}", file=sys.stderr)
+        return 1
+    if len(document) > 4 * 1024 * 1024:
+        if not quiet:
+            print(f"router: autodetect {source}: seed response is too large", file=sys.stderr)
+        return 1
+    text = document.decode("utf-8", "replace")
+    hosts = domain_autodetect.extract_related_hosts(text, settings["roots"])
+    if not hosts:
+        if not quiet:
+            print(f"router: autodetect {source}: no trusted dependency hosts found", file=sys.stderr)
+        return 1
+    before = _read_autodetect_state(source)
+    now = int(time.time())
+    before_domains = set(domain_autodetect.active_domains(before, now=now))
+    state, _ = domain_autodetect.merge_state(
+        before, hosts, now=now, ttl_seconds=settings["ttl_seconds"]
+    )
+    state.update({
+        "source": source,
+        "route_id": settings["route_id"],
+        "provider": settings["provider"],
+        "seed": settings["seed"],
+        "roots": settings["roots"],
+        "ttl_seconds": settings["ttl_seconds"],
+    })
+    state_changed = state != before
+    route_changed = before_domains != set(domain_autodetect.active_domains(state, now=now))
+    if state_changed:
+        _atomic_write(_autodetect_state_path(source), json.dumps(state, indent=2) + "\n", 0o600)
+    reload_rc = 0
+    if route_changed and reload:
+        reload_rc = engine_reload()
+    result = {
+        "source": source,
+        "changed": route_changed,
+        "state_changed": state_changed,
+        "domains": domain_autodetect.active_domains(state, now=now),
+        "reload_rc": reload_rc,
+        "updated_at": state.get("updated_at"),
+    }
+    if not quiet:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if reload_rc == 0 else 1
 
 
 def _open_probe(opener, request, timeout: float):
@@ -2485,6 +2636,77 @@ def dns_transport() -> str:
     return transport
 
 
+def _autodetect_state_path(source: str) -> Path:
+    if not isinstance(source, str) or not _PROVIDER_NAME.fullmatch(source):
+        raise ValueError("invalid autodetect source")
+    return ROOT / "state" / "autodetect" / f"{source}.json"
+
+
+def _read_autodetect_state(source: str) -> dict:
+    try:
+        value = json.loads(_autodetect_state_path(source).read_text())
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _autodetected_domains_by_route() -> dict[str, list[str]]:
+    """Return non-expired exact learned hosts grouped by configured route."""
+    result: dict[str, list[str]] = {}
+    if not _autodetect.get("enabled"):
+        return result
+    for source, settings in (_autodetect.get("sources") or {}).items():
+        if not isinstance(settings, dict):
+            continue
+        state = _read_autodetect_state(source)
+        if (state.get("route_id") != settings.get("route_id")
+                or state.get("provider") != settings.get("provider")):
+            continue
+        domains = domain_autodetect.active_domains(state)
+        if domains:
+            result.setdefault(settings["route_id"], []).extend(domains)
+    return {route_id: sorted(set(domains)) for route_id, domains in result.items()}
+
+
+def _routes_with_autodetected_domains(routes: list[dict]) -> list[dict]:
+    learned = _autodetected_domains_by_route()
+    if not learned:
+        return routes
+    expanded: list[dict] = []
+    for route in routes:
+        route_copy = dict(route)
+        domains = list(route.get("domains") or [])
+        route_id = route.get("id")
+        for host in learned.get(route_id, []):
+            if not any(domain_autodetect.host_matches_root(host, str(domain).lstrip("*."))
+                       for domain in domains):
+                domains.append(host)
+        route_copy["domains"] = domains
+        expanded.append(route_copy)
+    return expanded
+
+
+def autodetect_status() -> dict:
+    """Read-only status for configured hostname discovery sources."""
+    sources = {}
+    for source, settings in (_autodetect.get("sources") or {}).items():
+        state = _read_autodetect_state(source)
+        sources[source] = {
+            "route_id": settings.get("route_id"),
+            "provider": settings.get("provider"),
+            "seed": settings.get("seed"),
+            "ttl_seconds": settings.get("ttl_seconds"),
+            "updated_at": state.get("updated_at"),
+            "domains": domain_autodetect.active_domains(state),
+        }
+    return {
+        "enabled": bool(_autodetect.get("enabled")),
+        "interval_seconds": _autodetect.get("interval_seconds", 300),
+        "timeout_seconds": _autodetect.get("timeout_seconds", 12),
+        "sources": sources,
+    }
+
+
 def _routes_by_health_order(routes: list[dict], selected: dict[str, Path]) -> list[dict]:
     """Stable-sort routes so providers with healthy egress records lead.
 
@@ -2713,10 +2935,11 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
     # pure route-table order, so a healthy lane leads shared domains and a
     # degraded one trails (or drops out) without manual reorders. Falls back
     # to the configured route order when the flag is off.
+    routed_domains = _routes_with_autodetected_domains(_routes)
     if routing.get("health_order") and selected:
-        build_routes = _routes_by_health_order(_routes, selected)
+        build_routes = _routes_by_health_order(routed_domains, selected)
     else:
-        build_routes = _routes
+        build_routes = routed_domains
     dns_rules = []
     if routing_mode == "safe-list" and routing["direct_domains"]:
         # Safe-list: trusted domains go DIRECT, so their DNS must resolve via
@@ -2725,7 +2948,9 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
         # tunnel. The rule comes first so a domain listed both here and in a
         # provider route always wins the direct resolver.
         dns_rules.append({"domain_suffix": list(routing["direct_domains"]), "server": "dns-local"})
-    vpn_domains = frozenset(routing["vpn_domains"])
+    vpn_domains = frozenset(routing["vpn_domains"]) | frozenset(
+        domain for domains in _autodetected_domains_by_route().values() for domain in domains
+    )
     for route in build_routes:
         route_provider = _effective_route_provider(route["provider"])
         if ((route_provider != "direct" and route_provider not in active
@@ -3599,7 +3824,8 @@ def _config_inputs_fingerprint() -> tuple | None:
         st = config_path.stat()
         entries.append((str(config_path), st.st_mtime_ns, st.st_size))
         for pattern in ("providers/*/*.conf", "state/*.active", "state/*.cooldown",
-                        "state/mode", "state/fallback", "state/egress/*/*.json"):
+                        "state/mode", "state/fallback", "state/egress/*/*.json",
+                        "state/autodetect/*.json"):
             for path in ROOT.glob(pattern):
                 try:
                     st = path.stat()
@@ -5212,6 +5438,7 @@ def status_json() -> dict:
         "domains": route.get("domains", []),
         "ip_cidr": route.get("ip_cidr", []),
     } for route in _routes]
+    data["autodetect"] = autodetect_status()
     data["routing"] = routing_state()
     try:
         cfg = json.loads(CONFIG_FILE.read_text())
@@ -6931,6 +7158,13 @@ def main() -> int:
                                help="run bounded direct/routed connectivity and DNS checks")
     status.add_argument("--json", action="store_true", help="machine-readable status (JSON)")
     sub.add_parser("reload")
+    autodetect = sub.add_parser("autodetect", help="discover routed web-app dependency hostnames")
+    autodetect.add_argument("source", nargs="?", default="twitch",
+                            help="configured discovery source (default: twitch)")
+    autodetect.add_argument("--no-reload", action="store_true",
+                            help="persist discoveries without reloading sing-box")
+    autodetect.add_argument("--quiet", action="store_true",
+                            help="suppress normal discovery output")
     sub.add_parser("routes")
     sub.add_parser("up")
     sub.add_parser("down")
@@ -7351,6 +7585,10 @@ def main() -> int:
         if rc == 0:
             route_watcher_start()
         return rc
+    if args.cmd == "autodetect":
+        return _with_lock(lambda: autodetect_source(
+            args.source, reload=not args.no_reload, quiet=args.quiet
+        ))
     if args.cmd == "rotate":
         if args.if_due:
             return _with_lock(lambda: rotate_due(args.provider))

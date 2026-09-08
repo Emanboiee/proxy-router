@@ -83,6 +83,12 @@
     "slow_latency_ms": 1200,
     "ok_window": 86400
   },
+  "autodetect": {
+    "enabled": false,
+    "interval_seconds": 300,
+    "timeout_seconds": 12,
+    "sources": {}
+  },
   "rotation": {
     "interval_seconds": 7200,
     "jitter_seconds": 300,

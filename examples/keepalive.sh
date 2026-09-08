@@ -147,6 +147,50 @@ PY
   fi
 }
 
+# Read one validated top-level autodetection setting. Environment overrides
+# remain available for temporary operator changes without rewriting config.
+autodetect_setting() {
+  if [ -n "${PROXY_ROUTER_PYTHON:-}" ]; then
+    "$PROXY_ROUTER_PYTHON" - "$ROOT/router.json" "$1" "$2" <<'PY' 2>/dev/null || printf '%s\n' "$2"
+import json
+import sys
+
+path, key, default = sys.argv[1:]
+try:
+    data = json.loads(open(path, encoding="utf-8").read())
+    value = (data.get("autodetect") or {}).get(key, default)
+    if key == "enabled":
+        print("1" if value not in (False, 0, "0", "false", "off") else "0")
+    else:
+        value = int(value)
+        if value < 30:
+            raise ValueError
+        print(value)
+except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    raise SystemExit(1)
+PY
+  else
+    python3 - "$ROOT/router.json" "$1" "$2" <<'PY' 2>/dev/null || printf '%s\n' "$2"
+import json
+import sys
+
+path, key, default = sys.argv[1:]
+try:
+    data = json.loads(open(path, encoding="utf-8").read())
+    value = (data.get("autodetect") or {}).get(key, default)
+    if key == "enabled":
+        print("1" if value not in (False, 0, "0", "false", "off") else "0")
+    else:
+        value = int(value)
+        if value < 30:
+            raise ValueError
+        print(value)
+except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    raise SystemExit(1)
+PY
+  fi
+}
+
 ENABLED="${PROXY_KEEPALIVE_ENABLED:-$(config_setting enabled 1)}"
 case "$ENABLED" in
   0|false|False|off|OFF)
@@ -162,6 +206,8 @@ STORM_WINDOW="${PROXY_KEEPALIVE_STORM_WINDOW:-$(config_setting storm_window 600)
 MAX_ROTATIONS="${PROXY_KEEPALIVE_MAX_ROTATIONS:-$(config_setting max_rotations 2)}"
 SWEEP_EVERY="${PROXY_KEEPALIVE_SWEEP_EVERY:-$(config_setting sweep_every 1800)}"
 NETWORK_GRACE="${PROXY_KEEPALIVE_NETWORK_GRACE:-$(config_setting network_grace 1)}"
+AUTODETECT_ENABLED="${PROXY_AUTODETECT_ENABLED:-$(autodetect_setting enabled 0)}"
+AUTODETECT_INTERVAL="${PROXY_AUTODETECT_INTERVAL:-$(autodetect_setting interval_seconds 300)}"
 
 backoff="$INTERVAL"
 boot=1
@@ -170,6 +216,7 @@ strikes=0
 rotations=0
 window_start=0
 last_sweep=0
+last_autodetect=0
 network_lost=0
 network_quiet=0
 
@@ -472,6 +519,8 @@ while true; do
   # without waiting for an agent restart (env override still wins for
   # temporary ops changes).
   ENABLED="${PROXY_KEEPALIVE_ENABLED:-$(config_setting enabled 1)}"
+  AUTODETECT_ENABLED="${PROXY_AUTODETECT_ENABLED:-$(autodetect_setting enabled 0)}"
+  AUTODETECT_INTERVAL="${PROXY_AUTODETECT_INTERVAL:-$(autodetect_setting interval_seconds 300)}"
   case "$ENABLED" in
     0|false|False|off|OFF)
       echo "$(date '+%Y-%m-%d %H:%M:%S') router: autocheck disabled by config; exiting" >&2
@@ -573,6 +622,16 @@ while true; do
           echo "router: scheduled rotation: rotated provider(s)" >&2
         fi
       fi
+    fi
+    autodetect_now=$(date +%s)
+    if [ "$AUTODETECT_ENABLED" != "0" ] && ! is_tun_mode \
+       && { [ "$last_autodetect" -eq 0 ] || [ $((autodetect_now - last_autodetect)) -ge "$AUTODETECT_INTERVAL" ]; }; then
+      if controller autodetect twitch --quiet; then
+        :
+      else
+        echo "router: autodetect twitch failed; keeping existing learned routes" >&2
+      fi
+      last_autodetect="$autodetect_now"
     fi
     # Time-based full-pool sweep: on the first successful ensure, and every
     # SWEEP_EVERY seconds after, probe EVERY profile of every provider and
