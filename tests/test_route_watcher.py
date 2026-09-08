@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import route_watcher as w
+import router
 
 
 class RouteWatcherTests(unittest.TestCase):
@@ -59,6 +60,75 @@ class RouteWatcherTests(unittest.TestCase):
         assert event is not None
         self.assertEqual(event["host"], "opencode.ai")
         self.assertTrue(event["failure"])
+
+    def test_classify_reason_mirrors_router_taxonomy(self):
+        for text in ("TLS handshake timeout", "SSL_ERROR_SYSCALL",
+                     "remote error: tls: internal error", "certificate verify failed",
+                     "unexpected EOF", "tls alert close_notify"):
+            self.assertEqual(w._classify_reason(text), "tls", text)
+        for text in ("connection refused", "connection reset by peer",
+                     "connect timed out", "i/o timeout", "no route to host",
+                     "network is unreachable", "curl failed", ""):
+            self.assertEqual(w._classify_reason(text), "connection", text)
+        # Policy consequence: both classes quarantine 300s, not the 60s
+        # the worker used to send for every rotation via hardcoded timeout.
+        self.assertEqual(router.policy_action("proton", "tls"), ("cooldown", 300))
+        self.assertEqual(router.policy_action("proton", "connection"), ("cooldown", 300))
+
+    def _run_worker(self, lines, probe_result, ticks_to_run=1):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        w.state_dir(root).mkdir(parents=True)
+        (root / "router.json").write_text(json.dumps({
+            "routes": [{"id": "opencode", "domains": ["opencode.ai"], "provider": "proton"}],
+        }))
+        reads = [0]
+        calls = []
+        ticks = [0]
+
+        def fake_read(_path, offset):
+            if reads[0] == 0:
+                reads[0] += 1
+                return offset, lines
+            return offset, []
+
+        def stop_after_ticks(_seconds):
+            ticks[0] += 1
+            if ticks[0] >= ticks_to_run:
+                w.enabled_file(root).unlink(missing_ok=True)
+
+        with mock.patch.object(w, "engine_pid_alive", return_value=True), \
+             mock.patch.object(w, "_read_new_lines", side_effect=fake_read), \
+             mock.patch.object(w, "client_snapshot", return_value=[]), \
+             mock.patch.object(w, "_network_check_hop"), \
+             mock.patch.object(w, "PROBE_EVERY_SECONDS", 0), \
+             mock.patch.object(w, "probe_target", return_value=probe_result), \
+             mock.patch.object(w, "rotate_provider",
+                               side_effect=lambda *a, **k: calls.append((a, k)) or {"rotated": True}):
+            self.assertEqual(w.worker(root, interval=0.05, sleep=stop_after_ticks), 0)
+        return calls
+
+    def test_worker_passes_classified_reason_on_log_failures(self):
+        tls_calls = self._run_worker(
+            ["ERROR connection: open connection to opencode.ai:443: TLS handshake timeout\n"] * 2,
+            {"transport_failure": False})
+        self.assertEqual(len(tls_calls), 1)
+        self.assertEqual(tls_calls[0][0][1], "proton")
+        self.assertEqual(tls_calls[0][1].get("reason"), "tls")
+
+        refused_calls = self._run_worker(
+            ["ERROR connection: open connection to opencode.ai:443: connection refused\n"] * 2,
+            {"transport_failure": False})
+        self.assertEqual(len(refused_calls), 1)
+        self.assertEqual(refused_calls[0][1].get("reason"), "connection")
+
+    def test_worker_probe_failure_passes_transport_reason(self):
+        calls = self._run_worker(
+            ["INFO inbound/mixed[local-proxy]: inbound connection to opencode.ai:443\n"],
+            {"host": "opencode.ai", "transport_failure": True, "error": "SSL_ERROR_SYSCALL"},
+            ticks_to_run=2)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1].get("reason"), "tls")
 
     def test_guard_requires_two_failures_and_cooldown(self):
         guard = w.RotationGuard()
