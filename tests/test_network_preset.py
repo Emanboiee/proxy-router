@@ -207,6 +207,26 @@ def test_engine_ensure_stays_quiescent_while_network_latch_exists(tmp_path):
     assert router.engine_ensure() == 3
 
 
+def test_cmd_network_check_serializes_preset_reload_under_engine_lock(tmp_path, capsys):
+    router = load_router(tmp_path)
+    _write_config(tmp_path, preset="default")
+    calls = []
+
+    def fake_lock(action):
+        calls.append(action)
+        return action()
+
+    with (
+        mock.patch.object(router, "_with_lock", side_effect=fake_lock),
+        mock.patch.object(router, "apply_network_preset", return_value={
+            "applied": False, "reason": "no network mapping", "checked_at": 1,
+        }),
+    ):
+        assert router.cmd_network_check() == 0
+    assert len(calls) == 1
+    json.loads(capsys.readouterr().out)
+
+
 class _SubprocessRun:
     """Simplest possible fake runner for route_watcher._network_check_hop."""
 
