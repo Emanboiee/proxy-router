@@ -300,6 +300,45 @@ def validate_profile(conf_path: Path) -> bool:
     return ok
 
 
+# Roaming default (seconds): a WireGuard client that goes quiet behind
+# NAT/school Wi-Fi never re-advertises its address after a roam, so the
+# server keeps sending to the dead endpoint until user traffic flows.
+# A 25s persistent keepalive (empty packet only when idle, ~0.3 MB/day)
+# keeps the UDP mapping alive and announces the new endpoint within one
+# interval. Stamped at import so every stored profile roams; an explicit
+# per-profile value is always respected.
+_ROAM_KEEPALIVE_DEFAULT = 25
+
+
+def _stamp_roam_keepalive(text: str) -> str:
+    """Insert ``PersistentKeepalive`` into ``[Peer]`` when the profile omits it.
+
+    Returns the text unchanged when any keepalive entry (any case) is
+    already present or no ``[Peer]`` section exists. Text-level edit on
+    purpose: the rest of the file (keys, order, comments) is preserved
+    byte-for-byte. Callers must never print the return value (key material).
+    """
+    lines = text.split("\n")
+    try:
+        peer_at = next(
+            i for i, line in enumerate(lines) if line.strip() == "[Peer]"
+        )
+    except StopIteration:
+        return text
+    section_end = next(
+        (i for i in range(peer_at + 1, len(lines))
+         if lines[i].strip().startswith("[") and lines[i].strip().endswith("]")),
+        len(lines),
+    )
+    if any(
+        line.strip().lower().startswith("persistentkeepalive")
+        for line in lines[peer_at + 1:section_end]
+    ):
+        return text
+    lines.insert(peer_at + 1, f"PersistentKeepalive = {_ROAM_KEEPALIVE_DEFAULT}")
+    return "\n".join(lines)
+
+
 def sanitize_name(name: str) -> str:
     """Lowercase, safe filename preserving a trailing ``.conf`` extension."""
     name = name.strip()
@@ -363,7 +402,8 @@ def import_profiles(source, destination, validator=None) -> dict:
     ``source`` is a single ``.conf`` file or a directory of ``.conf`` files.
     Each profile is validated, given a sanitized, collision-free name, and
     written atomically: a fresh O_CREAT|O_EXCL|O_NOFOLLOW fd at mode 0600
-    (never following symlinks), bytes copied through it, then fsync + close —
+    (never following symlinks), bytes copied through it with the roaming
+    keepalive default stamped when absent, then fsync + close —
     matching the tmp+replace discipline PR #89 gave the config writers.
     Nothing about the contents is printed.
 
@@ -419,7 +459,11 @@ def import_profiles(source, destination, validator=None) -> dict:
         try:
             with os.fdopen(fd, "wb") as out:
                 with open(candidate, "rb") as src_handle:
-                    shutil.copyfileobj(src_handle, out)
+                    raw = src_handle.read()
+                try:
+                    out.write(_stamp_roam_keepalive(raw.decode("utf-8")).encode("utf-8"))
+                except UnicodeDecodeError:
+                    out.write(raw)
                 out.flush()
                 os.fsync(out.fileno())
         except OSError as exc:
