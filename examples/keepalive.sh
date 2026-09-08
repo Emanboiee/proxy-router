@@ -247,7 +247,7 @@ rotate_dead() {
   rotations=$((rotations + 1))
   strikes=0
   echo "router: rotating '$provider' after dead tunnel checks" >&2
-  if controller rotate "$provider" --reason timeout --automatic; then
+  if controller rotate "$provider" --reason connection --automatic; then
     :
   else
     rotate_rc=$?
@@ -273,7 +273,7 @@ rotate_dead() {
         return
         ;;
     esac
-    if ! controller failover "$provider" on --reason timeout --automatic >/dev/null 2>&1; then
+    if ! controller failover "$provider" on --reason connection --automatic >/dev/null 2>&1; then
       echo "router: fallback for '$provider' failed; will retry after the next dead check" >&2
       return
     fi
@@ -299,7 +299,7 @@ restore_fallbacks() {
       echo "router: '$provider' primary is alive again; fallback cleared" >&2
     else
       echo "router: '$provider' primary still dead; re-activating fallback" >&2
-      controller failover "$provider" on --reason timeout --automatic >/dev/null 2>&1 || true
+      controller failover "$provider" on --reason connection --automatic >/dev/null 2>&1 || true
     fi
   done
 }

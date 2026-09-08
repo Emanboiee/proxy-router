@@ -339,6 +339,8 @@ class KeepaliveEgressCheckTests(unittest.TestCase):
             rotates = [line for line in lines if line.startswith("rotate proton")]
             self.assertEqual(len(rotates), 1,
                              f"storm guard must cap rotations at 1: {rotates}")
+            self.assertIn("rotate proton --reason connection --automatic", rotates[0],
+                          f"dead transport must use connection policy: {rotates}")
             self.assertIn("boot self-test: active tunnel is dead", h.err,
                           f"boot warning missing: {h.err!r}")
             self.assertIn("storm guard", h.err,
@@ -501,8 +503,8 @@ class KeepaliveFallbackRestoreTests(unittest.TestCase):
             lines = h.lines()
             self.assertTrue(any(line.startswith("failover proton off") for line in lines),
                             f"expected failover off: {lines}")
-            self.assertTrue(any(line.startswith("failover proton on --reason timeout") for line in lines),
-                            f"expected fallback re-activation: {lines}")
+            self.assertTrue(any(line.startswith("failover proton on --reason connection --automatic") for line in lines),
+                            f"expected connection-reason fallback re-activation: {lines}")
             h.close()
             self.assertIn("'proton' primary still dead; re-activating fallback", h.err,
                           f"re-activation message missing: {h.err!r}")
