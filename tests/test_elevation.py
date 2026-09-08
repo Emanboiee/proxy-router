@@ -75,12 +75,61 @@ class PrivilegedHelperCommandTests(unittest.TestCase):
                 "/usr/bin/env", "-i", "HOME=/var/empty",
                 "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LANG=C",
                 "/usr/bin/python3", "-I", "-S",
-                "/Library/PrivilegedHelperTools/com.proxy-router/current/privileged_helper.py",
+                str(router.PRIVILEGED_HELPER),
                 "reload", "501",
             ],
         )
         self.assertNotIn(str(Path(router.__file__).resolve()), command)
         self.assertNotIn(router.sys.executable, command)
+
+    def test_linux_helper_command_uses_canonical_linux_helper_path(self):
+        linux_helper = Path("/usr/local/libexec/proxy-router/current/privileged_helper.py")
+        with mock.patch.object(router.sys, "platform", "linux"), \
+             mock.patch.object(router, "PRIVILEGED_HELPER", linux_helper), \
+             mock.patch.object(router.os, "getuid", return_value=501):
+            self.assertTrue(router._privileged_helper_supported())
+            command = router._helper_command("start")
+
+        self.assertEqual(command[:2], ["sudo", "-n"])
+        self.assertIn(str(linux_helper), command)
+        self.assertNotIn("/Library/PrivilegedHelperTools", " ".join(command))
+
+    def test_linux_engine_liveness_and_mode_use_helper_backend_first(self):
+        status = {"installed": True, "running": True, "pid": 4242, "mode": "tun", "schema_version": 1}
+        with mock.patch.object(router.sys, "platform", "linux"), \
+             mock.patch.object(router.os, "geteuid", return_value=501), \
+             mock.patch.object(router, "_helper_status", return_value=status):
+            self.assertTrue(router.engine_alive())
+            with mock.patch.object(router, "current_mode", return_value="tun"):
+                self.assertTrue(router.engine_mode_consistent())
+
+    def test_linux_interactive_elevate_uses_sudo_launcher_not_macos_dialog(self):
+        with mock.patch.object(router.sys, "platform", "linux"), \
+             mock.patch.object(router.os, "geteuid", return_value=501), \
+             mock.patch.object(router.sys.stdin, "isatty", return_value=True), \
+             mock.patch.object(router, "_elevate_linux", return_value=0) as linux, \
+             mock.patch.object(router, "_elevate_macos") as macos:
+            self.assertEqual(router.cmd_elevate("install"), 0)
+
+        linux.assert_called_once_with()
+        macos.assert_not_called()
+
+    def test_linux_elevate_wraps_digest_checked_bootstrap_with_interactive_sudo(self):
+        fd, raw_archive = tempfile.mkstemp(prefix="proxy-router-test-")
+        os.close(fd)
+        archive = Path(raw_archive)
+        self.addCleanup(archive.unlink, missing_ok=True)
+        command = ["/usr/bin/python3", "-I", "-S", "-c", "bootstrap"]
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with mock.patch.object(router, "_prepare_privileged_install", return_value=(command, archive)), \
+             mock.patch.object(router.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(router._elevate_linux(), 0)
+
+        self.assertEqual(
+            run.call_args.args[0],
+            ["/usr/bin/sudo", "-p", "proxy-router administrator password: ", *command],
+        )
+        self.assertEqual(run.call_args.kwargs, {"text": True})
 
     def test_helper_status_executes_exact_status_and_parses_json(self):
         payload = {"installed": True, "running": True, "pid": 4242, "mode": "tun", "schema_version": 1}
@@ -129,6 +178,29 @@ class PrivilegedHelperCommandTests(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         write_config.assert_called_once_with(config)
+        helper_run.assert_called_once_with("start")
+        popen.assert_not_called()
+        local_stop.assert_not_called()
+
+    def test_linux_tun_engine_start_delegates_to_root_helper(self):
+        config = {
+            "log": {"level": "info"}, "inbounds": [], "endpoints": [],
+            "outbounds": [], "dns": {}, "route": {},
+        }
+        with mock.patch.object(router.sys, "platform", "linux"), \
+             mock.patch.object(router.os, "geteuid", return_value=1000), \
+             mock.patch.object(router, "resolve_sing_box", return_value="/trusted/sing-box"), \
+             mock.patch.object(router, "sing_box_at_least", return_value=True), \
+             mock.patch.object(router, "build_singbox_config", return_value=(config, {"p": Path("p.conf")})), \
+             mock.patch.object(router, "write_sing_box"), \
+             mock.patch.object(router, "validate_config", return_value=True), \
+             mock.patch.object(router, "current_mode", return_value="tun"), \
+             mock.patch.object(router, "_helper_status", return_value={"installed": True, "running": False}), \
+             mock.patch.object(router, "_helper_run", return_value=0) as helper_run, \
+             mock.patch.object(router.subprocess, "Popen") as popen, \
+             mock.patch.object(router, "engine_stop") as local_stop:
+            self.assertEqual(router.engine_start(), 0)
+
         helper_run.assert_called_once_with("start")
         popen.assert_not_called()
         local_stop.assert_not_called()
@@ -422,7 +494,7 @@ class HelperPermissionUxTests(unittest.TestCase):
         elevation = data["elevation"]
         self.assertFalse(elevation["root_engine"])
         self.assertTrue(elevation["sudo_grant"])
-        # Non-macOS: helper probe skipped -> installed flag stays False.
+        # The helper probe has no installed helper in this isolated test.
         self.assertFalse(elevation["helper_installed"])
         self.assertIn("elevate install", elevation["fix_hint"])
 

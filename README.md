@@ -370,8 +370,10 @@ and `rotate` all respect whatever mode is active.
 
 Platform notes:
 
-- **Linux**: needs root for the TUN device + route table (iproute2)
-  (`sudo proxy-router vpn on`).
+- **Linux**: needs the one-time root-owned helper plus `/dev/net/tun` and
+  route-table support (`iproute2`). Run `proxy-router elevate install` once,
+  then `proxy-router vpn on`; normal lifecycle calls stay unprivileged and
+  delegate through exact `sudo -n` helper operations.
 - **Windows**: needs an elevated shell and `wintun.dll` next to
   `sing-box.exe` (drop it from the official Wintun release).
 - **macOS**: needs root to create the `utun` interface. Run
@@ -382,9 +384,9 @@ Platform notes:
   tray, and keepalive stay unprivileged and silently request helper
   `start`/`stop`/`reload` as needed. Without a valid helper, root-required
   operations fail closed and tell you to install it; they never execute the
-  user-writable checkout as root or pop repeated admin dialogs. This is NOT a System Settings VPN
-  provider entry — that would require a signed NetworkExtension app. It is a
-  TUN interface managed from the terminal.
+  user-writable checkout as root or pop repeated admin dialogs. This is NOT a
+  System Settings VPN provider entry — that would require a signed
+  NetworkExtension app. It is a TUN interface managed from the terminal.
 
 TUN options live under `"vpn"` in `router.json`:
 `address` (CIDR list), `mtu`, `stack` (`system`, default | `gvisor`).
@@ -416,9 +418,9 @@ Two more knobs in `"vpn"` control address-family policy:
   allowing outbound TCP 443; the same IP literal is used as the server
   address with `server_port: 443`.
 
-## One-time elevation (macOS)
+## One-time elevation (macOS/Linux)
 
-`vpn` engine commands need root to create the `utun` interface. Install the
+`vpn` engine commands need root to create the TUN interface. Install the
 minimal lifecycle helper once:
 
 ```sh
@@ -438,7 +440,9 @@ watcher as the normal user. Before root sing-box sees a config, the helper
 safe-opens the fixed generated file without following links, validates a
 closed versioned schema (no file/command/plugin/controller fields), copies the
 bytes into root-owned state, and checks them with the hash-pinned binary.
-Helper code, binary, policy, PID, and config live under root-owned macOS paths;
+Helper code, binary, policy, PID, and config live under platform-specific
+root-owned paths (`/Library/PrivilegedHelperTools` and `/private/var/db` on
+macOS; `/usr/local/libexec/proxy-router` and `/var/lib/proxy-router` on Linux);
 modifying the checkout after installation cannot change executable root code.
 
 Install/upgrade requires a fresh admin approval. A recognized legacy policy
