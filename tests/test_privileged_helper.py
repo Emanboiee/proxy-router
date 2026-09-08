@@ -705,6 +705,9 @@ class HelperLifecycleTests(unittest.TestCase):
             self.assertEqual(spawn.kwargs["env"], helper.sing_box_environment(runtime.state_dir))
             self.assertTrue(spawn.kwargs["start_new_session"])
             self.assertEqual(runtime.pid_file.read_text(), "4242\n")
+            self.assertTrue((user_root / "logs" / "sing-box.log").is_file())
+            self.assertEqual((user_root / "logs").stat().st_mode & 0o777, 0o700)
+            self.assertEqual((user_root / "logs" / "sing-box.log").stat().st_mode & 0o777, 0o600)
             waiter.assert_called_once_with(4242, runtime)
 
     def test_start_engine_readiness_failure_stops_spawned_engine(self):
@@ -824,7 +827,8 @@ class HelperLifecycleTests(unittest.TestCase):
             target = root / "other-user-file"
             target.write_text("do not touch", encoding="ascii")
             target.chmod(0o600)
-            os.link(target, root / "sing-box.log")
+            (root / "logs").mkdir(mode=0o700)
+            os.link(target, root / "logs" / "sing-box.log")
             identity = root.stat()
             install = helper.InstallMetadata(
                 uid=os.getuid(), gid=os.getgid(), user_root=root,
@@ -880,7 +884,8 @@ class HelperLifecycleTests(unittest.TestCase):
             target = user_root / "other"
             target.write_text("x", encoding="ascii")
             target.chmod(0o600)
-            os.link(target, user_root / "sing-box.log")
+            (user_root / "logs").mkdir(mode=0o700)
+            os.link(target, user_root / "logs" / "sing-box.log")
             identity = user_root.stat()
             install = helper.InstallMetadata(
                 uid=os.getuid(), gid=os.getgid(), user_root=user_root,

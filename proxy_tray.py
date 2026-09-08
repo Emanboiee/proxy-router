@@ -195,7 +195,10 @@ class RouterStatus:
     active_providers: dict = field(default_factory=dict)
     providers: dict = field(default_factory=dict)  # name -> {active, profiles, egress}
     routing_mode: str = "default"
+    default_provider: str | None = None
     preset: str | None = None
+    system_proxy_status: str = "ok"
+    network_status: str = "unknown"
     error: str | None = None
 
     @classmethod
@@ -209,8 +212,15 @@ class RouterStatus:
         try:
             payload = stdout[stdout.find("{"):] if "{" in stdout else stdout
             d = json.JSONDecoder().raw_decode(payload)[0]
-        except (json.JSONDecodeError, ValueError) as e:
+            if not isinstance(d, dict):
+                raise ValueError("status payload is not an object")
+        except (json.JSONDecodeError, ValueError, TypeError) as e:
             return cls(error=f"status exit {rc}" if rc else f"bad json: {e}")
+        state = str(d.get("state") or "")
+        diagnostic = stdout.lower()
+        if ("unusable config" in state.lower()
+                and "missing router.json" not in diagnostic):
+            return cls(error="unusable router configuration")
         providers = {}
         provider_map = {}
         for name, info in (d.get("providers") or {}).items():
@@ -237,7 +247,17 @@ class RouterStatus:
                 "egress": egress,
             }
         routing = d.get("routing") or {}
+        if not isinstance(routing, dict):
+            routing = {}
         watcher = d.get("watcher") or {}
+        if not isinstance(watcher, dict):
+            watcher = {}
+        system_proxy = d.get("system_proxy") or {}
+        if not isinstance(system_proxy, dict):
+            system_proxy = {}
+        network = d.get("network") or {}
+        if not isinstance(network, dict):
+            network = {}
         return cls(
             up=bool(d.get("up")),
             mode=str(d.get("mode") or "unknown"),
@@ -247,7 +267,11 @@ class RouterStatus:
             active_providers=providers,
             providers=provider_map,
             routing_mode=str(routing.get("mode") or "default"),
+            default_provider=routing.get("default_provider") or None,
             preset=d.get("preset") or None,
+            system_proxy_status=str(system_proxy.get("status") or (
+                "unknown" if d.get("up") and d.get("mode") == "proxy" else "skipped")),
+            network_status=str(network.get("status") or "unknown"),
         )
 
     def provider_label(self, name: str) -> str:
@@ -311,13 +335,28 @@ class RouterStatus:
             return " · ok"
         return ""
 
+    def engine_label(self) -> str:
+        """Describe the current engine mode without implying provider choice."""
+        if self.mode == "tun":
+            return "router: TUN"
+        if self.mode == "proxy":
+            port = f" :{self.port}" if self.port else ""
+            return f"router: proxy{port}"
+        return f"router: {self.mode}"
+
     def headline(self) -> str:
         if self.error:
             return f"proxy-router: error ({self.error})"
-        state = "connected" if self.up else "disconnected"
-        detail = self.mode
-        if self.up and self.port:
-            detail = f"proxy :{self.port}"
+        degraded = self.up and self.mode == "proxy" and (
+            self.system_proxy_status not in {"ok", "skipped"}
+            or self.network_status not in {"ok", "unknown", "skipped"})
+        state = "degraded" if degraded else ("connected" if self.up else "disconnected")
+        detail = self.engine_label().removeprefix("router: ") if self.up else self.mode
+        if degraded:
+            reason = (self.system_proxy_status
+                      if self.system_proxy_status not in {"ok", "skipped"}
+                      else self.network_status)
+            detail += f" · {reason}"
         watcher = "watcher on" if self.watcher else "watcher off"
         return f"proxy {state} · {detail} · {watcher}"
 
@@ -417,9 +456,11 @@ class RouterClient:
     def status(self) -> RouterStatus:
         rc, out = self._run("status", "--json")
         st = RouterStatus.from_cli(rc, out)
-        if st.active_providers:
-            # remember the carrying provider for bare "Rotate exit"
-            self._active_provider = next(iter(st.active_providers))
+        # The cache mirrors the latest valid payload, including an empty
+        # provider set. Keeping an old provider after disconnect/error can make
+        # the generic Switch server action target an unrelated lane.
+        if not st.error:
+            self._active_provider = next(iter(st.active_providers), None)
         return st
 
     def ensure(self) -> tuple[int, str]:
@@ -497,6 +538,8 @@ class RouterClient:
         return self._run("stop")
 
     def rotate(self) -> tuple[int, str]:
+        if not self._active_provider:
+            return 1, "no active provider"
         return self._run("rotate", self._active_provider)
 
     def rotate_to(self, provider: str, profile: str, force: bool = False) -> tuple[int, str]:
@@ -558,6 +601,16 @@ class RouterClient:
         return self._run(*args)
 
 
+def _status_icon_color(st: RouterStatus, action_result: str | None = None) -> str:
+    """Choose green/red/orange from current state plus the latest action."""
+    action_failed = bool(action_result and ": failed" in action_result.lower())
+    if action_failed or st.error or (st.up and st.mode == "proxy" and (
+            st.system_proxy_status not in {"ok", "skipped"}
+            or st.network_status not in {"ok", "unknown", "skipped"})):
+        return "#ff9800"
+    return "#4caf50" if st.up else "#e53935"
+
+
 def make_icon(color: str, size: int = 64) -> "Image.Image":
     """Small filled-circle status icon (green=up, red=down, orange=warn)."""
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
@@ -581,6 +634,7 @@ class TrayApp:
         self.tray = None
         self._menu_sig: str | None = None
         self._icon_sig: str | None = None
+        self._menu_lock = threading.Lock()
 
         # Issue #60: mutations used to run on independent daemon threads, so
         # two clicks raced each other inside router.py and an older
@@ -637,13 +691,32 @@ class TrayApp:
             "up": st.up, "error": st.error, "mode": st.mode, "port": st.port,
             "watcher": st.watcher, "routing": st.routing_mode,
             "preset": st.preset,
+            "system_proxy": st.system_proxy_status,
+            "network": st.network_status,
             "active": st.active_providers,
             "profiles": {n: list((i or {}).get("profiles") or [])
                          for n, i in (st.providers or {}).items()},
             "health": health,
+            "custom_presets": self._custom_preset_signature(),
             "action": self.last_action_result,
-            "epoch": self._status_epoch,
         })
+
+    def _refresh_icon(self) -> None:
+        """Update the tray icon from the current snapshot and action state."""
+        if self.tray is None:
+            return
+        with self.lock:
+            st = self.latest
+            color = _status_icon_color(st, self.last_action_result)
+            if color == self._icon_sig:
+                return
+            try:
+                self.tray.icon = make_icon(color)
+            except Exception as exc:
+                print(f"tray: icon refresh failed: {type(exc).__name__}",
+                      file=sys.stderr)
+                return
+            self._icon_sig = color
 
     def _publish_status(self, st: RouterStatus, epoch: int | None = None) -> None:
         """Install a new status snapshot unless a NEWER one already landed.
@@ -660,17 +733,33 @@ class TrayApp:
             if epoch is not None:
                 self._status_epoch = max(self._status_epoch, epoch)
             self.latest = st
+        self._refresh_icon()
         self._refresh_menu()
 
     def _refresh_menu(self) -> None:
-        """Rebuild the tray menu from live state (no-op without a tray)."""
+        """Rebuild the tray menu only when rendered state changed."""
         if self.tray is None:
             return
-        self._menu_sig = None
-        self.tray.menu = self.build_menu()
+        # pystray replaces the native menu tree on assignment. Serialize that
+        # operation and publish the signature only after the new tree exists so
+        # a poll/action pair cannot tear down the menu under a click.
+        try:
+            with self._menu_lock:
+                with self.lock:
+                    st = self.latest
+                    signature = self._status_signature(st)
+                if signature == self._menu_sig:
+                    return
+                self.tray.menu = self.build_menu()
+                self._menu_sig = signature
+        except Exception as exc:
+            self._menu_sig = None
+            print(f"tray: menu refresh failed: {type(exc).__name__}",
+                  file=sys.stderr)
 
     def poll_loop(self) -> None:
         while not self.quit_flag.is_set():
+            epoch: int | None = None
             try:
                 # Claim the epoch BEFORE fetching (issue #60): a poll that
                 # fetched pre-action but publishes post-action must lose to
@@ -681,24 +770,10 @@ class TrayApp:
                     self._status_epoch = epoch
                 st = self.client.status()
                 self._publish_status(st, epoch)
-                if self.tray is not None:
-                    icon_color = (
-                        "#4caf50" if st.up
-                        else ("#ff9800" if st.error else "#e53935")
-                    )
-                    if icon_color != self._icon_sig:
-                        self._icon_sig = icon_color
-                        self.tray.icon = make_icon(icon_color)
-                    sig = self._status_signature(st)
-                    if sig != self._menu_sig:
-                        self._menu_sig = sig
-                        # Rebuild the menu from the live snapshot: pystray's
-                        # update_menu() re-renders the OLD menu tree, so
-                        # without reassigning .menu the status/action labels
-                        # stay frozen at whatever was captured at startup.
-                        self.tray.menu = self.build_menu()
             except Exception as e:  # keep the tray alive on any poll failure
-                self._publish_status(RouterStatus(error=str(e)[:80]))
+                # Keep the poll's epoch so a late failure cannot overwrite a
+                # newer action snapshot that landed while status() was out.
+                self._publish_status(RouterStatus(error=str(e)[:80]), epoch)
             self.quit_flag.wait(POLL_SECONDS)
 
     def _snapshot(self) -> RouterStatus:
@@ -785,12 +860,23 @@ class TrayApp:
         self._do(self.client.stop, "disconnect")
 
     def action_toggle_vpn(self):
-        """Full-tunnel (TUN) on/off switch: click turns the tunnel on when
-        off and off when on (home/school switch)."""
-        with self.lock:
-            on = self.latest.mode == "tun"
-        self._do(lambda: self.client.vpn("off" if on else "on"),
-                 f"full tunnel {'off' if on else 'on'}")
+        """Toggle full-tunnel mode from a fresh status snapshot.
+
+        The menu snapshot may be several seconds old—or an external CLI may
+        have changed mode since it was rendered. Resolve the direction inside
+        the serialized worker immediately before issuing the lifecycle command.
+        """
+        def toggle():
+            status = self.client.status()
+            if status.error:
+                return 1, f"cannot determine current tunnel mode: {status.error}"
+            if status.mode not in {"proxy", "tun"}:
+                return 1, f"cannot determine current tunnel mode: {status.mode}"
+            target = "off" if status.mode == "tun" else "on"
+            rc, out = self.client.vpn(target)
+            return rc, f"{target}: {out}" if out else target
+
+        self._do(toggle, "full tunnel")
 
     def action_rotate(self):
         self._do(self.client.rotate, "switch server")
@@ -799,12 +885,12 @@ class TrayApp:
         provider = None
         if mode == "safe-list":
             # safe-list routes everything NOT on the direct list through
-            # ONE provider. If the config has no default_provider yet, fall
-            # back to the currently active provider so the click just works
-            # instead of returning a raw "needs default_provider" rc=1.
+            # ONE provider. Prefer the persisted default even while the engine
+            # is down; active exits are empty in that state by design.
             with self.lock:
-                active = self.latest.active_providers
-            provider = next(iter(active), None) if active else None
+                st = self.latest
+                provider = (getattr(st, "default_provider", None)
+                            or next(iter(st.active_providers), None))
         self._do(lambda: self.client.set_mode(mode, provider),
                  f"mode {_ROUTING_MODE_LABELS.get(mode, mode)}")
 
@@ -845,9 +931,20 @@ class TrayApp:
         keeps running) and the toast reports the combined result.
         """
         def _apply_and_reload():
+            try:
+                current = self.client.status()
+            except Exception as exc:
+                return 1, f"cannot determine engine state; preset not applied: {exc}"
+            if current.error:
+                return 1, ("cannot determine engine state; preset not applied: "
+                            f"{current.error}")
             rc, out = self.client.setup_preset(name)
             if rc != 0:
                 return rc, out
+            if not current.up:
+                # router.py reload starts a missing engine. A disconnected tray
+                # preset click is configuration-only; Connect applies it later.
+                return 0, (out + "\nengine is untouched — Connect to apply").strip()
             return self.client.reload()
         self._do(_apply_and_reload, f"preset {name}")
 
@@ -955,6 +1052,8 @@ class TrayApp:
             st = self.latest
             last_action_result = self.last_action_result
             mutation_active = self._mutation_active
+        can_disconnect = bool(st.up or st.pid is not None or st.error)
+        single_provider_lane = len(st.active_providers) == 1
         items = []
 
         # Issue #60: while one mutation executes, further engine mutations
@@ -971,19 +1070,32 @@ class TrayApp:
         first_run = not st.providers and not st.up and not st.error
         if first_run:
             state = "● No VPN set up yet"
-        elif st.up:
+        elif st.up and (st.mode != "proxy" or (
+                st.system_proxy_status in {"ok", "skipped"}
+                and st.network_status in {"ok", "unknown", "skipped"})):
             state = "● Connected"
+        elif st.up:
+            reason = (st.system_proxy_status
+                      if st.system_proxy_status not in {"ok", "skipped"}
+                      else st.network_status)
+            state = f"▲ Degraded ({reason})"
         elif st.error:
             state = "! Error"
         else:
             state = "○ Disconnected"
         items.append(pystray.MenuItem(state, None))
+        if st.network_status == "direct_dns_unavailable":
+            items.append(pystray.MenuItem(
+                "Recovery: restore DHCP DNS → reload → doctor --network", None,
+                enabled=False))
         if first_run:
             items.append(pystray.MenuItem(
                 "Start here: Setup → Add a profile (.conf)", None))
         if st.active_providers:
             prov = ", ".join(f"{k} → {v}" for k, v in st.active_providers.items())
             items.append(pystray.MenuItem(prov, None))
+        if st.mode in {"proxy", "tun"}:
+            items.append(pystray.MenuItem(st.engine_label(), None))
         if st.routing_mode != "default":
             items.append(pystray.MenuItem(
                 f"mode: {_ROUTING_MODE_LABELS.get(st.routing_mode, st.routing_mode)}",
@@ -991,8 +1103,9 @@ class TrayApp:
         if st.preset:
             items.append(pystray.MenuItem(
                 f"preset: {st.preset}", None))
-        if last_action_result:
-            items.append(pystray.MenuItem(last_action_result, None))
+        if last_action_result and not mutation_active:
+            items.append(pystray.MenuItem(
+                f"last action: {last_action_result}", None))
         # Issue #76: when the failure was a permission gap, surface the
         # repair right where the error appeared instead of leaving a toast
         # the user cannot act on.
@@ -1019,7 +1132,7 @@ class TrayApp:
             and not mutation_active))
         items.append(pystray.MenuItem(
             "Switch VPN server", self.action_rotate,
-            enabled=st.up and not mutation_active))
+            enabled=st.up and single_provider_lane and not mutation_active))
 
         # Provider picker — like Tailscale/Proton: pick a provider, then an exit
         if st.providers and st.up:
@@ -1028,12 +1141,12 @@ class TrayApp:
                                           enabled=not mutation_active))
         items.append(pystray.MenuItem(
             "Disconnect", self.action_disconnect,
-            enabled=st.up and not mutation_active))
+            enabled=can_disconnect and not mutation_active))
         # Full tunnel (TUN) — checked when on. Clicking toggles it, which on
         # macOS pops the standard admin dialog (the engine/utun needs root).
         items.append(pystray.MenuItem(
-            "Full tunnel (WARP): on" if st.mode == "tun"
-            else "Full tunnel (WARP): off",
+            "Full tunnel (TUN): on" if st.mode == "tun"
+            else "Full tunnel (TUN): off",
             self.action_toggle_vpn,
             checked=lambda item: st.mode == "tun",
             enabled=not mutation_active))
@@ -1105,6 +1218,23 @@ class TrayApp:
         items.append(pystray.Menu.SEPARATOR)
         items.append(pystray.MenuItem("Quit", self.action_quit))
         return pystray.Menu(*items)
+
+    def _custom_preset_signature(self) -> tuple[tuple[str, int, int], ...]:
+        """Return a stable filesystem signature for custom preset files."""
+        root = getattr(self.client, "root", None)
+        if not root:
+            return ()
+        try:
+            entries = []
+            for path in Path(root, "presets").glob("*.json"):
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                entries.append((path.name, stat.st_mtime_ns, stat.st_size))
+            return tuple(sorted(entries))
+        except OSError:
+            return ()
 
     def _custom_preset_names(self) -> list[str]:
         """Custom preset names from ``root/presets/*.json`` (read-only)."""
@@ -1237,6 +1367,25 @@ class TrayApp:
         self.tray.run(setup=on_ready)
 
 
+def _default_root() -> str:
+    """Resolve the runtime root for canonical and legacy bundle layouts."""
+    override = os.environ.get("PROXY_ROUTER_ROOT")
+    if override:
+        return override
+
+    here = Path(__file__).resolve().parent
+    if (here / "router.py").is_file():
+        return str(here)
+
+    # Older checkouts kept the tray under examples/ while router.py lived at
+    # the repository root. Keep that layout usable without weakening an
+    # explicit --root or PROXY_ROUTER_ROOT override.
+    legacy_root = here.parent
+    if (legacy_root / "router.py").is_file():
+        return str(legacy_root)
+    return str(here)
+
+
 def selftest(root: str) -> int:
     """CLI-contract check: status parses, dispatch targets exist, no GUI."""
     print(f"selftest root: {root}")
@@ -1267,9 +1416,7 @@ def selftest(root: str) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="proxy-router tray agent")
-    ap.add_argument("--root", default=os.environ.get(
-        "PROXY_ROUTER_ROOT",
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    ap.add_argument("--root", default=_default_root())
     ap.add_argument("--selftest", action="store_true",
                     help="validate CLI contract, no GUI")
     args = ap.parse_args()
@@ -1283,8 +1430,10 @@ def main() -> int:
         return 2
 
     client = RouterClient(args.root)
-    client.latest = client.status()  # warm first status for the menu
-    app = TrayApp(client, make_icon("#e53935"))
+    # Let the first poll publish real state; status can block for COMMAND_TIMEOUT.
+    initial_color = _status_icon_color(RouterStatus())
+    app = TrayApp(client, make_icon(initial_color))
+    app._icon_sig = initial_color
     app.run()
     return 0
 

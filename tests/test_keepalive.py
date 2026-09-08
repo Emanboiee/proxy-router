@@ -28,6 +28,25 @@ cmd="${1:-}"
 logger="${FAKE_ROUTER_LOG:-}"
 if [ -n "$logger" ]; then printf '%s\n' "$*" >> "$logger"; fi
 case "$cmd" in
+  network-status)
+    state="${FAKE_ROUTER_NETWORK:-connected}"
+    if [ -n "${FAKE_ROUTER_NETWORK_FILE:-}" ] && [ -f "$FAKE_ROUTER_NETWORK_FILE" ]; then
+      state=$(cat "$FAKE_ROUTER_NETWORK_FILE")
+    fi
+    [ "$state" = "disconnected" ] && exit 1
+    exit 0
+    ;;
+  network-disconnect)
+    if [ -n "${FAKE_ROUTER_NETWORK_OFF_FILE:-}" ]; then
+      mkdir -p "$(dirname "$FAKE_ROUTER_NETWORK_OFF_FILE")"
+      : > "$FAKE_ROUTER_NETWORK_OFF_FILE"
+    fi
+    exit 0
+    ;;
+  network-reconnect)
+    rm -f "${FAKE_ROUTER_NETWORK_OFF_FILE:-/dev/null}"
+    exit 0
+    ;;
   ensure)
     n=$(cat "${FAKE_ROUTER_ENSURE_COUNT:-/dev/null}" 2>/dev/null || echo 0)
     n=$((n + 1))
@@ -100,6 +119,14 @@ FAKE_SLEEP = r"""#!/usr/bin/env bash
 printf '%s\n' "$1" >> "${SLEEP_LOG:-/dev/null}"
 """
 
+FAKE_DATE = r"""#!/usr/bin/env bash
+if [ "${1:-}" = "+%s" ] && [ -n "${FAKE_DATE_FILE:-}" ] && [ -f "$FAKE_DATE_FILE" ]; then
+  cat "$FAKE_DATE_FILE"
+  exit 0
+fi
+exec /bin/date "$@"
+"""
+
 # Records every invocation of the PINNED interpreter, then forwards to the
 # real target. keepalive.sh must call router.py through this exact path when
 # PROXY_ROUTER_PYTHON is set (issue #57).
@@ -119,7 +146,7 @@ class KeepaliveHarness:
     def __init__(self, *, interval="1", fail_ensures="", egress="alive",
                  probe_every="4", dead_strikes="2", storm_window="600",
                  max_rotations="2", fallback="", root=None, pinned_python="",
-                 mode="proxy"):
+                 mode="proxy", network="connected", wake_gap="", clock=None):
         self._tmp = None
         if root is None:
             self._tmp = tempfile.TemporaryDirectory()
@@ -137,6 +164,13 @@ class KeepaliveHarness:
         sleep_bin = self.root / "bin" / "sleep"
         sleep_bin.write_text(FAKE_SLEEP)
         sleep_bin.chmod(0o755)
+        self.clock_file = None
+        if clock is not None:
+            self.clock_file = self.root / "clock"
+            self.clock_file.write_text(str(clock))
+            date_bin = self.root / "bin" / "date"
+            date_bin.write_text(FAKE_DATE)
+            date_bin.chmod(0o755)
         router_bin = self.root / "router.py"
         router_bin.write_text(FAKE_ROUTER)
         router_bin.chmod(0o755)
@@ -156,6 +190,9 @@ class KeepaliveHarness:
         self.fallback_file = self.root / "fallback.state"
         if fallback:
             self.fallback_file.write_text(fallback)
+        self.network_file = self.root / "network.state"
+        self.network_file.write_text(network)
+        self.network_off_file = self.root / "state" / "network-off"
         env = dict(os.environ)
         env["PATH"] = f"{self.root / 'bin'}:" + env["PATH"]
         env["PROXY_KEEPALIVE_INTERVAL"] = interval
@@ -169,6 +206,12 @@ class KeepaliveHarness:
         env["FAKE_ROUTER_ENSURE_COUNT"] = str(self.count)
         env["FAKE_ROUTER_EGRESS_FILE"] = str(self.egress_file)
         env["FAKE_ROUTER_FALLBACK_FILE"] = str(self.fallback_file)
+        env["FAKE_ROUTER_NETWORK_FILE"] = str(self.network_file)
+        env["FAKE_ROUTER_NETWORK_OFF_FILE"] = str(self.network_off_file)
+        if wake_gap:
+            env["PROXY_KEEPALIVE_WAKE_GAP"] = wake_gap
+        if self.clock_file is not None:
+            env["FAKE_DATE_FILE"] = str(self.clock_file)
         if pinned_python:
             pinned_bin = self.root / "bin" / "pinned-python"
             env["PROXY_ROUTER_PYTHON"] = str(pinned_bin)
@@ -187,6 +230,20 @@ class KeepaliveHarness:
 
     def set_egress(self, state: str) -> None:
         self.egress_file.write_text(state)
+
+    def set_network(self, state: str) -> None:
+        self.network_file.write_text(state)
+
+    def advance_clock(self, seconds: int) -> None:
+        if self.clock_file is None:
+            raise AssertionError("clock simulation is not enabled")
+        current = int(self.clock_file.read_text())
+        with tempfile.NamedTemporaryFile(
+                mode="w", dir=self.clock_file.parent,
+                prefix=f".{self.clock_file.name}.", delete=False) as tmp:
+            tmp.write(str(current + seconds))
+            replacement = Path(tmp.name)
+        replacement.replace(self.clock_file)
 
     def wait_lines(self, count: int, timeout: float = 20.0) -> list[str]:
         deadline = time.time() + timeout
@@ -284,8 +341,10 @@ class KeepaliveBackoffTests(unittest.TestCase):
     def test_failed_ensure_logs_timestamped_failure_then_recovery(self):
         h = KeepaliveHarness(interval="1", fail_ensures="1")
         try:
-            # 3rd line = boot self-test, which runs after the recovery echo.
-            h.wait_lines(3)
+            # Wait for the failed ensure and its first successful retry.
+            deadline = time.time() + 5
+            while time.time() < deadline and h.lines().count("ensure") < 2:
+                time.sleep(0.05)
         finally:
             h.close()
         self.assertRegex(h.err, r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} router: ensure failed \(rc=1\)",
@@ -321,7 +380,7 @@ class KeepaliveEgressCheckTests(unittest.TestCase):
             }
             ticks = [line for i, line in enumerate(lines)
                      if i not in restore_probes
-                     and line not in {"rotate --if-due", "egress sweep --json"}]
+                     and line not in {"network-status", "rotate --if-due", "egress sweep --json"}]
             check_lines = [i for i, line in enumerate(ticks) if line == "egress check"]
             gaps = [b - a for a, b in zip(check_lines, check_lines[1:])]
             # every PROBE_EVERY ensures triggers a check; log distance is
@@ -387,8 +446,13 @@ class KeepaliveEgressCheckTests(unittest.TestCase):
         h = KeepaliveHarness(egress="dead", probe_every="1", dead_strikes="1",
                              storm_window="0", max_rotations="1")
         try:
-            h.wait_lines(20)
-            rotates = [line for line in h.lines() if line.startswith("rotate proton")]
+            deadline = time.time() + 5
+            rotates = []
+            while time.time() < deadline:
+                rotates = [line for line in h.lines() if line.startswith("rotate proton")]
+                if len(rotates) >= 4:
+                    break
+                time.sleep(0.05)
             self.assertGreaterEqual(len(rotates), 4, f"expected rotation churn: {rotates}")
         finally:
             h.close()
@@ -506,6 +570,56 @@ class KeepaliveFallbackRestoreTests(unittest.TestCase):
             h.close()
             self.assertIn("'proton' primary still dead; re-activating fallback", h.err,
                           f"re-activation message missing: {h.err!r}")
+        finally:
+            h.close()
+
+
+class KeepaliveNetworkGuardTests(unittest.TestCase):
+    def test_wifi_loss_disconnects_and_return_reconnects(self):
+        h = KeepaliveHarness(interval="1", network="disconnected")
+        try:
+            h.wait_lines(4)
+            lines = h.lines()
+            self.assertIn("network-status", lines)
+            self.assertIn("network-disconnect", lines)
+            self.assertNotIn("ensure", lines)
+            self.assertTrue(h.network_off_file.is_file())
+
+            h.set_network("connected")
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                lines = h.lines()
+                if "network-reconnect" in lines and "ensure" in lines:
+                    break
+                time.sleep(0.05)
+            self.assertIn("network-reconnect", lines)
+            self.assertIn("ensure", lines)
+            self.assertFalse(h.network_off_file.exists())
+            h.close()
+            self.assertIn("Wi-Fi returned; supervision resumed", h.err)
+        finally:
+            h.close()
+
+    def test_wake_gap_forces_immediate_network_recovery(self):
+        h = KeepaliveHarness(interval="1", probe_every="99", wake_gap="5", clock=1000)
+        try:
+            baseline = len(h.wait_lines(4))
+            h.advance_clock(10)
+            deadline = time.time() + 5
+            lines = h.lines()
+            while time.time() < deadline:
+                lines = h.lines()
+                if ("network-disconnect" in lines[baseline:] and "network-reconnect" in lines[baseline:]
+                        and "ensure" in lines[baseline:] and "egress check" in lines[baseline:]):
+                    break
+                time.sleep(0.05)
+            tail = lines[baseline:]
+            self.assertIn("network-disconnect", tail)
+            self.assertIn("network-reconnect", tail)
+            self.assertIn("ensure", tail)
+            self.assertIn("egress check", tail)
+            h.close()
+            self.assertIn("wake gap detected (10s)", h.err)
         finally:
             h.close()
 

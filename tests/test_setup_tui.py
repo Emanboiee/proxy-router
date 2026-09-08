@@ -422,6 +422,110 @@ class BridgeTests(unittest.TestCase):
         self.assertFalse(state.quit)
 
 
+class DashboardSafetyTests(unittest.TestCase):
+    def test_default_render_root_is_not_the_live_module_root(self):
+        state = setup_tui.TuiState()
+        self.assertNotEqual(state.root, setup_tui.ROOT)
+        with mock.patch.object(setup_tui, "_tui_engine_up", return_value=False) as probe:
+            setup_tui.render_frame(state)
+        probe.assert_not_called()
+
+    def test_engine_up_requires_exact_sing_box_process_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "sing-box.json"
+            config.write_text("{}")
+            (root / "sing-box.pid").write_text("4242")
+            with mock.patch.object(
+                    setup_tui, "_tui_process_argv",
+                    return_value=["/opt/homebrew/bin/sing-box", "run", "-c",
+                                  str(config.resolve())]) as argv:
+                self.assertTrue(setup_tui._tui_engine_up(root))
+            argv.assert_called_once_with(4242)
+            with mock.patch.object(
+                    setup_tui, "_tui_process_argv",
+                    return_value=["/other/sing-box", "run", "-c",
+                                  "/other/sing-box.json"]):
+                self.assertFalse(setup_tui._tui_engine_up(root))
+
+    def test_engine_up_preserves_config_paths_with_spaces(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "root with space"
+            root.mkdir()
+            config = root / "sing-box.json"
+            config.write_text("{}")
+            (root / "sing-box.pid").write_text("4242")
+            argv = ["/opt/homebrew/bin/sing-box", "run", "-c",
+                    str(config.resolve())]
+            with mock.patch.object(setup_tui, "_tui_process_argv",
+                                   return_value=argv):
+                self.assertTrue(setup_tui._tui_engine_up(root))
+
+    def test_active_blocked_exit_is_not_counted_healthy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider_dir = root / "providers" / "proton"
+            provider_dir.mkdir(parents=True)
+            (provider_dir / "a.conf").write_text("profile")
+            (root / "router.json").write_text(json.dumps({
+                "providers": {"proton": {"directory": "providers/proton"}},
+                "egress": {"ok_window": 86400},
+            }))
+            state_dir = root / "state" / "egress" / "proton"
+            state_dir.mkdir(parents=True)
+            (root / "state" / "proton.active").write_text("a")
+            (state_dir / "a.json").write_text(json.dumps({
+                "checked_at": time.time(), "ok": False, "blocked": True,
+            }))
+            rows = setup_tui._tui_profiles(root, "proton")
+            self.assertEqual(rows, [("a", "active-blocked")])
+            joined = "\n".join(setup_tui.render_frame(setup_tui.TuiState(root=root)))
+            self.assertIn("0/1 healthy", joined)
+            self.assertIn("active-blocked", joined)
+
+    def test_failed_rotation_and_failover_do_not_claim_success(self):
+        actions = (
+            ("rotate_provider", "proton"),
+            ("rotate_to", "proton", "a"),
+            ("failover_on", "proton"),
+            ("failover_off", "proton"),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with mock.patch.object(setup_tui, "_router_command", return_value=1):
+                for action in actions:
+                    with self.subTest(action=action):
+                        text, rc = setup_tui._execute_action(action, root)
+                        self.assertEqual(rc, 1)
+                        self.assertIn("failed", text.lower())
+                        self.assertNotIn("rotated", text.lower())
+                        self.assertNotIn("primary restored", text.lower())
+
+
+    def test_vpn_toggle_uses_verified_running_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with mock.patch.object(setup_tui, "_tui_engine_state",
+                                   return_value=(True, "tun")) as state, \
+                 mock.patch.object(setup_tui, "_router_command", return_value=0) as command:
+                text, rc = setup_tui._execute_action(("vpn_toggle",), root)
+        self.assertEqual(rc, 0, text)
+        state.assert_called_once_with(root)
+        command.assert_called_once_with(root, "vpn", "off")
+        self.assertIn("TUN mode off", text)
+
+    def test_vpn_toggle_fails_closed_when_running_mode_is_unverified(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with mock.patch.object(setup_tui, "_tui_engine_state",
+                                   return_value=(False, "unknown")), \
+                 mock.patch.object(setup_tui, "_router_command") as command:
+                text, rc = setup_tui._execute_action(("vpn_toggle",), root)
+        self.assertEqual(rc, 1)
+        command.assert_not_called()
+        self.assertIn("unverified", text.lower())
+
+
 class FullScreenTuiTests(unittest.TestCase):
     """Pure render/apply_key functions and wizard entry paths (no real TTY)."""
 

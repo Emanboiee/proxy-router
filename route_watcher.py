@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 ROOT = Path(os.environ.get("PROXY_ROUTER_ROOT") or Path(__file__).resolve().parent).resolve()
-LOG_FILE_NAME = "sing-box.log"
+LOG_FILE_NAME = "logs/sing-box.log"
 STATE_DIR_NAME = "state/route-watcher"
 PID_NAME = "pid"
 ENABLED_NAME = "enabled"
@@ -42,6 +42,7 @@ CLIENT_SNAPSHOT_EVERY_SECONDS = 5.0
 FAILURE_WINDOW_SECONDS = 60.0
 MIN_TRANSPORT_FAILURES = 2
 ROTATE_COOLDOWN_SECONDS = 120.0
+RESTORE_COOLDOWN_SECONDS = 300.0
 NETWORK_CHECK_EVERY_SECONDS = 30.0
 EVENT_MAX_LINES = 5000
 EVENT_MAX_BYTES = 2_000_000
@@ -366,17 +367,34 @@ def provider_for_host(root: Path, host: str) -> str | None:
     return None
 
 
-def rotate_provider(root: Path, provider: str = "proton", *, runner: Callable = subprocess.run) -> dict:
-    """Ask proxy-router itself to rotate; Hermes is not involved."""
+def rotate_provider(root: Path, provider: str = "proton", *, host: str | None = None,
+                    runner: Callable = subprocess.run) -> dict:
+    """Ask the controller to confirm failures and recover the affected route."""
+    command = (["failover", provider, "recover", "--host", host] if host else
+               ["rotate", provider, "--reason", "timeout", "--automatic"])
     try:
         result = runner(
-            [sys.executable, str(Path(root) / "router.py"), "rotate", provider,
-             "--reason", "timeout"],
-            cwd=str(root), capture_output=True, text=True, timeout=50,
+            [sys.executable, str(Path(root) / "router.py"), *command],
+            cwd=str(root), capture_output=True, text=True, timeout=180 if host else 50,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"rotated": False, "error": type(exc).__name__}
     return {"rotated": result.returncode == 0, "returncode": result.returncode,
+            "output": (result.stderr or result.stdout or "")[-300:]}
+
+
+def restore_provider(root: Path, provider: str, host: str,
+                     runner: Callable = subprocess.run) -> dict:
+    """Ask the controller to test and, when stable, restore the primary VPN."""
+    try:
+        result = runner(
+            [sys.executable, str(Path(root) / "router.py"), "failover", provider,
+             "restore", "--host", host],
+            cwd=str(root), capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"restored": False, "error": type(exc).__name__}
+    return {"restored": result.returncode == 0, "returncode": result.returncode,
             "output": (result.stderr or result.stdout or "")[-300:]}
 
 
@@ -444,6 +462,7 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
     guard = RotationGuard()
     last_provider: dict[str, str] = {}
     last_network_check = -NETWORK_CHECK_EVERY_SECONDS
+    last_restore: dict[str, float] = {}
     engine_down_ticks = 0
     try:
         while enabled_file(root).is_file():
@@ -459,6 +478,17 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
             # target set each tick so transparent capture starts observing a
             # newly configured domain without requiring a router restart.
             domains = critical_domains(root)
+            # Probe one representative per configured lane even before a slow
+            # connection timeout produces its first log line.
+            representatives: set[str] = set()
+            for host in domains:
+                provider = provider_for_host(root, host)
+                if provider and provider not in representatives:
+                    representatives.add(provider)
+                    last_target[host] = time.monotonic()
+                    last_provider[host] = provider
+                if len(representatives) >= 3:
+                    break
             offset, lines = _read_new_lines(log_path, offset)
             for line in lines:
                 event = parse_line(line)
@@ -484,7 +514,7 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
                             last_provider[host] = provider
                         if event.get("failure") and guard.record_transport_failure(now, host):
                             target = last_provider.get(host) or "proton"
-                            result = rotate_provider(root, target)
+                            result = rotate_provider(root, provider_for_host(root, host) or target, host=host)
                             append_event(root, {"kind": "rotation", "observed_at": time.time(), **result})
                 elif event["kind"] == "client":
                     # Client lines are retained only as a bounded observation;
@@ -502,10 +532,19 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
                     continue
                 last_probe[host] = now
                 result = probe_target(root, host)
+                provider = last_provider.get(host) or provider_for_host(root, host)
+                if result.get("ok"):
+                    guard.failure_times.pop(normalize_host(host), None)
+                    if provider and now - last_restore.get(provider, -RESTORE_COOLDOWN_SECONDS) >= RESTORE_COOLDOWN_SECONDS:
+                        restore = restore_provider(root, provider, host)
+                        last_restore[provider] = now
+                        if restore.get("returncode") is not None:
+                            append_event(root, {"kind": "restore", "observed_at": time.time(),
+                                                "provider": provider, "host": host, **restore})
                 append_event(root, {"kind": "probe", "observed_at": time.time(), **result})
                 if result.get("transport_failure") and guard.record_transport_failure(now, host):
-                    target = last_provider.get(host) or provider_for_host(root, host) or "proton"
-                    rotation = rotate_provider(root, target)
+                    target = provider or "proton"
+                    rotation = rotate_provider(root, provider or target, host=host)
                     append_event(root, {"kind": "rotation", "observed_at": time.time(), **rotation})
             sleep(max(0.5, float(interval)))
     finally:

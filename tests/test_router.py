@@ -776,6 +776,102 @@ class WaitEngineTests(unittest.TestCase):
             self.assertTrue(router.wait_engine(timeout=2.0))
 
 
+class SystemProxyScopeTests(unittest.TestCase):
+    """Reconnect speed without stranding traffic: the proxy toggle must hit
+    the active service only, while off() sweeps stale ON states elsewhere.
+
+    Toggling all 9 services is 63 sequential networksetup spawns (~5s)
+    on every connect. Only the default route's service is used by macOS
+    clients; an unknown active service falls back to all (old behavior).
+    The sweep exists because stale 127.0.0.1:2080 ON states (e.g. on the
+    ProtonVPN/Tailscale services) strand traffic at a dead listener with
+    ERR_PROXY_CONNECTION_FAILED once the engine stops.
+    """
+
+    def setUp(self):
+        self._port = router._port
+        self._state_file = router.SYSTEM_PROXY_STATE_FILE
+        self._tmp = tempfile.TemporaryDirectory()
+        router.SYSTEM_PROXY_STATE_FILE = Path(self._tmp.name) / "system-proxy.json"
+        router._port = 2080
+
+    def tearDown(self):
+        router._port = self._port
+        router.SYSTEM_PROXY_STATE_FILE = self._state_file
+        self._tmp.cleanup()
+
+    def _run_toggle(self, func, active, stale=()):
+        sets = []
+
+        def fake_run(command, **kwargs):
+            if command[1].startswith("-set"):
+                sets.append((command[1], command[2]))
+            if command[:2] == ["scutil", "--proxy"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=("<dictionary> {\n"
+                            "  HTTPEnable : 1\n  HTTPProxy : 127.0.0.1\n"
+                            "  HTTPPort : 2080\n  HTTPSEnable : 1\n"
+                            "  HTTPSProxy : 127.0.0.1\n  HTTPSPort : 2080\n"
+                            "}\n"),
+                )
+            if command[0] == "networksetup" and command[1] in {
+                    "-getwebproxy", "-getsecurewebproxy"}:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="Enabled: Yes\nServer: 127.0.0.1\nPort: 2080\n",
+                )
+            return SimpleNamespace(returncode=0, stdout="")
+
+        with mock.patch.object(router, "active_service_name", return_value=active), \
+             mock.patch.object(router, "network_services", return_value=["Wi-Fi", "Ethernet"]) as all_fn, \
+             mock.patch.object(router, "_proxy_points_at_us", side_effect=lambda s: s in stale), \
+             mock.patch("subprocess.run", side_effect=fake_run), \
+             io.StringIO() as buf, \
+             mock.patch("sys.stdout", buf):
+            self.assertEqual(func(), 0)
+        return sets, all_fn
+
+    def test_proxy_on_targets_active_service_only(self):
+        sets, all_fn = self._run_toggle(router.system_proxy_on, "Wi-Fi")
+        self.assertTrue(sets)
+        self.assertEqual({service for _, service in sets}, {"Wi-Fi"})
+        all_fn.assert_not_called()
+
+    def test_proxy_off_targets_active_service_only(self):
+        sets, all_fn = self._run_toggle(router.system_proxy_off, "Wi-Fi")
+        self.assertEqual({service for _, service in sets}, {"Wi-Fi"})
+        all_fn.assert_called_once()  # the stale-endpoint sweep ran
+
+    def test_proxy_off_sweeps_stale_other_service(self):
+        sets, _ = self._run_toggle(router.system_proxy_off, "Wi-Fi", stale=("Ethernet",))
+        self.assertIn(("-setwebproxystate", "Ethernet"), sets)
+        self.assertIn(("-setsecurewebproxystate", "Ethernet"), sets)
+
+    def test_proxy_falls_back_to_all_services_when_active_unknown(self):
+        sets, all_fn = self._run_toggle(router.system_proxy_on, None)
+        self.assertEqual({service for _, service in sets}, {"Wi-Fi", "Ethernet"})
+        all_fn.assert_called_once()
+
+    def _points_at_us(self, stdout):
+        with mock.patch("subprocess.run", return_value=SimpleNamespace(stdout=stdout)):
+            return router._proxy_points_at_us("Ethernet")
+
+    def test_stale_detector_matches_our_endpoint(self):
+        self.assertTrue(self._points_at_us(
+            "Enabled: Yes\nServer: 127.0.0.1\nPort: 2080\n"
+            "Authenticated Proxy Enabled: 0\n"
+        ))
+
+    def test_stale_detector_ignores_foreign_proxy(self):
+        self.assertFalse(self._points_at_us(
+            "Enabled: Yes\nServer: 10.0.0.5\nPort: 8080\n"
+        ))
+
+    def test_stale_detector_ignores_switched_off(self):
+        self.assertFalse(self._points_at_us("Enabled: No\nServer: 127.0.0.1\nPort: 2080\n"))
+
+
 class ProcessIdentityTests(unittest.TestCase):
     """Issue #62: whole-process-table liveness/ownership must be row-scoped.
     A foreign sing-box run plus an unrelated process carrying our config
@@ -1941,33 +2037,31 @@ class EgressLiveCheckTests(unittest.TestCase):
         self.assertIs(record["dns_ok"], False)
         self.assertFalse(router.is_cooled_down("proton", self.profile))
 
-    def test_transport_failure_alone_is_still_dead(self):
-        # no HTTP status at all = the tunnel path is broken even when the DNS
-        # companion check cannot be determined - never leave it unhealed.
+    def test_transport_failure_with_unknown_dns_is_degraded(self):
+        # An unknown direct DNS result is insufficient evidence to blame the
+        # tunnel; keep the exit degraded and avoid cooldown/rotation.
         with mock.patch.object(router, "probe_egress", return_value=self._probe(
                 error="TimeoutError: timed out")), \
              mock.patch.object(router, "egress_dns_probe", return_value=None):
             status, record = router.check_egress_live("proton", self.profile)
-        self.assertEqual(status, "dead")
+        self.assertEqual(status, "degraded")
         self.assertFalse(record["ok"])
         self.assertNotIn("dns_ok", record)  # only persisted when determined
 
-    def test_transport_death_applies_cooldown(self):
-        # Connection-level death (no HTTP status, no TLS handshake) must cool
-        # the exit so resolve_active/rotation stop re-picking it for the
-        # cooldown window. Multi-strike: only the SECOND consecutive dead
-        # check cools (mirroring keepalive dead_strikes). TLS-classed errors
-        # never cool (degraded = upstream throttle), covered separately.
+    def test_transport_death_with_unknown_dns_never_cools(self):
+        # Connection-level failure with an unknown direct DNS signal is not
+        # enough evidence to cool the exit. The explicit network diagnostic
+        # reports the DNS condition separately.
         with mock.patch.object(router, "probe_egress", return_value=self._probe(
                 error="URLError: <urlopen error [Errno 61] Connection refused>")), \
              mock.patch.object(router, "egress_dns_probe", return_value=None), \
              mock.patch.object(router.time, "sleep"):
             status, _ = router.check_egress_live("proton", self.profile)
-            self.assertEqual(status, "dead")
+            self.assertEqual(status, "degraded")
             self.assertFalse(router.is_cooled_down("proton", self.profile))
             status, _ = router.check_egress_live("proton", self.profile)
-            self.assertEqual(status, "dead")
-            self.assertTrue(router.is_cooled_down("proton", self.profile))
+            self.assertEqual(status, "degraded")
+            self.assertFalse(router.is_cooled_down("proton", self.profile))
 
     def test_degraded_http_status_does_not_cooldown(self):
         # A 403/1010 reputation block marks blocked (stronger than cooldown);
@@ -2861,7 +2955,7 @@ class ErrorPolicyTests(unittest.TestCase):
             "proton", self.profile, "[SSL: UNEXPECTED_EOF_WHILE_READING]", 60)
         self.assertGreaterEqual(self._cooldown_until(), int(time.time()) + 40)
 
-    def test_check_egress_live_dead_uses_connection_seconds(self):
+    def test_check_egress_live_unknown_dns_never_cools(self):
         router._error_policy = {"connection": {"action": "cooldown", "seconds": 20}}
         with mock.patch.object(router, "probe_egress", return_value={
                 "ok": False, "latency_ms": None, "status": None,
@@ -2870,11 +2964,11 @@ class ErrorPolicyTests(unittest.TestCase):
              mock.patch.object(router, "egress_dns_probe", return_value=None), \
              mock.patch.object(router.time, "sleep"):
             status, _ = router.check_egress_live("proton", self.profile)
-            self.assertEqual(status, "dead")
+            self.assertEqual(status, "degraded")
             self.assertFalse(router.is_cooled_down("proton", self.profile))
             status, _ = router.check_egress_live("proton", self.profile)
-            self.assertEqual(status, "dead")
-            self.assertGreaterEqual(self._cooldown_until(), int(time.time()) + 15)
+            self.assertEqual(status, "degraded")
+            self.assertFalse(router.is_cooled_down("proton", self.profile))
 
     def test_load_config_validates_and_merges_error_policy(self):
         (self.root / "router.json").write_text(json.dumps({

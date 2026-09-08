@@ -36,10 +36,11 @@ def _top_level_help_text() -> str:
 def test_top_level_help_lists_every_command():
     text = _top_level_help_text()
     for cmd in ("ensure", "start", "stop", "status", "doctor", "reload",
-                "routes", "up", "down", "routing", "egress", "vpn",
+                "autodetect", "routes", "up", "down", "routing", "egress", "vpn",
                 "setup", "monitor", "watcher", "add", "remove", "rotate",
-                "response-event", "with-proxy", "failover",
-                "provider-count", "profile", "elevate"):
+                "response-event", "with-proxy", "failover", "network-status",
+                "network-disconnect", "network-reconnect", "provider-count",
+                "profile", "elevate"):
         assert cmd in text.split("positional arguments:")[-1], (
             f"top-level help is missing `{cmd}`"
         )
@@ -107,10 +108,11 @@ def _readme() -> str:
 
 
 @pytest.mark.parametrize("cmd", [
-    "ensure", "start", "stop", "status", "doctor", "reload", "routes",
+    "ensure", "start", "stop", "status", "doctor", "reload", "autodetect", "routes",
     "routing", "egress", "vpn", "setup", "monitor", "watcher", "add",
     "remove", "rotate", "response-event", "with-proxy", "failover",
-    "provider-count", "profile", "elevate", "network-check",
+    "provider-count", "profile", "elevate", "network-check", "network-status",
+    "network-disconnect", "network-reconnect",
 ])
 def test_readme_mentions_every_top_level_command(cmd):
     assert re.search(rf"(?<![\w-]){re.escape(cmd)}(?![\w-])", _readme()), (

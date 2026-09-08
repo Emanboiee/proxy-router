@@ -96,6 +96,10 @@ except ImportError:  # pragma: no cover - non-POSIX platforms
 _HAVE_TERMIOS = termios is not None and tty is not None
 
 ROOT = Path(os.environ.get("PROXY_ROUTER_ROOT") or Path(__file__).resolve().parent).resolve()
+# A bare TuiState is also used by pure renderer callers and tests. It must not
+# silently inspect the checkout's live PID/config; the wizard always injects its
+# real root through _initial_state(root).
+_UNBOUND_ROOT = Path(tempfile.gettempdir()) / f"proxy-router-unbound-{os.getpid()}"
 
 # Default Hermes config path for the bridge check (resolved via env at call
 # time so tests can override; defaults to this module-level value).
@@ -128,6 +132,8 @@ _PRESET_ROUTES = {
             "discord.com",
             "discord.gg",
             "discordapp.com",
+            "discordapp.net",
+            "discord.media",
             "twitch.tv",
             "facebook.com",
             "fbcdn.net",
@@ -138,6 +144,8 @@ _PRESET_ROUTES = {
             "ytimg.com",
             "x.com",
             "twitter.com",
+            "twimg.com",
+            "t.co",
             "cdn.sstatic.net",
             # Wayground/Quizizz requires these first-party and challenge hosts;
             # apex entries cover all subdomains through domain-suffix matching.
@@ -1571,7 +1579,7 @@ class TuiState:
     quit: bool = False
     cols: int = 80
     rows: int = 24
-    root: Path = ROOT
+    root: Path = dataclasses.field(default_factory=lambda: _UNBOUND_ROOT)
 
 
 def _initial_state(root: Path | None = None) -> TuiState:
@@ -1687,13 +1695,94 @@ def _tui_active(root: Path, provider: str) -> str:
         return ""
 
 
+def _tui_process_argv(pid: int) -> list[str] | None:
+    """Read one process's argument vector without shell-style reconstruction.
+
+    macOS exposes original argv through KERN_PROCARGS2; errors return None.
+    """
+    if sys.platform != "darwin":
+        return None
+    try:
+        import ctypes
+        import struct
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        sysctl = libc.sysctl
+        sysctl.restype = ctypes.c_int
+        mib = (ctypes.c_int * 3)(1, 49, pid)
+        size = ctypes.c_size_t(0)
+        if sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0:
+            return None
+        if not 4 < size.value <= 65536:
+            return None
+        buffer = ctypes.create_string_buffer(size.value)
+        if sysctl(mib, 3, buffer, ctypes.byref(size), None, 0) != 0:
+            return None
+        payload = bytes(buffer.raw[:size.value])
+        argc = struct.unpack_from("i", payload)[0]
+        if argc < 1 or argc > 256:
+            return None
+        values = payload[4:].split(b"\\0")
+        if len(values) < argc + 1:
+            return None
+        return [value.decode("utf-8", "surrogateescape") for value in values[:argc + 1]]
+    except (AttributeError, OSError, UnicodeError, ValueError, struct.error):
+        return None
+
+
+def _tui_argv_matches_config(argv: list[str], config: Path) -> bool:
+    if not argv or not Path(argv[0]).name.startswith("sing-box"):
+        return False
+    if "run" not in argv:
+        return False
+    for index, arg in enumerate(argv[:-1]):
+        if arg in ("-c", "--config"):
+            try:
+                if Path(argv[index + 1]).resolve() == config:
+                    return True
+            except (OSError, RuntimeError):
+                pass
+    return False
+
+
 def _tui_engine_up(root: Path) -> bool:
+    """Prove PID belongs to sing-box running this checkout's config."""
+    root = Path(root)
     try:
         pid = int((root / "sing-box.pid").read_text().strip())
-        os.kill(pid, 0)
-        return True
-    except (OSError, ValueError):
+        if pid <= 0:
+            return False
+    except (OSError, ValueError, UnicodeError):
         return False
+    config = (root / "sing-box.json").resolve()
+    argv = _tui_process_argv(pid)
+    return argv is not None and _tui_argv_matches_config(argv, config)
+
+
+def _tui_generated_mode(root: Path) -> str | None:
+    """Return the mode represented by a generated sing-box config."""
+    try:
+        data = json.loads((Path(root) / "sing-box.json").read_text())
+        inbounds = data.get("inbounds")
+        if not isinstance(inbounds, list):
+            return "unknown"
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return "unknown"
+    return "tun" if any(
+        isinstance(item, dict) and item.get("type") == "tun"
+        for item in inbounds
+    ) else "proxy"
+
+
+def _tui_engine_state(root: Path) -> tuple[bool, str | None]:
+    """Return (verified_up, verified_mode); stale PID state is unknown."""
+    root = Path(root)
+    pid_file = root / "sing-box.pid"
+    if not pid_file.is_file():
+        return False, None
+    if not _tui_engine_up(root):
+        return False, "unknown"
+    return True, _tui_generated_mode(root)
 
 
 def _tui_fallback_chain(provider: str, entry: dict) -> list[str]:
@@ -1745,27 +1834,92 @@ def _tui_profiles(root: Path, provider: str) -> list[tuple[str, str]]:
             marker = "dead"
         else:
             marker = ""
-        rows.append((conf.stem, "active" if conf.stem == active else marker))
+        if conf.stem == active:
+            marker = {
+                "blocked": "active-blocked",
+                "cooling": "active-cooling",
+                "ok": "active",
+                "dead": "active-dead",
+                "": "active-unknown",
+            }[marker]
+        rows.append((conf.stem, marker))
     return rows
+
+
+def _tui_egress_age(root: Path, provider: str) -> float | None:
+    """Seconds since the newest egress probe verdict; None if never probed."""
+    newest: float | None = None
+    try:
+        records = sorted((Path(root) / "state" / "egress" / provider).glob("*.json"))
+    except OSError:
+        return None
+    for record in records:
+        try:
+            checked = json.loads(record.read_text()).get("checked_at")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(checked, (int, float)) and (newest is None or checked > newest):
+            newest = float(checked)
+    if newest is None:
+        return None
+    return max(0.0, time.time() - newest)
+
+
+def _format_probe_age(age: float | None) -> str:
+    if age is None:
+        return "never probed"
+    if age < 90:
+        return "probed just now"
+    if age < 3600:
+        return f"probed {int(age // 60)}m ago"
+    if age < 86400:
+        return f"probed {int(age // 3600)}h ago"
+    return f"probed {int(age // 86400)}d ago"
 
 
 def _render_home(state: TuiState) -> list[str]:
     root = state.root
     config = _tui_config(root)
-    mode = _read_vpn_mode(root)
-    engine = "UP" if _tui_engine_up(root) else "down"
-    engine_chip = ("\u25cf UP", _Theme.OK) if engine == "UP" else ("\u25cb down", _Theme.MUTED)
-    mode_chip = ("tun" if mode == "tun" else "proxy", _Theme.ACCENT)
+    desired_mode = _read_vpn_mode(root)
+    engine_up, engine_mode = _tui_engine_state(root)
+    if engine_up and engine_mode in {"proxy", "tun"}:
+        engine = "UP"
+        mode_chip = (engine_mode, _Theme.ACCENT)
+    elif engine_up:
+        engine = "UP (mode unknown)"
+        mode_chip = ("mode unverified", _Theme.WARN)
+    elif engine_mode == "unknown":
+        engine = "unknown"
+        mode_chip = ("mode unverified", _Theme.WARN)
+    else:
+        engine = "down"
+        mode_chip = (f"configured {desired_mode}", _Theme.MUTED)
+    engine_chip = (("\u25cf UP", _Theme.OK) if engine == "UP"
+                   else ("\u26a0 unknown", _Theme.WARN) if engine == "unknown"
+                   else ("\u25cb down", _Theme.MUTED))
     body: list[str] = [""]
     for provider in _tui_providers(root):
         entry = (config.get("providers") or {}).get(provider, {})
         profiles = _tui_profiles(root, provider)
         active = _tui_active(root, provider) or "-"
+        active_marker = next((marker for stem, marker in profiles if stem == active), "")
+        active_display = active
+        if active_marker and active_marker != "active":
+            active_display = f"{active} ({active_marker})"
         healthy = sum(1 for _stem, marker in profiles if marker in ("ok", "active"))
+        stale = sum(1 for _stem, marker in profiles if marker in ("", "active-unknown"))
         chain = _tui_fallback_chain(provider, entry)
         chain_text = " -> ".join(chain) if chain else "-"
-        health = _style(f"{healthy}/{len(profiles)} healthy", _Theme.OK if healthy else _Theme.ERR)
-        body.append(f" {_tint_provider(provider)}: exit {active} | {health} | fallback {chain_text}")
+        stale_hint: str | None = None
+        if healthy == 0 and stale:
+            # No fresh verdicts: say the data is old, not that everything is dead.
+            stale_hint = _format_probe_age(_tui_egress_age(root, provider))
+            health = _style(f"0/{len(profiles)} fresh", _Theme.WARN)
+        else:
+            health = _style(f"{healthy}/{len(profiles)} healthy", _Theme.OK if healthy else _Theme.ERR)
+        body.append(f" {_tint_provider(provider)}: exit {active_display} | {health} | fallback {chain_text}")
+        if stale_hint is not None:
+            body.append(f"   {_style('probe data ' + stale_hint + ' · [6] to refresh', _Theme.MUTED)}")
     status_height = len(body)
     body.append("")
     for index, (key, label) in enumerate(TUI_MENU):
@@ -1785,9 +1939,17 @@ def _render_servers(state: TuiState) -> list[str]:
     state.servers_provider = provider
     profiles = _tui_profiles(state.root, provider)
     glyph_color = {"active": _Theme.OK, "ok": _Theme.OK, "dead": _Theme.ERR,
-                   "cooling": _Theme.MUTED, "blocked": _Theme.WARN, "": _Theme.MUTED}
-    glyphs = {"active": "\u25cf", "ok": "\u25cf", "dead": "\u2715", "cooling": "\u25cb", "blocked": "\u26a0", "": "\u00b7"}
-    labels = {"active": "active", "ok": "ok", "dead": "dead", "cooling": "cooling", "blocked": "blocked", "": "unprobed"}
+                   "cooling": _Theme.MUTED, "blocked": _Theme.WARN,
+                   "active-dead": _Theme.ERR, "active-cooling": _Theme.MUTED,
+                   "active-blocked": _Theme.WARN, "active-unknown": _Theme.MUTED,
+                   "": _Theme.MUTED}
+    glyphs = {"active": "\u25cf", "ok": "\u25cf", "dead": "\u2715", "cooling": "\u25cb", "blocked": "\u26a0",
+              "active-dead": "\u2715", "active-cooling": "\u25cb",
+              "active-blocked": "\u26a0", "active-unknown": "\u25cf", "": "\u00b7"}
+    labels = {"active": "active", "ok": "ok", "dead": "dead", "cooling": "cooling", "blocked": "blocked",
+              "active-dead": "active · dead", "active-cooling": "active · cooling",
+              "active-blocked": "active · blocked", "active-unknown": "active · unprobed",
+              "": "unprobed"}
     body = [f" {provider}  ({providers.index(provider) + 1}/{len(providers)})", ""]
     if not profiles:
         body.append(" no profiles imported for this provider")
@@ -2456,13 +2618,18 @@ def _execute_action(action: tuple, root: Path) -> tuple[str, int]:
             else:
                 buf.write("engine stop failed (see output above)")
         elif kind == "vpn_toggle":
-            target = "off" if _read_vpn_mode(root) == "tun" else "on"
-            rc = _router_command(root, "vpn", target)
-            if rc == 0:
-                buf.write("TUN mode on (all traffic via engine rules)" if target == "on"
-                          else "TUN mode off (proxy mode)")
+            engine_up, engine_mode = _tui_engine_state(root)
+            if engine_mode == "unknown" or (engine_up and engine_mode not in {"proxy", "tun"}):
+                buf.write("vpn toggle failed: running mode is unverified")
+                rc = 1
             else:
-                buf.write("vpn toggle failed (see output above)")
+                target = "off" if engine_up and engine_mode == "tun" else "on"
+                rc = _router_command(root, "vpn", target)
+                if rc == 0:
+                    buf.write("TUN mode on (all traffic via engine rules)" if target == "on"
+                              else "TUN mode off (proxy mode)")
+                else:
+                    buf.write("vpn toggle failed (see output above)")
         elif kind == "rotation_set":
             try:
                 _cmd_rotation_set(root, action[1], action[2])
@@ -2474,17 +2641,29 @@ def _execute_action(action: tuple, root: Path) -> tuple[str, int]:
         elif kind == "rotate_provider":
             # rotation includes probe + settle window + possible rollback
             rc = _router_command(root, "rotate", action[1], timeout=180.0)
-            buf.write(f"rotated {action[1]} (in place; settle retry applies)")
+            if rc == 0:
+                buf.write(f"rotated {action[1]} (in place; settle retry applies)")
+            else:
+                buf.write(f"rotation {action[1]} failed (see output above)")
         elif kind == "rotate_to":
             rc = _router_command(root, "rotate", action[1], "--to", action[2],
                                  timeout=180.0)
-            buf.write(f"set {action[1]} exit -> {action[2]}")
+            if rc == 0:
+                buf.write(f"set {action[1]} exit -> {action[2]}")
+            else:
+                buf.write(f"setting {action[1]} exit failed (see output above)")
         elif kind == "failover_on":
             rc = _router_command(root, "failover", action[1], "on")
-            buf.write(f"failover {action[1]} on (first valid chain member)")
+            if rc == 0:
+                buf.write(f"failover {action[1]} on (first valid chain member)")
+            else:
+                buf.write(f"failover {action[1]} on failed (see output above)")
         elif kind == "failover_off":
             rc = _router_command(root, "failover", action[1], "off")
-            buf.write(f"failover {action[1]} off (primary restored)")
+            if rc == 0:
+                buf.write(f"failover {action[1]} off (primary restored)")
+            else:
+                buf.write(f"failover {action[1]} off failed (see output above)")
         elif kind == "bridge_install":
             rc = _cmd_bridge_install(root)
         elif kind == "routing":

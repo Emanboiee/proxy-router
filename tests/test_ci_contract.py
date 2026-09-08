@@ -51,6 +51,11 @@ def test_workflow_runs_complete_mac_only_pytest_matrix():
         step.get("run", "") for step in job["steps"] if isinstance(step, dict)
     )
     assert "pip install -r requirements-dev.txt" in runs
+    assert "Install pinned sing-box runtime" in text
+    assert "SING_BOX_SHA_ARM64" in text
+    assert "SING_BOX_SHA_AMD64" in text
+    assert "shasum -a 256 --check -" in runs
+    assert '"$bin_dir/sing-box" version' in runs
     assert "python -m pytest tests -q --randomly-seed=58" in runs
     assert "python -m pytest tests -q --randomly-seed=5800" in runs
     assert "unittest discover" not in text
