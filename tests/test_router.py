@@ -134,6 +134,7 @@ class ConfigBuildTests(unittest.TestCase):
             {"id": "roblox", "domains": ["roblox.com"], "provider": "cloudflare"},
         ]
         router._port = 2080
+        router._vpn = {}
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -964,7 +965,8 @@ class EngineStopTerminationTests(unittest.TestCase):
             [sys.executable, "-c", child_code], stdout=subprocess.DEVNULL)
         try:
             router.PID_FILE.write_text(f"{proc.pid}\n")
-            with mock.patch.object(router, "_pid_matches", return_value=True):
+            with mock.patch.object(router, "_pid_matches", return_value=True), \
+                 mock.patch.object(router, "_find_our_engine_pids", return_value=[]):
                 self.assertTrue(
                     router._pid_matches(proc.pid),
                     "precondition: stand-in engine must be recognized as ours")
@@ -2905,9 +2907,13 @@ class ErrorPolicyTests(unittest.TestCase):
     def test_seconds_override_honored_by_rotate_reason(self):
         router.set_active("proton", self.profile)
         router._providers["proton"]["error_policy"] = {"503": {"action": "cooldown", "seconds": 45}}
+        before = int(time.time())
         with mock.patch.object(router, "probe_profile", return_value=(True, {"ok": True})):
             self.assertEqual(router.rotate("proton", reason="503"), 0)
-        self.assertEqual(self._cooldown_until(), int(time.time()) + 45)  # exact policy seconds
+        after = int(time.time())
+        cooldown_until = self._cooldown_until()
+        self.assertGreaterEqual(cooldown_until, before + 45)
+        self.assertLessEqual(cooldown_until, after + 45)  # exact policy seconds
         record = router.read_egress("proton", self.profile)
         self.assertEqual(record["upstream_error"], "503")
         self.assertFalse(record.get("exhausted"))

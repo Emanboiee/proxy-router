@@ -410,6 +410,37 @@ class ReleaseArtifactTests(unittest.TestCase):
         )
         self.assertEqual(release["archive_root"], "sing-box-1.13.19-darwin-arm64")
 
+    def test_manifest_selects_exact_pinned_linux_x86_64_release(self):
+        manifest = Path(__file__).resolve().parents[1] / "sing-box-release.json"
+
+        release = helper.release_for_architecture(
+            manifest,
+            "x86_64",
+            owner_uid=os.getuid(),
+            anchor=manifest.parent,
+            platform_name="linux",
+        )
+
+        self.assertEqual(release["version"], "1.13.19")
+        self.assertEqual(release["size"], 24727716)
+        self.assertEqual(
+            release["sha256"],
+            "77e26226c111b8a269f559aec7999f6f5ae1961f25374b58b126d06405d4f516",
+        )
+        self.assertEqual(release["archive_root"], "sing-box-1.13.19-linux-amd64-glibc")
+
+    def test_manifest_rejects_unreviewed_linux_arm64(self):
+        manifest = Path(__file__).resolve().parents[1] / "sing-box-release.json"
+
+        with self.assertRaisesRegex(helper.SecurityError, "architecture"):
+            helper.release_for_architecture(
+                manifest,
+                "arm64",
+                owner_uid=os.getuid(),
+                anchor=manifest.parent,
+                platform_name="linux",
+            )
+
     def test_manifest_loader_rejects_symlinked_trust_root(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
