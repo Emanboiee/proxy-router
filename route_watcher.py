@@ -58,6 +58,7 @@ FAILURE_RE = re.compile(
     r"tls|ssl|eof|network is unreachable|no route to host|i/o timeout)\b",
     re.IGNORECASE,
 )
+_CONTEXT_CANCEL_RE = re.compile(r"\bcontext\s+cancel(?:ed|led)\b", re.IGNORECASE)
 
 
 def state_dir(root: Path | None = None) -> Path:
@@ -105,19 +106,42 @@ def _provider_from_line(line: str) -> str | None:
     return match.group("provider") if match else None
 
 
+def _transport_failure_kind(line: str) -> str | None:
+    """Classify a sing-box open-connection error without trusting a client abort.
+
+    ``context canceled`` is emitted when an upstream attempt is torn down, but
+    it can also follow a caller abandoning a request.  The worker therefore
+    treats this kind as a candidate and confirms the exact target separately
+    before rotating; ordinary transport errors retain the existing path.
+    """
+    lowered = line.lower()
+    if "open connection to" not in lowered:
+        return None
+    if _CONTEXT_CANCEL_RE.search(line):
+        if not re.search(r"\b(?:error|fatal)\b", line, re.IGNORECASE):
+            return None
+        return "context-canceled"
+    if FAILURE_RE.search(line):
+        return "transport"
+    return None
+
+
 def parse_line(line: str) -> dict | None:
     """Parse a sing-box connection line, including a safe provider tag."""
     clean = ANSI_RE.sub("", line).strip()
     provider = _provider_from_line(clean)
     target = TARGET_RE.search(clean)
     if target:
+        failure_kind = _transport_failure_kind(clean)
         event = {
             "kind": "target",
             "host": normalize_host(target.group("host")),
             "port": int(target.group("port") or 443),
-            "failure": bool("open connection to" in clean.lower() and FAILURE_RE.search(clean)),
+            "failure": failure_kind is not None,
             "line": clean[-400:],
         }
+        if failure_kind:
+            event["failure_kind"] = failure_kind
         if provider:
             event["provider"] = provider
         return event
@@ -335,6 +359,28 @@ def probe_target(root: Path, host: str, *, runner: Callable = subprocess.run) ->
     }
 
 
+def confirm_context_cancellation(root: Path, event: dict) -> bool:
+    """Require an exact target probe before acting on ``context canceled``.
+
+    sing-box uses that message both for upstream teardown and for a caller
+    abandoning a request.  A second, current transport failure through the
+    same local proxy is the evidence that justifies rotation.
+    """
+    if event.get("failure_kind") != "context-canceled":
+        return True
+    host = normalize_host(str(event.get("host") or ""))
+    if not host:
+        return False
+    result = probe_target(root, host)
+    append_event(root, {
+        "kind": "probe-confirmation",
+        "reason": "context-canceled",
+        "observed_at": time.time(),
+        **result,
+    })
+    return bool(result.get("transport_failure"))
+
+
 def provider_for_host(root: Path, host: str) -> str | None:
     """Map a failing host to the first active route provider.
 
@@ -512,7 +558,11 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
                         provider = event.get("provider") or provider_for_host(root, host)
                         if provider:
                             last_provider[host] = provider
-                        if event.get("failure") and guard.record_transport_failure(now, host):
+                        if (
+                            event.get("failure")
+                            and guard.record_transport_failure(now, host)
+                            and confirm_context_cancellation(root, event)
+                        ):
                             target = last_provider.get(host) or "proton"
                             result = rotate_provider(root, provider_for_host(root, host) or target, host=host)
                             append_event(root, {"kind": "rotation", "observed_at": time.time(), **result})
