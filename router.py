@@ -1194,16 +1194,13 @@ def read_egress(name: str, profile: Path) -> dict:
     path = egress_record_path(name, profile)
     if not path.is_file():
         return {}
-    try:
-        record = json.loads(path.read_text())
-        return record if isinstance(record, dict) else {}
-    except (json.JSONDecodeError, OSError):
-        return {}
+    record = state.read_json(path, default={})
+    return record if isinstance(record, dict) else {}
 
 
 def write_egress(name: str, profile: Path, record: dict) -> None:
     path = egress_record_path(name, profile)
-    _atomic_write(path, json.dumps(record, indent=2, sort_keys=True) + "\n", 0o600)
+    state.write_json(path, record, 0o600, on_commit=_hand_back_ownership)
     _hand_back_ownership(path)
     _hand_back_ownership(path.parent)
 

@@ -53,3 +53,13 @@ def test_atomic_write_cleans_temporary_file_when_write_fails(tmp_path: Path, mon
 
     assert not target.exists()
     assert list(tmp_path.glob(".*.tmp")) == []
+
+
+def test_json_helpers_round_trip_and_default_on_corrupt_input(tmp_path: Path):
+    """JSON helpers preserve structured state and tolerate corrupt markers."""
+    target = tmp_path / "record.json"
+    state.write_json(target, {"ok": True, "latency_ms": 12.5})
+
+    assert state.read_json(target) == {"latency_ms": 12.5, "ok": True}
+    target.write_text("not json")
+    assert state.read_json(target, default={"ok": False}) == {"ok": False}
