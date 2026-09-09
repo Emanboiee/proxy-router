@@ -1141,11 +1141,15 @@ class DarwinStatusButtonTests(unittest.TestCase):
     """Verify the private pystray-Darwin adapter without opening a window."""
 
     class Event:
-        def __init__(self, event_type):
+        def __init__(self, event_type, modifier_flags=0):
             self._event_type = event_type
+            self._modifier_flags = modifier_flags
 
         def type(self):
             return self._event_type
+
+        def modifierFlags(self):
+            return self._modifier_flags
 
     def test_native_button_routes_left_to_dashboard_and_right_to_menu(self):
         if not tray._COCOA_AVAILABLE:
@@ -1162,6 +1166,18 @@ class DarwinStatusButtonTests(unittest.TestCase):
 
         icon._dashboard_callback.assert_called_once_with()
         icon._show_native_menu.assert_called_once_with(right)
+
+    def test_control_click_opens_existing_menu(self):
+        if not tray._COCOA_AVAILABLE:
+            self.skipTest("Cocoa unavailable")
+        control_mask = getattr(
+            tray.AppKit, "NSEventModifierFlagControl",
+            getattr(tray.AppKit, "NSControlKeyMask", 0),
+        )
+        if not control_mask:
+            self.skipTest("Cocoa control modifier unavailable")
+        event = self.Event(tray.AppKit.NSLeftMouseUp, control_mask)
+        self.assertTrue(tray._is_right_click_event(event))
 
     def test_native_menu_rebuild_keeps_status_item_menu_unset(self):
         if not tray._COCOA_AVAILABLE:

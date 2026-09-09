@@ -1005,9 +1005,14 @@ if _REAL_DARWIN_PYSTRAY:
             self.page_title = _dashboard_label("Home", 20, white, bold=True)
             self.page_caption = _dashboard_label("Private routing, without the mystery", 12, muted)
             self.home_button = self._nav_button("Home", "house.fill", selected=True)
-            self.servers_button = self._nav_button("Servers", "server.rack", selected=False)
-            self.routing_button = self._nav_button("Routing", "point.3.connected.trianglepath.dotted", selected=False)
-            self.settings_button = self._nav_button("Preferences", "slider.horizontal.3", selected=False)
+            self.servers_button = self._nav_button(
+                "Servers", "server.rack", selected=False, enabled=False)
+            self.routing_button = self._nav_button(
+                "Routing", "point.3.connected.trianglepath.dotted",
+                selected=False, enabled=False)
+            self.settings_button = self._nav_button(
+                "Preferences", "slider.horizontal.3", selected=False,
+                enabled=False)
 
             self.hero_dot = _dashboard_label("●", 42, blue, bold=True,
                                             align=AppKit.NSCenterTextAlignment)
@@ -1051,7 +1056,8 @@ if _REAL_DARWIN_PYSTRAY:
             ):
                 self.root.addSubview_(child)
 
-        def _nav_button(self, title: str, symbol: str, *, selected: bool):
+        def _nav_button(self, title: str, symbol: str, *, selected: bool,
+                        enabled: bool = True):
             button = AppKit.NSButton.alloc().initWithFrame_(AppKit.NSZeroRect)
             button.setTitle_(title)
             button.setBordered_(False)
@@ -1064,6 +1070,7 @@ if _REAL_DARWIN_PYSTRAY:
             button.setImagePosition_(AppKit.NSImageLeft)
             button.setImageScaling_(AppKit.NSImageScaleProportionallyDown)
             button.setToolTip_(title)
+            button.setEnabled_(enabled)
             return button
 
         def _layout_dashboard(self, width: float, height: float):
@@ -1199,7 +1206,7 @@ if _REAL_DARWIN_PYSTRAY:
                     "disconnect": ("action_disconnect", ()),
                     "rotate": ("action_rotate", ()),
                     "mode": ("action_mode", (value,)),
-                    "setup": ("action_dashboard", ()),
+                    "setup": ("action_setup", ()),
                 }
                 method_name, args = methods[kind]
                 getattr(self.action_handler, method_name)(*args)
@@ -1251,10 +1258,18 @@ def _event_type(event):
 def _is_right_click_event(event) -> bool:
     if not _COCOA_AVAILABLE or event is None:
         return False
-    return _event_type(event) in {
+    if _event_type(event) in {
         getattr(AppKit, "NSRightMouseDown", None),
         getattr(AppKit, "NSRightMouseUp", None),
-    }
+    }:
+        return True
+    flags = getattr(event, "modifierFlags", None)
+    flags = flags() if callable(flags) else flags
+    control_mask = getattr(
+        AppKit, "NSEventModifierFlagControl",
+        getattr(AppKit, "NSControlKeyMask", 0),
+    )
+    return bool(flags and control_mask and flags & control_mask)
 
 
 if _REAL_DARWIN_PYSTRAY:
