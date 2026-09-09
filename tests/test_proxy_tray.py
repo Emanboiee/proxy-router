@@ -1485,7 +1485,7 @@ class DashboardClickRoutingTests(unittest.TestCase):
 
         app = tray.TrayApp(RootedClient(), None)
         labels = [item.text for item in app.build_menu()]
-        for expected in ("Open Setup in Terminal", "Connect", "Disconnect",
+        for expected in ("Open Dashboard (Terminal setup)", "Connect", "Disconnect",
                          "Routing mode", "Setup", "Presets", "Quit"):
             self.assertIn(expected, labels)
 

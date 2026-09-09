@@ -2056,7 +2056,7 @@ class TrayApp:
         # status-button left click calls it directly; on other platforms this
         # entry remains the normal pystray menu action.
         items.append(pystray.MenuItem(
-            "Open Setup in Terminal", self.action_dashboard, default=True))
+            "Open Dashboard (Terminal setup)", self.action_dashboard, default=True))
 
         # Actions — terse, no CLI flags. Connect is only offered once at
         # least one provider exists; on a fresh install the banner above
