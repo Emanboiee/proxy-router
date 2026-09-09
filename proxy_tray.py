@@ -33,7 +33,6 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
-import traceback
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -489,7 +488,6 @@ class DashboardController:
         with self._lock:
             self._status = status
             window = self._window
-            last_action = self._last_action
         if window is None:
             with self._window_create_lock:
                 with self._lock:
@@ -1394,8 +1392,9 @@ if _REAL_DARWIN_PYSTRAY:
                     bounds = button.bounds()
                     menu.popUpMenuPositioningItem_atLocation_inView_(
                         None, AppKit.NSMakePoint(0, bounds.size.height), button)
-                except Exception:
-                    print("dashboard: native menu popup failed", file=sys.stderr)
+                except Exception as fallback_exc:
+                    print(f"dashboard: native menu popup failed: {fallback_exc}",
+                          file=sys.stderr)
                     return
 
 else:
@@ -1630,7 +1629,6 @@ class TrayApp:
                     self._publish_status(refreshed, epoch)
                 except Exception as exc:
                     print(f"tray: status publish skipped: {exc}", file=sys.stderr)
-                    traceback.print_exc()
             finally:
                 # A dashboard/UI failure must not leave the mutation gate
                 # permanently active or make Quit wait for a dead worker.
@@ -2204,11 +2202,22 @@ def selftest(root: str) -> int:
     return 0
 
 
+def _default_root() -> str:
+    override = os.environ.get("PROXY_ROUTER_ROOT")
+    if override:
+        return override
+    here = Path(__file__).resolve().parent
+    if (here / "router.py").is_file():
+        return str(here)
+    parent = here.parent
+    if (parent / "router.py").is_file():
+        return str(parent)
+    return str(here)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="proxy-router tray agent")
-    ap.add_argument("--root", default=os.environ.get(
-        "PROXY_ROUTER_ROOT",
-        os.path.dirname(os.path.abspath(__file__))))
+    ap.add_argument("--root", default=_default_root())
     ap.add_argument("--selftest", action="store_true",
                     help="validate CLI contract, no GUI")
     args = ap.parse_args()
