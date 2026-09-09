@@ -2770,13 +2770,26 @@ def _autodetected_domains_by_route() -> dict[str, list[str]]:
 
 def _routes_with_autodetected_domains(routes: list[dict]) -> list[dict]:
     learned = _autodetected_domains_by_route()
-    if not learned:
+    roots: dict[str, list[str]] = {}
+    for settings in (_autodetect.get("sources") or {}).values():
+        if not isinstance(settings, dict):
+            continue
+        route_id = settings.get("route_id")
+        if not isinstance(route_id, str):
+            continue
+        roots.setdefault(route_id, []).extend(
+            root for root in settings.get("roots", []) if isinstance(root, str)
+        )
+    if not learned and not roots:
         return routes
     expanded: list[dict] = []
     for route in routes:
         route_copy = dict(route)
         domains = list(route.get("domains") or [])
         route_id = route.get("id")
+        for root in roots.get(route_id, []):
+            if root not in domains:
+                domains.append(root)
         for host in learned.get(route_id, []):
             if not any(domain_autodetect.host_matches_root(host, str(domain).lstrip("*."))
                        for domain in domains):

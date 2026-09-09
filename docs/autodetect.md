@@ -31,6 +31,7 @@ in the source entry identifies the discovery policy and does not pin the
 learned hosts to one egress. The keepalive agent refreshes the source at the
 configured interval and reloads only when the routed hostname set changes.
 
-The roots are an allowlist. Shared CDN roots such as `cloudfront.net` are not
-learned automatically because they can serve unrelated sites. Use
-`router.py status --json` to inspect learned hosts and their source route.
+The roots are both an allowlist and the route suffixes used while the source is
+configured. Shared CDN roots such as `cloudfront.net` are not learned or routed
+automatically because they can serve unrelated sites. Use `router.py status
+--json` to inspect learned hosts and their source route.
