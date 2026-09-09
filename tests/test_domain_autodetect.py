@@ -238,3 +238,23 @@ def test_load_autodetect_skips_ip_only_route():
     )
 
     assert settings["sources"] == {}
+
+
+def test_load_autodetect_does_not_materialize_sources_when_disabled():
+    settings = router._load_autodetect(
+        {"autodetect": {"enabled": False}},
+        [{"id": "school", "domains": ["twitch.tv"], "provider": "cloudflare"}],
+        {"cloudflare": {}},
+    )
+
+    assert settings["sources"] == {}
+
+
+def test_load_autodetect_ignores_malformed_route_domains():
+    settings = router._load_autodetect(
+        {"autodetect": {"enabled": True}},
+        [{"id": "school", "domains": None, "provider": "cloudflare"}],
+        {"cloudflare": {}},
+    )
+
+    assert settings["sources"] == {}

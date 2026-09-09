@@ -209,6 +209,8 @@ try:
     routes = data.get("routes") or []
     providers = data.get("providers") or {}
     settings = router._load_autodetect(data, routes, providers)
+    if not settings["enabled"]:
+        raise SystemExit(0)
     for source in sorted(settings["sources"]):
         print(source)
 except (OSError, TypeError, ValueError, json.JSONDecodeError, ImportError, AttributeError):

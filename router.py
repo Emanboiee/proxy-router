@@ -478,6 +478,8 @@ def _autodetect_route_sources(routes: list[dict], providers: dict,
     }
     generated = dict(sources)
     for route in routes:
+        if not isinstance(route, dict):
+            continue
         route_id = route.get("id")
         provider = route.get("provider")
         if (
@@ -490,7 +492,10 @@ def _autodetect_route_sources(routes: list[dict], providers: dict,
             continue
         roots: list[str] = []
         seed_host: str | None = None
-        for raw_domain in route.get("domains", []):
+        raw_domains = route.get("domains")
+        if not isinstance(raw_domains, list):
+            continue
+        for raw_domain in raw_domains:
             if not isinstance(raw_domain, str):
                 continue
             host = domain_autodetect.normalize_host(raw_domain.lstrip("*."))
@@ -584,7 +589,7 @@ def _load_autodetect(data: dict, routes: list, providers: dict) -> dict:
             "roots": sorted(set(normalized_roots)),
             "ttl_seconds": ttl,
         }
-    if auto_sources:
+    if auto_sources and enabled:
         cleaned_sources = _autodetect_route_sources(routes, providers, cleaned_sources)
     return {
         "enabled": enabled,
