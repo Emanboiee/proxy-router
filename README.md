@@ -567,6 +567,16 @@ python3 proxy_tray.py --selftest   # no GUI needed: validates CLI contract + dis
 python3 proxy_tray.py              # run it in the foreground
 ```
 
+On macOS, the tray uses the Cocoa support already installed with pystray's
+Darwin backend. A **left click** opens or focuses proxy-router's custom dark
+Home dashboard. It is a normal proxy-router window with a navigation rail,
+connection hero, Connect/Disconnect action, routing mode, provider health, and
+route status. It does not open System Settings and it ships no provider-brand
+artwork. A **right click** opens the existing pystray status/action menu; its
+RouterClient and CLI ownership are unchanged. If Cocoa is unavailable, the
+core CLI and `--selftest` remain usable and the native dashboard path fails
+closed.
+
 macOS login autostart (launchd agent):
 
 ```sh

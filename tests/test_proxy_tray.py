@@ -547,6 +547,16 @@ class MutationSerializationTests(unittest.TestCase):
             and "failed" in app.last_action_result))
         self.assertIn("RuntimeError", app.last_action_result)
 
+    def test_dashboard_update_failure_does_not_stick_mutation_active(self):
+        app = self._make_app()
+
+        def fail_publish(*_args):
+            raise RuntimeError("dashboard closed")
+
+        app._publish_status = fail_publish
+        app._do(lambda: (0, "ok"), "connect")
+        self.assertTrue(self._wait_until(lambda: not app._mutation_active))
+
     def test_stale_poll_cannot_overwrite_newer_post_action_snapshot(self):
         # Deliberately inverted completion driven through the REAL poll
         # loop: the poll claims its slot and fetches status BEFORE the
@@ -1297,6 +1307,302 @@ class PresetApplyReloadTests(unittest.TestCase):
             bound("school-warp")
         run.assert_called_once_with("setup", "--preset", "school-warp")
         self.assertEqual(captured["rc"], (1, "boom"))
+
+
+class PresetMenuCallbackTests(unittest.TestCase):
+    def test_preset_activation_keeps_captured_name_instead_of_icon(self):
+        calls = []
+
+        class FakeClient:
+            root = "/tmp"
+
+            def status(self):
+                return tray.RouterStatus(
+                    up=True,
+                    providers={"proton": {"active": "nl", "profiles": ["nl"], "egress": {}}},
+                    preset="school-warp",
+                )
+
+            def setup_preset(self, name):
+                calls.append(("setup", name))
+                return 0, "preset applied"
+
+            def reload(self):
+                calls.append(("reload",))
+                return 0, "reloaded"
+
+        app = tray.TrayApp(FakeClient(), None)
+        captured = {}
+
+        def fake_do(fn, label):
+            captured["label"] = label
+            captured["result"] = fn()
+
+        app._do = fake_do
+        menu = app.build_menu()
+        presets = next(item for item in menu if item.text == "Presets").submenu
+        preset = next(item for item in presets if "school-warp" in item.text)
+        preset(object())
+        self.assertEqual(captured["label"], "preset school-warp")
+        self.assertEqual(calls, [("setup", "school-warp"), ("reload",)])
+
+
+class DashboardViewModelTests(unittest.TestCase):
+    def test_disconnected_model_binds_primary_connect_and_route_health(self):
+        status = tray.RouterStatus(
+            up=False,
+            routing_mode="safe-list",
+            providers={
+                "proton": {
+                    "active": "01-NL",
+                    "profiles": ["01-NL"],
+                    "egress": {"01-NL": {"ok": True, "latency_ms": 42}},
+                }
+            },
+        )
+        model = tray.DashboardViewModel.from_status(status)
+        self.assertEqual(model.title, "Disconnected")
+        self.assertEqual(model.primary_action, "connect")
+        self.assertEqual(model.primary_label, "Connect")
+        self.assertEqual(model.mode_label, "Home")
+        self.assertEqual(model.provider_summary, "Proton")
+        self.assertEqual(model.route_health, "Healthy")
+        self.assertEqual(model.port_label, "Not running")
+
+    def test_connected_model_binds_disconnect_and_route_details(self):
+        status = tray.RouterStatus(
+            up=True,
+            mode="proxy",
+            port=2080,
+            watcher=True,
+            routing_mode="vpn-list",
+            providers={
+                "proton": {
+                    "active": "01-NL",
+                    "profiles": ["01-NL"],
+                    "egress": {"01-NL": {"ok": True, "latency_ms": 18}},
+                }
+            },
+        )
+        model = tray.DashboardViewModel.from_status(status)
+        self.assertEqual(model.title, "Connected")
+        self.assertEqual(model.primary_action, "disconnect")
+        self.assertEqual(model.mode_label, "School")
+        self.assertEqual(model.port_label, "Proxy :2080")
+        self.assertEqual(model.watcher_label, "Route watcher active")
+        self.assertEqual(model.route_health, "Healthy")
+
+    def test_error_model_renders_actionable_error_without_crashing(self):
+        model = tray.DashboardViewModel.from_status(
+            tray.RouterStatus(error="status exit 7"))
+        self.assertEqual(model.title, "Router unavailable")
+        self.assertIn("status exit 7", model.error)
+        self.assertEqual(model.route_health, "Unavailable")
+
+    def test_none_provider_entry_is_treated_as_unconfigured(self):
+        model = tray.DashboardViewModel.from_status(
+            tray.RouterStatus(providers={"proton": None}))
+        self.assertEqual(model.provider_rows, ("Proton   no active server",))
+        self.assertEqual(model.route_health, "Waiting")
+
+    def test_none_provider_map_is_treated_as_unconfigured(self):
+        model = tray.DashboardViewModel.from_status(
+            tray.RouterStatus(providers=None))
+        self.assertEqual(model.provider_summary, "No provider")
+        self.assertEqual(model.route_health, "Not configured")
+
+    def test_none_egress_record_is_treated_as_waiting(self):
+        model = tray.DashboardViewModel.from_status(
+            tray.RouterStatus(providers={
+                "proton": {"active": "01-NL", "egress": {"01-NL": None}},
+            }))
+        self.assertEqual(model.route_health, "Waiting")
+
+
+class DashboardLifecycleTests(unittest.TestCase):
+    class FakeWindow:
+        def __init__(self):
+            self.statuses = []
+            self.actions = []
+            self.shown = 0
+            self.closed = 0
+
+        def update_status(self, status):
+            self.statuses.append(status)
+
+        def update_action(self, action):
+            self.actions.append(action)
+
+        def show(self):
+            self.shown += 1
+
+        def close(self):
+            self.closed += 1
+
+    def test_show_reuses_and_focuses_one_window_then_closes_it(self):
+        windows = []
+
+        def factory(*_args):
+            window = self.FakeWindow()
+            windows.append(window)
+            return window
+
+        controller = tray.DashboardController(
+            object(), object(), window_factory=factory)
+        first = tray.RouterStatus(up=False)
+        second = tray.RouterStatus(up=True)
+        self.assertTrue(controller.show(first))
+        self.assertTrue(controller.show(second))
+        self.assertEqual(len(windows), 1)
+        self.assertEqual(windows[0].shown, 2)
+        self.assertEqual(windows[0].statuses, [first, second])
+        controller.update_action("connect: working")
+        self.assertEqual(windows[0].actions[-1], "connect: working")
+        controller.close()
+        self.assertEqual(windows[0].closed, 1)
+
+    def test_missing_cocoa_factory_fails_closed(self):
+        controller = tray.DashboardController(
+            object(), object(), window_factory=lambda *_args: None)
+        self.assertFalse(controller.show(tray.RouterStatus()))
+        self.assertIsNone(controller.window)
+
+
+class DashboardClickRoutingTests(unittest.TestCase):
+    def test_left_click_opens_dashboard_and_right_click_opens_existing_menu(self):
+        calls = []
+        token = object()
+        self.assertIsNone(tray._route_macos_click(
+            "left", lambda: calls.append("dashboard"),
+            lambda: calls.append("menu")))
+        self.assertIsNone(tray._route_macos_click(
+            "right", lambda: calls.append("dashboard"),
+            lambda: calls.append("menu")))
+        self.assertEqual(calls, ["dashboard", "menu"])
+        self.assertIs(tray._route_macos_click(
+            "other", lambda: None, lambda: None, event=token), token)
+
+    def test_menu_creation_keeps_existing_right_click_actions(self):
+        class RootedClient:
+            root = "/tmp"
+
+            def status(self):
+                return tray.RouterStatus()
+
+        app = tray.TrayApp(RootedClient(), None)
+        labels = [item.text for item in app.build_menu()]
+        for expected in ("Open Dashboard (Terminal setup)", "Connect", "Disconnect",
+                         "Routing mode", "Setup", "Presets", "Quit"):
+            self.assertIn(expected, labels)
+
+
+class DarwinStatusButtonTests(unittest.TestCase):
+    """Verify the private pystray-Darwin adapter without opening a window."""
+
+    class Event:
+        def __init__(self, event_type, modifier_flags=0):
+            self._event_type = event_type
+            self._modifier_flags = modifier_flags
+
+        def type(self):
+            return self._event_type
+
+        def modifierFlags(self):
+            return self._modifier_flags
+
+    def test_native_button_routes_left_to_dashboard_and_right_to_menu(self):
+        if not tray._REAL_DARWIN_PYSTRAY:
+            self.skipTest("Cocoa unavailable")
+        icon = object.__new__(tray._DarwinDashboardIcon)
+        icon._visible = False
+        icon._dashboard_callback = mock.Mock()
+        icon._show_native_menu = mock.Mock()
+        left = self.Event(tray.AppKit.NSLeftMouseUp)
+        right = self.Event(tray.AppKit.NSRightMouseUp)
+
+        icon._route_status_button_event(left)
+        icon._route_status_button_event(right)
+
+        icon._dashboard_callback.assert_called_once_with()
+        icon._show_native_menu.assert_called_once_with(right)
+
+    def test_control_click_opens_existing_menu(self):
+        if not tray._REAL_DARWIN_PYSTRAY:
+            self.skipTest("Cocoa unavailable")
+        control_mask = getattr(
+            tray.AppKit, "NSEventModifierFlagControl",
+            getattr(tray.AppKit, "NSControlKeyMask", 0),
+        )
+        if not control_mask:
+            self.skipTest("Cocoa control modifier unavailable")
+        event = self.Event(tray.AppKit.NSLeftMouseUp, control_mask)
+        self.assertTrue(tray._is_right_click_event(event))
+
+    def test_native_menu_rebuild_keeps_status_item_menu_unset(self):
+        if not tray._REAL_DARWIN_PYSTRAY:
+            self.skipTest("Cocoa unavailable")
+        icon = object.__new__(tray._DarwinDashboardIcon)
+        icon._visible = False
+        icon._menu_handle = None
+        icon._native_menu = None
+        icon._menu = object()
+        icon._dashboard_delegate = object()
+        button = SimpleNamespace(
+            setTarget_=mock.Mock(),
+            setAction_=mock.Mock(),
+            sendActionOn_=mock.Mock(),
+        )
+        icon._status_item = SimpleNamespace(
+            button=lambda: button, setMenu_=mock.Mock())
+        native_menu = object()
+        icon._create_menu = mock.Mock(return_value=native_menu)
+
+        icon._update_menu()
+
+        self.assertIs(icon._menu_handle[0], native_menu)
+        self.assertTrue(icon._status_item.setMenu_.call_args_list)
+        self.assertTrue(all(call.args == (None,)
+                            for call in icon._status_item.setMenu_.call_args_list))
+
+
+class DashboardTrayIntegrationTests(unittest.TestCase):
+    def test_left_click_entry_uses_native_callback_but_menu_entry_stays_legacy(self):
+        class RootedClient:
+            root = "/tmp"
+
+            def status(self):
+                return tray.RouterStatus()
+
+        app = tray.TrayApp(RootedClient(), None)
+        app.dashboard = mock.Mock()
+        with mock.patch.object(tray, "open_dashboard", return_value=True) as legacy:
+            app.action_dashboard()
+        legacy.assert_called_once_with("/tmp")
+
+        app.dashboard.show.reset_mock()
+        app._show_native_dashboard()
+        app.dashboard.show.assert_called_once_with(app.latest)
+
+    def test_dashboard_action_dispatch_reuses_existing_tray_methods(self):
+        app = object.__new__(tray.TrayApp)
+        app.action_connect = mock.Mock()
+        app.action_disconnect = mock.Mock()
+        app.action_rotate = mock.Mock()
+        app.action_mode = mock.Mock()
+        app.action_setup = mock.Mock()
+
+        app._dispatch_dashboard_action("connect")
+        app._dispatch_dashboard_action("disconnect")
+        app._dispatch_dashboard_action("rotate")
+        app._dispatch_dashboard_action("mode", "safe-list")
+        app._dispatch_dashboard_action("setup")
+        app._dispatch_dashboard_action("mode", "not-a-mode")
+
+        app.action_connect.assert_called_once_with()
+        app.action_disconnect.assert_called_once_with()
+        app.action_rotate.assert_called_once_with()
+        app.action_mode.assert_called_once_with("safe-list")
+        app.action_setup.assert_called_once_with()
 
 
 if __name__ == "__main__":
