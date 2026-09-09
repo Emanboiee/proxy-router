@@ -1,12 +1,17 @@
 # Routed dependency autodetection
 
-Proxy mode can learn exact dependency hostnames for a routed web application
-without decrypting TLS. Configure a source under `autodetect.sources`:
+Proxy mode can learn exact dependency hostnames for every configured domain route
+without decrypting TLS. With `autodetect.auto_sources` enabled (the default),
+routes without an explicit source automatically use their first domain as the
+seed and all configured route domains as trusted roots. Explicit entries under
+`autodetect.sources` override the generated source when a site needs a custom
+seed or additional owned asset roots.
 
 ```json
 {
   "autodetect": {
     "enabled": true,
+    "auto_sources": true,
     "interval_seconds": 300,
     "timeout_seconds": 12,
     "sources": {
@@ -22,12 +27,16 @@ without decrypting TLS. Configure a source under `autodetect.sources`:
 }
 ```
 
-`router.py autodetect twitch` fetches the seed through the local proxy, extracts
+`router.py autodetect <source>` fetches the seed through the local proxy, extracts
 URLs under the trusted roots, and stores exact hosts in
-`state/autodetect/twitch.json`. The next reload adds only non-expired learned
-hosts to the configured route. The keepalive agent refreshes the source at the
-configured interval and reloads only when the routed hostname set changes.
+`state/autodetect/<source>.json`. The keepalive agent refreshes every explicit
+and generated source at the configured interval. The next reload adds only
+non-expired learned hosts to the configured route. Learned hosts are keyed by
+`route_id`, so they follow that route's active provider and any fallback or
+rotation.
 
-The roots are an allowlist. Shared CDN roots such as `cloudfront.net` are not
-learned automatically because they can serve unrelated sites. Use
-`router.py status --json` to inspect learned hosts and their source route.
+The roots are both an allowlist and the route suffixes used while the source is
+configured. Shared CDN roots such as `cloudfront.net` are not learned or routed
+automatically because they can serve unrelated sites. Set `auto_sources` to
+`false` to require explicit sources, and use `router.py status --json` to inspect
+generated sources and learned hosts.

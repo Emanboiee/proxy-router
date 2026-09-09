@@ -193,21 +193,35 @@ PY
 }
 
 
-# Return every configured autodetection source for periodic refresh.
+# Return every explicit and generated autodetection source for periodic refresh.
 autodetect_sources() {
   python_runner - "$ROOT/router.json" <<'PY' 2>/dev/null
 import json
+import pathlib
 import sys
 
 try:
-    data = json.loads(open(sys.argv[1], encoding="utf-8").read())
-    sources = (data.get("autodetect") or {}).get("sources") or {}
-    if not isinstance(sources, dict):
-        raise ValueError
-    for source in sorted(sources):
-        if isinstance(source, str) and source:
+    config_path = pathlib.Path(sys.argv[1]).resolve()
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    autodetect = data.get("autodetect") or {}
+    if not autodetect.get("enabled", False):
+        raise SystemExit(0)
+    try:
+        sys.path.insert(0, str(config_path.parent))
+        import router
+
+        routes = data.get("routes") or []
+        providers = data.get("providers") or {}
+        settings = router._load_autodetect(data, routes, providers)
+        for source in sorted(settings["sources"]):
             print(source)
-except (OSError, TypeError, ValueError, json.JSONDecodeError):
+    except (OSError, TypeError, ValueError, ImportError, AttributeError):
+        sources = autodetect.get("sources") or {}
+        if not isinstance(sources, dict):
+            raise
+        for source in sorted(source for source in sources if isinstance(source, str) and source):
+            print(source)
+except (OSError, TypeError, ValueError, json.JSONDecodeError, ImportError, AttributeError):
     raise SystemExit(1)
 PY
 }
