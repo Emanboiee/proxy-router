@@ -414,12 +414,13 @@ class DashboardViewModel:
 
     @classmethod
     def from_status(cls, status: RouterStatus) -> "DashboardViewModel":
+        providers = status.providers or {}
         mode = status.routing_mode if status.routing_mode in _DASHBOARD_MODE_LABELS else "default"
         mode_label = _DASHBOARD_MODE_LABELS[mode]
         if status.error:
             title = "Router unavailable"
             explanation = "The dashboard could not read proxy-router status. Try Connect again or open Setup."
-        elif not status.providers:
+        elif not providers:
             title = "No VPN profile yet"
             explanation = "Add a provider profile from Setup, then Connect to start routing traffic."
         elif status.up:
@@ -432,7 +433,7 @@ class DashboardViewModel:
         if status.up:
             primary_label = "Disconnect"
             primary_action = "disconnect"
-        elif status.providers:
+        elif providers:
             primary_label = "Connect"
             primary_action = "connect"
         else:
@@ -440,8 +441,8 @@ class DashboardViewModel:
             primary_action = "setup"
 
         rows = []
-        for name in sorted(status.providers):
-            info = status.providers.get(name) or {}
+        for name in sorted(providers):
+            info = providers.get(name) or {}
             active = info.get("active")
             if active:
                 try:
@@ -455,18 +456,18 @@ class DashboardViewModel:
         if not rows:
             rows.append("No providers configured")
 
-        provider_summary = ", ".join(name.title() for name in sorted(status.providers))
+        provider_summary = ", ".join(name.title() for name in sorted(providers))
         if not provider_summary:
             provider_summary = "No provider"
         if status.error:
             route_health = "Unavailable"
-        elif not status.providers:
+        elif not providers:
             route_health = "Not configured"
         else:
             records = [
                 ((info.get("egress") or {}).get(info.get("active")) or {})
-                for info in (status.providers.get(name) or {}
-                             for name in status.providers)
+                for info in (providers.get(name) or {}
+                             for name in providers)
                 if info.get("active")
             ]
             if any(record.get("upstream_error") or record.get("blocked")
@@ -586,8 +587,9 @@ class DashboardController:
                 print(f"dashboard: action update skipped: {exc}", file=sys.stderr)
 
     def close(self) -> None:
-        with self._lock:
-            window = self._window
+        with self._window_create_lock:
+            with self._lock:
+                window = self._window
         if window is not None:
             try:
                 window.close()

@@ -1405,6 +1405,12 @@ class DashboardViewModelTests(unittest.TestCase):
         self.assertEqual(model.provider_rows, ("Proton   no active server",))
         self.assertEqual(model.route_health, "Waiting")
 
+    def test_none_provider_map_is_treated_as_unconfigured(self):
+        model = tray.DashboardViewModel.from_status(
+            tray.RouterStatus(providers=None))
+        self.assertEqual(model.provider_summary, "No provider")
+        self.assertEqual(model.route_health, "Not configured")
+
     def test_none_egress_record_is_treated_as_waiting(self):
         model = tray.DashboardViewModel.from_status(
             tray.RouterStatus(providers={
