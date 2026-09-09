@@ -10,6 +10,7 @@ invoking user.
 from __future__ import annotations
 
 import os
+import json
 import tempfile
 from pathlib import Path
 from typing import Callable
@@ -51,3 +52,27 @@ def atomic_write(
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+def read_json(path: Path, default: object | None = None) -> object | None:
+    """Read a JSON state value, returning ``default`` for missing/bad data."""
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return default
+
+
+def write_json(
+    path: Path,
+    value: object,
+    mode: int = 0o600,
+    *,
+    on_commit: Callable[[Path], None] | None = None,
+) -> None:
+    """Serialize ``value`` and persist it through :func:`atomic_write`."""
+    atomic_write(
+        path,
+        json.dumps(value, indent=2, sort_keys=True) + "\n",
+        mode,
+        on_commit=on_commit,
+    )
