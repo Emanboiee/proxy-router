@@ -2747,7 +2747,12 @@ def _read_autodetect_state(source: str) -> dict:
 
 
 def _autodetected_domains_by_route() -> dict[str, list[str]]:
-    """Return non-expired exact learned hosts grouped by configured route."""
+    """Return non-expired exact learned hosts grouped by route.
+
+    Autodetected dependencies belong to the configured route, not the provider
+    that happened to serve the discovery request. This keeps them routed when
+    the route fails over or is reassigned to another provider.
+    """
     result: dict[str, list[str]] = {}
     if not _autodetect.get("enabled"):
         return result
@@ -2755,8 +2760,7 @@ def _autodetected_domains_by_route() -> dict[str, list[str]]:
         if not isinstance(settings, dict):
             continue
         state = _read_autodetect_state(source)
-        if (state.get("route_id") != settings.get("route_id")
-                or state.get("provider") != settings.get("provider")):
+        if state.get("route_id") != settings.get("route_id"):
             continue
         domains = domain_autodetect.active_domains(state)
         if domains:

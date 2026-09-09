@@ -77,3 +77,45 @@ def test_build_config_includes_non_suffix_learned_hosts(tmp_path, monkeypatch):
     finally:
         (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
          router._vpn, router._routing, router._autodetect, router._port) = old
+
+
+def test_build_config_keeps_learned_hosts_when_provider_changes(tmp_path, monkeypatch):
+    old = (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
+           router._vpn, router._routing, router._autodetect, router._port)
+    try:
+        router.ROOT = Path(tmp_path)
+        router.CONFIG_FILE = router.ROOT / "router.json"
+        router._providers = {
+            "proton": {"socks5": {"host": "127.0.0.1", "port": 2182}}
+        }
+        router._routes = [{
+            "id": "school", "domains": ["twitch.tv"], "provider": "proton"
+        }]
+        router._vpn = {}
+        router._routing = {"mode": "default", "vpn_domains": []}
+        router._autodetect = {
+            "enabled": True,
+            "sources": {"twitch": {"route_id": "school", "provider": "proton"}},
+        }
+        router._port = 2080
+        state_path = router.ROOT / "state" / "autodetect" / "twitch.json"
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text(json.dumps({
+            "route_id": "school", "provider": "cloudflare",
+            "domains": {
+                "video-weaver.example.ttvnw.net": {
+                    "first_seen": 1, "last_seen": 2, "expires_at": 9999999999
+                }
+            }
+        }))
+        monkeypatch.setattr(router, "current_mode", lambda: "proxy")
+
+        config, _ = router.build_singbox_config()
+
+        assert {
+            "outbound": "proton",
+            "domain_suffix": ["twitch.tv", "video-weaver.example.ttvnw.net"],
+        } in config["route"]["rules"]
+    finally:
+        (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
+         router._vpn, router._routing, router._autodetect, router._port) = old
