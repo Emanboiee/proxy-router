@@ -508,7 +508,8 @@ class DashboardController:
             last_action = self._last_action
         try:
             window.update_status(display_status)
-            window.update_action(last_action)
+            if last_action is not None:
+                window.update_action(last_action)
             window.show()
         except Exception as exc:
             print(f"dashboard: could not show window: {exc}", file=sys.stderr)
@@ -2172,8 +2173,8 @@ def selftest(root: str) -> int:
         print(f"status parse FAIL: {st.error}")
         return 1
     model = DashboardViewModel.from_status(st)
-    if not model.title or not model.primary_action:
-        print("dashboard model FAIL: incomplete status projection")
+    if model.primary_action not in {"connect", "disconnect", "setup"}:
+        print(f"dashboard model FAIL: invalid primary action {model.primary_action!r}")
         return 1
     click_probe = []
     _route_macos_click(
