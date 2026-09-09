@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any
 
 import domain_autodetect
+import state
 from config_schema import (
     DEFAULT_DIRECT_PROBE_URL,
     DEFAULT_EGRESS_SETTINGS,
@@ -423,22 +424,7 @@ def _atomic_write(path: Path, text: str, mode: int = 0o600) -> None:
     """Write ``text`` to ``path`` atomically (temp file + os.replace) with
     ``mode`` permissions, so a crash mid-write never leaves a truncated
     config and the file is never world-readable (F5)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            "w", encoding="utf-8", dir=path.parent,
-            prefix=f".{path.name}.", suffix=".tmp", delete=False,
-        ) as handle:
-            temporary = Path(handle.name)
-            handle.write(text)
-        os.chmod(temporary, mode)
-        os.replace(temporary, path)
-        temporary = None
-        _hand_back_ownership(path)
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+    state.atomic_write(path, text, mode, on_commit=_hand_back_ownership)
 
 
 
