@@ -467,6 +467,55 @@ def _atomic_write(path: Path, text: str, mode: int = 0o600) -> None:
             temporary.unlink(missing_ok=True)
 
 
+
+def _autodetect_route_sources(routes: list[dict], providers: dict,
+                              sources: dict[str, dict]) -> dict[str, dict]:
+    """Create bounded discovery sources for routes without explicit sources."""
+    covered_routes = {
+        settings.get("route_id")
+        for settings in sources.values()
+        if isinstance(settings, dict)
+    }
+    generated = dict(sources)
+    for route in routes:
+        route_id = route.get("id")
+        provider = route.get("provider")
+        if (
+            not isinstance(route_id, str)
+            or not _PROVIDER_NAME.fullmatch(route_id)
+            or not isinstance(provider, str)
+            or provider not in providers
+            or route_id in covered_routes
+        ):
+            continue
+        roots: list[str] = []
+        seed_host: str | None = None
+        for raw_domain in route.get("domains", []):
+            if not isinstance(raw_domain, str):
+                continue
+            host = domain_autodetect.normalize_host(raw_domain.lstrip("*."))
+            if host is None:
+                continue
+            try:
+                ipaddress.ip_address(host)
+            except ValueError:
+                roots.append(host)
+                seed_host = seed_host or host
+        roots = sorted(set(roots))
+        if not roots or seed_host is None:
+            continue
+        source = f"route-{route_id}"
+        if source in generated:
+            continue
+        generated[source] = {
+            "seed": f"https://{seed_host}/",
+            "route_id": route_id,
+            "provider": provider,
+            "roots": roots,
+            "ttl_seconds": 1800,
+        }
+    return generated
+
 def _load_autodetect(data: dict, routes: list, providers: dict) -> dict:
     """Validate bounded hostname autodetection settings."""
     raw = data.get("autodetect", {}) if isinstance(data, dict) else {}
@@ -477,6 +526,9 @@ def _load_autodetect(data: dict, routes: list, providers: dict) -> dict:
     enabled = raw.get("enabled", False)
     if not isinstance(enabled, bool):
         raise ValueError("'autodetect.enabled' must be a boolean")
+    auto_sources = raw.get("auto_sources", True)
+    if not isinstance(auto_sources, bool):
+        raise ValueError("'autodetect.auto_sources' must be a boolean")
     try:
         interval = int(raw.get("interval_seconds", 300))
         timeout = int(raw.get("timeout_seconds", 12))
@@ -532,11 +584,14 @@ def _load_autodetect(data: dict, routes: list, providers: dict) -> dict:
             "roots": sorted(set(normalized_roots)),
             "ttl_seconds": ttl,
         }
+    if auto_sources:
+        cleaned_sources = _autodetect_route_sources(routes, providers, cleaned_sources)
     return {
         "enabled": enabled,
         "interval_seconds": interval,
         "timeout_seconds": timeout,
         "sources": cleaned_sources,
+        "auto_sources": auto_sources
     }
 
 
@@ -2816,6 +2871,7 @@ def autodetect_status() -> dict:
         "enabled": bool(_autodetect.get("enabled")),
         "interval_seconds": _autodetect.get("interval_seconds", 300),
         "timeout_seconds": _autodetect.get("timeout_seconds", 12),
+        "auto_sources": bool(_autodetect.get("auto_sources", True)),
         "sources": sources,
     }
 

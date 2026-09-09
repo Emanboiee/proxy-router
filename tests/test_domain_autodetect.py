@@ -157,3 +157,46 @@ def test_build_config_routes_configured_autodetect_roots(tmp_path, monkeypatch):
     finally:
         (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
          router._vpn, router._routing, router._autodetect, router._port) = old
+
+
+def test_load_autodetect_generates_sources_for_unconfigured_routes():
+    settings = router._load_autodetect(
+        {"autodetect": {"enabled": True}},
+        [
+            {"id": "school", "domains": ["twitch.tv", "ttvnw.net"], "provider": "cloudflare"},
+            {"id": "roblox", "domains": ["roblox.com", "rbxcdn.com"], "provider": "proton"},
+        ],
+        {"cloudflare": {}, "proton": {}},
+    )
+
+    assert set(settings["sources"]) == {"route-school", "route-roblox"}
+    assert settings["sources"]["route-roblox"] == {
+        "seed": "https://roblox.com/",
+        "route_id": "roblox",
+        "provider": "proton",
+        "roots": ["rbxcdn.com", "roblox.com"],
+        "ttl_seconds": 1800,
+    }
+
+
+def test_load_autodetect_explicit_source_covers_route():
+    settings = router._load_autodetect(
+        {
+            "autodetect": {
+                "enabled": True,
+                "sources": {
+                    "twitch": {
+                        "seed": "https://www.twitch.tv/",
+                        "route_id": "school",
+                        "provider": "cloudflare",
+                        "roots": ["twitch.tv", "ttvnw.net"],
+                    }
+                },
+            }
+        },
+        [{"id": "school", "domains": ["twitch.tv"], "provider": "cloudflare"}],
+        {"cloudflare": {}},
+    )
+
+    assert set(settings["sources"]) == {"twitch"}
+    assert settings["auto_sources"] is True
