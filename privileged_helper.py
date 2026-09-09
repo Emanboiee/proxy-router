@@ -1,9 +1,9 @@
 #!/usr/bin/python3
-"""Minimal root-owned lifecycle helper for proxy-router on macOS.
+"""Root-owned lifecycle helper for proxy-router on macOS and Linux.
 
 The importable validation surface is shared by the unprivileged controller and
-the installed root-owned copy. Privileged process/file operations are added in
-small, separately tested slices below this boundary.
+installed root-owned copies. Privileged process/file operations are kept behind
+this exact helper boundary and use platform-specific immutable layouts.
 """
 from __future__ import annotations
 
@@ -34,6 +34,18 @@ MAX_CONFIG_BYTES = 4 * 1024 * 1024
 MAX_RELEASE_ARCHIVE_BYTES = 100 * 1024 * 1024
 MAX_RELEASE_BINARY_BYTES = 80 * 1024 * 1024
 HELPER_OPERATIONS = frozenset({"status", "start", "stop", "reload", "uninstall"})
+
+if sys.platform.startswith("linux"):
+    DEFAULT_STATE_BASE = Path("/var/lib/proxy-router")
+    DEFAULT_HELPER_BASE = Path("/usr/local/libexec/proxy-router")
+    DEFAULT_VERSIONS_DIR = DEFAULT_HELPER_BASE / "versions"
+    DEFAULT_SUDOERS_FILE = Path("/etc/sudoers.d/91-proxy-router")
+else:
+    DEFAULT_STATE_BASE = Path("/private/var/db/proxy-router")
+    DEFAULT_HELPER_BASE = Path("/Library/PrivilegedHelperTools/com.proxy-router")
+    DEFAULT_VERSIONS_DIR = DEFAULT_HELPER_BASE / "versions"
+    DEFAULT_SUDOERS_FILE = Path("/private/etc/sudoers.d/91-proxy-router")
+
 _LIFECYCLE_LOCKS: dict[str, threading.RLock] = {}
 _LIFECYCLE_LOCKS_GUARD = threading.Lock()
 _LIFECYCLE_LOCAL = threading.local()
@@ -160,31 +172,62 @@ def release_for_architecture(
     *,
     owner_uid: int,
     anchor: Path,
+    platform_name: str = "darwin",
 ) -> dict:
-    """Load one exact reviewed sing-box release entry."""
+    """Load one exact reviewed sing-box release entry for a platform."""
     verify_secure_chain(manifest_path, owner_uid=owner_uid, anchor=anchor)
     try:
         value = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise SecurityError(f"cannot load sing-box release manifest: {exc}") from exc
-    value = _exact_object(value, {"schema_version", "release", "architectures"}, set(), "manifest")
+    value = _exact_object(
+        value,
+        {"schema_version", "release", "architectures"},
+        {"platforms"},
+        "manifest",
+    )
     if value["schema_version"] != 1:
         raise SecurityError("unsupported sing-box release manifest version")
     release = _exact_object(value["release"], {"version", "tag"}, set(), "manifest release")
     if not isinstance(release["version"], str) or release["tag"] != "v" + release["version"]:
         raise SecurityError("sing-box manifest release identity is invalid")
-    architectures = value["architectures"]
-    if not isinstance(architectures, dict) or set(architectures) != {"arm64", "x86_64"}:
-        raise SecurityError("sing-box manifest architectures must be exactly arm64 and x86_64")
+
+    darwin_architectures = value["architectures"]
+    if not isinstance(darwin_architectures, dict) or set(darwin_architectures) != {"arm64", "x86_64"}:
+        raise SecurityError("sing-box Darwin architectures must be exactly arm64 and x86_64")
+
+    platform_name = str(platform_name)
+    if platform_name == "darwin":
+        architectures = darwin_architectures
+        expected_architectures = {"arm64", "x86_64"}
+        expected_platform = "darwin"
+    elif platform_name.startswith("linux"):
+        platforms = value.get("platforms")
+        if not isinstance(platforms, dict) or set(platforms) != {"linux"}:
+            raise SecurityError("sing-box Linux platform manifest is missing or has unknown platforms")
+        linux = _exact_object(platforms["linux"], {"architectures"}, set(), "manifest Linux platform")
+        architectures = linux["architectures"]
+        expected_architectures = {"x86_64"}
+        expected_platform = "linux"
+    else:
+        raise SecurityError(f"unsupported sing-box platform: {platform_name}")
+
+    if not isinstance(architectures, dict) or set(architectures) != expected_architectures:
+        raise SecurityError(
+            f"sing-box {expected_platform} architectures must be exactly "
+            + " and ".join(sorted(expected_architectures))
+        )
     if architecture not in architectures:
-        raise SecurityError(f"unsupported macOS architecture: {architecture}")
+        raise SecurityError(
+            f"unsupported {expected_platform} architecture: {architecture}"
+        )
     entry = _exact_object(
         architectures[architecture],
         {"name", "url", "size", "sha256", "archive_root"},
         set(),
         "manifest architecture",
     )
-    expected_prefix = f"sing-box-{release['version']}-darwin-"
+    expected_prefix = f"sing-box-{release['version']}-{expected_platform}-"
     if (
         not isinstance(entry["name"], str)
         or not entry["name"].startswith(expected_prefix)
@@ -288,8 +331,8 @@ class RuntimeMetadata:
 def load_installed_runtime(
     uid: int,
     *,
-    state_base: Path = Path("/private/var/db/proxy-router"),
-    versions_dir: Path = Path("/Library/PrivilegedHelperTools/com.proxy-router/versions"),
+    state_base: Path = DEFAULT_STATE_BASE,
+    versions_dir: Path = DEFAULT_VERSIONS_DIR,
     root_uid: int = 0,
     root_gid: int = 0,
 ) -> tuple[InstallMetadata, RuntimeMetadata]:
@@ -769,9 +812,11 @@ def _promote_runtime_candidate(metadata: RuntimeMetadata) -> None:
 
 
 def _open_user_log(metadata: InstallMetadata) -> int:
+    """Open the private logs/sing-box.log inode without following user-controlled links."""
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
     log_flags = os.O_WRONLY | os.O_APPEND | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
     root_fd = os.open(metadata.user_root, directory_flags)
+    logs_fd = None
     try:
         root_info = os.fstat(root_fd)
         if (
@@ -782,44 +827,80 @@ def _open_user_log(metadata: InstallMetadata) -> int:
             or root_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
         ):
             raise SecurityError("pinned user root identity changed before log open")
-        created = False
+        created_dir = False
         try:
-            fd = os.open("sing-box.log", log_flags, dir_fd=root_fd)
+            logs_fd = os.open("logs", directory_flags, dir_fd=root_fd)
         except FileNotFoundError:
             try:
-                fd = os.open(
-                    "sing-box.log",
-                    log_flags | os.O_CREAT | os.O_EXCL,
-                    0o600,
-                    dir_fd=root_fd,
-                )
-                created = True
+                os.mkdir("logs", 0o700, dir_fd=root_fd)
+                created_dir = True
+            except FileExistsError:
+                pass
+            try:
+                logs_fd = os.open("logs", directory_flags, dir_fd=root_fd)
             except OSError as exc:
-                raise SecurityError(f"cannot create user log safely: {exc}") from exc
+                raise SecurityError(f"cannot open user log directory safely: {exc}") from exc
         except OSError as exc:
-            raise SecurityError(f"cannot open user log safely: {exc}") from exc
+            raise SecurityError(f"cannot open user log directory safely: {exc}") from exc
+        logs_info = os.fstat(logs_fd)
+        if not stat.S_ISDIR(logs_info.st_mode):
+            raise SecurityError("user log directory must be a directory")
+        if created_dir:
+            if logs_info.st_uid != os.geteuid():
+                raise SecurityError("new user log directory has an unexpected owner")
+            os.fchown(logs_fd, metadata.uid, metadata.gid)
+            os.fchmod(logs_fd, 0o700)
+        elif (
+            logs_info.st_uid != metadata.uid
+            or logs_info.st_gid != metadata.gid
+            or stat.S_IMODE(logs_info.st_mode) != 0o700
+        ):
+            raise SecurityError("existing user log directory owner/mode is unsafe")
+        created = False
         try:
-            info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-                raise SecurityError("user log must be one unlinked regular inode")
-            if created:
-                if info.st_uid != os.geteuid():
-                    raise SecurityError("new user log has an unexpected owner")
-                os.fchown(fd, metadata.uid, metadata.gid)
-                os.fchmod(fd, 0o600)
-            elif (
-                info.st_uid != metadata.uid
-                or info.st_gid != metadata.gid
-                or stat.S_IMODE(info.st_mode) != 0o600
-            ):
-                raise SecurityError("existing user log owner/mode is unsafe")
-            current_flags = fcntl.fcntl(fd, fcntl.F_GETFL)
-            fcntl.fcntl(fd, fcntl.F_SETFL, current_flags & ~os.O_NONBLOCK)
-            return fd
-        except BaseException:
-            os.close(fd)
-            raise
+            try:
+                fd = os.open("sing-box.log", log_flags, dir_fd=logs_fd)
+            except FileNotFoundError:
+                try:
+                    fd = os.open(
+                        "sing-box.log",
+                        log_flags | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                        dir_fd=logs_fd,
+                    )
+                    created = True
+                except OSError as exc:
+                    raise SecurityError(f"cannot create user log safely: {exc}") from exc
+            except OSError as exc:
+                raise SecurityError(f"cannot open user log safely: {exc}") from exc
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise SecurityError("user log must be one unlinked regular inode")
+                if created:
+                    if info.st_uid != os.geteuid():
+                        raise SecurityError("new user log has an unexpected owner")
+                    os.fchown(fd, metadata.uid, metadata.gid)
+                    os.fchmod(fd, 0o600)
+                elif (
+                    info.st_uid != metadata.uid
+                    or info.st_gid != metadata.gid
+                    or stat.S_IMODE(info.st_mode) != 0o600
+                ):
+                    raise SecurityError("existing user log owner/mode is unsafe")
+                current_flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+                fcntl.fcntl(fd, fcntl.F_SETFL, current_flags & ~os.O_NONBLOCK)
+                return fd
+            except BaseException:
+                os.close(fd)
+                raise
+        finally:
+            if logs_fd is not None:
+                os.close(logs_fd)
+                logs_fd = None
     finally:
+        if logs_fd is not None:
+            os.close(logs_fd)
         os.close(root_fd)
 
 
@@ -1392,8 +1473,8 @@ def uninstall_helper(
     install: InstallMetadata,
     runtime: RuntimeMetadata,
     *,
-    helper_base: Path = Path("/Library/PrivilegedHelperTools/com.proxy-router"),
-    sudoers_file: Path = Path("/private/etc/sudoers.d/91-proxy-router"),
+    helper_base: Path = DEFAULT_HELPER_BASE,
+    sudoers_file: Path = DEFAULT_SUDOERS_FILE,
     stopper=stop_engine,
     visudo=subprocess.run,
 ) -> dict:

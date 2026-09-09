@@ -22,7 +22,11 @@
 # seconds, so a broken pool cannot storm. A boot self-test runs once on the
 # first successful ensure (one early rotation in proxy mode, same storm
 # guard). TUN mode still permits read-only checks, but never performs an
-# automatic profile or fallback change.
+# automatic profile or fallback change. A single-profile pool with no viable
+# rotation candidate parks once on its configured fallback and stays sticky
+# (restore rides the sweep cadence); base-route gaps ("missing default
+# interface", "no route to internet", "WireGuard is not ready") defer
+# without consuming strike/rotation budget.
 #
 # Scheduled rotation: when router.json has a "rotation" block, the loop also
 # calls `router.py rotate --if-due` on every healthy tick in proxy mode - the
@@ -48,6 +52,12 @@
 # state, not an engine failure; the tunnel stays down until `router.py start`
 # clears the marker. The agent polls only its own enabled flag while quiescent.
 #
+# Network-loss guard: on macOS the loop checks the active Wi-Fi SSID before
+# supervision. After NETWORK_GRACE consecutive misses it disables the system
+# proxy and stops sing-box, then reconnects only after the SSID returns. The
+# network-off latch is separate from manual-off, so an operator disconnect still
+# remains quiescent and never gets auto-resurrected.
+#
 # Runtime reconfiguration: the enabled flag is re-read from router.json on
 # every tick (env override wins), so `keepalive.enabled: false` stops the
 # agent without a launchctl reload, and true resumes it.
@@ -60,6 +70,8 @@
 #   PROXY_KEEPALIVE_STORM_WINDOW   rotation-guard window in seconds    (600)
 #   PROXY_KEEPALIVE_MAX_ROTATIONS  max keepalive rotations per window  (2)
 #   PROXY_KEEPALIVE_SWEEP_EVERY    full-pool egress sweep every N seconds (1800)
+#   PROXY_KEEPALIVE_NETWORK_GRACE consecutive Wi-Fi misses before stop (1)
+#   PROXY_KEEPALIVE_WAKE_GAP       sleep/wake gap forcing recovery (2x interval)
 #   PROXY_KEEPALIVE_ENABLED        temporary on/off override               (config)
 set -uo pipefail
 
@@ -136,6 +148,84 @@ PY
   fi
 }
 
+# Read one validated top-level autodetection setting. Environment overrides
+# remain available for temporary operator changes without rewriting config.
+autodetect_setting() {
+  if [ -n "${PROXY_ROUTER_PYTHON:-}" ]; then
+    "$PROXY_ROUTER_PYTHON" - "$ROOT/router.json" "$1" "$2" <<'PY' 2>/dev/null || printf '%s\n' "$2"
+import json
+import sys
+
+path, key, default = sys.argv[1:]
+try:
+    data = json.loads(open(path, encoding="utf-8").read())
+    value = (data.get("autodetect") or {}).get(key, default)
+    if key == "enabled":
+        print("1" if value not in (False, 0, "0", "false", "off") else "0")
+    else:
+        value = int(value)
+        if value < 30:
+            raise ValueError
+        print(value)
+except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    raise SystemExit(1)
+PY
+  else
+    python3 - "$ROOT/router.json" "$1" "$2" <<'PY' 2>/dev/null || printf '%s\n' "$2"
+import json
+import sys
+
+path, key, default = sys.argv[1:]
+try:
+    data = json.loads(open(path, encoding="utf-8").read())
+    value = (data.get("autodetect") or {}).get(key, default)
+    if key == "enabled":
+        print("1" if value not in (False, 0, "0", "false", "off") else "0")
+    else:
+        value = int(value)
+        if value < 30:
+            raise ValueError
+        print(value)
+except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    raise SystemExit(1)
+PY
+  fi
+}
+
+
+# Return every explicit and generated autodetection source for periodic refresh.
+autodetect_sources() {
+  python_runner - "$ROOT/router.json" <<'PY' 2>/dev/null
+import json
+import pathlib
+import sys
+
+try:
+    config_path = pathlib.Path(sys.argv[1]).resolve()
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    autodetect = data.get("autodetect") or {}
+    if not autodetect.get("enabled", False):
+        raise SystemExit(0)
+    try:
+        sys.path.insert(0, str(config_path.parent))
+        import router
+
+        routes = data.get("routes") or []
+        providers = data.get("providers") or {}
+        settings = router._load_autodetect(data, routes, providers)
+        for source in sorted(settings["sources"]):
+            print(source)
+    except (OSError, TypeError, ValueError, ImportError, AttributeError):
+        sources = autodetect.get("sources") or {}
+        if not isinstance(sources, dict):
+            raise
+        for source in sorted(source for source in sources if isinstance(source, str) and source):
+            print(source)
+except (OSError, TypeError, ValueError, json.JSONDecodeError, ImportError, AttributeError):
+    raise SystemExit(1)
+PY
+}
+
 ENABLED="${PROXY_KEEPALIVE_ENABLED:-$(config_setting enabled 1)}"
 case "$ENABLED" in
   0|false|False|off|OFF)
@@ -150,6 +240,14 @@ DEAD_STRIKES="${PROXY_KEEPALIVE_DEAD_STRIKES:-$(config_setting dead_strikes 2)}"
 STORM_WINDOW="${PROXY_KEEPALIVE_STORM_WINDOW:-$(config_setting storm_window 600)}"
 MAX_ROTATIONS="${PROXY_KEEPALIVE_MAX_ROTATIONS:-$(config_setting max_rotations 2)}"
 SWEEP_EVERY="${PROXY_KEEPALIVE_SWEEP_EVERY:-$(config_setting sweep_every 1800)}"
+NETWORK_GRACE="${PROXY_KEEPALIVE_NETWORK_GRACE:-$(config_setting network_grace 1)}"
+AUTODETECT_ENABLED="${PROXY_AUTODETECT_ENABLED:-$(autodetect_setting enabled 0)}"
+AUTODETECT_INTERVAL="${PROXY_AUTODETECT_INTERVAL:-$(autodetect_setting interval_seconds 300)}"
+WAKE_GAP="${PROXY_KEEPALIVE_WAKE_GAP:-$((INTERVAL * 2))}"
+case "$WAKE_GAP" in
+  ''|*[!0-9]*) WAKE_GAP=$((INTERVAL * 2)) ;;
+esac
+((WAKE_GAP < 1)) && WAKE_GAP=1
 
 backoff="$INTERVAL"
 boot=1
@@ -158,6 +256,10 @@ strikes=0
 rotations=0
 window_start=0
 last_sweep=0
+last_autodetect=0
+network_lost=0
+network_quiet=0
+last_tick=0
 
 # Allow at most MAX_ROTATIONS keepalive rotations per STORM_WINDOW seconds.
 rotation_allowed() {
@@ -217,13 +319,147 @@ PY
   return 0
 }
 
+# LIFECYCLE-HELPERS-START (extracted verbatim by lifecycle unit tests; keep
+# these functions side-effect free and free of top-level state).
+# Base-route / network-loss signals are a deferral, never rotation budget:
+# reloading the engine while the base route is gone only produces "missing
+# default interface" / "no route to internet" / "WireGuard is not ready"
+# noise and drops long-lived flows (Discord). Case-insensitive.
+is_network_gap() {
+  printf '%s' "${1:-}" | grep -iq -e 'missing default' -e 'no route to' -e 'wireguard is not ready' -e 'no default route' -e 'network unreachable' -e 'network is down' -e 'no internet' -e 'tunnel is down' -e 'engine not listening'
+}
+
+# Lowercase + trim + strip brackets/quotes/parens, for inactive-marker
+# comparison only (provider-name spelling is preserved by
+# fallback_active_name).
+normalize_fallback_token() {
+  printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | tr -d "[]()\"'" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+# True (0) for inactive markers: empty, none, no, false, 0, off, null,
+# nil, -, n/a, na, [], etc. Anything else is a candidate name. Never
+# mistakes an inactive marker for an active fallback.
+fallback_value_is_inactive() {
+  _fvi_stripped=$(printf '%s' "${1:-}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+  case "$_fvi_stripped" in
+    ""|"[]"|"["|"]") return 0 ;;
+  esac
+  _fvi_norm=$(normalize_fallback_token "${1:-}")
+  case "$_fvi_norm" in
+    ""|none|no|n|false|0|off|null|nil|-|n/a|na) return 0 ;;
+  esac
+  return 1
+}
+
+# True (0) when the raw configured value names at least one candidate:
+# plain names, comma lists, and Python list reprs (['proton'],
+# ["proton", "direct"]). Inactive markers and empty lists do not count.
+fallback_configured_has_candidate() {
+  _fcc_cleaned=$(printf '%s' "${1:-}" | tr ',;' ' ' | tr -d "[]()\"'")
+  for _fcc_tok in $_fcc_cleaned; do
+    if fallback_value_is_inactive "$_fcc_tok"; then
+      continue
+    fi
+    case "$_fcc_tok" in
+      *[!A-Za-z0-9._-]* ) continue ;;
+      *) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# Echo the active fallback provider name, or nothing when the raw value is
+# an inactive marker. Lenient toward sticky (first valid token wins) so a
+# malformed status line can never trigger a reload storm; a status that
+# reads inactive simply retries within the storm guard.
+fallback_active_name() {
+  _fan_cleaned=$(printf '%s' "${1:-}" | tr ',;' ' ' | tr -d "[]()\"'")
+  for _fan_tok in $_fan_cleaned; do
+    _fan_trimmed=$(printf '%s' "$_fan_tok" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    [ -n "$_fan_trimmed" ] || continue
+    if fallback_value_is_inactive "$_fan_trimmed"; then
+      continue
+    fi
+    case "$_fan_trimmed" in
+      *[!A-Za-z0-9._-]* ) continue ;;
+      *) printf '%s\n' "$_fan_trimmed"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# Split `failover status` text into FB_CONFIGURED / FB_ACTIVE globals.
+# Handles extra whitespace, any-case keys, and list-valued configured
+# fields containing spaces. Returns 1 when no configured field is found.
+fallback_split_status_text() {
+  _fst_line=$(printf '%s\n' "${1:-}" | grep -i 'configured[[:space:]]*=' | tail -n 1)
+  [ -n "$_fst_line" ] || return 1
+  _fst_rest=$(printf '%s\n' "$_fst_line" | sed -n 's/.*[Cc][Oo][Nn][Ff][Ii][Gg][Uu][Rr][Ee][Dd][[:space:]]*=[[:space:]]*//p')
+  [ -n "$_fst_rest" ] || return 1
+  if printf '%s\n' "$_fst_rest" | grep -iq '[[:space:]]active[[:space:]]*='; then
+    FB_ACTIVE=$(printf '%s\n' "$_fst_rest" | sed -n 's/.*[[:space:]][Aa][Cc][Tt][Ii][Vv][Ee][[:space:]]*=[[:space:]]*//p' | sed -e 's/[[:space:]]*$//')
+    FB_CONFIGURED=$(printf '%s\n' "$_fst_rest" | sed 's/[[:space:]][Aa][Cc][Tt][Ii][Vv][Ee][[:space:]]*=[[:space:]]*.*$//' | sed -e 's/[[:space:]]*$//')
+  else
+    FB_CONFIGURED=$(printf '%s' "$_fst_rest" | sed -e 's/[[:space:]]*$//')
+    FB_ACTIVE=""
+  fi
+  return 0
+}
+
+# Set FB_CONFIGURED / FB_ACTIVE for a provider. Prefers `status --json`
+# (list-safe); falls back to text parsing. Returns 1 when unavailable.
+get_fallback_state() {
+  FB_CONFIGURED=""; FB_ACTIVE=""
+  _gfs_provider="$1"
+  if _gfs_json=$(controller failover "$_gfs_provider" status --json 2>/dev/null); then
+    if _gfs_parsed=$(python_runner - "$_gfs_json" 2>/dev/null <<'PY'
+import json
+import sys
+
+try:
+    data = json.loads(sys.argv[1])
+except Exception:
+    raise SystemExit(1)
+if not isinstance(data, dict):
+    raise SystemExit(1)
+conf = data.get("configured", "")
+if isinstance(conf, list):
+    conf = ",".join(str(x) for x in conf)
+elif conf is None:
+    conf = ""
+else:
+    conf = str(conf)
+act = data.get("active", "")
+if act is None:
+    act = ""
+else:
+    act = str(act)
+print(conf)
+print(act)
+PY
+); then
+      FB_CONFIGURED=$(printf '%s\n' "$_gfs_parsed" | sed -n '1p')
+      FB_ACTIVE=$(printf '%s\n' "$_gfs_parsed" | sed -n '2p')
+      return 0
+    fi
+  fi
+  _gfs_state=$(controller failover "$_gfs_provider" status 2>/dev/null || true)
+  [ -n "$_gfs_state" ] || return 1
+  fallback_split_status_text "$_gfs_state"
+}
+# LIFECYCLE-HELPERS-END
+
 # One bounded auto-rotation for the provider `egress check` reported dead in
 # proxy mode. TUN mode only reports the dead path; it does not reload the
 # shared engine automatically.
 # `egress check` prints "dead: <provider>" as its last stdout line (and exits
 # 1) when an active exit is dead; without that line nothing is rotated.
+# Single-profile pools with a configured fallback park once and stay sticky;
+# base-route gaps defer without budget. $2 carries the full egress output
+# for gap detection.
 rotate_dead() {
   provider="$1"
+  egress_out="${2:-}"
   if is_tun_mode; then
     echo "router: automatic dead-exit rotation skipped in TUN mode" >&2
     strikes=0
@@ -236,6 +472,24 @@ rotate_dead() {
     echo "router: egress check dead but no provider identified; skipping rotation" >&2
     strikes=0
     return
+  fi
+  # Base-route gap: defer without consuming strike/rotation budget.
+  if [ -n "$egress_out" ] && is_network_gap "$egress_out"; then
+    echo "router: network gap detected for '$provider'; deferring rotation (no budget consumed)" >&2
+    strikes=0
+    return
+  fi
+  # If the egress checker already identifies a fallback path, do not spend
+  # a rotation/status round-trip on the parked primary. This keeps normal
+  # non-fallback rotation cadence unchanged while making the sticky path
+  # completely quiet.
+  if printf '%s\n' "$egress_out" | grep -Eiq 'fallback[[:space:]]*\('; then
+    parked=$(printf '%s\n' "$egress_out" | sed -n 's/.*fallback[[:space:]]*(\([^)]*\)).*/\1/p' | tail -n 1)
+    if [ -n "$parked" ]; then
+      echo "router: fallback '$parked' already active for '$provider'; staying parked (no rotation)" >&2
+      strikes=0
+      return
+    fi
   fi
   if ! rotation_allowed; then
     echo "router: rotation skipped (storm guard: $rotations rotations in the last ${STORM_WINDOW}s)" >&2
@@ -256,27 +510,24 @@ rotate_dead() {
       return
     fi
     echo "router: rotate '$provider' failed; checking configured fallback" >&2
-    fallback_state=$(controller failover "$provider" status 2>/dev/null || true)
-    configured_fallback=$(printf '%s\n' "$fallback_state" | sed -n 's/.* configured=\([^ ]*\).*/\1/p')
-    active_fallback=$(printf '%s\n' "$fallback_state" | sed -n 's/.* active=\([^ ]*\).*/\1/p')
-    case "$active_fallback" in
-      ""|none|no|false|0|off|OFF)
-        ;;
-      *)
-        echo "router: fallback '$active_fallback' already active; waiting for the next dead check" >&2
-        return
-        ;;
-    esac
-    case "$configured_fallback" in
-      ""|none|no|false|0|off|OFF)
-        echo "router: no configured fallback for '$provider'; backing off" >&2
-        return
-        ;;
-    esac
+    if ! get_fallback_state "$provider"; then
+      echo "router: fallback status unavailable for '$provider'; backing off" >&2
+      return
+    fi
+    parked=$(fallback_active_name "$FB_ACTIVE" || true)
+    if [ -n "$parked" ]; then
+      echo "router: fallback '$parked' already active for '$provider'; staying parked (no rotation)" >&2
+      return
+    fi
+    if ! fallback_configured_has_candidate "$FB_CONFIGURED"; then
+      echo "router: no configured fallback for '$provider'; backing off" >&2
+      return
+    fi
     if ! controller failover "$provider" on --reason timeout --automatic >/dev/null 2>&1; then
       echo "router: fallback for '$provider' failed; will retry after the next dead check" >&2
       return
     fi
+    echo "router: parked '$provider' on fallback (sticky; restore rides the sweep cadence)" >&2
   fi
 }
 
@@ -305,10 +556,22 @@ restore_fallbacks() {
 }
 
 while true; do
+  tick_now=$(date +%s 2>/dev/null || echo 0)
+  case "$tick_now" in ''|*[!0-9]*) tick_now=0 ;; esac
+  wake_detected=0
+  wake_elapsed=0
+  if [ "$last_tick" -gt 0 ] && [ "$tick_now" -ge "$last_tick" ] \
+     && [ $((tick_now - last_tick)) -ge "$WAKE_GAP" ]; then
+    wake_detected=1
+    wake_elapsed=$((tick_now - last_tick))
+  fi
+  last_tick="$tick_now"
   # Re-read the enabled flag every tick so a runtime config flip takes effect
   # without waiting for an agent restart (env override still wins for
   # temporary ops changes).
   ENABLED="${PROXY_KEEPALIVE_ENABLED:-$(config_setting enabled 1)}"
+  AUTODETECT_ENABLED="${PROXY_AUTODETECT_ENABLED:-$(autodetect_setting enabled 0)}"
+  AUTODETECT_INTERVAL="${PROXY_AUTODETECT_INTERVAL:-$(autodetect_setting interval_seconds 300)}"
   case "$ENABLED" in
     0|false|False|off|OFF)
       echo "$(date '+%Y-%m-%d %H:%M:%S') router: autocheck disabled by config; exiting" >&2
@@ -330,6 +593,62 @@ while true; do
     continue
   fi
   manual_quiet=0
+  if [ "$wake_detected" -eq 1 ]; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') router: wake gap detected (${wake_elapsed}s); forcing network recovery" >&2
+    if controller network-status >/dev/null 2>&1; then
+      if controller network-disconnect >/dev/null 2>&1 \
+         && controller network-reconnect >/dev/null 2>&1; then
+        network_lost=0
+        network_quiet=0
+        boot=1
+        checks=0
+        strikes=0
+        backoff="$INTERVAL"
+      else
+        echo "$(date '+%Y-%m-%d %H:%M:%S') router: wake recovery failed; retrying" >&2
+        network_quiet=1
+        backoff="$INTERVAL"
+        sleep "$backoff"
+        continue
+      fi
+    fi
+  fi
+  # Network guard runs before ensure so a stale proxy cannot strand browsers
+  # while Wi-Fi is off. `network-status` is read-only; the controller commands
+  # own the durable marker and the teardown/reconnect transaction.
+  if controller network-status >/dev/null 2>&1; then
+    network_lost=0
+    if [ -f "$ROOT/state/network-off" ]; then
+      if controller network-reconnect >/dev/null 2>&1; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') router: Wi-Fi returned; supervision resumed" >&2
+        network_quiet=0
+        boot=1
+        checks=0
+        strikes=0
+        backoff="$INTERVAL"
+      else
+        echo "$(date '+%Y-%m-%d %H:%M:%S') router: Wi-Fi returned but reconnect failed; retrying" >&2
+        backoff="$INTERVAL"
+        sleep "$backoff"
+        continue
+      fi
+    fi
+  else
+    network_lost=$((network_lost + 1))
+    if [ "$network_lost" -ge "$NETWORK_GRACE" ]; then
+      if controller network-disconnect >/dev/null 2>&1; then
+        if [ "$network_quiet" -ne 1 ]; then
+          echo "$(date '+%Y-%m-%d %H:%M:%S') router: Wi-Fi unavailable; proxy-router disconnected" >&2
+        fi
+      elif [ "$network_quiet" -ne 1 ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') router: Wi-Fi unavailable; disconnect retry pending" >&2
+      fi
+      network_quiet=1
+    fi
+    backoff="$INTERVAL"
+    sleep "$backoff"
+    continue
+  fi
   if ensure_out=$(controller ensure 2>&1); then
     if [ "$backoff" -ne "$INTERVAL" ]; then
       echo "$(date '+%Y-%m-%d %H:%M:%S') router: ensure ok; backoff reset to ${INTERVAL}s" >&2
@@ -342,9 +661,12 @@ while true; do
       # healthy one is logged and the normal loop continues.
       if out=$(controller egress check 2>&1); then
         echo "router: boot self-test ok"
+      elif is_network_gap "$out"; then
+        echo "router: boot self-test: network gap detected - deferring rotation ($(printf '%s\n' "$out" | tail -n 1))" >&2
+        strikes=0
       else
         echo "router: boot self-test: active tunnel is dead - rotating once ($(printf '%s\n' "$out" | tail -n 1))" >&2
-        rotate_dead "$(printf '%s\n' "$out" | sed -n 's/^dead: //p')"
+        rotate_dead "$(printf '%s\n' "$out" | sed -n 's/^dead: //p')" "$out"
       fi
     else
       checks=$((checks + 1))
@@ -352,11 +674,14 @@ while true; do
         checks=0
         if out=$(controller egress check 2>&1); then
           strikes=0
+        elif is_network_gap "$out"; then
+          echo "router: egress check: network gap detected - deferring (no strike, no rotation): $(printf '%s\n' "$out" | tail -n 1)" >&2
+          strikes=0
         else
           strikes=$((strikes + 1))
           echo "router: egress check: dead exit ($strikes/$DEAD_STRIKES strikes): $(printf '%s\n' "$out" | tail -n 1)" >&2
           if [ "$strikes" -ge "$DEAD_STRIKES" ]; then
-            rotate_dead "$(printf '%s\n' "$out" | sed -n 's/^dead: //p')"
+            rotate_dead "$(printf '%s\n' "$out" | sed -n 's/^dead: //p')" "$out"
           fi
         fi
       fi
@@ -368,6 +693,20 @@ while true; do
           echo "router: scheduled rotation: rotated provider(s)" >&2
         fi
       fi
+    fi
+    autodetect_now=$(date +%s)
+    if [ "$AUTODETECT_ENABLED" != "0" ] && ! is_tun_mode \
+       && { [ "$last_autodetect" -eq 0 ] || [ $((autodetect_now - last_autodetect)) -ge "$AUTODETECT_INTERVAL" ]; }; then
+      sources=$(autodetect_sources 2>/dev/null || printf '%s\n' twitch)
+      while IFS= read -r source; do
+        [ -n "$source" ] || continue
+        if controller autodetect "$source" --quiet; then
+          :
+        else
+          echo "router: autodetect $source failed; keeping existing learned routes" >&2
+        fi
+      done <<< "$sources"
+      last_autodetect="$autodetect_now"
     fi
     # Time-based full-pool sweep: on the first successful ensure, and every
     # SWEEP_EVERY seconds after, probe EVERY profile of every provider and

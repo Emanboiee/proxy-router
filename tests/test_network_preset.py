@@ -153,6 +153,80 @@ def test_cmd_network_check_returns_zero_on_apply(tmp_path, capsys):
     assert payload["applied"] is True
 
 
+def test_network_status_reports_wifi_state(tmp_path):
+    router = load_router(tmp_path)
+    with mock.patch.object(router.sys, "platform", "darwin"), \
+         mock.patch.object(router, "current_ssid", return_value="SchoolWiFi"):
+        assert router.network_status()["connected"] is True
+    with mock.patch.object(router.sys, "platform", "darwin"), \
+         mock.patch.object(router, "current_ssid", return_value=None):
+        result = router.network_status()
+    assert result["connected"] is False
+    assert result["supported"] is True
+
+
+def test_network_disconnect_latches_and_tears_down_without_manual_off(tmp_path):
+    router = load_router(tmp_path)
+    router.MANUAL_OFF_FILE = tmp_path / "state" / "manual-off"
+    with (
+        mock.patch.object(router.sys, "platform", "darwin"),
+        mock.patch.object(router, "route_watcher_stop"),
+        mock.patch.object(router, "system_proxy_off", return_value=0),
+        mock.patch.object(router, "_with_lock", return_value=0) as locked,
+    ):
+        assert router.cmd_network_disconnect() == 0
+    assert router.network_off_marker().is_file()
+    assert not router.MANUAL_OFF_FILE.exists()
+    locked.assert_called_once()
+
+
+def test_network_reconnect_clears_latch_after_engine_and_proxy_are_ready(tmp_path):
+    router = load_router(tmp_path)
+    router.MANUAL_OFF_FILE = tmp_path / "state" / "manual-off"
+    marker = router.network_off_marker()
+    marker.parent.mkdir(parents=True)
+    marker.write_text("network unavailable\\n")
+    with (
+        mock.patch.object(router.sys, "platform", "darwin"),
+        mock.patch.object(router, "current_ssid", return_value="HomeWiFi"),
+        mock.patch.object(router, "load_config", return_value=0),
+        mock.patch.object(router, "_with_lock", return_value=0) as locked,
+        mock.patch.object(router, "route_watcher_start"),
+        mock.patch.object(router, "system_proxy_on", return_value=0),
+    ):
+        assert router.cmd_network_reconnect() == 0
+    assert not marker.exists()
+    locked.assert_called_once()
+
+
+def test_engine_ensure_stays_quiescent_while_network_latch_exists(tmp_path):
+    router = load_router(tmp_path)
+    router.MANUAL_OFF_FILE = tmp_path / "state" / "manual-off"
+    router.network_off_marker().parent.mkdir(parents=True)
+    router.network_off_marker().write_text("network unavailable\\n")
+    assert router.engine_ensure() == 3
+
+
+def test_cmd_network_check_serializes_preset_reload_under_engine_lock(tmp_path, capsys):
+    router = load_router(tmp_path)
+    _write_config(tmp_path, preset="default")
+    calls = []
+
+    def fake_lock(action):
+        calls.append(action)
+        return action()
+
+    with (
+        mock.patch.object(router, "_with_lock", side_effect=fake_lock),
+        mock.patch.object(router, "apply_network_preset", return_value={
+            "applied": False, "reason": "no network mapping", "checked_at": 1,
+        }),
+    ):
+        assert router.cmd_network_check() == 0
+    assert len(calls) == 1
+    json.loads(capsys.readouterr().out)
+
+
 class _SubprocessRun:
     """Simplest possible fake runner for route_watcher._network_check_hop."""
 

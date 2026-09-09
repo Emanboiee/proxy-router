@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 ROOT = Path(os.environ.get("PROXY_ROUTER_ROOT") or Path(__file__).resolve().parent).resolve()
-LOG_FILE_NAME = "sing-box.log"
+LOG_FILE_NAME = "logs/sing-box.log"
 STATE_DIR_NAME = "state/route-watcher"
 PID_NAME = "pid"
 ENABLED_NAME = "enabled"
@@ -42,6 +42,7 @@ CLIENT_SNAPSHOT_EVERY_SECONDS = 5.0
 FAILURE_WINDOW_SECONDS = 60.0
 MIN_TRANSPORT_FAILURES = 2
 ROTATE_COOLDOWN_SECONDS = 120.0
+RESTORE_COOLDOWN_SECONDS = 300.0
 NETWORK_CHECK_EVERY_SECONDS = 30.0
 EVENT_MAX_LINES = 5000
 EVENT_MAX_BYTES = 2_000_000
@@ -57,6 +58,7 @@ FAILURE_RE = re.compile(
     r"tls|ssl|eof|network is unreachable|no route to host|i/o timeout)\b",
     re.IGNORECASE,
 )
+_CONTEXT_CANCEL_RE = re.compile(r"\bcontext\s+cancel(?:ed|led)\b", re.IGNORECASE)
 
 
 def state_dir(root: Path | None = None) -> Path:
@@ -97,11 +99,32 @@ PROVIDER_RE = re.compile(
     r"(?:endpoint|using outbound)/wireguard\[(?P<provider>[A-Za-z0-9_.-]{1,64})\]",
     re.IGNORECASE,
 )
+PROVIDER_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 
 
 def _provider_from_line(line: str) -> str | None:
     match = PROVIDER_RE.search(line)
     return match.group("provider") if match else None
+
+
+def _transport_failure_kind(line: str) -> str | None:
+    """Classify a sing-box open-connection error without trusting a client abort.
+
+    ``context canceled`` is emitted when an upstream attempt is torn down, but
+    it can also follow a caller abandoning a request.  The worker therefore
+    treats this kind as a candidate and confirms the exact target separately
+    before rotating; ordinary transport errors retain the existing path.
+    """
+    lowered = line.lower()
+    if "open connection to" not in lowered:
+        return None
+    if _CONTEXT_CANCEL_RE.search(line):
+        if not re.search(r"\b(?:error|fatal)\b", line, re.IGNORECASE):
+            return None
+        return "context-canceled"
+    if FAILURE_RE.search(line):
+        return "transport"
+    return None
 
 
 def parse_line(line: str) -> dict | None:
@@ -110,13 +133,16 @@ def parse_line(line: str) -> dict | None:
     provider = _provider_from_line(clean)
     target = TARGET_RE.search(clean)
     if target:
+        failure_kind = _transport_failure_kind(clean)
         event = {
             "kind": "target",
             "host": normalize_host(target.group("host")),
             "port": int(target.group("port") or 443),
-            "failure": bool("open connection to" in clean.lower() and FAILURE_RE.search(clean)),
+            "failure": failure_kind is not None,
             "line": clean[-400:],
         }
+        if failure_kind:
+            event["failure_kind"] = failure_kind
         if provider:
             event["provider"] = provider
         return event
@@ -334,8 +360,69 @@ def probe_target(root: Path, host: str, *, runner: Callable = subprocess.run) ->
     }
 
 
+def confirm_context_cancellation(root: Path, event: dict) -> bool:
+    """Require an exact target probe before acting on ``context canceled``.
+
+    sing-box uses that message both for upstream teardown and for a caller
+    abandoning a request.  A second, current transport failure through the
+    same local proxy is the evidence that justifies rotation.
+    """
+    if event.get("failure_kind") != "context-canceled":
+        return True
+    host = normalize_host(str(event.get("host") or ""))
+    if not host:
+        return False
+    result = probe_target(root, host)
+    append_event(root, {
+        "kind": "probe-confirmation",
+        "reason": "context-canceled",
+        "observed_at": time.time(),
+        **result,
+    })
+    return bool(result.get("transport_failure"))
+
+
+def _effective_provider(root: Path, provider: str, providers: dict) -> str:
+    """Follow active fallback markers for watcher attribution.
+
+    A connection log without an outbound tag identifies only the destination,
+    so the configured primary would otherwise be returned even while its
+    traffic is served by a fallback. Follow only configured, active markers and
+    stop on malformed state or cycles; attribution must never guess.
+    """
+    current = provider
+    seen: set[str] = set()
+    while current not in seen:
+        if not PROVIDER_NAME_RE.fullmatch(current):
+            return current
+        seen.add(current)
+        entry = providers.get(current)
+        if not isinstance(entry, dict):
+            return current
+        raw = entry.get("fallback_providers")
+        if raw is None:
+            raw = entry.get("fallback_provider")
+        targets = raw if isinstance(raw, list) else [raw]
+        targets = [target for target in targets
+                   if isinstance(target, str) and PROVIDER_NAME_RE.fullmatch(target)
+                   and target != current and target in providers]
+        if not targets:
+            return current
+        try:
+            marker = json.loads(
+                (Path(root) / "state" / "fallback" / f"{current}.json").read_text()
+            )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return current
+        active = marker.get("provider") if isinstance(marker, dict) else None
+        if active not in targets:
+            return current
+        current = active
+    return current
+
+
 def provider_for_host(root: Path, host: str) -> str | None:
-    """Map a failing host to the first active route provider.
+    """Map a failing host to the effective active route provider.
 
     The lookup mirrors sing-box's route order and ``vpn-list`` scope. Log lines
     that name an outbound provider take precedence in the worker because they
@@ -346,6 +433,9 @@ def provider_for_host(root: Path, host: str) -> str | None:
         config = json.loads((Path(root) / "router.json").read_text())
     except (OSError, ValueError, TypeError):
         return None
+    providers = config.get("providers") or {}
+    if not isinstance(providers, dict):
+        providers = {}
     normalized = normalize_host(str(host))
     routing = config.get("routing") or {}
     mode = routing.get("mode") if isinstance(routing, dict) else None
@@ -362,21 +452,40 @@ def provider_for_host(root: Path, host: str) -> str | None:
         ):
             continue
         provider = route.get("provider")
-        return str(provider) if provider else None
+        if not isinstance(provider, str) or not PROVIDER_NAME_RE.fullmatch(provider):
+            return None
+        return _effective_provider(Path(root), provider, providers)
     return None
 
 
-def rotate_provider(root: Path, provider: str = "proton", *, runner: Callable = subprocess.run) -> dict:
-    """Ask proxy-router itself to rotate; Hermes is not involved."""
+def rotate_provider(root: Path, provider: str = "proton", *, host: str | None = None,
+                    runner: Callable = subprocess.run) -> dict:
+    """Ask the controller to confirm failures and recover the affected route."""
+    command = (["failover", provider, "recover", "--host", host] if host else
+               ["rotate", provider, "--reason", "timeout", "--automatic"])
     try:
         result = runner(
-            [sys.executable, str(Path(root) / "router.py"), "rotate", provider,
-             "--reason", "timeout"],
-            cwd=str(root), capture_output=True, text=True, timeout=50,
+            [sys.executable, str(Path(root) / "router.py"), *command],
+            cwd=str(root), capture_output=True, text=True, timeout=180 if host else 50,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"rotated": False, "error": type(exc).__name__}
     return {"rotated": result.returncode == 0, "returncode": result.returncode,
+            "output": (result.stderr or result.stdout or "")[-300:]}
+
+
+def restore_provider(root: Path, provider: str, host: str,
+                     runner: Callable = subprocess.run) -> dict:
+    """Ask the controller to test and, when stable, restore the primary VPN."""
+    try:
+        result = runner(
+            [sys.executable, str(Path(root) / "router.py"), "failover", provider,
+             "restore", "--host", host],
+            cwd=str(root), capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"restored": False, "error": type(exc).__name__}
+    return {"restored": result.returncode == 0, "returncode": result.returncode,
             "output": (result.stderr or result.stdout or "")[-300:]}
 
 
@@ -444,6 +553,7 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
     guard = RotationGuard()
     last_provider: dict[str, str] = {}
     last_network_check = -NETWORK_CHECK_EVERY_SECONDS
+    last_restore: dict[str, float] = {}
     engine_down_ticks = 0
     try:
         while enabled_file(root).is_file():
@@ -459,6 +569,17 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
             # target set each tick so transparent capture starts observing a
             # newly configured domain without requiring a router restart.
             domains = critical_domains(root)
+            # Probe one representative per configured lane even before a slow
+            # connection timeout produces its first log line.
+            representatives: set[str] = set()
+            for host in domains:
+                provider = provider_for_host(root, host)
+                if provider and provider not in representatives:
+                    representatives.add(provider)
+                    last_target[host] = time.monotonic()
+                    last_provider[host] = provider
+                if len(representatives) >= 3:
+                    break
             offset, lines = _read_new_lines(log_path, offset)
             for line in lines:
                 event = parse_line(line)
@@ -482,9 +603,13 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
                         provider = event.get("provider") or provider_for_host(root, host)
                         if provider:
                             last_provider[host] = provider
-                        if event.get("failure") and guard.record_transport_failure(now, host):
+                        if (
+                            event.get("failure")
+                            and guard.record_transport_failure(now, host)
+                            and confirm_context_cancellation(root, event)
+                        ):
                             target = last_provider.get(host) or "proton"
-                            result = rotate_provider(root, target)
+                            result = rotate_provider(root, provider_for_host(root, host) or target, host=host)
                             append_event(root, {"kind": "rotation", "observed_at": time.time(), **result})
                 elif event["kind"] == "client":
                     # Client lines are retained only as a bounded observation;
@@ -502,10 +627,19 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
                     continue
                 last_probe[host] = now
                 result = probe_target(root, host)
+                provider = last_provider.get(host) or provider_for_host(root, host)
+                if result.get("ok"):
+                    guard.failure_times.pop(normalize_host(host), None)
+                    if provider and now - last_restore.get(provider, -RESTORE_COOLDOWN_SECONDS) >= RESTORE_COOLDOWN_SECONDS:
+                        restore = restore_provider(root, provider, host)
+                        last_restore[provider] = now
+                        if restore.get("returncode") is not None:
+                            append_event(root, {"kind": "restore", "observed_at": time.time(),
+                                                "provider": provider, "host": host, **restore})
                 append_event(root, {"kind": "probe", "observed_at": time.time(), **result})
                 if result.get("transport_failure") and guard.record_transport_failure(now, host):
-                    target = last_provider.get(host) or provider_for_host(root, host) or "proton"
-                    rotation = rotate_provider(root, target)
+                    target = provider or "proton"
+                    rotation = rotate_provider(root, provider or target, host=host)
                     append_event(root, {"kind": "rotation", "observed_at": time.time(), **rotation})
             sleep(max(0.5, float(interval)))
     finally:

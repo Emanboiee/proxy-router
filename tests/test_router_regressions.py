@@ -28,6 +28,8 @@ def load_router(tmp_path):
     module.LOCK_FILE = tmp_path / "state" / "engine.lock"
     module.MODE_FILE = tmp_path / "state" / "mode"
     module.MANUAL_OFF_FILE = tmp_path / "state" / "manual-off"
+    module.SYSTEM_PROXY_STATE_FILE = tmp_path / "state" / "system-proxy.json"
+    module.NETWORK_DIAGNOSTIC_FILE = tmp_path / "state" / "network-diagnostic.json"
     return module
 
 
@@ -766,7 +768,7 @@ def test_tray_fresh_install_is_not_error_and_shows_setup_banner(tmp_path):
         "port": None, "providers": {}, "routes": [],
         "routing": {"mode": None, "direct_domains": [], "vpn_domains": [],
                     "default_provider": None},
-    })
+    }) + "\nrouter: missing router.json; run 'router.py init' first\n"
     st = module.RouterStatus.from_cli(1, fresh)
     assert st.error is None
     assert st.up is False
@@ -965,11 +967,11 @@ def test_tray_menu_offers_dashboard_default_action(tmp_path):
     assert any("Open Dashboard" in t for t in texts)
     # the bold default action is the first actionable top-level entry:
     # before Connect/Reconnect in the raw item order
-    raw = [getattr(i, "text", None) for i in items.items]
-    actionable = [t for t in raw if t and not t.startswith(("●", "○", "!"))]
+    actionable = [getattr(i, "text", None) for i in items.items
+                  if getattr(i, "action", None) is not None]
     first_action = actionable[0] if actionable else None
     assert first_action and "Open Dashboard" in first_action, f"first action: {first_action!r}"
-    assert "onnect" in actionable[1], actionable[:4]  # Reconnect when up
+    assert actionable[1] and "onnect" in actionable[1], actionable[:4]  # Reconnect when up
 
 
 def test_tray_exit_picker_sorts_healthy_first(tmp_path):
@@ -1500,6 +1502,7 @@ def test_stop_bypasses_invalid_config_and_publishes_manual_off_before_lock(tmp_p
         AssertionError("stop must not load semantic configuration")))
     monkeypatch.setattr(router, "route_watcher_stop", lambda: None)
     monkeypatch.setattr(router, "engine_stop", lambda: 0)
+    monkeypatch.setattr(router, "_find_our_engine_pids", lambda: [])
     observed = []
 
     def locked(action, timeout=None):
@@ -1704,8 +1707,8 @@ def test_tray_full_tunnel_toggle_checked_when_tun(tmp_path):
     app = _tray_app(module, tmp_path, up=True, mode="tun")
     rows = _flatten(app.build_menu().items)
     labels = [text for _, text, _, _ in rows]
-    assert "Full tunnel (WARP): on" in labels
-    toggle = next(r for r in rows if r[1].startswith("Full tunnel (WARP)"))
+    assert "Full tunnel (TUN): on" in labels
+    toggle = next(r for r in rows if r[1].startswith("Full tunnel (TUN)"))
     assert toggle[3] is True  # checked
 
 
@@ -1715,8 +1718,8 @@ def test_tray_full_tunnel_toggle_unchecked_when_proxy(tmp_path):
     module = load_tray(tmp_path)
     app = _tray_app(module, tmp_path, up=True, mode="proxy")
     rows = _flatten(app.build_menu().items)
-    toggle = next(r for r in rows if r[1].startswith("Full tunnel (WARP)"))
-    assert toggle[1] == "Full tunnel (WARP): off"
+    toggle = next(r for r in rows if r[1].startswith("Full tunnel (TUN)"))
+    assert toggle[1] == "Full tunnel (TUN): off"
     assert toggle[3] is False
 
 
@@ -1727,6 +1730,7 @@ def test_tray_full_tunnel_toggle_invokes_vpn_action(tmp_path, monkeypatch):
     module = load_tray(tmp_path)
     app = _tray_app(module, tmp_path, up=True, mode="tun")
     calls = []
+    monkeypatch.setattr(app.client, "status", lambda: app.latest)
     monkeypatch.setattr(app.client, "vpn", lambda a: calls.append(a) or (0, ""))
     monkeypatch.setattr(app, "_do", lambda action, _label: action())
     app.action_toggle_vpn()
@@ -1734,6 +1738,7 @@ def test_tray_full_tunnel_toggle_invokes_vpn_action(tmp_path, monkeypatch):
 
     app2 = _tray_app(module, tmp_path, up=True, mode="proxy")
     calls2 = []
+    monkeypatch.setattr(app2.client, "status", lambda: app2.latest)
     monkeypatch.setattr(app2.client, "vpn", lambda a: calls2.append(a) or (0, ""))
     monkeypatch.setattr(app2, "_do", lambda action, _label: action())
     app2.action_toggle_vpn()

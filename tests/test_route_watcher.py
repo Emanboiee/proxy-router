@@ -50,6 +50,42 @@ class RouteWatcherTests(unittest.TestCase):
         assert event is not None
         self.assertEqual(event["provider"], "proton2")
 
+    def test_parse_context_canceled_transport_candidate(self):
+        event = w.parse_line(
+            "ERROR connection: open connection to opencode.ai:443 using "
+            "outbound/wireguard[proton]: context canceled"
+        )
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertTrue(event["failure"])
+        self.assertEqual(event["failure_kind"], "context-canceled")
+        self.assertEqual(event["provider"], "proton")
+
+        info = w.parse_line(
+            "INFO connection: open connection to opencode.ai:443 using "
+            "outbound/wireguard[proton]: context canceled"
+        )
+        self.assertIsNotNone(info)
+        assert info is not None
+        self.assertFalse(info["failure"])
+        self.assertNotIn("failure_kind", info)
+
+    def test_context_canceled_requires_exact_target_confirmation(self):
+        event = {
+            "host": "opencode.ai",
+            "failure": True,
+            "failure_kind": "context-canceled",
+        }
+        with mock.patch.object(
+            w,
+            "probe_target",
+            return_value={"host": "opencode.ai", "transport_failure": False, "status": 200},
+        ) as probe, mock.patch.object(w, "append_event") as append:
+            self.assertFalse(w.confirm_context_cancellation(Path("/tmp"), event))
+        probe.assert_called_once_with(Path("/tmp"), "opencode.ai")
+        append.assert_called_once()
+        self.assertEqual(append.call_args.args[1]["kind"], "probe-confirmation")
+
     def test_parse_transport_failure(self):
         event = w.parse_line(
             "ERROR connection: open connection to opencode.ai:443: "
@@ -243,6 +279,44 @@ class RouteWatcherTests(unittest.TestCase):
             rc = w.worker(root, interval=0.05, sleep=fake_sleep)
         self.assertEqual(rc, 0)
         self.assertGreaterEqual(ticks, 3)
+
+    def test_worker_rotates_after_context_canceled_probe_confirmation(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        w.state_dir(root).mkdir(parents=True)
+        (root / "router.json").write_text(json.dumps({
+            "routes": [{"id": "opencode", "domains": ["opencode.ai"], "provider": "proton"}],
+        }))
+        lines = [
+            "ERROR connection: open connection to opencode.ai:443 using "
+            "outbound/wireguard[proton]: context canceled\n",
+            "ERROR connection: open connection to opencode.ai:443 using "
+            "outbound/wireguard[proton]: context canceled\n",
+        ]
+        reads = [0]
+        calls = []
+
+        def fake_read(_path, offset):
+            if reads[0] == 0:
+                reads[0] += 1
+                return offset, lines
+            return offset, []
+
+        def stop_after_tick(_seconds):
+            w.enabled_file(root).unlink(missing_ok=True)
+
+        with mock.patch.object(w, "engine_pid_alive", return_value=True), \
+             mock.patch.object(w, "_read_new_lines", side_effect=fake_read), \
+             mock.patch.object(w, "client_snapshot", return_value=[]), \
+             mock.patch.object(w, "_network_check_hop"), \
+             mock.patch.object(w, "probe_target", return_value={
+                 "host": "opencode.ai", "transport_failure": True,
+                 "error": "SSL_ERROR_SYSCALL",
+             }), \
+             mock.patch.object(w, "rotate_provider", side_effect=lambda *args, **kwargs: calls.append(args) or {"rotated": True}):
+            rc = w.worker(root, interval=0.05, sleep=stop_after_tick)
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, [(root.resolve(), "proton")])
 
     def test_worker_rotates_provider_from_outbound_tag(self):
         root = Path(tempfile.mkdtemp())
@@ -493,3 +567,31 @@ class ProviderForHostTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.assertIsNone(w.provider_for_host(Path(tmp.name), "x.com"))
+
+    def test_provider_for_host_follows_active_fallback(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / "state" / "fallback").mkdir(parents=True)
+        (root / "router.json").write_text(json.dumps({
+            "providers": {
+                "proton": {"fallback_providers": ["cloudflare"]},
+                "cloudflare": {},
+            },
+            "routes": [{"id": "discord", "domains": ["discord.com"], "provider": "proton"}],
+        }))
+        (root / "state" / "fallback" / "proton.json").write_text(
+            json.dumps({"provider": "cloudflare"})
+        )
+        assert w.provider_for_host(root, "discord.com") == "cloudflare"
+
+    def test_provider_for_host_rejects_path_like_provider_names(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / "router.json").write_text(json.dumps({
+            "providers": {"../../outside": {}},
+            "routes": [{"id": "bad", "domains": ["discord.com"],
+                        "provider": "../../outside"}],
+        }))
+        assert w.provider_for_host(root, "discord.com") is None

@@ -112,7 +112,7 @@ examples/proxy-manager.sh   bridge for the Hermes opencode-server-rotation plugi
 tests/                       unit tests (unittest, no deps)
 providers/<provider>/        WireGuard configs, one file per profile (chmod 600)
 state/                       active profile + cooldown markers (gitignored)
-sing-box.json / .pid / .log  runtime state (gitignored)
+logs/                       sing-box runtime logs and rotations (gitignored)
 ```
 
 ## Usage
@@ -147,6 +147,10 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py rotate <provider> --to 01-NL-FREE-140  # switch to this exact exit profile (used by the tray's Provider picker)
 ./router.py response-event --host example.com --status 429 [--provider proton]
                                  # feed an observed upstream status into cooldown/error-policy handling
+./router.py autodetect [source] [--quiet] [--no-reload]  # discover routed web-app dependency hostnames
+./router.py response-event --host example.com --status 0 --reason timeout|tls|connection
+                                 # report a real-traffic stall with no usable response: rotates the exit
+                                 # through error-policy handling (for throttled exits that still pass probes)
 ./router.py profile copy <path...> --provider proton
                                  # copy validated .conf file(s)/directory into a provider
 ./router.py watcher status       # routed-connection watcher state (JSON)
@@ -156,6 +160,8 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py network-check        # auto-apply the preset mapped to the current Wi-Fi (run by the route watcher every 30s)
 ./router.py failover <provider> on [--to <fallback>]  # route the provider's domains through its configured fallback chain (first valid entry, or the named member)
 ./router.py failover <provider> off    # clear fallback and restore the provider's routes
+./router.py failover <provider> recover --host <domain>  # confirm a stalled route, then try VPN fallbacks and opt-in direct
+./router.py failover <provider> restore --host <domain>  # test a direct fallback's primary VPN and restore it after two wins
 ./router.py failover <provider> status --json   # configured chain + active fallback
 ./router.py provider-count proton # rotation candidates (retry budget)
 ./router.py providers check [provider] [--json]  # offline validity preflight: which providers can carry traffic at all (exit 1 = some invalid)
@@ -242,6 +248,7 @@ Rotation is then egress-aware instead of blind round-robin:
   changes because every provider shares one engine. Explicit `rotate`,
   `egress sweep`, and `failover` commands remain available for intentional
   operator-controlled interruptions.
+- For proxy-mode recovery, set `"fail_open_direct": true` in a provider's configuration to permit its routes to leave the VPN when configured VPN fallbacks also fail. This is off by default and never applies to TUN mode. The watcher confirms the failing hostname, tries up to two configured VPN alternatives, then direct. Each provider has a 120-second recovery cooldown. Once direct is serving, the watcher tests the primary VPN at most every five minutes and keeps direct until two consecutive HTTP responses succeed; a failed check immediately reinstates direct. Recovery takes seconds plus reload time, and existing connections may need a refresh.
 - `egress check` is the read-only liveness view used by the keepalive self-heal
   loop: it probes the ACTIVE exit(s) through the running tunnel and classifies
   each one `alive` (HTTP response rode the tunnel), `degraded` (an HTTP status
@@ -287,6 +294,14 @@ for existing configs (a single name or list; both keys together are an
 error). New configurations should use `"fallback_providers"`.
 
 Tunables live in `router.json` under `"egress"` (see `router.example.json`).
+
+When a provider serves multiple routes, set `providers.<name>.probe_route_id`
+to the route that represents the real client path (for example,
+`"opencode-zen"`). The router validates that the route exists, belongs to the
+provider, and has a tunneled domain, then probes that route instead of silently
+using the first route in the table. If the explicitly pinned route is no longer
+eligible for tunneling, selection returns no probe rather than measuring an
+unrelated target.
 
 ## Error policy table (`error_policy`)
 
@@ -637,9 +652,41 @@ Linux/Windows: run `examples/keepalive.sh` under a supervisor of your choice
 The keepalive waits `PROXY_KEEPALIVE_INTERVAL` (default 15s) between checks,
 but while `ensure` keeps failing the wait grows exponentially (15, 30, 60, ...)
 up to `PROXY_KEEPALIVE_MAX_BACKOFF` (default 300s), so a dead engine is not
-hammered; one successful check resets the wait. `sing-box.log` is also rotated
-to `sing-box.log.1` once it exceeds 10 MB (at engine start, when no engine
+hammered; one successful check resets the wait. `logs/sing-box.log` is also rotated
+to `logs/sing-box.log.1` once it exceeds 10 MB (at engine start, when no engine
 holds the log).
+A fresh engine start creates `logs/`; existing root-level logs are copied there once for compatibility.
+
+On macOS the keepalive also guards the physical Wi-Fi link. It runs
+`router.py network-status` before supervision; after one missed SSID check
+(`PROXY_KEEPALIVE_NETWORK_GRACE`, default `1`) it disables only proxy-router's
+owned system-proxy settings, stops the engine, and writes `state/network-off`.
+While that latch exists, `ensure` stays quiescent. Once Wi-Fi returns,
+keepalive runs `router.py network-reconnect`, verifies the engine and proxy
+surface, then clears the latch. This automatic latch is separate from
+`state/manual-off`: `router.py stop` still requires an explicit `start` and is
+never auto-reconnected.
+
+The lifecycle commands are also available for diagnostics:
+
+```sh
+proxy-router network-status --json
+proxy-router network-disconnect
+proxy-router network-reconnect
+```
+
+
+For proxy-mode recovery, set `"fail_open_direct": true` in a provider's
+configuration to permit its routes to leave the VPN when fallback providers
+also fail. This is off by default and never applies to TUN mode. Direct traffic
+uses local DNS and can still be blocked by the network. The watcher confirms
+the failing hostname, tries up to two configured VPN alternatives, then direct.
+Each provider has a 120-second recovery cooldown; HTTP responses and DNS
+failures do not trigger failover. Recovery takes seconds plus reload time,
+and existing connections may need a refresh. Direct fallback stays active
+until restored with `failover <provider> off` or existing maintenance.
+Use `router.py failover <provider> recover --host <routed-host>` for the same
+confirmed recovery from the CLI.
 
 `ensure` only proves the process is alive, so the keepalive ALSO self-heals a
 dead-but-listening tunnel (WireGuard handshake/route dead while the port still
