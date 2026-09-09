@@ -6755,11 +6755,19 @@ def system_proxy_off(runner=None) -> int:
     """
     injected = runner is not None
     run = runner or subprocess.run
+    state = _proxy_state_read()
     services = _proxy_target_services(runner) if runner is not None else _proxy_target_services()
+    # A network handoff can temporarily hide every service from the live
+    # discovery commands.  A recorded Connect operation still gives us the
+    # exact service names and port needed for safe cleanup, so do not abandon
+    # ownership-based teardown just because discovery is empty.
+    recorded_services = [record.get("service") for record in (state or {}).get("services", [])
+                         if isinstance(record, dict) and record.get("service")]
+    if not services and recorded_services:
+        services = list(dict.fromkeys(recorded_services))
     if not services:
         return fail("could not determine any macOS network services")
     strict = injected or sys.platform == "darwin"
-    state = _proxy_state_read()
     # Preserve the historical test/non-macOS path: there is no scutil
     # effective state to inspect, so target the active service and sweep
     # explicitly detected stale local endpoints.
