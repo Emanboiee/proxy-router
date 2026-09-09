@@ -1156,6 +1156,7 @@ if _REAL_DARWIN_PYSTRAY:
             with self._status_lock:
                 status = self._pending_status
                 action = self._pending_action
+                self._pending_status = None
                 self._pending_action = None
                 self._ui_dispatch_queued = False
             if status is not None:
@@ -1645,9 +1646,14 @@ class TrayApp:
         """Open or focus the custom macOS dashboard without engine changes."""
         shown = self.dashboard.show(self._snapshot())
         if not shown:
-            self._dashboard_update_action(
-                "dashboard unavailable; use Open Dashboard from the menu")
-            self.action_dashboard()
+            opened = open_dashboard(self.client.root)
+            result = ("dashboard unavailable; opened terminal dashboard"
+                      if opened else
+                      "dashboard unavailable; use Open Dashboard from the menu")
+            with self.lock:
+                self.last_action_result = result
+            self._dashboard_update_action(result)
+            self._refresh_menu()
         return shown
 
     def action_setup(self):
@@ -1830,6 +1836,7 @@ class TrayApp:
                 with self.lock:
                     self._quit_pending = False
                 self.quit_flag.set()
+            self.dashboard.close()
             if self.tray is not None:
                 self.tray.stop()
 
