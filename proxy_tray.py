@@ -1249,9 +1249,20 @@ if _REAL_DARWIN_PYSTRAY:
             self.window.makeKeyAndOrderFront_(None)
             AppKit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
 
-        def close(self):
+        @objc.namedSelector(b"closeOnMainThread:")
+        def close_on_main_thread(self, _sender):
+            self._close_now()
+
+        def _close_now(self):
             self._visible = False
             self.window.orderOut_(None)
+
+        def close(self):
+            if not Foundation.NSThread.isMainThread():
+                self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                    "closeOnMainThread:", None, False)
+                return
+            self._close_now()
 
         def _window_closed(self):
             self._visible = False
@@ -1650,7 +1661,7 @@ class TrayApp:
             opened = open_dashboard(self.client.root)
             result = ("dashboard unavailable; opened terminal dashboard"
                       if opened else
-                      "dashboard unavailable; use Open Dashboard from the menu")
+                "dashboard unavailable; use Open Setup in Terminal from the menu")
             with self.lock:
                 self.last_action_result = result
             self._dashboard_update_action(result)
@@ -1900,7 +1911,7 @@ class TrayApp:
         # status-button left click calls it directly; on other platforms this
         # entry remains the normal pystray menu action.
         items.append(pystray.MenuItem(
-            "Open Dashboard", self.action_dashboard, default=True))
+            "Open Setup in Terminal", self.action_dashboard, default=True))
 
         # Actions — terse, no CLI flags. Connect is only offered once at
         # least one provider exists; on a fresh install the banner above
