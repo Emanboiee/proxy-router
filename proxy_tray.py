@@ -422,7 +422,7 @@ class DashboardViewModel:
             route_health = "Not configured"
         else:
             records = [
-                (info.get("egress") or {}).get(info.get("active"), {})
+                ((info.get("egress") or {}).get(info.get("active")) or {})
                 for info in (status.providers.get(name) or {}
                              for name in status.providers)
                 if info.get("active")

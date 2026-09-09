@@ -1065,6 +1065,13 @@ class DashboardViewModelTests(unittest.TestCase):
         self.assertEqual(model.provider_rows, ("Proton   no active server",))
         self.assertEqual(model.route_health, "Waiting")
 
+    def test_none_egress_record_is_treated_as_waiting(self):
+        model = tray.DashboardViewModel.from_status(
+            tray.RouterStatus(providers={
+                "proton": {"active": "01-NL", "egress": {"01-NL": None}},
+            }))
+        self.assertEqual(model.route_health, "Waiting")
+
 
 class DashboardLifecycleTests(unittest.TestCase):
     class FakeWindow:
