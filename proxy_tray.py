@@ -892,7 +892,6 @@ if _REAL_DARWIN_PYSTRAY:
             rail = _dashboard_color(17, 21, 28)
             panel = _dashboard_color(25, 30, 40)
             border = _dashboard_color(46, 54, 68)
-            selected = _dashboard_color(30, 37, 49)
 
             background.set()
             AppKit.NSRectFill_(self.bounds())
@@ -903,7 +902,6 @@ if _REAL_DARWIN_PYSTRAY:
             border.set()
             AppKit.NSRectFill_(separator)
 
-            self._round_fill(AppKit.NSMakeRect(16, 78, 164, 46), 12, selected)
             content_x = 228
             content_width = max(420, width - content_x - 32)
             hero_y = 72
@@ -1289,10 +1287,12 @@ def _event_type(event):
 def _is_right_click_event(event) -> bool:
     if not _COCOA_AVAILABLE or event is None:
         return False
-    if _event_type(event) in {
+    click_types = {
         getattr(AppKit, "NSRightMouseDown", None),
         getattr(AppKit, "NSRightMouseUp", None),
-    }:
+    }
+    click_types.discard(None)
+    if _event_type(event) in click_types:
         return True
     flags = getattr(event, "modifierFlags", None)
     flags = flags() if callable(flags) else flags
@@ -1356,8 +1356,12 @@ if _REAL_DARWIN_PYSTRAY:
 
         def _update_menu(self):
             self._bind_status_button()
+            create_menu = getattr(self, "_create_menu", None)
+            if not callable(create_menu):
+                self._menu_handle = None
+                return
             callbacks = []
-            self._native_menu = self._create_menu(self.menu, callbacks)
+            self._native_menu = create_menu(self.menu, callbacks)
             self._menu_handle = (
                 (self._native_menu, callbacks)
                 if self._native_menu is not None else None)
@@ -2118,10 +2122,18 @@ class TrayApp:
     def _make_tray_icon(self):
         menu = self.build_menu()
         if _REAL_DARWIN_PYSTRAY:
-            return _DarwinDashboardIcon(
-                "proxy-router", self.icon_image, "proxy-router", menu=menu,
-                dashboard_callback=self._show_native_dashboard,
-            )
+            if not callable(getattr(pystray.Icon, "_create_menu", None)):
+                print("tray: native dashboard unavailable: unsupported pystray",
+                      file=sys.stderr)
+                return pystray.Icon(
+                    "proxy-router", self.icon_image, "proxy-router", menu=menu)
+            try:
+                return _DarwinDashboardIcon(
+                    "proxy-router", self.icon_image, "proxy-router", menu=menu,
+                    dashboard_callback=self._show_native_dashboard,
+                )
+            except (AttributeError, TypeError) as exc:
+                print(f"tray: native dashboard unavailable: {exc}", file=sys.stderr)
         return pystray.Icon(
             "proxy-router", self.icon_image, "proxy-router", menu=menu)
 
