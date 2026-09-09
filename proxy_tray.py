@@ -1590,7 +1590,7 @@ class TrayApp:
                 return  # stale poll: a newer post-action snapshot won already
             if epoch is not None:
                 self._status_epoch = max(self._status_epoch, epoch)
-        self.latest = st
+            self.latest = st
         self._refresh_icon()
         self._dashboard_update_status(st)
         self._refresh_menu()
