@@ -56,7 +56,7 @@ try:
     else:
         AppKit = Foundation = objc = None
         _COCOA_AVAILABLE = False
-except ImportError:  # pragma: no cover - depends on the host Python
+except Exception:  # pragma: no cover - depends on the host Python
     AppKit = Foundation = objc = None
     _COCOA_AVAILABLE = False
 
@@ -349,11 +349,12 @@ class RouterStatus:
         return f"proxy {state} · {detail} · {watcher}"
 
 
-_DASHBOARD_MODE_LABELS = {
-    "safe-list": "Home",
-    "vpn-list": "School",
-    "default": "Default",
-}
+_DASHBOARD_MODES = (
+    ("safe-list", "Home"),
+    ("vpn-list", "School"),
+    ("default", "Default"),
+)
+_DASHBOARD_MODE_LABELS = dict(_DASHBOARD_MODES)
 
 
 @dataclass(frozen=True)
@@ -1028,7 +1029,7 @@ if _REAL_DARWIN_PYSTRAY:
                 "Choose which destinations use the tunnel.", 12, muted)
             self.mode_popup = AppKit.NSPopUpButton.alloc().initWithFrame_pullsDown_(
                 AppKit.NSZeroRect, False)
-            for label in ("Home", "School", "Default"):
+            for _mode, label in _DASHBOARD_MODES:
                 self.mode_popup.addItemWithTitle_(label)
             self.mode_popup.setTarget_(self)
             self.mode_popup.setAction_("modeChanged:")
@@ -1109,7 +1110,11 @@ if _REAL_DARWIN_PYSTRAY:
             frame(self.route_label, content_x + 24, health_y + 48,
                   content_width - 48, 22)
             row_y = health_y + 78
-            for label in self.provider_labels:
+            visible_rows = max(0, int((health_height - 78) // 28))
+            for index, label in enumerate(self.provider_labels):
+                label.setHidden_(index >= visible_rows)
+                if index >= visible_rows:
+                    continue
                 frame(label, content_x + 24, row_y, content_width - 48, 23)
                 row_y += 28
 
@@ -1154,9 +1159,12 @@ if _REAL_DARWIN_PYSTRAY:
             self.hero_title.setStringValue_(self._model.title)
             self.hero_explanation.setStringValue_(self._model.explanation)
             self.primary_button.setTitle_(self._model.primary_label)
-            self.mode_popup.selectItemAtIndex_({
-                "safe-list": 0, "vpn-list": 1, "default": 2,
-            }.get(self._model.mode, 2))
+            mode_index = next(
+                (index for index, (mode, _label) in enumerate(_DASHBOARD_MODES)
+                 if mode == self._model.mode),
+                len(_DASHBOARD_MODES) - 1,
+            )
+            self.mode_popup.selectItemAtIndex_(mode_index)
             self.mode_popup.setEnabled_(bool(status.providers))
             if status.error:
                 color = _dashboard_color(242, 157, 76)
@@ -1214,7 +1222,7 @@ if _REAL_DARWIN_PYSTRAY:
 
         @objc.namedSelector(b"modeChanged:")
         def mode_changed(self, sender):
-            mode = ("safe-list", "vpn-list", "default")[sender.indexOfSelectedItem()]
+            mode = _DASHBOARD_MODES[sender.indexOfSelectedItem()][0]
             self._invoke_action("mode", mode)
 
         def show(self):
