@@ -486,17 +486,21 @@ class DashboardController:
         with self._lock:
             self._status = status
             window = self._window
-            if window is None:
-                try:
-                    window = self.window_factory(
-                        self.client, self.action_handler, status)
-                except Exception as exc:
-                    print(f"dashboard: unavailable: {exc}", file=sys.stderr)
-                    return False
-                if window is None:
-                    return False
-                self._window = window
             last_action = self._last_action
+        if window is None:
+            try:
+                created = self.window_factory(
+                    self.client, self.action_handler, status)
+            except Exception as exc:
+                print(f"dashboard: unavailable: {exc}", file=sys.stderr)
+                return False
+            if created is None:
+                return False
+            with self._lock:
+                window = self._window
+                if window is None:
+                    self._window = window = created
+                last_action = self._last_action
         try:
             window.update_status(status)
             window.update_action(last_action)
@@ -1184,7 +1188,12 @@ if _REAL_DARWIN_PYSTRAY:
             for label in self.provider_labels:
                 label.removeFromSuperview()
             self.provider_labels = []
-            for row in self._model.provider_rows[:4]:
+            rows = list(self._model.provider_rows[:4])
+            if len(self._model.provider_rows) > len(rows):
+                rows[-1] = (
+                    f"{rows[-1]} · +{len(self._model.provider_rows) - len(rows)} more"
+                )
+            for row in rows:
                 label = _dashboard_label(row, 12, _dashboard_color(190, 198, 210))
                 self.provider_labels.append(label)
                 self.root.addSubview_(label)
@@ -1222,7 +1231,10 @@ if _REAL_DARWIN_PYSTRAY:
 
         @objc.namedSelector(b"modeChanged:")
         def mode_changed(self, sender):
-            mode = _DASHBOARD_MODES[sender.indexOfSelectedItem()][0]
+            index = sender.indexOfSelectedItem()
+            if index < 0 or index >= len(_DASHBOARD_MODES):
+                return
+            mode = _DASHBOARD_MODES[index][0]
             self._invoke_action("mode", mode)
 
         def show(self):

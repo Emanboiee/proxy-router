@@ -50,7 +50,8 @@ jobs:
               ;;
           esac
           archive="$RUNNER_TEMP/$asset"
-          curl --fail --location --retry 3 --output "$archive" \
+          curl --fail --location --proto '=https' --tlsv1.2 --max-time 120 \
+            --retry 3 --output "$archive" \
             "https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/${asset}"
           printf '%s  %s\n' "$expected" "$archive" | shasum -a 256 --check -
           tar -xzf "$archive" -C "$RUNNER_TEMP"
