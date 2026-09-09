@@ -1448,6 +1448,7 @@ if _REAL_DARWIN_PYSTRAY:
         def _show_native_menu(self, event):
             menu_handle = getattr(self, "_menu_handle", None)
             if not menu_handle:
+                print("tray: native menu unavailable", file=sys.stderr)
                 return
             menu = menu_handle[0]
             status_item = getattr(self, "_status_item", None)
