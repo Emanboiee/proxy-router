@@ -513,6 +513,9 @@ class DashboardController:
             window.show()
         except Exception as exc:
             print(f"dashboard: could not show window: {exc}", file=sys.stderr)
+            with self._lock:
+                if self._window is window:
+                    self._window = None
             return False
         return True
 
@@ -1016,7 +1019,9 @@ if _REAL_DARWIN_PYSTRAY:
             self.brand_caption = _dashboard_label("CONTROL CENTER", 9, quiet, bold=True)
             self.page_title = _dashboard_label("Home", 20, white, bold=True)
             self.page_caption = _dashboard_label("Private routing, without the mystery", 12, muted)
-            self.home_button = self._nav_button("Home", "house.fill", selected=True)
+            # Navigation pages are not implemented yet; do not render a dead
+            # home button while the dashboard has a single page.
+            self.home_button = None
             # These pages are not implemented yet; do not render dead controls.
             self.servers_button = None
             self.routing_button = None
@@ -1055,28 +1060,13 @@ if _REAL_DARWIN_PYSTRAY:
             self.provider_labels = []
             for child in (
                 self.brand, self.brand_caption, self.page_title, self.page_caption,
-                self.home_button, self.hero_dot, self.hero_title,
+                self.hero_dot, self.hero_title,
                 self.hero_explanation, self.primary_button, self.rotate_button,
                 self.action_label, self.mode_title, self.mode_hint, self.mode_popup,
                 self.health_title, self.route_label,
                 self.health_summary,
             ):
                 self.root.addSubview_(child)
-
-        def _nav_button(self, title: str, symbol: str, *, selected: bool):
-            button = AppKit.NSButton.alloc().initWithFrame_(AppKit.NSZeroRect)
-            button.setTitle_(title)
-            button.setBordered_(False)
-            button.setBezelStyle_(AppKit.NSBezelStyleTexturedRounded)
-            button.setAlignment_(AppKit.NSLeftTextAlignment)
-            button.setFont_(_dashboard_font(13, AppKit.NSFontWeightMedium))
-            button.setContentTintColor_(_dashboard_color(
-                244, 247, 251) if selected else _dashboard_color(142, 152, 168))
-            button.setImage_(_dashboard_system_image(symbol, title))
-            button.setImagePosition_(AppKit.NSImageLeft)
-            button.setImageScaling_(AppKit.NSImageScaleProportionallyDown)
-            button.setToolTip_(title)
-            return button
 
         def _layout_dashboard(self, width: float, height: float):
             content_x = 228
@@ -1092,8 +1082,6 @@ if _REAL_DARWIN_PYSTRAY:
 
             frame(self.brand, 24, 24, 148, 24)
             frame(self.brand_caption, 24, 50, 148, 16)
-            frame(self.home_button, 26, 84, 144, 34)
-
             frame(self.page_title, content_x, 26, 300, 28)
             frame(self.page_caption, content_x, 52, 430, 20)
             center = content_x + content_width / 2
@@ -1389,6 +1377,7 @@ if _REAL_DARWIN_PYSTRAY:
                     menu.popUpMenuPositioningItem_atLocation_inView_(
                         None, AppKit.NSMakePoint(0, bounds.size.height), button)
                 except Exception:
+                    print("dashboard: native menu popup failed", file=sys.stderr)
                     return
 
 else:
