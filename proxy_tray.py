@@ -406,7 +406,10 @@ class DashboardViewModel:
             info = status.providers.get(name) or {}
             active = info.get("active")
             if active:
-                health = status.profile_health(name, active)
+                try:
+                    health = status.profile_health(name, active)
+                except Exception:
+                    health = ""
                 suffix = health.strip() if health else "ready"
                 rows.append(f"{name.title()}   {active}   {suffix}")
             else:
@@ -565,10 +568,16 @@ def _route_macos_click(kind: str, open_dashboard: Callable,
     through untouched.
     """
     if kind == "left":
-        open_dashboard()
+        try:
+            open_dashboard()
+        except Exception as exc:
+            print(f"dashboard: click failed: {exc}", file=sys.stderr)
         return None
     if kind == "right":
-        open_menu()
+        try:
+            open_menu()
+        except Exception as exc:
+            print(f"dashboard: menu click failed: {exc}", file=sys.stderr)
         return None
     return event
 
@@ -2132,7 +2141,7 @@ class TrayApp:
                     "proxy-router", self.icon_image, "proxy-router", menu=menu,
                     dashboard_callback=self._show_native_dashboard,
                 )
-            except (AttributeError, TypeError) as exc:
+            except Exception as exc:
                 print(f"tray: native dashboard unavailable: {exc}", file=sys.stderr)
         return pystray.Icon(
             "proxy-router", self.icon_image, "proxy-router", menu=menu)
