@@ -464,13 +464,14 @@ class DashboardController:
     Cocoa session and makes missing AppKit fail closed.
     """
 
-    def __init__(self, client, action_handler, window_factory=None):
+    def __init__(self, client, action_handler, window_factory=None,
+                 initial_status=None):
         self.client = client
         self.action_handler = action_handler
         self.window_factory = window_factory or _make_macos_dashboard_window
         self._window = None
         self._window_create_lock = threading.Lock()
-        self._status = RouterStatus()
+        self._status = initial_status if initial_status is not None else RouterStatus()
         self._last_action: str | None = None
         self._lock = threading.RLock()
 
@@ -836,7 +837,8 @@ if _REAL_DARWIN_PYSTRAY:
         return AppKit.NSFont.systemFontOfSize_(size)
 
 
-    def _dashboard_label(text: str, size: float, color, *, bold=False, align=None):
+    def _dashboard_label(text: str, size: float, color, *, bold=False,
+                         align=None, wrap=False):
         label = AppKit.NSTextField.labelWithString_(text)
         label.setFont_(_dashboard_font(
             size, AppKit.NSFontWeightSemibold if bold else None))
@@ -845,7 +847,11 @@ if _REAL_DARWIN_PYSTRAY:
         label.setEditable_(False)
         label.setBezeled_(False)
         label.setDrawsBackground_(False)
-        label.setLineBreakMode_(AppKit.NSLineBreakByTruncatingTail)
+        label.setLineBreakMode_(
+            AppKit.NSLineBreakByWordWrapping
+            if wrap else AppKit.NSLineBreakByTruncatingTail)
+        if wrap:
+            label.setMaximumNumberOfLines_(2)
         if align is not None:
             label.setAlignment_(align)
         return label
@@ -866,14 +872,6 @@ if _REAL_DARWIN_PYSTRAY:
         else:
             button.setBezelColor_(_dashboard_color(42, 48, 60))
         return button
-
-
-    def _dashboard_system_image(symbol: str, description: str):
-        try:
-            return AppKit.NSImage.imageWithSystemSymbolName_accessibilityDescription_(
-                symbol, description)
-        except Exception:
-            return None
 
 
     class _DashboardRootView(AppKit.NSView):
@@ -1037,7 +1035,8 @@ if _REAL_DARWIN_PYSTRAY:
             self.hero_title = _dashboard_label(self._model.title, 30, white, bold=True,
                                                align=AppKit.NSCenterTextAlignment)
             self.hero_explanation = _dashboard_label(
-                self._model.explanation, 14, muted, align=AppKit.NSCenterTextAlignment)
+                self._model.explanation, 14, muted,
+                align=AppKit.NSCenterTextAlignment, wrap=True)
             self.primary_button = _dashboard_button(
                 self._model.primary_label, self, "primaryAction:", primary=True)
             self.rotate_button = _dashboard_button(
@@ -1405,7 +1404,8 @@ class TrayApp:
         self.quit_flag = threading.Event()
         self.tray = None
         self.dashboard = DashboardController(
-            client, self._dispatch_dashboard_action)
+            client, self._dispatch_dashboard_action,
+            initial_status=self.latest)
         self._menu_sig: str | None = None
         self._icon_sig: str | None = None
 

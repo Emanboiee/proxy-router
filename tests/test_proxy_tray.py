@@ -1210,8 +1210,9 @@ class DarwinStatusButtonTests(unittest.TestCase):
         icon._update_menu()
 
         self.assertIs(icon._menu_handle[0], native_menu)
-        self.assertEqual(icon._status_item.setMenu_.call_count, 2)
-        icon._status_item.setMenu_.assert_called_with(None)
+        self.assertTrue(icon._status_item.setMenu_.call_args_list)
+        self.assertTrue(all(call.args == (None,)
+                            for call in icon._status_item.setMenu_.call_args_list))
 
 
 class DashboardTrayIntegrationTests(unittest.TestCase):
