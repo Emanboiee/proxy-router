@@ -33,6 +33,7 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
+import traceback
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -468,6 +469,7 @@ class DashboardController:
         self.action_handler = action_handler
         self.window_factory = window_factory or _make_macos_dashboard_window
         self._window = None
+        self._window_create_lock = threading.Lock()
         self._status = RouterStatus()
         self._last_action: str | None = None
         self._lock = threading.RLock()
@@ -488,19 +490,22 @@ class DashboardController:
             window = self._window
             last_action = self._last_action
         if window is None:
-            try:
-                created = self.window_factory(
-                    self.client, self.action_handler, status)
-            except Exception as exc:
-                print(f"dashboard: unavailable: {exc}", file=sys.stderr)
-                return False
-            if created is None:
-                return False
-            with self._lock:
-                window = self._window
+            with self._window_create_lock:
+                with self._lock:
+                    window = self._window
                 if window is None:
-                    self._window = window = created
-                last_action = self._last_action
+                    try:
+                        created = self.window_factory(
+                            self.client, self.action_handler, status)
+                    except Exception as exc:
+                        print(f"dashboard: unavailable: {exc}", file=sys.stderr)
+                        return False
+                    if created is None:
+                        return False
+                    with self._lock:
+                        self._window = window = created
+                with self._lock:
+                    last_action = self._last_action
         try:
             window.update_status(status)
             window.update_action(last_action)
@@ -1604,6 +1609,7 @@ class TrayApp:
                     self._publish_status(refreshed, epoch)
                 except Exception as exc:
                     print(f"tray: status publish skipped: {exc}", file=sys.stderr)
+                    traceback.print_exc()
             finally:
                 # A dashboard/UI failure must not leave the mutation gate
                 # permanently active or make Quit wait for a dead worker.
@@ -1641,6 +1647,7 @@ class TrayApp:
         if not shown:
             self._dashboard_update_action(
                 "dashboard unavailable; use Open Dashboard from the menu")
+            self.action_dashboard()
         return shown
 
     def action_setup(self):
