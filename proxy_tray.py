@@ -513,6 +513,11 @@ class DashboardController:
             window.show()
         except Exception as exc:
             print(f"dashboard: could not show window: {exc}", file=sys.stderr)
+            try:
+                window.close()
+            except Exception as close_exc:
+                print(f"dashboard: failed to close broken window: {close_exc}",
+                      file=sys.stderr)
             with self._lock:
                 if self._window is window:
                     self._window = None
@@ -1323,10 +1328,11 @@ if _REAL_DARWIN_PYSTRAY:
 
         def _bind_status_button(self):
             status_item = getattr(self, "_status_item", None)
-            if status_item is None:
+            delegate = getattr(self, "_dashboard_delegate", None)
+            if status_item is None or delegate is None:
                 return
             button = status_item.button()
-            button.setTarget_(self._dashboard_delegate)
+            button.setTarget_(delegate)
             button.setAction_(b"activateDashboard:")
             try:
                 button.sendActionOn_(

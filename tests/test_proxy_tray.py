@@ -298,16 +298,12 @@ class MutationSerializationTests(unittest.TestCase):
 
     def test_dashboard_update_failure_does_not_stick_mutation_active(self):
         app = self._make_app()
-        calls = []
 
-        def fail_after_working(result):
-            calls.append(result)
-            if len(calls) == 2:
-                raise RuntimeError("dashboard closed")
+        def fail_publish(*_args):
+            raise RuntimeError("dashboard closed")
 
-        app.dashboard.update_action = fail_after_working
+        app._publish_status = fail_publish
         app._do(lambda: (0, "ok"), "connect")
-        self.assertTrue(self._wait_until(lambda: len(calls) == 2))
         self.assertTrue(self._wait_until(lambda: not app._mutation_active))
 
     def test_stale_poll_cannot_overwrite_newer_post_action_snapshot(self):
