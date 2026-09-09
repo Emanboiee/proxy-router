@@ -90,6 +90,10 @@ SYSTEM_PROXY_STATE_FILE = ROOT / "state" / "system-proxy.json"
 # Cached result written only by the explicit ``doctor --network`` command.
 # ``status --json`` reads this file but never starts a fresh network probe.
 NETWORK_DIAGNOSTIC_FILE = ROOT / "state" / "network-diagnostic.json"
+# A cached diagnostic is evidence for the dashboard, not a live health probe.
+# Mark it stale after five minutes so a previous network's green result cannot
+# hide a current proxy/DNS failure.
+NETWORK_DIAGNOSTIC_MAX_AGE_SECONDS = 300
 # Pending per-provider overrides handed to an elevated `reload` when the
 # engine runs as root and the invoking process cannot SIGHUP it directly.
 RELOAD_OVERRIDE_FILE = ROOT / "state" / "reload-override.json"
@@ -5405,12 +5409,35 @@ def _network_diagnostic(*, runner=subprocess.run, opener=None,
     }
 
 
-def _cached_network_diagnostic() -> dict | None:
+def _cached_network_diagnostic(*, now: float | None = None) -> dict | None:
+    """Read the last network diagnostic and annotate its freshness.
+
+    ``status --json`` remains read-only; callers can use ``stale`` to avoid
+    presenting an old successful probe as current connectivity evidence.
+    Malformed or missing timestamps are stale by definition.
+    """
     try:
         data = json.loads(NETWORK_DIAGNOSTIC_FILE.read_text())
-        return data if isinstance(data, dict) else None
+        if not isinstance(data, dict):
+            return None
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return None
+    checked_at = data.get("checked_at")
+    age: float | None = None
+    try:
+        if isinstance(checked_at, (int, float)):
+            checked_epoch = float(checked_at)
+        else:
+            checked_epoch = datetime.datetime.fromisoformat(
+                str(checked_at)
+            ).timestamp()
+        age = max(0.0, (time.time() if now is None else float(now)) - checked_epoch)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    enriched = dict(data)
+    enriched["age_seconds"] = round(age, 1) if age is not None else None
+    enriched["stale"] = age is None or age > NETWORK_DIAGNOSTIC_MAX_AGE_SECONDS
+    return enriched
 
 
 def doctor(network: bool = False) -> int:
