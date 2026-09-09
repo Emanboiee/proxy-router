@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import domain_autodetect
+import pytest
 import router
 
 
@@ -258,3 +259,27 @@ def test_load_autodetect_ignores_malformed_route_domains():
     )
 
     assert settings["sources"] == {}
+
+
+def test_load_autodetect_rejects_generated_source_collision():
+    with pytest.raises(ValueError, match="collides with generated route source"):
+        router._load_autodetect(
+            {
+                "autodetect": {
+                    "enabled": True,
+                    "sources": {
+                        "route-school": {
+                            "seed": "https://other.example/",
+                            "route_id": "other",
+                            "provider": "cloudflare",
+                            "roots": ["other.example"],
+                        }
+                    },
+                }
+            },
+            [
+                {"id": "school", "domains": ["school.example"], "provider": "cloudflare"},
+                {"id": "other", "domains": ["other.example"], "provider": "cloudflare"},
+            ],
+            {"cloudflare": {}},
+        )

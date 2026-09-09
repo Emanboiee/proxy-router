@@ -511,6 +511,11 @@ def _autodetect_route_sources(routes: list[dict], providers: dict,
             continue
         source = f"route-{route_id}"
         if source in generated:
+            existing = generated[source]
+            if existing.get("route_id") != route_id:
+                raise ValueError(
+                    f"autodetect source '{source}' collides with generated route source"
+                )
             continue
         generated[source] = {
             "seed": f"https://{seed_host}/",
