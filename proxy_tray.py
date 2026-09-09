@@ -63,8 +63,7 @@ except Exception:  # pragma: no cover - depends on the host Python
 _REAL_DARWIN_PYSTRAY = bool(
     _COCOA_AVAILABLE
     and pystray is not None
-    and getattr(getattr(pystray, "Icon", None), "__module__", "")
-    == "pystray._darwin"
+    and callable(getattr(getattr(pystray, "Icon", None), "_create_menu", None))
 )
 
 POLL_SECONDS = 5.0  # live-enough menu state without spawning 24 CLI procs/min
