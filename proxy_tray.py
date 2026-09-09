@@ -409,7 +409,7 @@ class DashboardViewModel:
                     health = status.profile_health(name, active)
                 except Exception:
                     health = ""
-                suffix = health.strip() if health else "ready"
+                suffix = health.strip() if isinstance(health, str) and health else "ready"
                 rows.append(f"{name.title()}   {active}   {suffix}")
             else:
                 rows.append(f"{name.title()}   no active server")
@@ -1003,7 +1003,7 @@ if _REAL_DARWIN_PYSTRAY:
             self.window.setMovableByWindowBackground_(True)
             self.window.setReleasedWhenClosed_(False)
             self.window.setRestorable_(False)
-            self.window.setMinSize_(AppKit.NSMakeSize(860, 560))
+            self.window.setMinSize_(AppKit.NSMakeSize(860, 620))
             self.window.setBackgroundColor_(_dashboard_color(14, 17, 23))
             self.window.setOpaque_(True)
             self.window.setHasShadow_(True)
@@ -1369,7 +1369,13 @@ if _REAL_DARWIN_PYSTRAY:
                 self._menu_handle = None
                 return
             callbacks = []
-            self._native_menu = create_menu(self.menu, callbacks)
+            try:
+                self._native_menu = create_menu(self.menu, callbacks)
+            except Exception as exc:
+                self._native_menu = None
+                self._menu_handle = None
+                print(f"tray: native menu rebuild skipped: {exc}", file=sys.stderr)
+                return
             self._menu_handle = (
                 (self._native_menu, callbacks)
                 if self._native_menu is not None else None)
@@ -1665,6 +1671,8 @@ class TrayApp:
             self.action_mode(value)
         elif kind == "setup":
             self.action_setup()
+        else:
+            print(f"dashboard: unknown action {kind!r}", file=sys.stderr)
 
     def action_dashboard(self):
         # Preserve the existing right-click menu action: its Dashboard entry
