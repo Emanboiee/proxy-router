@@ -44,6 +44,20 @@ from pathlib import Path
 from typing import Any
 
 import domain_autodetect
+from config_schema import (
+    DEFAULT_DIRECT_PROBE_URL,
+    DEFAULT_EGRESS_SETTINGS,
+    DEFAULT_ENDPOINT_MTU,
+    DEFAULT_ERROR_POLICY,
+    DEFAULT_PORT,
+    DEFAULT_PROBE_URL,
+    DEFAULT_ROTATION_SETTINGS,
+    DEFAULT_TUN_ADDRESS,
+    DEFAULT_TUN_MTU,
+    DEFAULT_TUN_STACK,
+    SCHEMA_VERSION,
+    migrate as migrate_config,
+)
 
 
 def _effective_uid() -> int:
@@ -78,56 +92,7 @@ NETWORK_DIAGNOSTIC_FILE = ROOT / "state" / "network-diagnostic.json"
 # Pending per-provider overrides handed to an elevated `reload` when the
 # engine runs as root and the invoking process cannot SIGHUP it directly.
 RELOAD_OVERRIDE_FILE = ROOT / "state" / "reload-override.json"
-DEFAULT_PORT = 2080
-DEFAULT_TUN_ADDRESS = ["172.19.0.1/30"]
-DEFAULT_TUN_MTU = 1500
-# sing-box's 1500 default black-holes TCP on restrictive paths (see proton profiles)
-DEFAULT_ENDPOINT_MTU = 1280
-DEFAULT_TUN_STACK = "system"
-DEFAULT_PROBE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
-DEFAULT_DIRECT_PROBE_URL = "https://example.com/"
-DEFAULT_EGRESS_SETTINGS = {
-    "probe_url": DEFAULT_PROBE_URL,
-    "probe_timeout": 8.0,
-    # Probe identity. Cloudflare-fronted upstreams (zen's free tier) reset
-    # generic clients on TLS fingerprint and gate by client type; set this to
-    # the real client's UA (e.g. ``opencode/1.18.18``) so probe verdicts match
-    # what the client actually experiences through the tunnel.
-    "probe_user_agent": "proxy-router-egress/1.0",
-    "block_seconds": 3600,
-    "upstream_cooldown_seconds": 300,
-    "fail_threshold": 2,
-    "slow_latency_ms": 1200.0,
-    "ok_window": 86400,
-    # A just-switched WireGuard exit handshakes fine but can blackhole inner
-    # TLS for its first seconds of life (measured on Proton free: ~10-30s).
-    # Switch-adjacent probes retry once after this settle window before the
-    # caller treats the exit as dead; 0 disables the retry.
-    "probe_settle_seconds": 20.0,
-}
-# Optional scheduled rotation (router.json top-level ``rotation``): churn the
-# active provider's exit every ``interval_seconds`` (0/absent = off) with
-# ``jitter_seconds`` spread (default 300) instead of only rotating reactively
-# on failures, so upstream rate limits see a fresh egress IP on a cadence.
-DEFAULT_ROTATION_SETTINGS = {"interval_seconds": 0, "jitter_seconds": 300, "policy": "latency"}
-
 _rotation: dict = {}
-# Per-reason upstream-error policy (router.json top-level ``error_policy``,
-# then per-provider ``providers.<name>.error_policy``, then these built-in
-# defaults; closest scope wins). action: cooldown (rotate skips the lane until
-# reset), exhaust (cooldown + ``exhausted``/``exhausted_until`` marker with a
-# machine-readable reset time in the egress record), block (reputation block:
-# rotate skips the lane entirely until expiry or --force).
-DEFAULT_ERROR_POLICY = {
-    "default": {"action": "cooldown", "seconds": 300},
-    "429": {"action": "exhaust", "seconds": 900},
-    "503": {"action": "cooldown", "seconds": 120},
-    "timeout": {"action": "cooldown", "seconds": 60},
-    "tls": {"action": "cooldown", "seconds": 300},
-    "connection": {"action": "cooldown", "seconds": 300},
-    "1010": {"action": "block", "seconds": 3600},
-    "403": {"action": "block", "seconds": 3600},
-}
 # Rotate logs/sing-box.log once it outgrows this (mirrors monitor.py sample
 # rotation); the live log grows a line per connection and is unbounded.
 LOG_MAX_BYTES = 10_000_000
@@ -622,6 +587,7 @@ def load_config() -> int:
         data = json.loads(CONFIG_FILE.read_text())
         if not isinstance(data, dict):
             return fail(f"bad {CONFIG_FILE.name}: top level must be an object")
+        data = migrate_config(data)
         port = int(data.get("port", DEFAULT_PORT))
     except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
         return fail(f"bad {CONFIG_FILE.name}: {exc}")
@@ -5636,7 +5602,7 @@ def status_json() -> dict:
     """Full machine-readable status for `status --json`."""
     rc, line = _status_report()
     data = {"up": rc == 0, "state": line, "mode": current_mode(), "port": _port,
-            "sing_box": resolve_sing_box()}
+            "sing_box": resolve_sing_box(), "schema_version": SCHEMA_VERSION}
     # Local settings inspection is read-only and does not perform a network
     # probe. Keep engine liveness separate from proxy readiness so a listener
     # alone cannot make the tray claim that GUI traffic is connected.
