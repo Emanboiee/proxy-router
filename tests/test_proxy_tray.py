@@ -1059,6 +1059,12 @@ class DashboardViewModelTests(unittest.TestCase):
         self.assertIn("status exit 7", model.error)
         self.assertEqual(model.route_health, "Unavailable")
 
+    def test_none_provider_entry_is_treated_as_unconfigured(self):
+        model = tray.DashboardViewModel.from_status(
+            tray.RouterStatus(providers={"proton": None}))
+        self.assertEqual(model.provider_rows, ("Proton   no active server",))
+        self.assertEqual(model.route_health, "Waiting")
+
 
 class DashboardLifecycleTests(unittest.TestCase):
     class FakeWindow:
@@ -1187,14 +1193,22 @@ class DarwinStatusButtonTests(unittest.TestCase):
         icon._menu_handle = None
         icon._native_menu = None
         icon._menu = object()
-        icon._status_item = SimpleNamespace(setMenu_=mock.Mock())
+        icon._dashboard_delegate = object()
+        button = SimpleNamespace(
+            setTarget_=mock.Mock(),
+            setAction_=mock.Mock(),
+            sendActionOn_=mock.Mock(),
+        )
+        icon._status_item = SimpleNamespace(
+            button=lambda: button, setMenu_=mock.Mock())
         native_menu = object()
         icon._create_menu = mock.Mock(return_value=native_menu)
 
         icon._update_menu()
 
         self.assertIs(icon._menu_handle[0], native_menu)
-        icon._status_item.setMenu_.assert_called_once_with(None)
+        self.assertEqual(icon._status_item.setMenu_.call_count, 2)
+        icon._status_item.setMenu_.assert_called_with(None)
 
 
 class DashboardTrayIntegrationTests(unittest.TestCase):

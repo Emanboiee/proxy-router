@@ -423,7 +423,8 @@ class DashboardViewModel:
         else:
             records = [
                 (info.get("egress") or {}).get(info.get("active"), {})
-                for info in status.providers.values()
+                for info in (status.providers.get(name) or {}
+                             for name in status.providers)
                 if info.get("active")
             ]
             if any(record.get("upstream_error") or record.get("blocked")
@@ -1005,14 +1006,10 @@ if _REAL_DARWIN_PYSTRAY:
             self.page_title = _dashboard_label("Home", 20, white, bold=True)
             self.page_caption = _dashboard_label("Private routing, without the mystery", 12, muted)
             self.home_button = self._nav_button("Home", "house.fill", selected=True)
-            self.servers_button = self._nav_button(
-                "Servers", "server.rack", selected=False, enabled=False)
-            self.routing_button = self._nav_button(
-                "Routing", "point.3.connected.trianglepath.dotted",
-                selected=False, enabled=False)
-            self.settings_button = self._nav_button(
-                "Preferences", "slider.horizontal.3", selected=False,
-                enabled=False)
+            # These pages are not implemented yet; do not render dead controls.
+            self.servers_button = None
+            self.routing_button = None
+            self.settings_button = None
 
             self.hero_dot = _dashboard_label("●", 42, blue, bold=True,
                                             align=AppKit.NSCenterTextAlignment)
@@ -1047,8 +1044,7 @@ if _REAL_DARWIN_PYSTRAY:
             self.provider_labels = []
             for child in (
                 self.brand, self.brand_caption, self.page_title, self.page_caption,
-                self.home_button, self.servers_button, self.routing_button,
-                self.settings_button, self.hero_dot, self.hero_title,
+                self.home_button, self.hero_dot, self.hero_title,
                 self.hero_explanation, self.primary_button, self.rotate_button,
                 self.action_label, self.mode_title, self.mode_hint, self.mode_popup,
                 self.health_title, self.route_label,
@@ -1056,8 +1052,7 @@ if _REAL_DARWIN_PYSTRAY:
             ):
                 self.root.addSubview_(child)
 
-        def _nav_button(self, title: str, symbol: str, *, selected: bool,
-                        enabled: bool = True):
+        def _nav_button(self, title: str, symbol: str, *, selected: bool):
             button = AppKit.NSButton.alloc().initWithFrame_(AppKit.NSZeroRect)
             button.setTitle_(title)
             button.setBordered_(False)
@@ -1070,7 +1065,6 @@ if _REAL_DARWIN_PYSTRAY:
             button.setImagePosition_(AppKit.NSImageLeft)
             button.setImageScaling_(AppKit.NSImageScaleProportionallyDown)
             button.setToolTip_(title)
-            button.setEnabled_(enabled)
             return button
 
         def _layout_dashboard(self, width: float, height: float):
@@ -1088,9 +1082,6 @@ if _REAL_DARWIN_PYSTRAY:
             frame(self.brand, 24, 24, 148, 24)
             frame(self.brand_caption, 24, 50, 148, 16)
             frame(self.home_button, 26, 84, 144, 34)
-            frame(self.servers_button, 26, 132, 144, 34)
-            frame(self.routing_button, 26, 180, 144, 34)
-            frame(self.settings_button, 26, 228, 144, 34)
 
             frame(self.page_title, content_x, 26, 300, 28)
             frame(self.page_caption, content_x, 52, 430, 20)
@@ -1299,9 +1290,16 @@ if _REAL_DARWIN_PYSTRAY:
         def __init__(self, *args, dashboard_callback=None, **kwargs):
             self._dashboard_callback = dashboard_callback
             self._native_menu = None
+            self._menu_handle = None
             super().__init__(*args, **kwargs)
             self._dashboard_delegate = _DashboardIconDelegate.alloc().initWithOwner_(self)
-            button = self._status_item.button()
+            self._bind_status_button()
+
+        def _bind_status_button(self):
+            status_item = getattr(self, "_status_item", None)
+            if status_item is None:
+                return
+            button = status_item.button()
             button.setTarget_(self._dashboard_delegate)
             button.setAction_(b"activateDashboard:")
             try:
@@ -1311,9 +1309,10 @@ if _REAL_DARWIN_PYSTRAY:
                 # Older AppKit/PyObjC still delivers the default left action;
                 # right-click remains best-effort rather than breaking startup.
                 pass
-            self._status_item.setMenu_(None)
+            status_item.setMenu_(None)
 
         def _update_menu(self):
+            self._bind_status_button()
             callbacks = []
             self._native_menu = self._create_menu(self.menu, callbacks)
             self._menu_handle = (
@@ -1331,11 +1330,14 @@ if _REAL_DARWIN_PYSTRAY:
                 lambda: self._show_native_menu(event), event=event)
 
         def _show_native_menu(self, event):
-            menu_handle = self._menu_handle
+            menu_handle = getattr(self, "_menu_handle", None)
             if not menu_handle:
                 return
             menu = menu_handle[0]
-            button = self._status_item.button()
+            status_item = getattr(self, "_status_item", None)
+            if status_item is None:
+                return
+            button = status_item.button()
             try:
                 AppKit.NSMenu.popUpContextMenu_withEvent_forView_(
                     menu, event, button)
@@ -2082,6 +2084,9 @@ class TrayApp:
         def on_ready(icon):
             # Custom setup replaces pystray's default setup; explicitly show
             # the status item or the agent runs invisibly on macOS.
+            bind = getattr(icon, "_bind_status_button", None)
+            if callable(bind):
+                bind()
             icon.visible = True
             threading.Thread(target=self.poll_loop, daemon=True,
                              name="tray-status").start()
