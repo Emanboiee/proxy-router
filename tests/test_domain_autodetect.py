@@ -200,3 +200,41 @@ def test_load_autodetect_explicit_source_covers_route():
 
     assert set(settings["sources"]) == {"twitch"}
     assert settings["auto_sources"] is True
+
+
+def test_build_config_does_not_expand_roots_when_disabled(tmp_path, monkeypatch):
+    old = (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
+           router._vpn, router._routing, router._autodetect, router._port)
+    try:
+        router.ROOT = Path(tmp_path)
+        router.CONFIG_FILE = router.ROOT / "router.json"
+        router._providers = {"cloudflare": {"socks5": {"host": "127.0.0.1", "port": 2181}}}
+        router._routes = [{"id": "school", "domains": ["twitch.tv"], "provider": "cloudflare"}]
+        router._vpn = {}
+        router._routing = {"mode": "default", "vpn_domains": []}
+        router._autodetect = {
+            "enabled": False,
+            "sources": {
+                "twitch": {
+                    "route_id": "school",
+                    "provider": "cloudflare",
+                    "roots": ["twitch.tv", "ttvnw.net"],
+                }
+            },
+        }
+        router._port = 2080
+
+        assert router._routes_with_autodetected_domains(router._routes) == router._routes
+    finally:
+        (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
+         router._vpn, router._routing, router._autodetect, router._port) = old
+
+
+def test_load_autodetect_skips_ip_only_route():
+    settings = router._load_autodetect(
+        {"autodetect": {"enabled": True}},
+        [{"id": "ip-only", "domains": ["192.0.2.1"], "provider": "cloudflare"}],
+        {"cloudflare": {}},
+    )
+
+    assert settings["sources"] == {}

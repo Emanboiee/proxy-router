@@ -2824,6 +2824,8 @@ def _autodetected_domains_by_route() -> dict[str, list[str]]:
 
 
 def _routes_with_autodetected_domains(routes: list[dict]) -> list[dict]:
+    if not _autodetect.get("enabled"):
+        return routes
     learned = _autodetected_domains_by_route()
     roots: dict[str, list[str]] = {}
     for settings in (_autodetect.get("sources") or {}).values():

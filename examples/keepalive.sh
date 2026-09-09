@@ -197,33 +197,21 @@ PY
 autodetect_sources() {
   python_runner - "$ROOT/router.json" <<'PY' 2>/dev/null
 import json
+import pathlib
 import sys
 
 try:
-    data = json.loads(open(sys.argv[1], encoding="utf-8").read())
-    autodetect = data.get("autodetect") or {}
-    sources = autodetect.get("sources") or {}
-    if not isinstance(sources, dict):
-        raise ValueError
-    names = {source for source in sources if isinstance(source, str) and source}
-    if autodetect.get("auto_sources", True):
-        covered_routes = {
-            spec.get("route_id") for spec in sources.values()
-            if isinstance(spec, dict)
-        }
-        for route in data.get("routes") or []:
-            route_id = route.get("id") if isinstance(route, dict) else None
-            domains = route.get("domains") if isinstance(route, dict) else None
-            if (
-                isinstance(route_id, str)
-                and route_id not in covered_routes
-                and isinstance(domains, list)
-                and any(isinstance(domain, str) and domain for domain in domains)
-            ):
-                names.add("route-" + route_id)
-    for source in sorted(names):
+    config_path = pathlib.Path(sys.argv[1]).resolve()
+    sys.path.insert(0, str(config_path.parent))
+    import router
+
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    routes = data.get("routes") or []
+    providers = data.get("providers") or {}
+    settings = router._load_autodetect(data, routes, providers)
+    for source in sorted(settings["sources"]):
         print(source)
-except (OSError, TypeError, ValueError, json.JSONDecodeError):
+except (OSError, TypeError, ValueError, json.JSONDecodeError, ImportError, AttributeError):
     raise SystemExit(1)
 PY
 }
