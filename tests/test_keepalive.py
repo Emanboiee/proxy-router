@@ -345,7 +345,10 @@ class KeepaliveBackoffTests(unittest.TestCase):
             # running; allow the child to reach its first retry before
             # declaring the recovery log missing.
             deadline = time.time() + 20
-            while time.time() < deadline and h.lines().count("ensure") < 2:
+            # The fake router records an ensure invocation before the shell
+            # can emit its recovery message.  Wait for the boot probe that
+            # follows that message so close() cannot race the stderr write.
+            while time.time() < deadline and "egress check" not in h.lines():
                 time.sleep(0.05)
         finally:
             h.close()
