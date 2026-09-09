@@ -10,6 +10,7 @@ import state
 
 
 def test_atomic_write_replaces_content_and_sets_mode(tmp_path: Path):
+    """Successful writes replace content, permissions, and temp artifacts."""
     target = tmp_path / "state" / "marker"
     state.atomic_write(target, "ready\n", 0o640)
 
@@ -19,6 +20,7 @@ def test_atomic_write_replaces_content_and_sets_mode(tmp_path: Path):
 
 
 def test_atomic_write_calls_commit_after_replace(tmp_path: Path):
+    """The ownership callback observes the committed destination."""
     target = tmp_path / "marker"
     seen: list[tuple[Path, str]] = []
 
@@ -32,6 +34,7 @@ def test_atomic_write_calls_commit_after_replace(tmp_path: Path):
 
 
 def test_atomic_write_cleans_temporary_file_when_write_fails(tmp_path: Path, monkeypatch):
+    """Failed replacement propagates the error and removes the temp file."""
     target = tmp_path / "marker"
     real_replace = os.replace
 
