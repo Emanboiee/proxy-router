@@ -20,7 +20,10 @@ import ipaddress
 import json
 import os
 import platform
-import pwd
+try:
+    import pwd
+except ImportError:  # Windows has no POSIX account database module.
+    pwd = None
 import random
 import re
 import shlex
@@ -41,6 +44,12 @@ from pathlib import Path
 from typing import Any
 
 import domain_autodetect
+
+
+def _effective_uid() -> int:
+    """Return the effective uid where the platform exposes POSIX ids."""
+    getter = getattr(os, "geteuid", None)
+    return int(getter()) if getter is not None else -1
 
 ROOT = Path(os.environ.get("PROXY_ROUTER_ROOT") or Path(__file__).resolve().parent).resolve()
 CONFIG_FILE = ROOT / "router.json"
@@ -423,7 +432,7 @@ def _hand_back_ownership(path: Path) -> None:
     churning restarts. SUDO_UID/SUDO_GID identify who to hand back to.
     Failures are reported, not swallowed: an unhanded-back file locks the
     regular-user keepalive out and silently resurrects the churn loop."""
-    if os.geteuid() != 0:
+    if _effective_uid() != 0:
         return
     uid = os.environ.get("SUDO_UID")
     gid = os.environ.get("SUDO_GID")
@@ -3517,7 +3526,7 @@ def engine_alive() -> bool:
     """True when a sing-box started by us is still running (tun mode has no
     TCP listener to probe, so process liveness is the health check). Also
     refuses foreign/recycled PIDs so a stale pid file can't claim liveness."""
-    if sys.platform == "darwin" and os.geteuid() != 0:
+    if sys.platform == "darwin" and _effective_uid() != 0:
         helper = _helper_status()
         if helper and helper.get("installed") and helper.get("running"):
             return True
@@ -3557,7 +3566,7 @@ def engine_mode_consistent() -> bool:
 
     Prevents the H2 false-positive: a proxy-mode engine running while
     state/mode says 'tun' (or vice versa) is NOT the state we claim."""
-    if sys.platform == "darwin" and os.geteuid() != 0:
+    if sys.platform == "darwin" and _effective_uid() != 0:
         helper = _helper_status()
         if helper and helper.get("installed") and helper.get("running"):
             return helper.get("mode") == current_mode()
@@ -3686,7 +3695,7 @@ def ensure_tray_started() -> None:
     exact plist once and kickstart it. Failures are warnings only because the
     engine itself remains usable from the CLI.
     """
-    if sys.platform != "darwin" or os.geteuid() == 0:
+    if sys.platform != "darwin" or _effective_uid() == 0:
         return
     domain = f"gui/{os.getuid()}"
     label = f"{domain}/com.proxy-router.tray"
@@ -3812,7 +3821,7 @@ def engine_start(use_existing_config: bool = False, *, recover: bool = True) -> 
     # made the gap look like a broken engine instead of the one-time fix.
     # Scoped to TUN like the helper consult below: plain proxy-mode starts
     # work unprivileged and must never depend on helper state (issue #62).
-    if sys.platform == "darwin" and os.geteuid() != 0 and current_mode() == "tun":
+    if sys.platform == "darwin" and _effective_uid() != 0 and current_mode() == "tun":
         helper = _helper_status()
         if not (helper and helper.get("installed")):
             return fail(_HELPER_NOT_INSTALLED)
@@ -3876,7 +3885,7 @@ def engine_start(use_existing_config: bool = False, *, recover: bool = True) -> 
             # support; a non-root verdict is the safe fallback.
             helper_relevant = False
 
-    if sys.platform == "darwin" and os.geteuid() != 0 and helper_relevant:
+    if sys.platform == "darwin" and _effective_uid() != 0 and helper_relevant:
         # Issue #76: the missing-grant case was already surfaced (with the
         # actionable message) by the early permission gate above, so reaching
         # this point means the helper is installed and authorized.
@@ -4212,7 +4221,7 @@ def _terminate_pid(pid: int) -> bool:
 
 
 def engine_stop() -> int:
-    if sys.platform == "darwin" and os.geteuid() != 0:
+    if sys.platform == "darwin" and _effective_uid() != 0:
         helper = _helper_status()
         if helper and helper.get("installed") and helper.get("running"):
             return _helper_run("stop")
@@ -4528,7 +4537,7 @@ def engine_reload(active_overrides: dict[str, Path] | None = None) -> int:
         # not leave the proxy dead while a known-good config exists).
         print("router: new sing-box config failed validation; restoring last-good", file=sys.stderr)
         return restore_last_good()
-    if sys.platform == "darwin" and os.geteuid() != 0:
+    if sys.platform == "darwin" and _effective_uid() != 0:
         helper = _helper_status()
         if helper and helper.get("installed") and helper.get("running"):
             rc = _helper_run("reload")
@@ -4572,7 +4581,7 @@ def engine_reload(active_overrides: dict[str, Path] | None = None) -> int:
     try:
         os.kill(pid, signal.SIGHUP)  # SIGHUP: sing-box hot-reloads the config in place
     except PermissionError:
-        if os.geteuid() != 0:
+        if _effective_uid() != 0:
             if overrides:
                 RELOAD_OVERRIDE_FILE.parent.mkdir(parents=True, exist_ok=True)
                 _atomic_write(RELOAD_OVERRIDE_FILE,
@@ -5485,7 +5494,7 @@ def doctor(network: bool = False) -> int:
         note("ok" if "matches" in drift else "warn", "engine", f"alive, mode {current_mode()} — {drift}")
     else:
         note("warn", "engine", f"down (mode {current_mode()}); run 'router.py ensure' to start it")
-    if os.geteuid() != 0 and shutil.which("sudo"):
+    if _effective_uid() != 0 and shutil.which("sudo"):
         note("ok" if _sudoers_installed() else "warn", "elevate",
              "safe root-owned lifecycle helper active" if _sudoers_installed()
              else "helper absent; run 'router.py elevate install' for TUN lifecycle")
@@ -5670,7 +5679,7 @@ def status_json() -> dict:
     # dashboard) can tell a permission gap apart from a broken engine and
     # offer the one-click repair instead of a generic failure.
     helper = None
-    if sys.platform == "darwin" and os.geteuid() != 0:
+    if sys.platform == "darwin" and _effective_uid() != 0:
         try:
             helper = _helper_status()
         except Exception:
@@ -6977,7 +6986,7 @@ def _engine_runs_as_root() -> bool:
     process-table evidence is not a reason to signal locally; the lifecycle
     path will fail closed or use the installed helper.
     """
-    if os.name == "nt" or os.geteuid() == 0:
+    if os.name == "nt" or _effective_uid() == 0:
         return False
     try:
         pids = _find_our_engine_pids()
@@ -7235,7 +7244,7 @@ def _sudoers_rules(user: str, uid: int) -> str:
 
 def _sudoers_installed() -> bool:
     """True only when the exact root-owned helper status command succeeds."""
-    if os.geteuid() == 0:
+    if _effective_uid() == 0:
         return True
     status = _helper_status()
     return bool(status and status.get("installed"))
@@ -7272,7 +7281,7 @@ def _safe_source_bytes(path: Path, owner_uid: int, *, maximum: int = 4 * 1024 * 
 
 def _install_privileged_helper_root() -> int:
     """Authenticated root phase: revoke legacy grant, stage helper, install v2."""
-    if os.geteuid() != 0:
+    if _effective_uid() != 0:
         return fail("privileged helper install root phase requires administrator approval")
     try:
         import privileged_helper
@@ -7283,6 +7292,8 @@ def _install_privileged_helper_root() -> int:
         owner_gid = int(os.environ.get("SUDO_GID") or root_info.st_gid)
         if owner_uid <= 0 or root_info.st_uid != owner_uid or not stat.S_ISDIR(root_info.st_mode):
             raise RuntimeError("installer root must be owned by the authenticated non-root user")
+        if pwd is None:
+            raise RuntimeError("the privileged macOS helper is unavailable on Windows")
         username = pwd.getpwuid(owner_uid).pw_name
         source_root = Path(os.environ.get("PROXY_ROUTER_INSTALL_SOURCE") or ROOT).resolve()
         source_owner = 0 if os.environ.get("PROXY_ROUTER_INSTALL_SOURCE") else owner_uid
@@ -7354,10 +7365,10 @@ def cmd_elevate(action: str) -> int:
               file=sys.stderr)
         return 1
     if action == "uninstall":
-        if os.geteuid() == 0:
+        if _effective_uid() == 0:
             return fail("run uninstall through the installed helper as the owning user")
         return _helper_run("uninstall")
-    if os.geteuid() != 0:
+    if _effective_uid() != 0:
         if not sys.stdin.isatty():
             return fail("elevate install needs an interactive terminal for administrator approval")
         return _elevate_macos()
@@ -7990,7 +8001,7 @@ def _with_lock(action, timeout: float | None = None) -> Any:
     # parent holds the flock while it waits for the child, so a child that
     # re-acquires the lock would deadlock (parent waits for child, child
     # waits for the parent's lock).
-    if os.geteuid() == 0 and os.environ.get("PROXY_ROUTER_ELEVATED"):
+    if _effective_uid() == 0 and os.environ.get("PROXY_ROUTER_ELEVATED"):
         return action()
     try:
         with _EngineLock(timeout=timeout):

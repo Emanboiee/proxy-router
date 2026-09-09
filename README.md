@@ -53,6 +53,17 @@ cd proxy-router
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
+The installer skips resource directories that are absent from a release
+archive, creates `bin\proxy-router.cmd` and `bin\proxy-router.ps1` launchers,
+and preserves an existing `router.json` on upgrades. Pass `-SetPath` to make
+the command launcher available in new shells. Windows supervision uses the
+native `bin\proxy-router-keepalive.ps1` script, which can be registered with
+Task Scheduler; it does not require Bash or the Unix `examples/keepalive.sh`.
+Proxy mode works without extra files. TUN mode requires `wintun.dll` beside
+`bin\sing-box.exe`; the installer warns with that exact path when the DLL is
+missing. Provider profiles and generated state receive explicit ACLs for the
+installing user, SYSTEM, and Administrators.
+
 The installer creates `router.json` from `router.example.json` on first run
 (once — reruns never clobber it), so there is nothing to initialize by hand.
 `init` is only for creating a fresh config from a bare checkout, and it
