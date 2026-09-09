@@ -25,6 +25,76 @@ jobs:
           cache: pip
       - name: Install test dependencies
         run: python -m pip install -r requirements-dev.txt
+      - name: Load pinned sing-box manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - "$GITHUB_WORKSPACE/sing-box-release.json" >> "$GITHUB_ENV" <<'PY'
+          import json
+          import pathlib
+          import re
+          import sys
+
+          manifest_path = pathlib.Path(sys.argv[1])
+          data = json.loads(manifest_path.read_text(encoding="utf-8"))
+          release = data.get("release") or {}
+          version = release.get("version")
+          tag = release.get("tag")
+          if not isinstance(version, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+              raise SystemExit("sing-box manifest has an invalid release version")
+          if tag != f"v{version}":
+              raise SystemExit("sing-box manifest tag does not match its release version")
+
+          architectures = data.get("architectures") or {}
+          expected = {
+              "arm64": f"sing-box-{version}-darwin-arm64.tar.gz",
+              "x86_64": f"sing-box-{version}-darwin-amd64.tar.gz",
+          }
+          for architecture, asset_name in expected.items():
+              entry = architectures.get(architecture) or {}
+              if entry.get("name") != asset_name:
+                  raise SystemExit(f"sing-box manifest has an invalid {architecture} asset name")
+              if entry.get("archive_root") != asset_name.removesuffix(".tar.gz"):
+                  raise SystemExit(f"sing-box manifest has an invalid {architecture} archive root")
+              checksum = entry.get("sha256")
+              if not isinstance(checksum, str) or not re.fullmatch(r"[0-9a-f]{64}", checksum):
+                  raise SystemExit(f"sing-box manifest has an invalid {architecture} SHA-256")
+
+          print(f"SING_BOX_VERSION={version}")
+          print(f"SING_BOX_SHA_ARM64={architectures['arm64']['sha256']}")
+          print(f"SING_BOX_SHA_AMD64={architectures['x86_64']['sha256']}")
+          PY
+      - name: Install pinned sing-box runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            arm64|aarch64)
+              asset="sing-box-${SING_BOX_VERSION}-darwin-arm64.tar.gz"
+              archive_root="sing-box-${SING_BOX_VERSION}-darwin-arm64"
+              expected="$SING_BOX_SHA_ARM64"
+              ;;
+            x86_64|amd64)
+              asset="sing-box-${SING_BOX_VERSION}-darwin-amd64.tar.gz"
+              archive_root="sing-box-${SING_BOX_VERSION}-darwin-amd64"
+              expected="$SING_BOX_SHA_AMD64"
+              ;;
+            *)
+              echo "unsupported macOS runner architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          archive="$RUNNER_TEMP/$asset"
+          curl --fail --location --retry 3 --output "$archive" \
+            "https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/${asset}"
+          printf '%s  %s\n' "$expected" "$archive" | shasum -a 256 --check -
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          test -x "$RUNNER_TEMP/$archive_root/sing-box"
+          bin_dir="$RUNNER_TEMP/sing-box-bin"
+          mkdir -p "$bin_dir"
+          install -m 0755 "$RUNNER_TEMP/$archive_root/sing-box" "$bin_dir/sing-box"
+          echo "$bin_dir" >> "$GITHUB_PATH"
+          "$bin_dir/sing-box" version
       - name: Full pytest suite (seed 58)
         run: python -m pytest tests -q --randomly-seed=58
       - name: Full pytest suite (seed 5800)

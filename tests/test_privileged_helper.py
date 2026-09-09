@@ -410,6 +410,37 @@ class ReleaseArtifactTests(unittest.TestCase):
         )
         self.assertEqual(release["archive_root"], "sing-box-1.13.19-darwin-arm64")
 
+    def test_manifest_selects_exact_pinned_linux_x86_64_release(self):
+        manifest = Path(__file__).resolve().parents[1] / "sing-box-release.json"
+
+        release = helper.release_for_architecture(
+            manifest,
+            "x86_64",
+            owner_uid=os.getuid(),
+            anchor=manifest.parent,
+            platform_name="linux",
+        )
+
+        self.assertEqual(release["version"], "1.13.19")
+        self.assertEqual(release["size"], 24727716)
+        self.assertEqual(
+            release["sha256"],
+            "77e26226c111b8a269f559aec7999f6f5ae1961f25374b58b126d06405d4f516",
+        )
+        self.assertEqual(release["archive_root"], "sing-box-1.13.19-linux-amd64-glibc")
+
+    def test_manifest_rejects_unreviewed_linux_arm64(self):
+        manifest = Path(__file__).resolve().parents[1] / "sing-box-release.json"
+
+        with self.assertRaisesRegex(helper.SecurityError, "architecture"):
+            helper.release_for_architecture(
+                manifest,
+                "arm64",
+                owner_uid=os.getuid(),
+                anchor=manifest.parent,
+                platform_name="linux",
+            )
+
     def test_manifest_loader_rejects_symlinked_trust_root(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -705,6 +736,9 @@ class HelperLifecycleTests(unittest.TestCase):
             self.assertEqual(spawn.kwargs["env"], helper.sing_box_environment(runtime.state_dir))
             self.assertTrue(spawn.kwargs["start_new_session"])
             self.assertEqual(runtime.pid_file.read_text(), "4242\n")
+            self.assertTrue((user_root / "logs" / "sing-box.log").is_file())
+            self.assertEqual((user_root / "logs").stat().st_mode & 0o777, 0o700)
+            self.assertEqual((user_root / "logs" / "sing-box.log").stat().st_mode & 0o777, 0o600)
             waiter.assert_called_once_with(4242, runtime)
 
     def test_start_engine_readiness_failure_stops_spawned_engine(self):
@@ -824,7 +858,8 @@ class HelperLifecycleTests(unittest.TestCase):
             target = root / "other-user-file"
             target.write_text("do not touch", encoding="ascii")
             target.chmod(0o600)
-            os.link(target, root / "sing-box.log")
+            (root / "logs").mkdir(mode=0o700)
+            os.link(target, root / "logs" / "sing-box.log")
             identity = root.stat()
             install = helper.InstallMetadata(
                 uid=os.getuid(), gid=os.getgid(), user_root=root,
@@ -880,7 +915,8 @@ class HelperLifecycleTests(unittest.TestCase):
             target = user_root / "other"
             target.write_text("x", encoding="ascii")
             target.chmod(0o600)
-            os.link(target, user_root / "sing-box.log")
+            (user_root / "logs").mkdir(mode=0o700)
+            os.link(target, user_root / "logs" / "sing-box.log")
             identity = user_root.stat()
             install = helper.InstallMetadata(
                 uid=os.getuid(), gid=os.getgid(), user_root=user_root,
