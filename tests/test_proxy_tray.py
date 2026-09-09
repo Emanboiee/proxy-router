@@ -1161,7 +1161,7 @@ class DarwinStatusButtonTests(unittest.TestCase):
             return self._modifier_flags
 
     def test_native_button_routes_left_to_dashboard_and_right_to_menu(self):
-        if not tray._COCOA_AVAILABLE:
+        if not tray._REAL_DARWIN_PYSTRAY:
             self.skipTest("Cocoa unavailable")
         icon = object.__new__(tray._DarwinDashboardIcon)
         icon._visible = False
@@ -1177,7 +1177,7 @@ class DarwinStatusButtonTests(unittest.TestCase):
         icon._show_native_menu.assert_called_once_with(right)
 
     def test_control_click_opens_existing_menu(self):
-        if not tray._COCOA_AVAILABLE:
+        if not tray._REAL_DARWIN_PYSTRAY:
             self.skipTest("Cocoa unavailable")
         control_mask = getattr(
             tray.AppKit, "NSEventModifierFlagControl",
@@ -1189,7 +1189,7 @@ class DarwinStatusButtonTests(unittest.TestCase):
         self.assertTrue(tray._is_right_click_event(event))
 
     def test_native_menu_rebuild_keeps_status_item_menu_unset(self):
-        if not tray._COCOA_AVAILABLE:
+        if not tray._REAL_DARWIN_PYSTRAY:
             self.skipTest("Cocoa unavailable")
         icon = object.__new__(tray._DarwinDashboardIcon)
         icon._visible = False

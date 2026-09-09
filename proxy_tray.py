@@ -1238,7 +1238,7 @@ if _REAL_DARWIN_PYSTRAY:
         def show(self):
             if not Foundation.NSThread.isMainThread():
                 self.performSelectorOnMainThread_withObject_waitUntilDone_(
-                    "showOnMainThread:", None, False)
+                    "showOnMainThread:", None, True)
                 return
             self._show_now()
 
