@@ -208,6 +208,25 @@ def test_build_emits_socks_outbound_and_scoped_rules(tmp_path):
     assert {"domain_suffix": ["opencode.ai"], "server": "dns-proton"} in config["dns"]["rules"]
 
 
+def test_engine_start_accepts_proxy_only_provider(tmp_path, monkeypatch):
+    """Proxy mode may start with a SOCKS provider and no WireGuard profiles."""
+    router = load_router(tmp_path)
+    router._providers = {
+        "warp-proxy": {"socks5": {"host": "127.0.0.1", "port": 2181}},
+    }
+    router._port = 2180
+    monkeypatch.setattr(router, "resolve_sing_box", lambda: "/bin/sing-box")
+    monkeypatch.setattr(router, "sing_box_at_least", lambda _minimum: True)
+    monkeypatch.setattr(router, "build_singbox_config", lambda: ({"inbounds": []}, {}))
+    monkeypatch.setattr(router, "active_proxy_providers", lambda: {
+        "warp-proxy": ("127.0.0.1", 2181),
+    })
+    monkeypatch.setattr(router, "write_sing_box", lambda _config: None)
+    monkeypatch.setattr(router, "validate_config", lambda: False)
+
+    assert router.engine_start() == 1
+
+
 def test_proxy_provider_ignores_stale_wireguard_profiles(tmp_path):
     """Switching a provider to SOCKS must not emit its old .conf endpoint."""
     router = load_router(tmp_path)

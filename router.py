@@ -3791,7 +3791,10 @@ def engine_start(use_existing_config: bool = False, *, recover: bool = True) -> 
             config, active = build_singbox_config()
         except (SystemExit, KeyError, ValueError, OSError, configparser.Error) as exc:
             return fail(f"could not build sing-box config: {exc}")
-        if not active:
+        # Proxy-backed providers intentionally have no WireGuard profile;
+        # their SOCKS5 outbounds are assembled separately in the generated
+        # config and still make proxy-mode startup valid.
+        if not active and not active_proxy_providers():
             return fail("no provider profile available (drop *.conf into providers/<name>/)")
         write_sing_box(config)
         if not validate_config():
