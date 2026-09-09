@@ -2515,9 +2515,18 @@ def persisted_active(name: str) -> Path | None:
         except OSError:
             marker = ""
         if marker != live.stem:
-            # The engine is the source of truth for a tunnel that is already
-            # running. Repair stale state before probes can blame the wrong exit.
-            set_active(name, live)
+            # A staged reload can temporarily make the generated config differ
+            # from the committed marker. Repair only when both files agree;
+            # otherwise keep the marker authoritative until the probe commits.
+            try:
+                candidate = SING_BOX_CONFIG.read_text()
+                committed = LAST_GOOD_FILE.read_text()
+            except OSError:
+                candidate = committed = None
+            if candidate is not None and candidate == committed:
+                set_active(name, live)
+            else:
+                return next((p for p in profiles if p.stem == marker), None)
         return live
     state = ROOT / "state" / f"{name}.active"
     if state.is_file():

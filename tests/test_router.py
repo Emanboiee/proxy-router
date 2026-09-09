@@ -1674,6 +1674,15 @@ class RotationEgressTests(unittest.TestCase):
         self.assertEqual(self._active(), "a")
         self.assertFalse(router.is_cooled_down("proton", self._profile("a")))
 
+    def test_persisted_active_missing_last_good_keeps_marker(self):
+        router.set_active("proton", self._profile("a"))
+        router.LAST_GOOD_FILE.unlink(missing_ok=True)
+        with mock.patch.object(router, "engine_alive", return_value=True), \
+                mock.patch.object(router, "configured_profile", return_value=self._profile("b")):
+            active = router.persisted_active("proton")
+        self.assertEqual(active.stem, "a")
+        self.assertEqual(self._active(), "a")
+
     def test_rotate_probe_failure_without_previous_keeps_switch(self):
         with mock.patch.object(router, "listener_up", return_value=True), \
                 mock.patch.object(router, "probe_profile", return_value=(False, {"ok": False})):
