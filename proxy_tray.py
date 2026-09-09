@@ -1641,6 +1641,10 @@ class TrayApp:
                 try:
                     self._publish_status(refreshed, epoch)
                 except Exception as exc:
+                    refresh_note = f"{result} — status refresh failed"
+                    with self.lock:
+                        self.last_action_result = refresh_note
+                    self._dashboard_update_action(refresh_note)
                     print(f"tray: status publish skipped: {exc}", file=sys.stderr)
             finally:
                 # A dashboard/UI failure must not leave the mutation gate
