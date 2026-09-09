@@ -105,6 +105,18 @@ class FailingProxyRunner(ProxyRunner):
         return super().__call__(command, **kwargs)
 
 
+class NoServiceDiscoveryRunner(ProxyRunner):
+    """Discovery can fail during a Wi-Fi/VPN handoff while networksetup still
+    knows how to inspect and clear the recorded service."""
+
+    def __call__(self, command, **kwargs):
+        if command[:3] == ["route", "-n", "get"] or command[:2] in (
+                ["networksetup", "-listallnetworkservices"],
+                ["scutil", "--nc"]):
+            return SimpleNamespace(returncode=1, stdout="", stderr="handoff")
+        return super().__call__(command, **kwargs)
+
+
 class ConnectedOverrideRunner(ProxyRunner):
     """Physical proxy is set first; a connected extension overrides it until
     the extension service is reconciled."""
@@ -189,6 +201,28 @@ def test_disconnect_cleanup_failure_is_nonzero_and_retains_record(tmp_path, monk
     runner.fail_secure_off = True
     assert router.system_proxy_off(runner=runner) == 1
     assert (tmp_path / "system-proxy.json").exists()
+
+
+def test_disconnect_uses_ownership_record_when_service_discovery_is_empty(tmp_path, monkeypatch):
+    runner = NoServiceDiscoveryRunner()
+    runner.http = {"enabled": True, "server": "127.0.0.1", "port": 2080}
+    runner.https = {"enabled": True, "server": "127.0.0.1", "port": 2080}
+    state_file = tmp_path / "system-proxy.json"
+    monkeypatch.setattr(router, "SYSTEM_PROXY_STATE_FILE", state_file)
+    state_file.write_text(json.dumps({
+        "version": 1,
+        "endpoint": {"server": "127.0.0.1", "port": 2080},
+        "services": [{
+            "service": "Campus Wi-Fi",
+            "port": 2080,
+            "owned": {"http": True, "https": True},
+            "aux": {},
+        }],
+    }))
+
+    assert router.system_proxy_off(runner=runner) == 0
+    assert runner.http["enabled"] is False and runner.https["enabled"] is False
+    assert not state_file.exists()
 
 
 def test_dns_timeout_with_routed_success_is_classified_without_side_effects(monkeypatch):

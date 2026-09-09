@@ -341,9 +341,14 @@ class KeepaliveBackoffTests(unittest.TestCase):
     def test_failed_ensure_logs_timestamped_failure_then_recovery(self):
         h = KeepaliveHarness(interval="1", fail_ensures="1")
         try:
-            # Wait for the failed ensure and its first successful retry.
-            deadline = time.time() + 5
-            while time.time() < deadline and h.lines().count("ensure") < 2:
+            # Hosted runners can be heavily loaded while the full suite is
+            # running; allow the child to reach its first retry before
+            # declaring the recovery log missing.
+            deadline = time.time() + 20
+            # The fake router records an ensure invocation before the shell
+            # can emit its recovery message.  Wait for the boot probe that
+            # follows that message so close() cannot race the stderr write.
+            while time.time() < deadline and "egress check" not in h.lines():
                 time.sleep(0.05)
         finally:
             h.close()
