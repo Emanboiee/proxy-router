@@ -504,10 +504,11 @@ class DashboardController:
                         return False
                     with self._lock:
                         self._window = window = created
-                with self._lock:
-                    last_action = self._last_action
+        with self._lock:
+            display_status = self._status
+            last_action = self._last_action
         try:
-            window.update_status(status)
+            window.update_status(display_status)
             window.update_action(last_action)
             window.show()
         except Exception as exc:
