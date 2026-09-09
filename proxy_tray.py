@@ -1320,7 +1320,9 @@ if _REAL_DARWIN_PYSTRAY:
                 if self._native_menu is not None else None)
             # The menu is intentionally not assigned to NSStatusItem. AppKit
             # would consume left-click before the button target can route it.
-            self._status_item.setMenu_(None)
+            status_item = getattr(self, "_status_item", None)
+            if status_item is not None:
+                status_item.setMenu_(None)
 
         def _route_status_button_event(self, event):
             kind = "right" if _is_right_click_event(event) else "left"
@@ -1344,9 +1346,12 @@ if _REAL_DARWIN_PYSTRAY:
             except Exception:
                 # Keep a compatibility fallback for AppKit versions that do
                 # not expose the context-popup selector through PyObjC.
-                bounds = button.bounds()
-                menu.popUpMenuPositioningItem_atLocation_inView_(
-                    None, AppKit.NSMakePoint(0, bounds.size.height), button)
+                try:
+                    bounds = button.bounds()
+                    menu.popUpMenuPositioningItem_atLocation_inView_(
+                        None, AppKit.NSMakePoint(0, bounds.size.height), button)
+                except Exception:
+                    return
 
 else:
     class _DarwinDashboardIcon:
@@ -1360,7 +1365,8 @@ class TrayApp:
                  initial_status: RouterStatus | None = None):
         self.client = client
         self.icon_image = icon_image
-        self.latest: RouterStatus = initial_status or RouterStatus()
+        self.latest: RouterStatus = (
+            initial_status if initial_status is not None else RouterStatus())
         self.lock = threading.Lock()
         self.last_action_result: str | None = None
         self.quit_flag = threading.Event()
@@ -1619,7 +1625,7 @@ class TrayApp:
 
     def action_setup(self):
         """Open the existing setup wizard without duplicating its logic."""
-        opened = _launch_terminal(Path(self.client.root), [])
+        opened = open_dashboard(self.client.root)
         result = "setup opened in Terminal" if opened else "setup: no terminal"
         with self.lock:
             self.last_action_result = result
