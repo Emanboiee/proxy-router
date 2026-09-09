@@ -1237,6 +1237,17 @@ if _REAL_DARWIN_PYSTRAY:
             self._invoke_action("mode", mode)
 
         def show(self):
+            if not Foundation.NSThread.isMainThread():
+                self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                    "showOnMainThread:", None, False)
+                return
+            self._show_now()
+
+        @objc.namedSelector(b"showOnMainThread:")
+        def show_on_main_thread(self, _sender):
+            self._show_now()
+
+        def _show_now(self):
             self._visible = True
             self.window.makeKeyAndOrderFront_(None)
             AppKit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
@@ -1331,6 +1342,8 @@ if _REAL_DARWIN_PYSTRAY:
             if status_item is None or delegate is None:
                 return
             button = status_item.button()
+            if button is None:
+                return
             button.setTarget_(delegate)
             button.setAction_(b"activateDashboard:")
             try:
@@ -1994,12 +2007,12 @@ class TrayApp:
         for name, label in _BUILTIN_PRESETS:
             preset_items.append(pystray.MenuItem(
                 label, lambda *_, n=name: self.action_apply_preset(n),
-                checked=lambda item, n=name: st.preset == n))
+                checked=lambda *_, n=name: st.preset == n))
         for name in self._custom_preset_names():
             preset_items.append(pystray.MenuItem(
                 self._custom_preset_label(name),
                 lambda *_, n=name: self.action_apply_preset(n),
-                checked=lambda item, n=name: st.preset == n))
+                checked=lambda *_, n=name: st.preset == n))
         items.append(pystray.MenuItem("Presets", pystray.Menu(*preset_items),
                                       enabled=not mutation_active))
         items.append(pystray.Menu.SEPARATOR)
