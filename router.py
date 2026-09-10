@@ -1625,7 +1625,7 @@ def _response_host_matches(host: str, domain: str) -> bool:
 
 def response_provider_for_host(host: str) -> str | None:
     """Return the configured route provider responsible for ``host``."""
-    for route in _routes:
+    for route in _routes_with_autodetected_domains(_routes):
         provider = route.get("provider")
         if not isinstance(provider, str):
             continue
@@ -5381,8 +5381,7 @@ def _diagnostic_host_is_routed(host: str) -> bool:
             normalized = str(domain).lstrip("*.").lower()
             if host == normalized or host.endswith("." + normalized):
                 if routing.get("mode") == "vpn-list" and not any(
-                        host == vpn or host.endswith("." + vpn)
-                        for vpn in vpn_domains):
+                        _response_host_matches(host, vpn) for vpn in vpn_domains):
                     continue
                 return True
     return False
