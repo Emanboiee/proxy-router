@@ -1464,7 +1464,7 @@ def recover_route(name: str, host: str) -> int:
         return 3
     routing = routing_state()
     if routing["mode"] == "vpn-list" and not any(
-            _response_host_matches(host, domain) for domain in routing["vpn_domains"]):
+            _response_host_matches(host, domain) for domain in _effective_vpn_domains(routing)):
         return 3
     url = f"https://{host}/"
     if urllib.parse.urlsplit(url).hostname != host or unsafe_probe_target(url):
@@ -1535,7 +1535,7 @@ def restore_fallback(name: str, host: str) -> int:
         return 3
     routing = routing_state()
     if routing["mode"] == "vpn-list" and not any(
-            _response_host_matches(host, domain) for domain in routing["vpn_domains"]):
+            _response_host_matches(host, domain) for domain in _effective_vpn_domains(routing)):
         return 3
     url = f"https://{host}/"
     if urllib.parse.urlsplit(url).hostname != host or unsafe_probe_target(url):
@@ -1738,7 +1738,7 @@ def autodetect_source(source: str = "twitch", *, reload: bool = True,
         return 1
     text = document.decode("utf-8", "replace")
     hosts = domain_autodetect.extract_related_hosts(
-        text, settings["roots"], extra_roots=settings.get("extra_roots", [])
+        text, settings["roots"], extra_roots=settings.get("extra_roots") or []
     )
     if not hosts:
         if not quiet:
@@ -1746,7 +1746,7 @@ def autodetect_source(source: str = "twitch", *, reload: bool = True,
         return 1
     before = _read_autodetect_state(source)
     now = int(time.time())
-    before_domains = set(domain_autodetect.active_domains(before, now=now))
+    before_domains = set(_active_autodetected_domains(settings, before))
     state, _ = domain_autodetect.merge_state(
         before, hosts, now=now, ttl_seconds=settings["ttl_seconds"]
     )
@@ -1756,11 +1756,12 @@ def autodetect_source(source: str = "twitch", *, reload: bool = True,
         "provider": settings["provider"],
         "seed": settings["seed"],
         "roots": settings["roots"],
-        "extra_roots": settings.get("extra_roots", []),
+        "extra_roots": settings.get("extra_roots") or [],
         "ttl_seconds": settings["ttl_seconds"],
     })
     state_changed = state != before
-    route_changed = before_domains != set(domain_autodetect.active_domains(state, now=now))
+    active_domains = _active_autodetected_domains(settings, state)
+    route_changed = before_domains != set(active_domains)
     if state_changed:
         _atomic_write(_autodetect_state_path(source), json.dumps(state, indent=2) + "\n", 0o600)
     reload_rc = 0
@@ -1770,7 +1771,7 @@ def autodetect_source(source: str = "twitch", *, reload: bool = True,
         "source": source,
         "changed": route_changed,
         "state_changed": state_changed,
-        "domains": domain_autodetect.active_domains(state, now=now),
+        "domains": active_domains,
         "reload_rc": reload_rc,
         "updated_at": state.get("updated_at"),
     }
@@ -1806,6 +1807,8 @@ def probe_url_for(name: str) -> str | None:
     routing = routing_state()
     direct = frozenset(routing.get("direct_domains") or []) \
         if routing.get("mode") == "safe-list" else frozenset()
+    vpn_domains = _effective_vpn_domains(routing)
+    routed_routes = _routes_with_autodetected_domains(_routes)
 
     def matches_domain(host: str, domain: str) -> bool:
         domain = domain.lstrip("*.").strip().lower()
@@ -1821,7 +1824,7 @@ def probe_url_for(name: str) -> str | None:
             default_provider = routing.get("default_provider")
             if isinstance(default_provider, str) and _effective_route_provider(default_provider) == name:
                 return True
-        for route in _routes:
+        for route in routed_routes:
             if route.get("provider") != name:
                 continue
             for domain in route.get("domains", []):
@@ -1829,7 +1832,6 @@ def probe_url_for(name: str) -> str | None:
                 if not matches_domain(host, route_host):
                     continue
                 if routing.get("mode") == "vpn-list":
-                    vpn_domains = routing.get("vpn_domains") or []
                     if not any(matches_domain(route_host, vpn) for vpn in vpn_domains):
                         continue
                 return True
@@ -1848,7 +1850,7 @@ def probe_url_for(name: str) -> str | None:
     if isinstance(entry, dict):
         probe_route_id = entry.get("probe_route_id")
         if probe_route_id is not None:
-            for route in _routes:
+            for route in routed_routes:
                 if route.get("id") == probe_route_id and route.get("provider") == name:
                     # An explicit route is fail-closed: do not silently fall
                     # back to another route if its target is no longer tunneled.
@@ -1868,7 +1870,7 @@ def probe_url_for(name: str) -> str | None:
             if host and is_tunneled(host.lower()):
                 return default_probe
 
-    for route in _routes:
+    for route in routed_routes:
         if route.get("provider") != name:
             continue
         for host in route.get("domains", []):
@@ -1876,7 +1878,6 @@ def probe_url_for(name: str) -> str | None:
             if not host or "." not in host or host.startswith(".") or is_direct(host):
                 continue
             if routing.get("mode") == "vpn-list":
-                vpn_domains = routing.get("vpn_domains") or []
                 if not any(matches_domain(host, vpn) for vpn in vpn_domains):
                     continue
             return f"https://{host}{_PROBE_DOMAIN_PATHS.get(host, '')}"
@@ -2840,6 +2841,29 @@ def _active_autodetected_domains(settings: dict, state: dict) -> list[str]:
     ]
 
 
+def _effective_vpn_domains(routing: dict | None = None) -> frozenset[str]:
+    """Return configured and enabled autodetected domains for vpn-list checks."""
+    routing = routing if isinstance(routing, dict) else routing_state()
+    domains = set(routing.get("vpn_domains") or [])
+    if not _autodetect.get("enabled"):
+        return frozenset(domains)
+    for settings in (_autodetect.get("sources") or {}).values():
+        if not isinstance(settings, dict):
+            continue
+        domains.update(
+            root for root in (
+                *(settings.get("roots") or []),
+                *(settings.get("extra_roots") or []),
+            ) if isinstance(root, str)
+        )
+    domains.update(
+        host
+        for learned in _autodetected_domains_by_route().values()
+        for host in learned
+    )
+    return frozenset(domains)
+
+
 def _routes_with_autodetected_domains(routes: list[dict]) -> list[dict]:
     if not _autodetect.get("enabled"):
         return routes
@@ -2942,7 +2966,7 @@ def _route_capture_cidrs(routes: list[dict], routing: dict,
     """
     routing_mode = routing.get("mode", "default")
     vpn_domains = {
-        domain for value in (routing.get("vpn_domains") or [])
+        domain for value in _effective_vpn_domains(routing)
         if (domain := _capture_domain_name(value))
     }
     direct_domains = {
@@ -3141,25 +3165,7 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
         # tunnel. The rule comes first so a domain listed both here and in a
         # provider route always wins the direct resolver.
         dns_rules.append({"domain_suffix": list(routing["direct_domains"]), "server": "dns-local"})
-    autodetect_roots = frozenset(
-        root
-        for settings in (_autodetect.get("sources") or {}).values()
-        if _autodetect.get("enabled") and isinstance(settings, dict)
-        for root in (
-            *(settings.get("roots") or []),
-            *(settings.get("extra_roots") or []),
-        )
-        if isinstance(root, str)
-    )
-    vpn_domains = (
-        frozenset(routing["vpn_domains"])
-        | autodetect_roots
-        | frozenset(
-            domain
-            for domains in _autodetected_domains_by_route().values()
-            for domain in domains
-        )
-    )
+    vpn_domains = _effective_vpn_domains(routing)
     for route in build_routes:
         route_provider = _effective_route_provider(route["provider"])
         if ((route_provider != "direct" and route_provider not in active
@@ -5369,10 +5375,15 @@ def _diagnostic_host_is_routed(host: str) -> bool:
         return False
     if routing.get("mode") == "safe-list" and routing.get("default_provider"):
         return True
-    for route in _routes:
+    vpn_domains = _effective_vpn_domains(routing)
+    for route in _routes_with_autodetected_domains(_routes):
         for domain in route.get("domains") or []:
             normalized = str(domain).lstrip("*.").lower()
             if host == normalized or host.endswith("." + normalized):
+                if routing.get("mode") == "vpn-list" and not any(
+                        host == vpn or host.endswith("." + vpn)
+                        for vpn in vpn_domains):
+                    continue
                 return True
     return False
 
