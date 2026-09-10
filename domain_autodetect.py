@@ -44,11 +44,20 @@ def host_matches_root(host: str, root: str) -> bool:
     return host == root or host.endswith("." + root)
 
 
-def extract_related_hosts(document: str, roots: Iterable[str]) -> list[str]:
-    """Extract exact hosts from absolute/protocol-relative URLs under ``roots``."""
+def extract_related_hosts(document: str, roots: Iterable[str], *,
+                          extra_roots: Iterable[str] = ()) -> list[str]:
+    """Extract exact hosts under trusted route roots and optional asset roots.
+
+    ``extra_roots`` is explicit because shared CDNs can serve unrelated sites;
+    callers must opt in to each cross-origin dependency suffix they trust.
+    """
+    try:
+        candidates = (*(roots or ()), *(extra_roots or ()))
+    except TypeError:
+        return []
     allowed = {
         normalized
-        for root in roots
+        for root in candidates
         if (normalized := normalize_host(root)) is not None
     }
     if not allowed or not isinstance(document, str):

@@ -19,6 +19,17 @@ def test_extract_related_hosts_is_suffix_bounded():
     ) == ["static-cdn.jtvnw.net", "usher.ttvnw.net", "www.twitch.tv"]
 
 
+def test_extract_related_hosts_accepts_explicit_cross_origin_asset_root():
+    document = '''
+      <script src="https://cdn.prod.example.net/app.js"></script>
+      <img src="https://untrusted.example.net/image.png">
+    '''
+
+    assert domain_autodetect.extract_related_hosts(
+        document, ["wayground.com"], extra_roots=["cdn.prod.example.net"]
+    ) == ["cdn.prod.example.net"]
+
+
 def test_merge_state_refreshes_hosts_and_prunes_expired():
     state = {
         "domains": {
@@ -135,7 +146,7 @@ def test_build_config_routes_configured_autodetect_roots(tmp_path, monkeypatch):
             "id": "school", "domains": ["twitch.tv"], "provider": "cloudflare"
         }]
         router._vpn = {}
-        router._routing = {"mode": "default", "vpn_domains": []}
+        router._routing = {"mode": "vpn-list", "vpn_domains": []}
         router._autodetect = {
             "enabled": True,
             "sources": {
@@ -143,6 +154,7 @@ def test_build_config_routes_configured_autodetect_roots(tmp_path, monkeypatch):
                     "route_id": "school",
                     "provider": "cloudflare",
                     "roots": ["twitch.tv", "jtvnw.net", "ttvnw.net"],
+                    "extra_roots": ["cdn.example.net"],
                 }
             },
         }
@@ -153,7 +165,7 @@ def test_build_config_routes_configured_autodetect_roots(tmp_path, monkeypatch):
 
         assert {
             "outbound": "cloudflare",
-            "domain_suffix": ["twitch.tv", "jtvnw.net", "ttvnw.net"],
+            "domain_suffix": ["twitch.tv", "jtvnw.net", "ttvnw.net", "cdn.example.net"],
         } in config["route"]["rules"]
     finally:
         (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
@@ -203,6 +215,95 @@ def test_load_autodetect_explicit_source_covers_route():
     assert settings["auto_sources"] is True
 
 
+def test_load_autodetect_preserves_explicit_extra_roots():
+    settings = router._load_autodetect(
+        {
+            "autodetect": {
+                "enabled": True,
+                "auto_sources": False,
+                "sources": {
+                    "school": {
+                        "seed": "https://wayground.com/",
+                        "route_id": "school",
+                        "provider": "cloudflare",
+                        "roots": ["wayground.com"],
+                        "extra_roots": [
+                            "cdn.prod.website-files.com",
+                            "CDN.PROD.WEBSITE-FILES.COM",
+                        ],
+                    }
+                },
+            }
+        },
+        [{"id": "school", "domains": ["wayground.com"], "provider": "cloudflare"}],
+        {"cloudflare": {}},
+    )
+
+    assert settings["sources"]["school"]["extra_roots"] == [
+        "cdn.prod.website-files.com"
+    ]
+
+
+def test_load_autodetect_rejects_invalid_extra_roots():
+    with pytest.raises(ValueError, match="extra_roots"):
+        router._load_autodetect(
+            {
+                "autodetect": {
+                    "enabled": True,
+                    "auto_sources": False,
+                    "sources": {
+                        "school": {
+                            "seed": "https://wayground.com/",
+                            "route_id": "school",
+                            "provider": "cloudflare",
+                            "roots": ["wayground.com"],
+                            "extra_roots": ["not a host"],
+                        }
+                    },
+                }
+            },
+            [{"id": "school", "domains": ["wayground.com"], "provider": "cloudflare"}],
+            {"cloudflare": {}},
+        )
+
+
+def test_learned_hosts_outside_current_roots_are_pruned(tmp_path):
+    old = (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
+           router._vpn, router._routing, router._autodetect, router._port)
+    try:
+        router.ROOT = Path(tmp_path)
+        router.CONFIG_FILE = router.ROOT / "router.json"
+        router._autodetect = {
+            "enabled": True,
+            "sources": {
+                "school": {
+                    "route_id": "school",
+                    "roots": ["wayground.com"],
+                    "extra_roots": ["cdn.prod.example.net"],
+                }
+            },
+        }
+        state_path = router.ROOT / "state" / "autodetect" / "school.json"
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text(json.dumps({
+            "route_id": "school",
+            "domains": {
+                "cdn.prod.example.net": {"expires_at": 9999999999},
+                "old.shared-cdn.net": {"expires_at": 9999999999},
+            },
+        }))
+
+        assert router._autodetected_domains_by_route() == {
+            "school": ["cdn.prod.example.net"]
+        }
+        assert router.autodetect_status()["sources"]["school"]["domains"] == [
+            "cdn.prod.example.net"
+        ]
+    finally:
+        (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
+         router._vpn, router._routing, router._autodetect, router._port) = old
+
+
 def test_build_config_does_not_expand_roots_when_disabled(tmp_path, monkeypatch):
     old = (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
            router._vpn, router._routing, router._autodetect, router._port)
@@ -226,6 +327,44 @@ def test_build_config_does_not_expand_roots_when_disabled(tmp_path, monkeypatch)
         router._port = 2080
 
         assert router._routes_with_autodetected_domains(router._routes) == router._routes
+    finally:
+        (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
+         router._vpn, router._routing, router._autodetect, router._port) = old
+
+
+def test_build_config_does_not_use_disabled_autodetect_roots(tmp_path, monkeypatch):
+    old = (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
+           router._vpn, router._routing, router._autodetect, router._port)
+    try:
+        router.ROOT = Path(tmp_path)
+        router.CONFIG_FILE = router.ROOT / "router.json"
+        router._providers = {
+            "cloudflare": {"socks5": {"host": "127.0.0.1", "port": 2181}}
+        }
+        router._routes = [{
+            "id": "school", "domains": ["twitch.tv"], "provider": "cloudflare"
+        }]
+        router._vpn = {}
+        router._routing = {"mode": "vpn-list", "vpn_domains": []}
+        router._autodetect = {
+            "enabled": False,
+            "sources": {
+                "school": {
+                    "route_id": "school",
+                    "roots": ["twitch.tv"],
+                    "extra_roots": ["cdn.example.net"],
+                }
+            },
+        }
+        router._port = 2080
+        monkeypatch.setattr(router, "current_mode", lambda: "proxy")
+
+        config, _ = router.build_singbox_config()
+
+        assert not any(
+            rule.get("outbound") == "cloudflare"
+            for rule in config["route"]["rules"]
+        )
     finally:
         (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
          router._vpn, router._routing, router._autodetect, router._port) = old
