@@ -552,8 +552,6 @@ def _load_autodetect(data: dict, routes: list, providers: dict) -> dict:
         if not any(domain_autodetect.host_matches_root(seed_host, root) for root in normalized_roots):
             raise ValueError(f"'autodetect.sources.{source}.seed' must be under one of its roots")
         extra_roots = supplied.get("extra_roots", [])
-        if extra_roots is None:
-            extra_roots = []
         if not isinstance(extra_roots, list):
             raise ValueError(f"'autodetect.sources.{source}.extra_roots' must be a string list")
         normalized_extra_roots = []
@@ -2818,6 +2816,18 @@ def _autodetected_domains_by_route() -> dict[str, list[str]]:
         if state.get("route_id") != settings.get("route_id"):
             continue
         domains = domain_autodetect.active_domains(state)
+        allowed_roots = tuple(
+            root for root in (
+                *(settings.get("roots") or []),
+                *(settings.get("extra_roots") or []),
+            ) if isinstance(root, str)
+        )
+        if allowed_roots:
+            domains = [
+                host for host in domains
+                if any(domain_autodetect.host_matches_root(host, root)
+                       for root in allowed_roots)
+            ]
         if domains:
             result.setdefault(settings["route_id"], []).extend(domains)
     return {route_id: sorted(set(domains)) for route_id, domains in result.items()}
@@ -3124,8 +3134,24 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
         # tunnel. The rule comes first so a domain listed both here and in a
         # provider route always wins the direct resolver.
         dns_rules.append({"domain_suffix": list(routing["direct_domains"]), "server": "dns-local"})
-    vpn_domains = frozenset(routing["vpn_domains"]) | frozenset(
-        domain for domains in _autodetected_domains_by_route().values() for domain in domains
+    autodetect_roots = frozenset(
+        root
+        for settings in (_autodetect.get("sources") or {}).values()
+        if isinstance(settings, dict)
+        for root in (
+            *(settings.get("roots") or []),
+            *(settings.get("extra_roots") or []),
+        )
+        if isinstance(root, str)
+    )
+    vpn_domains = (
+        frozenset(routing["vpn_domains"])
+        | autodetect_roots
+        | frozenset(
+            domain
+            for domains in _autodetected_domains_by_route().values()
+            for domain in domains
+        )
     )
     for route in build_routes:
         route_provider = _effective_route_provider(route["provider"])

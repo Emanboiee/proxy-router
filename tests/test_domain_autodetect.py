@@ -26,8 +26,8 @@ def test_extract_related_hosts_accepts_explicit_cross_origin_asset_root():
     '''
 
     assert domain_autodetect.extract_related_hosts(
-        document, ["wayground.com"], extra_roots=["example.net"]
-    ) == ["cdn.prod.example.net", "untrusted.example.net"]
+        document, ["wayground.com"], extra_roots=["cdn.prod.example.net"]
+    ) == ["cdn.prod.example.net"]
 
 
 def test_merge_state_refreshes_hosts_and_prunes_expired():
@@ -265,6 +265,40 @@ def test_load_autodetect_rejects_invalid_extra_roots():
             [{"id": "school", "domains": ["wayground.com"], "provider": "cloudflare"}],
             {"cloudflare": {}},
         )
+
+
+def test_learned_hosts_outside_current_roots_are_pruned(tmp_path):
+    old = (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
+           router._vpn, router._routing, router._autodetect, router._port)
+    try:
+        router.ROOT = Path(tmp_path)
+        router.CONFIG_FILE = router.ROOT / "router.json"
+        router._autodetect = {
+            "enabled": True,
+            "sources": {
+                "school": {
+                    "route_id": "school",
+                    "roots": ["wayground.com"],
+                    "extra_roots": ["cdn.prod.example.net"],
+                }
+            },
+        }
+        state_path = router.ROOT / "state" / "autodetect" / "school.json"
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text(json.dumps({
+            "route_id": "school",
+            "domains": {
+                "cdn.prod.example.net": {"expires_at": 9999999999},
+                "old.shared-cdn.net": {"expires_at": 9999999999},
+            },
+        }))
+
+        assert router._autodetected_domains_by_route() == {
+            "school": ["cdn.prod.example.net"]
+        }
+    finally:
+        (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
+         router._vpn, router._routing, router._autodetect, router._port) = old
 
 
 def test_build_config_does_not_expand_roots_when_disabled(tmp_path, monkeypatch):
