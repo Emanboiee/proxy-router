@@ -146,7 +146,7 @@ def test_build_config_routes_configured_autodetect_roots(tmp_path, monkeypatch):
             "id": "school", "domains": ["twitch.tv"], "provider": "cloudflare"
         }]
         router._vpn = {}
-        router._routing = {"mode": "default", "vpn_domains": []}
+        router._routing = {"mode": "vpn-list", "vpn_domains": []}
         router._autodetect = {
             "enabled": True,
             "sources": {

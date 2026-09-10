@@ -43,4 +43,6 @@ provider. Use the narrowest owned suffix possible: shared roots such as
 `cloudfront.net` or `website-files.com` can serve unrelated tenants and would
 route their traffic too. Set `auto_sources` to `false` to require explicit
 sources, and use `router.py status --json` to inspect generated sources, roots,
-and learned hosts.
+and learned hosts. In `vpn-list` mode, enabled autodetection adds configured
+roots and learned hosts to the effective VPN allowlist so discovered assets do
+not silently fall back to a direct connection.
