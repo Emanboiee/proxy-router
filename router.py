@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any
 
 import domain_autodetect
+import egress
 import state
 from config_schema import (
     DEFAULT_DIRECT_PROBE_URL,
@@ -1119,10 +1120,7 @@ def _transport_reason(error_text) -> str:
     """Classify a transport-level probe failure (no HTTP status) into a policy
     reason: TLS/SSL/handshake/certificate errors are ``tls``, everything else
     (dial/connect/reset/read) is ``connection``."""
-    text = str(error_text or "").lower()
-    if any(token in text for token in ("tls", "ssl", "handshake", "certificate", "eof", "alert")):
-        return "tls"
-    return "connection"
+    return egress.transport_reason(error_text)
 
 
 def _load_egress_settings(data: dict) -> None:
@@ -1867,11 +1865,7 @@ def probe_url_for(name: str) -> str | None:
 
 def _classify_probe_body(status: int, text: str) -> str | None:
     """Reputation-block reason for an HTTP response body, else None."""
-    if re.search(r"error\s*code\s*[:=]?\s*1010|cloudflare.{0,20}1010", text, re.IGNORECASE):
-        return "cloudflare-1010"
-    if (status in (403, 1010)) and "cloudflare" in text.lower():
-        return "cloudflare-403"
-    return None
+    return egress.classify_probe_body(status, text)
 
 
 def _probe_failure_reason(status: int, text: str) -> tuple[str | None, str | None]:
@@ -1880,12 +1874,7 @@ def _probe_failure_reason(status: int, text: str) -> tuple[str | None, str | Non
     only — never a block (it is a transient quota signal, not an egress-IP
     reputation block, so it must route through the error-policy exhaust path,
     not mark_blocked)."""
-    reason = _classify_probe_body(status, text)
-    if reason is not None:
-        return reason, reason
-    if status == 429:
-        return "rate-limit-429", None
-    return None, None
+    return egress.probe_failure_reason(status, text)
 
 
 def _probe_via_curl(*, port: int, url: str, timeout: float) -> dict:
@@ -2118,17 +2107,10 @@ def _probe_with_settle(name: str, profile: Path, *, port: int | None = None) -> 
     return ok, record
 
 
-_DNS_ERROR_RE = re.compile(
-    r"(getaddrinfo|no such host|nodename nor servname|name or service not known|"
-    r"temporary failure in name resolution|could not resolve|servfail)",
-    re.IGNORECASE,
-)
-
-
 def _dns_error_markers(text: str) -> bool:
     """True when an error string describes a failed DNS resolution rather than
     a transport/connect failure (used to classify probe failures)."""
-    return bool(text) and bool(_DNS_ERROR_RE.search(text))
+    return egress.dns_error_markers(text)
 
 
 def _bounded_getaddrinfo(host: str, port: int, timeout: float) -> list[str] | None:
