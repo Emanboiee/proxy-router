@@ -562,6 +562,7 @@ def _load_autodetect(data: dict, routes: list, providers: dict) -> dict:
                     f"'autodetect.sources.{source}.extra_roots' contains an invalid hostname"
                 )
             normalized_extra_roots.append(normalized)
+        normalized_extra_roots = sorted(set(normalized_extra_roots) - set(normalized_roots))
         cleaned_source = {
             "seed": seed,
             "route_id": route_id,
@@ -2815,22 +2816,28 @@ def _autodetected_domains_by_route() -> dict[str, list[str]]:
         state = _read_autodetect_state(source)
         if state.get("route_id") != settings.get("route_id"):
             continue
-        domains = domain_autodetect.active_domains(state)
-        allowed_roots = tuple(
-            root for root in (
-                *(settings.get("roots") or []),
-                *(settings.get("extra_roots") or []),
-            ) if isinstance(root, str)
-        )
-        if allowed_roots:
-            domains = [
-                host for host in domains
-                if any(domain_autodetect.host_matches_root(host, root)
-                       for root in allowed_roots)
-            ]
+        domains = _active_autodetected_domains(settings, state)
         if domains:
             result.setdefault(settings["route_id"], []).extend(domains)
     return {route_id: sorted(set(domains)) for route_id, domains in result.items()}
+
+
+def _active_autodetected_domains(settings: dict, state: dict) -> list[str]:
+    """Return learned hosts still covered by the source's current roots."""
+    domains = domain_autodetect.active_domains(state)
+    allowed_roots = tuple(
+        root for root in (
+            *(settings.get("roots") or []),
+            *(settings.get("extra_roots") or []),
+        ) if isinstance(root, str)
+    )
+    if not allowed_roots:
+        return domains
+    return [
+        host for host in domains
+        if any(domain_autodetect.host_matches_root(host, root)
+               for root in allowed_roots)
+    ]
 
 
 def _routes_with_autodetected_domains(routes: list[dict]) -> list[dict]:
@@ -2848,7 +2855,7 @@ def _routes_with_autodetected_domains(routes: list[dict]) -> list[dict]:
             root for root in settings.get("roots", []) if isinstance(root, str)
         )
         roots[route_id].extend(
-            root for root in settings.get("extra_roots", []) if isinstance(root, str)
+            root for root in (settings.get("extra_roots") or []) if isinstance(root, str)
         )
     if not learned and not roots:
         return routes
@@ -2879,10 +2886,10 @@ def autodetect_status() -> dict:
             "provider": settings.get("provider"),
             "seed": settings.get("seed"),
             "roots": settings.get("roots", []),
-            "extra_roots": settings.get("extra_roots", []),
+            "extra_roots": settings.get("extra_roots") or [],
             "ttl_seconds": settings.get("ttl_seconds"),
             "updated_at": state.get("updated_at"),
-            "domains": domain_autodetect.active_domains(state),
+            "domains": _active_autodetected_domains(settings, state),
         }
     return {
         "enabled": bool(_autodetect.get("enabled")),
@@ -3137,7 +3144,7 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
     autodetect_roots = frozenset(
         root
         for settings in (_autodetect.get("sources") or {}).values()
-        if isinstance(settings, dict)
+        if _autodetect.get("enabled") and isinstance(settings, dict)
         for root in (
             *(settings.get("roots") or []),
             *(settings.get("extra_roots") or []),

@@ -296,6 +296,9 @@ def test_learned_hosts_outside_current_roots_are_pruned(tmp_path):
         assert router._autodetected_domains_by_route() == {
             "school": ["cdn.prod.example.net"]
         }
+        assert router.autodetect_status()["sources"]["school"]["domains"] == [
+            "cdn.prod.example.net"
+        ]
     finally:
         (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
          router._vpn, router._routing, router._autodetect, router._port) = old
@@ -324,6 +327,44 @@ def test_build_config_does_not_expand_roots_when_disabled(tmp_path, monkeypatch)
         router._port = 2080
 
         assert router._routes_with_autodetected_domains(router._routes) == router._routes
+    finally:
+        (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
+         router._vpn, router._routing, router._autodetect, router._port) = old
+
+
+def test_build_config_does_not_use_disabled_autodetect_roots(tmp_path, monkeypatch):
+    old = (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
+           router._vpn, router._routing, router._autodetect, router._port)
+    try:
+        router.ROOT = Path(tmp_path)
+        router.CONFIG_FILE = router.ROOT / "router.json"
+        router._providers = {
+            "cloudflare": {"socks5": {"host": "127.0.0.1", "port": 2181}}
+        }
+        router._routes = [{
+            "id": "school", "domains": ["twitch.tv"], "provider": "cloudflare"
+        }]
+        router._vpn = {}
+        router._routing = {"mode": "vpn-list", "vpn_domains": []}
+        router._autodetect = {
+            "enabled": False,
+            "sources": {
+                "school": {
+                    "route_id": "school",
+                    "roots": ["twitch.tv"],
+                    "extra_roots": ["cdn.example.net"],
+                }
+            },
+        }
+        router._port = 2080
+        monkeypatch.setattr(router, "current_mode", lambda: "proxy")
+
+        config, _ = router.build_singbox_config()
+
+        assert not any(
+            rule.get("outbound") == "cloudflare"
+            for rule in config["route"]["rules"]
+        )
     finally:
         (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
          router._vpn, router._routing, router._autodetect, router._port) = old
