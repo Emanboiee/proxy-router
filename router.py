@@ -551,13 +551,29 @@ def _load_autodetect(data: dict, routes: list, providers: dict) -> dict:
             normalized_roots.append(normalized)
         if not any(domain_autodetect.host_matches_root(seed_host, root) for root in normalized_roots):
             raise ValueError(f"'autodetect.sources.{source}.seed' must be under one of its roots")
-        cleaned_sources[source] = {
+        extra_roots = supplied.get("extra_roots", [])
+        if extra_roots is None:
+            extra_roots = []
+        if not isinstance(extra_roots, list):
+            raise ValueError(f"'autodetect.sources.{source}.extra_roots' must be a string list")
+        normalized_extra_roots = []
+        for root in extra_roots:
+            normalized = domain_autodetect.normalize_host(root)
+            if normalized is None:
+                raise ValueError(
+                    f"'autodetect.sources.{source}.extra_roots' contains an invalid hostname"
+                )
+            normalized_extra_roots.append(normalized)
+        cleaned_source = {
             "seed": seed,
             "route_id": route_id,
             "provider": provider,
             "roots": sorted(set(normalized_roots)),
             "ttl_seconds": ttl,
         }
+        if normalized_extra_roots:
+            cleaned_source["extra_roots"] = sorted(set(normalized_extra_roots))
+        cleaned_sources[source] = cleaned_source
     if auto_sources and enabled:
         cleaned_sources = _autodetect_route_sources(routes, providers, cleaned_sources)
     return {
@@ -1722,7 +1738,9 @@ def autodetect_source(source: str = "twitch", *, reload: bool = True,
             print(f"router: autodetect {source}: seed response is too large", file=sys.stderr)
         return 1
     text = document.decode("utf-8", "replace")
-    hosts = domain_autodetect.extract_related_hosts(text, settings["roots"])
+    hosts = domain_autodetect.extract_related_hosts(
+        text, settings["roots"], extra_roots=settings.get("extra_roots", [])
+    )
     if not hosts:
         if not quiet:
             print(f"router: autodetect {source}: no trusted dependency hosts found", file=sys.stderr)
@@ -1739,6 +1757,7 @@ def autodetect_source(source: str = "twitch", *, reload: bool = True,
         "provider": settings["provider"],
         "seed": settings["seed"],
         "roots": settings["roots"],
+        "extra_roots": settings.get("extra_roots", []),
         "ttl_seconds": settings["ttl_seconds"],
     })
     state_changed = state != before
@@ -2818,6 +2837,9 @@ def _routes_with_autodetected_domains(routes: list[dict]) -> list[dict]:
         roots.setdefault(route_id, []).extend(
             root for root in settings.get("roots", []) if isinstance(root, str)
         )
+        roots[route_id].extend(
+            root for root in settings.get("extra_roots", []) if isinstance(root, str)
+        )
     if not learned and not roots:
         return routes
     expanded: list[dict] = []
@@ -2846,6 +2868,8 @@ def autodetect_status() -> dict:
             "route_id": settings.get("route_id"),
             "provider": settings.get("provider"),
             "seed": settings.get("seed"),
+            "roots": settings.get("roots", []),
+            "extra_roots": settings.get("extra_roots", []),
             "ttl_seconds": settings.get("ttl_seconds"),
             "updated_at": state.get("updated_at"),
             "domains": domain_autodetect.active_domains(state),

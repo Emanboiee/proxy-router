@@ -19,6 +19,17 @@ def test_extract_related_hosts_is_suffix_bounded():
     ) == ["static-cdn.jtvnw.net", "usher.ttvnw.net", "www.twitch.tv"]
 
 
+def test_extract_related_hosts_accepts_explicit_cross_origin_asset_root():
+    document = '''
+      <script src="https://cdn.prod.example.net/app.js"></script>
+      <img src="https://untrusted.example.net/image.png">
+    '''
+
+    assert domain_autodetect.extract_related_hosts(
+        document, ["wayground.com"], extra_roots=["example.net"]
+    ) == ["cdn.prod.example.net", "untrusted.example.net"]
+
+
 def test_merge_state_refreshes_hosts_and_prunes_expired():
     state = {
         "domains": {
@@ -143,6 +154,7 @@ def test_build_config_routes_configured_autodetect_roots(tmp_path, monkeypatch):
                     "route_id": "school",
                     "provider": "cloudflare",
                     "roots": ["twitch.tv", "jtvnw.net", "ttvnw.net"],
+                    "extra_roots": ["cdn.example.net"],
                 }
             },
         }
@@ -153,7 +165,7 @@ def test_build_config_routes_configured_autodetect_roots(tmp_path, monkeypatch):
 
         assert {
             "outbound": "cloudflare",
-            "domain_suffix": ["twitch.tv", "jtvnw.net", "ttvnw.net"],
+            "domain_suffix": ["twitch.tv", "jtvnw.net", "ttvnw.net", "cdn.example.net"],
         } in config["route"]["rules"]
     finally:
         (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
@@ -201,6 +213,58 @@ def test_load_autodetect_explicit_source_covers_route():
 
     assert set(settings["sources"]) == {"twitch"}
     assert settings["auto_sources"] is True
+
+
+def test_load_autodetect_preserves_explicit_extra_roots():
+    settings = router._load_autodetect(
+        {
+            "autodetect": {
+                "enabled": True,
+                "auto_sources": False,
+                "sources": {
+                    "school": {
+                        "seed": "https://wayground.com/",
+                        "route_id": "school",
+                        "provider": "cloudflare",
+                        "roots": ["wayground.com"],
+                        "extra_roots": [
+                            "cdn.prod.website-files.com",
+                            "CDN.PROD.WEBSITE-FILES.COM",
+                        ],
+                    }
+                },
+            }
+        },
+        [{"id": "school", "domains": ["wayground.com"], "provider": "cloudflare"}],
+        {"cloudflare": {}},
+    )
+
+    assert settings["sources"]["school"]["extra_roots"] == [
+        "cdn.prod.website-files.com"
+    ]
+
+
+def test_load_autodetect_rejects_invalid_extra_roots():
+    with pytest.raises(ValueError, match="extra_roots"):
+        router._load_autodetect(
+            {
+                "autodetect": {
+                    "enabled": True,
+                    "auto_sources": False,
+                    "sources": {
+                        "school": {
+                            "seed": "https://wayground.com/",
+                            "route_id": "school",
+                            "provider": "cloudflare",
+                            "roots": ["wayground.com"],
+                            "extra_roots": ["not a host"],
+                        }
+                    },
+                }
+            },
+            [{"id": "school", "domains": ["wayground.com"], "provider": "cloudflare"}],
+            {"cloudflare": {}},
+        )
 
 
 def test_build_config_does_not_expand_roots_when_disabled(tmp_path, monkeypatch):

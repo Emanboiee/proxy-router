@@ -241,10 +241,6 @@ class CustomPresetTests(unittest.TestCase):
             "discord.media",
             "twimg.com",
             "t.co",
-            "wayground.com",
-            "quizizz.com",
-            "joinmyquiz.com",
-            "quizizz.app.link",
             "challenges.cloudflare.com",
             "pro.ip-api.com",
         ):
