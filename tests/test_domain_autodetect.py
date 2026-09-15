@@ -65,12 +65,7 @@ def test_build_config_includes_non_suffix_learned_hosts(tmp_path, monkeypatch):
         router._routing = {"mode": "default", "vpn_domains": []}
         router._autodetect = {
             "enabled": True,
-            "sources": {
-                "twitch": {
-                    "route_id": "school", "provider": "cloudflare",
-                    "roots": ["twitch.tv"], "extra_roots": ["cdn.example.net"],
-                }
-            },
+            "sources": {"twitch": {"route_id": "school", "provider": "cloudflare"}},
         }
         router._port = 2080
         state_path = router.ROOT / "state" / "autodetect" / "twitch.json"
@@ -89,7 +84,7 @@ def test_build_config_includes_non_suffix_learned_hosts(tmp_path, monkeypatch):
 
         assert {
             "outbound": "cloudflare",
-            "domain_suffix": ["twitch.tv", "cdn.example.net", "static-cdn.jtvnw.net"],
+            "domain_suffix": ["twitch.tv", "static-cdn.jtvnw.net"],
         } in config["route"]["rules"]
     finally:
         (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
