@@ -675,15 +675,64 @@ def _launch_terminal(root, script_args: list[str]) -> bool:
     return False
 
 
-def open_dashboard(root) -> bool:
-    """Open the full dashboard TUI in a terminal window (tray one-click).
+def _dashboard_bundle(root: Path) -> Path | None:
+    """Find the built Tauri dashboard without assuming a developer path."""
+    override = os.environ.get("PROXY_ROUTER_DASHBOARD")
+    candidates: list[Path] = []
+    if override:
+        candidates.append(Path(override).expanduser())
 
-    The tray menu is compact by design; the dashboard is where profiles,
-    exits, fallbacks, routing, and presets get managed. macOS: Terminal runs
-    setup_tui.py in the router root. Elsewhere: the first common terminal
-    emulator that exists wins. Never raises — the tray must survive a
-    broken terminal setup."""
+    layouts = (
+        root / "dashboard" / "src-tauri",
+        root.parent / "proxy-router-ui" / "dashboard" / "src-tauri",
+        Path(__file__).resolve().parent / "dashboard" / "src-tauri",
+        Path.home() / "Applications",
+        Path("/Applications"),
+    )
+    for base in layouts:
+        if base.name == "Applications":
+            candidates.append(base / "Proxy Router.app")
+            continue
+        for profile in ("release", "debug"):
+            candidates.append(
+                base / "target" / profile / "bundle" / "macos" / "Proxy Router.app"
+            )
+
+    for app in candidates:
+        if app.is_dir() and (app / "Contents" / "MacOS").is_dir():
+            return app
+    return None
+
+
+def _launch_dashboard_app(app: Path) -> bool:
+    """Open the Tauri dashboard asynchronously and never block the tray."""
+    try:
+        if sys.platform == "darwin":
+            subprocess.Popen(
+                ["open", "-a", str(app)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        else:
+            subprocess.Popen(
+                [str(app)],
+                cwd=str(app.parent),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        return True
+    except OSError as exc:
+        print(f"dashboard: could not open {app}: {exc}", file=sys.stderr)
+        return False
+
+
+def open_dashboard(root) -> bool:
+    """Open the Tauri dashboard from the tray, with a TUI fallback."""
     root = Path(root)
+    app = _dashboard_bundle(root)
+    if app is not None:
+        return _launch_dashboard_app(app)
+
     if not (root / "setup_tui.py").is_file():
         print(f"dashboard: missing {root / 'setup_tui.py'}", file=sys.stderr)
         return False

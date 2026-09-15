@@ -1204,6 +1204,25 @@ class DashboardOpenerTests(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
+    def test_prefers_tauri_dashboard_bundle(self):
+        app = self.root / "Proxy Router.app"
+        (app / "Contents" / "MacOS").mkdir(parents=True)
+        calls = []
+
+        def fake_popen(argv, **kwargs):
+            calls.append(argv)
+            return mock.Mock()
+
+        with mock.patch.dict(
+            tray.os.environ, {"PROXY_ROUTER_DASHBOARD": str(app)}, clear=False
+        ), mock.patch.object(tray.sys, "platform", "darwin"), mock.patch.object(
+            tray.subprocess, "Popen", side_effect=fake_popen
+        ):
+            self.assertTrue(tray.open_dashboard(self.root))
+
+        self.assertEqual(calls[0][:2], ["open", "-a"])
+        self.assertEqual(calls[0][2], str(app))
+
     def test_missing_tui_fails_quietly(self):
         (self.root / "setup_tui.py").unlink()
         self.assertFalse(tray.open_dashboard(self.root))
