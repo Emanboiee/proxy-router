@@ -1010,14 +1010,11 @@ if _REAL_DARWIN_PYSTRAY:
             panel = _dashboard_color(25, 30, 40)
             border = _dashboard_color(46, 54, 68)
 
-            background.set()
-            AppKit.NSRectFill_(self.bounds())
-            rail.set()
-            AppKit.NSRectFill_(AppKit.NSMakeRect(0, 0, 196, height))
+            self._fill_rect(self.bounds(), background)
+            self._fill_rect(AppKit.NSMakeRect(0, 0, 196, height), rail)
 
             separator = AppKit.NSMakeRect(195, 0, 1, height)
-            border.set()
-            AppKit.NSRectFill_(separator)
+            self._fill_rect(separator, border)
 
             content_x = 228
             content_width = max(420, width - content_x - 32)
@@ -1036,6 +1033,13 @@ if _REAL_DARWIN_PYSTRAY:
             self._round_fill(
                 AppKit.NSMakeRect(content_x, health_y, content_width, health_height),
                 16, panel, border)
+
+        @staticmethod
+        def _fill_rect(rect, color):
+            # NSRectFill_ is absent from current PyObjC builds; raising inside
+            # drawRect: escapes the draw callback and AppKit aborts the process.
+            color.set()
+            AppKit.NSBezierPath.bezierPathWithRect_(rect).fill()
 
         @staticmethod
         def _round_fill(rect, radius, fill, stroke=None):

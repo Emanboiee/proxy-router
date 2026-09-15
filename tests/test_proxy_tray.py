@@ -1507,6 +1507,45 @@ class DashboardLifecycleTests(unittest.TestCase):
         self.assertIsNone(controller.window)
 
 
+class DashboardRenderTests(unittest.TestCase):
+    """The dashboard must survive a real AppKit repaint.
+
+    A Python exception raised inside drawRect: escapes the draw callback, so
+    AppKit terminates the whole process (SIGTRAP via +[NSApplication
+    _crashOnException:]). Observed live as the tray icon vanishing on click
+    because AppKit.NSRectFill_ is absent from current PyObjC builds.
+    """
+
+    def setUp(self):
+        if not tray._REAL_DARWIN_PYSTRAY:
+            self.skipTest("Cocoa/pystray unavailable")
+
+    def render(self, root):
+        bounds = root.bounds()
+        image = tray.AppKit.NSImage.alloc().initWithSize_(bounds.size)
+        image.lockFocus()
+        try:
+            if tray.AppKit.NSGraphicsContext.currentContext() is None:
+                self.skipTest("no graphics context (headless)")
+            root.drawRect_(bounds)
+        finally:
+            image.unlockFocus()
+
+    def test_window_draw_survives_repaint(self):
+        client = tray.RouterClient("/tmp")
+        app = tray.TrayApp(client, None)
+        try:
+            window = app.dashboard.window_factory(
+                client, app._dispatch_dashboard_action,
+                tray.RouterStatus(up=True, port=2080))
+        except Exception as exc:
+            self.skipTest(f"no window server: {exc}")
+
+        self.render(window.root)
+        self.render(window.root)
+
+
+
 class DashboardClickRoutingTests(unittest.TestCase):
     def test_left_click_opens_dashboard_and_right_click_opens_existing_menu(self):
         calls = []
