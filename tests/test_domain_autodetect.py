@@ -96,6 +96,48 @@ def test_build_config_includes_non_suffix_learned_hosts(tmp_path, monkeypatch):
          router._vpn, router._routing, router._autodetect, router._port) = old
 
 
+def test_build_config_keeps_source_roots_in_vpn_list_mode(tmp_path, monkeypatch):
+    old = (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
+           router._vpn, router._routing, router._autodetect, router._port)
+    try:
+        router.ROOT = Path(tmp_path)
+        router.CONFIG_FILE = router.ROOT / "router.json"
+        router._providers = {
+            "cloudflare": {"socks5": {"host": "127.0.0.1", "port": 2181}}
+        }
+        router._routes = [{
+            "id": "school", "domains": ["twitch.tv"], "provider": "cloudflare"
+        }]
+        router._vpn = {}
+        router._routing = {
+            "mode": "vpn-list",
+            "vpn_domains": ["twitch.tv"],
+        }
+        router._autodetect = {
+            "enabled": True,
+            "sources": {
+                "twitch": {
+                    "route_id": "school", "provider": "cloudflare",
+                    "roots": ["twitch.tv", "jtvnw.net", "ttvnw.net"],
+                }
+            },
+        }
+        router._port = 2080
+        monkeypatch.setattr(router, "current_mode", lambda: "proxy")
+
+        config, _ = router.build_singbox_config()
+
+        rule = next(
+            rule for rule in config["route"]["rules"]
+            if rule.get("outbound") == "cloudflare"
+        )
+        assert "jtvnw.net" in rule["domain_suffix"]
+        assert "ttvnw.net" in rule["domain_suffix"]
+    finally:
+        (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
+         router._vpn, router._routing, router._autodetect, router._port) = old
+
+
 def test_build_config_keeps_learned_hosts_when_provider_changes(tmp_path, monkeypatch):
     old = (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
            router._vpn, router._routing, router._autodetect, router._port)
