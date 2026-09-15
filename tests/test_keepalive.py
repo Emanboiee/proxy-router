@@ -103,8 +103,17 @@ case "$cmd" in
   failover)
     if [ "$3" = "off" ]; then
       rm -f "${FAKE_ROUTER_FALLBACK_FILE:-/dev/null}"
+      # keepalive gates the restore lane on the real runtime markers, so the
+      # fake must clear them exactly like router.py does.
+      if [ -n "${FAKE_ROUTER_ROOT:-}" ]; then
+        rm -f "$FAKE_ROUTER_ROOT"/state/fallback/*.json
+      fi
     elif [ "$3" = "on" ] && [ -n "${FAKE_ROUTER_FALLBACK_FILE:-}" ]; then
       printf '%s\n' "$2" > "$FAKE_ROUTER_FALLBACK_FILE"
+      if [ -n "${FAKE_ROUTER_ROOT:-}" ]; then
+        mkdir -p "$FAKE_ROUTER_ROOT"/state/fallback
+        printf '%s\n' "{\"provider\": \"$2\"}" > "$FAKE_ROUTER_ROOT"/state/fallback/"$2".json
+      fi
     fi
     exit 0
     ;;
@@ -145,7 +154,8 @@ class KeepaliveHarness:
 
     def __init__(self, *, interval="1", fail_ensures="", egress="alive",
                  probe_every="4", dead_strikes="2", storm_window="600",
-                 max_rotations="2", fallback="", root=None, pinned_python="",
+                 max_rotations="2", restore_every="", fallback="", root=None,
+                 pinned_python="",
                  mode="proxy", network="connected", wake_gap="", clock=None):
         self._tmp = None
         if root is None:
@@ -189,7 +199,7 @@ class KeepaliveHarness:
         self.egress_file.write_text(egress)
         self.fallback_file = self.root / "fallback.state"
         if fallback:
-            self.fallback_file.write_text(fallback)
+            self.park(fallback)
         self.network_file = self.root / "network.state"
         self.network_file.write_text(network)
         self.network_off_file = self.root / "state" / "network-off"
@@ -201,6 +211,8 @@ class KeepaliveHarness:
         env["PROXY_KEEPALIVE_DEAD_STRIKES"] = dead_strikes
         env["PROXY_KEEPALIVE_STORM_WINDOW"] = storm_window
         env["PROXY_KEEPALIVE_MAX_ROTATIONS"] = max_rotations
+        if restore_every:
+            env["PROXY_KEEPALIVE_FALLBACK_RESTORE_EVERY"] = restore_every
         env["SLEEP_LOG"] = str(self.sleep_log)
         env["FAKE_ROUTER_LOG"] = str(self.log)
         env["FAKE_ROUTER_ENSURE_COUNT"] = str(self.count)
@@ -208,6 +220,9 @@ class KeepaliveHarness:
         env["FAKE_ROUTER_FALLBACK_FILE"] = str(self.fallback_file)
         env["FAKE_ROUTER_NETWORK_FILE"] = str(self.network_file)
         env["FAKE_ROUTER_NETWORK_OFF_FILE"] = str(self.network_off_file)
+        # The fake router keeps the real state/fallback markers in sync so the
+        # keepalive's restore lane sees exactly what production parks write.
+        env["FAKE_ROUTER_ROOT"] = str(self.root)
         if wake_gap:
             env["PROXY_KEEPALIVE_WAKE_GAP"] = wake_gap
         if self.clock_file is not None:
@@ -233,6 +248,18 @@ class KeepaliveHarness:
 
     def set_network(self, state: str) -> None:
         self.network_file.write_text(state)
+
+    def park(self, provider: str) -> None:
+        """Simulate a runtime fallback park exactly as router.py records it.
+
+        The keepalive gates its restore lane on the real marker directory, so
+        tests must write both the fake router's park state (which drives the
+        ``egress check`` output) and ``state/fallback/<provider>.json``.
+        """
+        self.fallback_file.write_text(provider)
+        markers = self.root / "state" / "fallback"
+        markers.mkdir(parents=True, exist_ok=True)
+        (markers / f"{provider}.json").write_text(json.dumps({"provider": provider}))
 
     def advance_clock(self, seconds: int) -> None:
         if self.clock_file is None:
@@ -373,19 +400,17 @@ class KeepaliveEgressCheckTests(unittest.TestCase):
             self.assertEqual(rotates, [])
             # cadence: periodic checks every PROBE_EVERY(2) ensures after boot.
             # `rotate --if-due` entries are tick noise, so measure gaps on the
-            # filtered list. restore_fallbacks() probes once right after the
-            # sweep, so drop the `egress check` that directly follows a sweep
-            # line too (the sweep cadence is measured separately).
+            # filtered list. Restore no longer tails every sweep (it runs on its
+            # own clock and only when a marker exists - #139), so no probe is
+            # glued to a sweep line here; the restore-cadence tests below cover
+            # that lane.
             checks = [line for line in lines if line == "egress check"]
-            self.assertGreaterEqual(len(checks), 4, f"too few checks: {lines}")
-            restore_probes = {
-                i + 1 for i, line in enumerate(lines)
-                if line == "egress sweep --json" and i + 1 < len(lines)
-                and lines[i + 1] == "egress check"
-            }
-            ticks = [line for i, line in enumerate(lines)
-                     if i not in restore_probes
-                     and line not in {"network-status", "rotate --if-due", "egress sweep --json"}]
+            # Boot check plus one per PROBE_EVERY ensures. The restore lane no
+            # longer glues a probe to each sweep and adds none while nothing is
+            # parked (#139), so the window holds 3 checks, not 4.
+            self.assertGreaterEqual(len(checks), 3, f"too few checks: {lines}")
+            ticks = [line for line in lines
+                     if line not in {"network-status", "rotate --if-due", "egress sweep --json"}]
             check_lines = [i for i, line in enumerate(ticks) if line == "egress check"]
             gaps = [b - a for a, b in zip(check_lines, check_lines[1:])]
             # every PROBE_EVERY ensures triggers a check; log distance is
@@ -543,10 +568,10 @@ class KeepaliveSweepStaggerTests(unittest.TestCase):
 
 
 class KeepaliveFallbackRestoreTests(unittest.TestCase):
-    """restore_fallbacks(): on the sweep cadence, clear the runtime fallback
-    marker and probe the primary; keep it cleared when alive, re-activate it
-    when the primary is still dead. The sweep runs on the FIRST successful
-    ensure (last_sweep=0), so both tests observe the restore immediately."""
+    """restore_fallbacks(): on its own restore cadence, clear the runtime
+    fallback marker and probe the primary; keep it cleared when alive,
+    re-activate it when the primary is still dead. Both clocks start at zero,
+    so the first successful ensure observes the restore immediately."""
 
     def test_restore_clears_fallback_when_primary_alive(self):
         h = KeepaliveHarness(egress="alive", fallback="proton")
@@ -577,6 +602,104 @@ class KeepaliveFallbackRestoreTests(unittest.TestCase):
                           f"re-activation message missing: {h.err!r}")
         finally:
             h.close()
+
+
+class KeepaliveFallbackRestoreCadenceTests(unittest.TestCase):
+    """Issue #139: parked-lane restore runs on its own, shorter clock.
+
+    The restore may not wait for the full-pool sweep (SWEEP_EVERY is 7200s in
+    the live config): on a filtered network a fail-open direct park is dead
+    (SNI-blocked) while the tunnel still reports green, so a sticky park is a
+    silent outage. These tests pin the three properties of the new lane:
+
+    1. a park added AFTER the sweep still gets restored on the restore clock,
+       with no sweep in between;
+    2. nothing is parked -> no controller work at all (cheap gate);
+    3. the lane honours the sweep's rotation-stagger window.
+    """
+
+    def test_restore_runs_on_own_cadence_without_a_sweep(self):
+        h = KeepaliveHarness(interval="1", restore_every="1", egress="alive")
+        try:
+            # First successful tick runs the boot sweep (last_sweep=0); every
+            # later sweep is SWEEP_EVERY away, so anything observed now comes
+            # from the restore lane.
+            h.wait_lines(4)
+            baseline = len(h.lines())
+            h.park("proton")
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                if any(line.startswith("failover proton off") for line in h.lines()[baseline:]):
+                    break
+                time.sleep(0.05)
+            tail = h.lines()[baseline:]
+            h.close()
+            self.assertTrue(
+                any(line.startswith("failover proton off") for line in tail),
+                f"restore never ran on the restore cadence: {tail}",
+            )
+            self.assertEqual([line for line in tail if line == "egress sweep --json"], [],
+                             f"restore must not require a sweep: {tail}")
+            self.assertIn("'proton' primary is alive again; fallback cleared", h.err,
+                          f"restore message missing: {h.err!r}")
+        finally:
+            h.close()
+
+    def test_no_restore_probe_when_nothing_is_parked(self):
+        # probe_every high => the only `egress check` is the boot probe. The
+        # restore lane must add no probe of its own while nothing is parked.
+        h = KeepaliveHarness(interval="1", restore_every="1", probe_every="99")
+        try:
+            h.wait_lines(6)
+            time.sleep(1.0)
+            lines = h.lines()
+            h.close()
+            self.assertFalse([line for line in lines if line.startswith("failover")],
+                             f"restore ran with nothing parked: {lines}")
+            checks = [line for line in lines if line == "egress check"]
+            self.assertEqual(len(checks), 1,
+                             f"parked-lane gate leaked probes: {lines}")
+        finally:
+            h.close()
+
+    def test_restore_defers_inside_the_rotation_stagger_window(self):
+        # Drive the clock instead of racing it: the record is pre-seeded, so
+        # `newest_rotation` is already in place when the first tick measures.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "state").mkdir(parents=True, exist_ok=True)
+            (root / "state" / "proton.rotation").write_text(
+                json.dumps({"profile": "a", "at": 1_000_000}))
+            h = KeepaliveHarness(interval="1", restore_every="1", egress="alive",
+                                 root=root, clock=1_000_000)
+            try:
+                h.wait_lines(4)
+                h.park("proton")
+                deadline = time.time() + 3
+                while time.time() < deadline:
+                    if [line for line in h.lines()
+                            if line.startswith("failover proton off")]:
+                        break
+                    time.sleep(0.05)
+                self.assertFalse(
+                    [line for line in h.lines()
+                     if line.startswith("failover proton off")],
+                    f"restore ran inside the stagger window: {h.lines()}",
+                )
+                h.advance_clock(400)   # older than the 300s stagger
+                deadline = time.time() + 20
+                while time.time() < deadline:
+                    if any(line.startswith("failover proton off") for line in h.lines()):
+                        break
+                    time.sleep(0.05)
+                lines = h.lines()
+                h.close()
+                self.assertTrue(
+                    any(line.startswith("failover proton off") for line in lines),
+                    f"restore never ran after the stagger window: {lines}",
+                )
+            finally:
+                h.close()
 
 
 class KeepaliveNetworkGuardTests(unittest.TestCase):
