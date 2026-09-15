@@ -1,6 +1,7 @@
 """Unit tests for proxy_tray.py (stdlib only, no GUI deps — the
 module's pystray/PIL imports are guarded)."""
 import importlib.util
+import io
 import json
 import signal
 import subprocess
@@ -1665,6 +1666,60 @@ class DashboardTrayIntegrationTests(unittest.TestCase):
         app.action_rotate.assert_called_once_with()
         app.action_mode.assert_called_once_with("safe-list")
         app.action_setup.assert_called_once_with()
+
+
+class TrayHeadlessTests(unittest.TestCase):
+    """Issue #144: the tray job can run without owning a menu-bar item.
+
+    The Tauri dashboard registers the single proxy-router status item, so the
+    launchd job supervises the app instead of racing it for the menu bar.
+    """
+
+    def test_headless_launches_the_app_when_absent(self):
+        launched = []
+        bundle = Path("/tmp/Proxy Router.app")
+        with mock.patch.object(tray, "dashboard_app_running", return_value=False), \
+                mock.patch.object(tray, "_dashboard_bundle", return_value=bundle), \
+                mock.patch.object(tray, "_launch_dashboard_app",
+                                  side_effect=lambda app: launched.append(app) or True):
+            rc = tray.supervise_dashboard("/tmp/root", interval=0,
+                                          sleep=lambda _seconds: None,
+                                          max_cycles=1)
+        self.assertEqual(rc, 0)
+        self.assertEqual(launched, [bundle])
+
+    def test_headless_never_stacks_a_second_app(self):
+        with mock.patch.object(tray, "dashboard_app_running", return_value=True), \
+                mock.patch.object(tray, "_launch_dashboard_app") as launch:
+            rc = tray.supervise_dashboard("/tmp/root", interval=0,
+                                          sleep=lambda _seconds: None,
+                                          max_cycles=3)
+        self.assertEqual(rc, 0)
+        launch.assert_not_called()
+
+    def test_headless_without_a_bundle_reports_a_hint(self):
+        stderr = io.StringIO()
+        with mock.patch.object(tray, "dashboard_app_running", return_value=False), \
+                mock.patch.object(tray, "_dashboard_bundle", return_value=None), \
+                mock.patch.object(sys, "stderr", stderr):
+            rc = tray.supervise_dashboard("/tmp/root", interval=0,
+                                          sleep=lambda _seconds: None,
+                                          max_cycles=1)
+        self.assertEqual(rc, 0)
+        self.assertIn("no dashboard app bundle found", stderr.getvalue())
+
+    def test_main_routes_headless_without_needing_pystray(self):
+        with mock.patch.object(tray, "supervise_dashboard", return_value=0) as sup, \
+                mock.patch.object(sys, "argv",
+                                  ["proxy_tray.py", "--root", "/tmp/root",
+                                   "--headless", "--headless-interval", "5"]):
+            rc = tray.main()
+        self.assertEqual(rc, 0)
+        sup.assert_called_once_with("/tmp/root", interval=5.0)
+
+    def test_dashboard_app_running_is_false_off_darwin(self):
+        with mock.patch.object(sys, "platform", "linux"):
+            self.assertFalse(tray.dashboard_app_running())
 
 
 if __name__ == "__main__":
