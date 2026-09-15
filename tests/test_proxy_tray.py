@@ -328,6 +328,26 @@ class StatusMenuPresentationTests(unittest.TestCase):
         self.assertIn("▲ Degraded (system_proxy_mismatch)", labels)
         self.assertNotIn("● Connected", labels)
 
+    def test_fail_open_parked_lane_is_degraded(self):
+        app = tray.TrayApp(SimpleNamespace(root="/tmp"), None)
+        app.latest = tray.RouterStatus(
+            up=True, mode="proxy", port=2080,
+            degraded_lanes=["school (cloudflare down, failing open to direct)"])
+        labels = [item.text for item in app.build_menu()]
+        self.assertIn(
+            "▲ Degraded (school (cloudflare down, failing open to direct))", labels)
+        self.assertNotIn("● Connected", labels)
+
+    def test_degraded_lanes_survive_status_payload(self):
+        status = tray.RouterStatus.from_cli(0, json.dumps({
+            "up": True, "mode": "proxy", "port": 2080,
+            "degraded_lanes": ["school (cloudflare down, failing open to direct)"],
+        }))
+        self.assertEqual(
+            status.degraded_lanes,
+            ["school (cloudflare down, failing open to direct)"])
+        self.assertIn("degraded", status.headline())
+
     def test_dns_degradation_shows_recovery_path(self):
         app = tray.TrayApp(SimpleNamespace(root="/tmp"), None)
         app.latest = tray.RouterStatus(
@@ -1194,7 +1214,7 @@ class PermissionErrorMappingTests(unittest.TestCase):
 
 
 class DashboardOpenerTests(unittest.TestCase):
-    """Tray one-click: open the full TUI in a terminal window."""
+    """Tray one-click prefers the Tauri dashboard over the legacy TUI."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -1203,6 +1223,25 @@ class DashboardOpenerTests(unittest.TestCase):
 
     def tearDown(self):
         self._tmp.cleanup()
+
+    def test_prefers_tauri_dashboard_bundle(self):
+        app = self.root / "Proxy Router.app"
+        (app / "Contents" / "MacOS").mkdir(parents=True)
+        calls = []
+
+        def fake_popen(argv, **kwargs):
+            calls.append(argv)
+            return mock.Mock()
+
+        with mock.patch.dict(
+            tray.os.environ, {"PROXY_ROUTER_DASHBOARD": str(app)}, clear=False
+        ), mock.patch.object(tray.sys, "platform", "darwin"), mock.patch.object(
+            tray.subprocess, "Popen", side_effect=fake_popen
+        ):
+            self.assertTrue(tray.open_dashboard(self.root))
+
+        self.assertEqual(calls[0][:2], ["open", "-a"])
+        self.assertEqual(calls[0][2], str(app))
 
     def test_missing_tui_fails_quietly(self):
         (self.root / "setup_tui.py").unlink()
@@ -1494,6 +1533,29 @@ class DashboardClickRoutingTests(unittest.TestCase):
         for expected in ("Open Dashboard (Terminal setup)", "Connect", "Disconnect",
                          "Routing mode", "Setup", "Presets", "Quit"):
             self.assertIn(expected, labels)
+
+    def test_primary_click_prefers_the_tauri_app(self):
+        opened = []
+        native = []
+        with mock.patch.object(tray, "_dashboard_bundle",
+                               return_value=Path("/tmp/Proxy Router.app")), \
+             mock.patch.object(tray, "_launch_dashboard_app",
+                               side_effect=lambda app: opened.append(app) or True):
+            app = tray.TrayApp(SimpleNamespace(root="/tmp"), None)
+            app.dashboard.show = lambda status: native.append(status) or True
+            self.assertTrue(app._open_primary_dashboard())
+
+        self.assertEqual([str(p) for p in opened], ["/tmp/Proxy Router.app"])
+        self.assertEqual(native, [])
+
+    def test_primary_click_falls_back_to_the_native_window(self):
+        native = []
+        with mock.patch.object(tray, "_dashboard_bundle", return_value=None):
+            app = tray.TrayApp(SimpleNamespace(root="/tmp"), None)
+            app.dashboard.show = lambda status: native.append(status) or True
+            self.assertTrue(app._open_primary_dashboard())
+
+        self.assertEqual(len(native), 1)
 
 
 class DarwinStatusButtonTests(unittest.TestCase):

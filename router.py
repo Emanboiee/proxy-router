@@ -5226,6 +5226,28 @@ def vpn_capture(scope: str) -> int:
     return 0
 
 
+def _degraded_lanes() -> list[str]:
+    """Routes whose provider is parked on fail-open direct.
+
+    Read-only view over the persisted fallback markers (the same state the
+    generated config was built from), so `status` reports what traffic is
+    actually doing without probing the network.
+    """
+    lanes = []
+    for route in _routes:
+        provider = route.get("provider")
+        route_id = route.get("id") or provider
+        if not provider or provider == "direct" or provider not in _providers:
+            continue
+        if _effective_route_provider(provider) != "direct":
+            continue
+        if active_fallback(provider) == "direct":
+            lanes.append(f"{route_id} ({provider} down, failing open to direct)")
+        else:
+            lanes.append(f"{route_id} ({provider} has no live exit)")
+    return lanes
+
+
 def _status_report() -> tuple[int, str]:
     """Single liveness check shared by `status` and `vpn status` (M13): both
     commands must report the same up/down state and exit code so automation
@@ -5246,6 +5268,9 @@ def _status_report() -> tuple[int, str]:
     if listener_up() and engine_alive():
         proxy_status, _effective = _system_proxy_status_readonly()
         suffix = "" if proxy_status in {"ok", "skipped"} else f"; {proxy_status}"
+        degraded = _degraded_lanes()
+        if degraded:
+            suffix += "; DEGRADED: " + ", ".join(degraded)
         return 0, "up (proxy 127.0.0.1:{}{})".format(_port, suffix)
     if listener_up():
         # F1: something answers the port but it is not our engine (stale pid
@@ -5679,6 +5704,7 @@ def status_json() -> dict:
     except (ValueError, OSError):
         pass
     data["providers"] = {name: _provider_status(name) for name in _providers}
+    data["degraded_lanes"] = _degraded_lanes()
     data["error_policy"] = {name: error_policy_for(name) for name in _providers}
     data["routes"] = [{
         "id": route.get("id"),

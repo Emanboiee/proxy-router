@@ -225,6 +225,7 @@ class RouterStatus:
     preset: str | None = None
     system_proxy_status: str = "ok"
     network_status: str = "unknown"
+    degraded_lanes: list = field(default_factory=list)
     error: str | None = None
 
     @classmethod
@@ -298,6 +299,8 @@ class RouterStatus:
             system_proxy_status=str(system_proxy.get("status") or (
                 "unknown" if d.get("up") and d.get("mode") == "proxy" else "skipped")),
             network_status=str(network.get("status") or "unknown"),
+            degraded_lanes=[str(lane) for lane in (d.get("degraded_lanes") or [])
+                            if isinstance(lane, str) and lane],
         )
 
     def provider_label(self, name: str) -> str:
@@ -375,13 +378,15 @@ class RouterStatus:
             return f"proxy-router: error ({self.error})"
         degraded = self.up and self.mode == "proxy" and (
             self.system_proxy_status not in {"ok", "skipped"}
-            or self.network_status not in {"ok", "unknown", "skipped"})
+            or self.network_status not in {"ok", "unknown", "skipped"}
+            or bool(self.degraded_lanes))
         state = "degraded" if degraded else ("connected" if self.up else "disconnected")
         detail = self.engine_label().removeprefix("router: ") if self.up else self.mode
         if degraded:
-            reason = (self.system_proxy_status
-                      if self.system_proxy_status not in {"ok", "skipped"}
-                      else self.network_status)
+            reason = (", ".join(self.degraded_lanes) if self.degraded_lanes
+                      else (self.system_proxy_status
+                            if self.system_proxy_status not in {"ok", "skipped"}
+                            else self.network_status))
             detail += f" · {reason}"
         watcher = "watcher on" if self.watcher else "watcher off"
         return f"proxy {state} · {detail} · {watcher}"
@@ -675,15 +680,64 @@ def _launch_terminal(root, script_args: list[str]) -> bool:
     return False
 
 
-def open_dashboard(root) -> bool:
-    """Open the full dashboard TUI in a terminal window (tray one-click).
+def _dashboard_bundle(root: Path) -> Path | None:
+    """Find the built Tauri dashboard without assuming a developer path."""
+    override = os.environ.get("PROXY_ROUTER_DASHBOARD")
+    candidates: list[Path] = []
+    if override:
+        candidates.append(Path(override).expanduser())
 
-    The tray menu is compact by design; the dashboard is where profiles,
-    exits, fallbacks, routing, and presets get managed. macOS: Terminal runs
-    setup_tui.py in the router root. Elsewhere: the first common terminal
-    emulator that exists wins. Never raises — the tray must survive a
-    broken terminal setup."""
+    layouts = (
+        root / "dashboard" / "src-tauri",
+        root.parent / "proxy-router-ui" / "dashboard" / "src-tauri",
+        Path(__file__).resolve().parent / "dashboard" / "src-tauri",
+        Path.home() / "Applications",
+        Path("/Applications"),
+    )
+    for base in layouts:
+        if base.name == "Applications":
+            candidates.append(base / "Proxy Router.app")
+            continue
+        for profile in ("release", "debug"):
+            candidates.append(
+                base / "target" / profile / "bundle" / "macos" / "Proxy Router.app"
+            )
+
+    for app in candidates:
+        if app.is_dir() and (app / "Contents" / "MacOS").is_dir():
+            return app
+    return None
+
+
+def _launch_dashboard_app(app: Path) -> bool:
+    """Open the Tauri dashboard asynchronously and never block the tray."""
+    try:
+        if sys.platform == "darwin":
+            subprocess.Popen(
+                ["open", "-a", str(app)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        else:
+            subprocess.Popen(
+                [str(app)],
+                cwd=str(app.parent),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        return True
+    except OSError as exc:
+        print(f"dashboard: could not open {app}: {exc}", file=sys.stderr)
+        return False
+
+
+def open_dashboard(root) -> bool:
+    """Open the Tauri dashboard from the tray, with a TUI fallback."""
     root = Path(root)
+    app = _dashboard_bundle(root)
+    if app is not None:
+        return _launch_dashboard_app(app)
+
     if not (root / "setup_tui.py").is_file():
         print(f"dashboard: missing {root / 'setup_tui.py'}", file=sys.stderr)
         return False
@@ -1763,6 +1817,22 @@ class TrayApp:
         self._dashboard_update_action(result)
         self._refresh_menu()
 
+    def _open_primary_dashboard(self):
+        """Left-click: launch the Tauri dashboard, else the native window.
+
+        Right-click keeps the classic tray menu, so this is only the icon's
+        primary click action.
+        """
+        app = _dashboard_bundle(Path(self.client.root))
+        if app is not None and _launch_dashboard_app(app):
+            result = "dashboard opened"
+            with self.lock:
+                self.last_action_result = result
+            self._dashboard_update_action(result)
+            self._refresh_menu()
+            return True
+        return self._show_native_dashboard()
+
     def _show_native_dashboard(self):
         """Open or focus the custom macOS dashboard without engine changes."""
         shown = self.dashboard.show(self._snapshot())
@@ -2011,12 +2081,14 @@ class TrayApp:
             state = "● No VPN set up yet"
         elif st.up and (st.mode != "proxy" or (
                 st.system_proxy_status in {"ok", "skipped"}
-                and st.network_status in {"ok", "unknown", "skipped"})):
+                and st.network_status in {"ok", "unknown", "skipped"}
+                and not st.degraded_lanes)):
             state = "● Connected"
         elif st.up:
-            reason = (st.system_proxy_status
-                      if st.system_proxy_status not in {"ok", "skipped"}
-                      else st.network_status)
+            reason = (", ".join(st.degraded_lanes) if st.degraded_lanes
+                      else (st.system_proxy_status
+                            if st.system_proxy_status not in {"ok", "skipped"}
+                            else st.network_status))
             state = f"▲ Degraded ({reason})"
         elif st.error:
             state = "! Error"
@@ -2283,7 +2355,7 @@ class TrayApp:
             try:
                 return _DarwinDashboardIcon(
                     "proxy-router", self.icon_image, "proxy-router", menu=menu,
-                    dashboard_callback=self._show_native_dashboard,
+                    dashboard_callback=self._open_primary_dashboard,
                 )
             except Exception as exc:
                 print(f"tray: native dashboard unavailable: {exc}", file=sys.stderr)
