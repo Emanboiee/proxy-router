@@ -225,6 +225,7 @@ class RouterStatus:
     preset: str | None = None
     system_proxy_status: str = "ok"
     network_status: str = "unknown"
+    degraded_lanes: list = field(default_factory=list)
     error: str | None = None
 
     @classmethod
@@ -298,6 +299,8 @@ class RouterStatus:
             system_proxy_status=str(system_proxy.get("status") or (
                 "unknown" if d.get("up") and d.get("mode") == "proxy" else "skipped")),
             network_status=str(network.get("status") or "unknown"),
+            degraded_lanes=[str(lane) for lane in (d.get("degraded_lanes") or [])
+                            if isinstance(lane, str) and lane],
         )
 
     def provider_label(self, name: str) -> str:
@@ -375,13 +378,15 @@ class RouterStatus:
             return f"proxy-router: error ({self.error})"
         degraded = self.up and self.mode == "proxy" and (
             self.system_proxy_status not in {"ok", "skipped"}
-            or self.network_status not in {"ok", "unknown", "skipped"})
+            or self.network_status not in {"ok", "unknown", "skipped"}
+            or bool(self.degraded_lanes))
         state = "degraded" if degraded else ("connected" if self.up else "disconnected")
         detail = self.engine_label().removeprefix("router: ") if self.up else self.mode
         if degraded:
-            reason = (self.system_proxy_status
-                      if self.system_proxy_status not in {"ok", "skipped"}
-                      else self.network_status)
+            reason = (", ".join(self.degraded_lanes) if self.degraded_lanes
+                      else (self.system_proxy_status
+                            if self.system_proxy_status not in {"ok", "skipped"}
+                            else self.network_status))
             detail += f" · {reason}"
         watcher = "watcher on" if self.watcher else "watcher off"
         return f"proxy {state} · {detail} · {watcher}"
@@ -2060,12 +2065,14 @@ class TrayApp:
             state = "● No VPN set up yet"
         elif st.up and (st.mode != "proxy" or (
                 st.system_proxy_status in {"ok", "skipped"}
-                and st.network_status in {"ok", "unknown", "skipped"})):
+                and st.network_status in {"ok", "unknown", "skipped"}
+                and not st.degraded_lanes)):
             state = "● Connected"
         elif st.up:
-            reason = (st.system_proxy_status
-                      if st.system_proxy_status not in {"ok", "skipped"}
-                      else st.network_status)
+            reason = (", ".join(st.degraded_lanes) if st.degraded_lanes
+                      else (st.system_proxy_status
+                            if st.system_proxy_status not in {"ok", "skipped"}
+                            else st.network_status))
             state = f"▲ Degraded ({reason})"
         elif st.error:
             state = "! Error"

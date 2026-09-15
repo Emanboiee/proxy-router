@@ -328,6 +328,26 @@ class StatusMenuPresentationTests(unittest.TestCase):
         self.assertIn("▲ Degraded (system_proxy_mismatch)", labels)
         self.assertNotIn("● Connected", labels)
 
+    def test_fail_open_parked_lane_is_degraded(self):
+        app = tray.TrayApp(SimpleNamespace(root="/tmp"), None)
+        app.latest = tray.RouterStatus(
+            up=True, mode="proxy", port=2080,
+            degraded_lanes=["school (cloudflare down, failing open to direct)"])
+        labels = [item.text for item in app.build_menu()]
+        self.assertIn(
+            "▲ Degraded (school (cloudflare down, failing open to direct))", labels)
+        self.assertNotIn("● Connected", labels)
+
+    def test_degraded_lanes_survive_status_payload(self):
+        status = tray.RouterStatus.from_cli(0, json.dumps({
+            "up": True, "mode": "proxy", "port": 2080,
+            "degraded_lanes": ["school (cloudflare down, failing open to direct)"],
+        }))
+        self.assertEqual(
+            status.degraded_lanes,
+            ["school (cloudflare down, failing open to direct)"])
+        self.assertIn("degraded", status.headline())
+
     def test_dns_degradation_shows_recovery_path(self):
         app = tray.TrayApp(SimpleNamespace(root="/tmp"), None)
         app.latest = tray.RouterStatus(
@@ -1194,7 +1214,7 @@ class PermissionErrorMappingTests(unittest.TestCase):
 
 
 class DashboardOpenerTests(unittest.TestCase):
-    """Tray one-click: open the full TUI in a terminal window."""
+    """Tray one-click prefers the Tauri dashboard over the legacy TUI."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
