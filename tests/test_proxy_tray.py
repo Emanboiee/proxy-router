@@ -1534,6 +1534,29 @@ class DashboardClickRoutingTests(unittest.TestCase):
                          "Routing mode", "Setup", "Presets", "Quit"):
             self.assertIn(expected, labels)
 
+    def test_primary_click_prefers_the_tauri_app(self):
+        opened = []
+        native = []
+        with mock.patch.object(tray, "_dashboard_bundle",
+                               return_value=Path("/tmp/Proxy Router.app")), \
+             mock.patch.object(tray, "_launch_dashboard_app",
+                               side_effect=lambda app: opened.append(app) or True):
+            app = tray.TrayApp(SimpleNamespace(root="/tmp"), None)
+            app.dashboard.show = lambda status: native.append(status) or True
+            self.assertTrue(app._open_primary_dashboard())
+
+        self.assertEqual([str(p) for p in opened], ["/tmp/Proxy Router.app"])
+        self.assertEqual(native, [])
+
+    def test_primary_click_falls_back_to_the_native_window(self):
+        native = []
+        with mock.patch.object(tray, "_dashboard_bundle", return_value=None):
+            app = tray.TrayApp(SimpleNamespace(root="/tmp"), None)
+            app.dashboard.show = lambda status: native.append(status) or True
+            self.assertTrue(app._open_primary_dashboard())
+
+        self.assertEqual(len(native), 1)
+
 
 class DarwinStatusButtonTests(unittest.TestCase):
     """Verify the private pystray-Darwin adapter without opening a window."""

@@ -1817,6 +1817,22 @@ class TrayApp:
         self._dashboard_update_action(result)
         self._refresh_menu()
 
+    def _open_primary_dashboard(self):
+        """Left-click: launch the Tauri dashboard, else the native window.
+
+        Right-click keeps the classic tray menu, so this is only the icon's
+        primary click action.
+        """
+        app = _dashboard_bundle(Path(self.client.root))
+        if app is not None and _launch_dashboard_app(app):
+            result = "dashboard opened"
+            with self.lock:
+                self.last_action_result = result
+            self._dashboard_update_action(result)
+            self._refresh_menu()
+            return True
+        return self._show_native_dashboard()
+
     def _show_native_dashboard(self):
         """Open or focus the custom macOS dashboard without engine changes."""
         shown = self.dashboard.show(self._snapshot())
@@ -2339,7 +2355,7 @@ class TrayApp:
             try:
                 return _DarwinDashboardIcon(
                     "proxy-router", self.icon_image, "proxy-router", menu=menu,
-                    dashboard_callback=self._show_native_dashboard,
+                    dashboard_callback=self._open_primary_dashboard,
                 )
             except Exception as exc:
                 print(f"tray: native dashboard unavailable: {exc}", file=sys.stderr)
