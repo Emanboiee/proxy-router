@@ -1721,6 +1721,41 @@ class TrayHeadlessTests(unittest.TestCase):
         with mock.patch.object(sys, "platform", "linux"):
             self.assertFalse(tray.dashboard_app_running())
 
+    def test_installed_dashboard_forces_headless_without_a_flag(self):
+        bundle = Path("/tmp/Proxy Router.app")
+        with mock.patch.object(tray, "_dashboard_bundle", return_value=bundle):
+            self.assertEqual(tray.tray_ownership("/tmp/root"), "headless")
+
+    def test_main_selects_headless_when_the_dashboard_is_installed(self):
+        stderr = io.StringIO()
+        with mock.patch.object(tray, "_dashboard_bundle",
+                               return_value=Path("/tmp/Proxy Router.app")), \
+                mock.patch.object(tray, "supervise_dashboard", return_value=0) as sup, \
+                mock.patch.object(sys, "stderr", stderr), \
+                mock.patch.object(sys, "argv",
+                                  ["proxy_tray.py", "--root", "/tmp/root"]):
+            rc = tray.main()
+        self.assertEqual(rc, 0)
+        sup.assert_called_once_with("/tmp/root", interval=30.0)
+        self.assertIn("running headless", stderr.getvalue())
+
+    def test_explicit_opt_out_keeps_the_legacy_icon_path(self):
+        with mock.patch.object(tray, "_dashboard_bundle",
+                               return_value=Path("/tmp/Proxy Router.app")), \
+                mock.patch.dict(tray.os.environ, {"PROXY_ROUTER_TRAY_HEADLESS": "0"}):
+            self.assertEqual(tray.tray_ownership("/tmp/root"), "icon")
+
+    def test_no_dashboard_bundle_keeps_the_legacy_icon(self):
+        with mock.patch.object(tray, "_dashboard_bundle", return_value=None), \
+                mock.patch.dict(tray.os.environ, {"PROXY_ROUTER_TRAY_HEADLESS": ""}):
+            self.assertEqual(tray.tray_ownership("/tmp/root"), "icon")
+
+    def test_explicit_headless_flag_wins_over_env(self):
+        with mock.patch.object(tray, "_dashboard_bundle", return_value=None), \
+                mock.patch.dict(tray.os.environ, {"PROXY_ROUTER_TRAY_HEADLESS": "0"}):
+            self.assertEqual(
+                tray.tray_ownership("/tmp/root", explicit_headless=True), "headless")
+
 
 if __name__ == "__main__":
     unittest.main()

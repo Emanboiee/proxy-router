@@ -770,6 +770,21 @@ def dashboard_app_running() -> bool:
     return result.returncode == 0
 
 
+def tray_ownership(root, *, explicit_headless: bool = False) -> str:
+    """Which side owns the single menu-bar item: ``"headless"`` or ``"icon"``.
+
+    The dashboard app registers its own status item (issue #144), so this agent
+    must never paint a second one while that app is installed. An explicit
+    ``PROXY_ROUTER_TRAY_HEADLESS=0`` opts back into the legacy icon for local
+    debugging.
+    """
+    if explicit_headless:
+        return "headless"
+    if os.environ.get("PROXY_ROUTER_TRAY_HEADLESS", "").strip() == "0":
+        return "icon"
+    return "headless" if _dashboard_bundle(Path(root)) is not None else "icon"
+
+
 def supervise_dashboard(root: str, *, interval: float = 30.0,
                         sleep: Callable | None = None,
                         max_cycles: int | None = None) -> int:
@@ -2541,7 +2556,11 @@ def main() -> int:
     if args.selftest:
         return selftest(args.root)
 
-    if args.headless:
+    if args.headless or tray_ownership(args.root) == "headless":
+        if not args.headless:
+            print("tray: dashboard app owns the menu bar; running headless "
+                  "(set PROXY_ROUTER_TRAY_HEADLESS=0 to force the legacy icon)",
+                  file=sys.stderr)
         return supervise_dashboard(args.root, interval=args.headless_interval)
 
     if pystray is None or Image is None:
