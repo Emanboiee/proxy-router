@@ -595,6 +595,29 @@ examples/install-tray.sh            # fills the plist template, bootstraps gui/$
 examples/install-tray.sh --remove   # unload + remove ~/Library/LaunchAgents/com.proxy-router.tray.plist
 ```
 
+### One tray at a time (dashboard app vs tray agent)
+
+The Tauri dashboard app (`dashboard/`, opened by the tray's left click)
+registers its **own** menu-bar item, so running both at once shows two
+proxy-router icons — and they can disagree, because the dashboard tray paints
+its own state while this agent polls `router.py status --json`. Pick one owner:
+
+- **Dashboard owns the tray** (use this when the desktop app runs at login).
+  Start the agent headless: it supervises the app without painting a second
+  icon, and the app reports live connected / degraded / failed state.
+
+  ```sh
+  python3 proxy_tray.py --headless                      # no menu-bar item
+  python3 proxy_tray.py --headless --headless-interval 15
+  ```
+
+- **Agent owns the tray** — close the dashboard app instead; its tray icon is
+  the duplicate, and `proxy_tray.py` already shows the accurate status colour.
+
+`--headless` never stacks a second app on top of a running one, and reports a
+hint (rather than a traceback) when no `Proxy Router.app` bundle is built —
+build it, or point `PROXY_ROUTER_DASHBOARD` at one. See issue #144.
+
 Rerunning the installer is safe: with the same root it re-renders and
 re-bootstraps (a real upgrade); with a different root it unloads the stale
 job, keeps the old plist as `*.stale`, and prints the restore command. Logs go
