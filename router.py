@@ -3704,6 +3704,18 @@ def ensure_tray_started() -> None:
             ["launchctl", *args], capture_output=True, text=True, timeout=10,
         )
 
+    # Single-tray policy (issue #144): when the dashboard app owns the menu bar
+    # the pystray agent is retired and there is no tray service to start. Keep
+    # the dashboard job alive instead, and stay quiet so a normal `start` does
+    # not report a missing service as a failure.
+    dashboard_plist = Path.home() / "Library" / "LaunchAgents" / "com.proxy-router.dashboard.plist"
+    if not plist.is_file() and dashboard_plist.is_file():
+        try:
+            run_launchctl("kickstart", f"{domain}/com.proxy-router.dashboard")
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return
+
     try:
         result = run_launchctl("kickstart", "-k", label)
         if result.returncode == 0:
