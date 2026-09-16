@@ -1,6 +1,6 @@
 import './tokens.css';
 import './style.css';
-import { LocalController, getLiveStatus, getPreviewStatus, reportPreviewFrame, setTrayStatus, states, type Accent, type Connection, type Density, type FallbackMode, type LayoutPreset, type MotionSpeed, type PreviewState, type Profile, type ProviderKind, type RouteMode, type Scheme, type Snapshot, type Status, type TailscaleMode } from './controller';
+import { LocalController, applyEngineAction, applyProfileToEngine, getLiveStatus, getPreviewStatus, reportPreviewFrame, setTrayStatus, states, type Accent, type Connection, type Density, type FallbackMode, type LayoutPreset, type MotionSpeed, type PreviewState, type Profile, type ProviderKind, type RouteMode, type Scheme, type Snapshot, type Status, type TailscaleMode } from './controller';
 import { isTauri } from '@tauri-apps/api/core';
 
 const pages = ['Home', 'Profiles', 'Providers', 'Connectivity', 'Settings', 'Appearance', 'About'] as const;
@@ -289,15 +289,26 @@ app.addEventListener('click', event => {
   if (option?.dataset.profileOption) {
     const owningTrigger = option.closest<HTMLElement>('[data-profile-picker]')?.querySelector<HTMLElement>('[data-profile-trigger]');
     if (owningTrigger) profileMenu(owningTrigger, false);
-    void perform(() => controller.selectProfile(option.dataset.profileOption!));
+    void selectProfile(option.dataset.profileOption!);
     return;
   }
   closeProfileMenus();
   const target = element.closest<HTMLElement>('[data-action]'); if (!target) return;
   const action = target.dataset.action; const profileId = target.dataset.profile;
-  if (action === 'connect') void perform(() => controller.connect());
-  else if (action === 'disconnect') void perform(() => controller.disconnect());
-  else if (action === 'reconnect' || action === 'refresh') void (action === 'refresh' ? refreshStatus() : perform(() => controller.reconnect()));
+  if (action === 'connect' || action === 'disconnect' || action === 'reconnect') {
+    // Desktop: change the real engine, then re-read it so the hero shows the
+    // truth. Browser preview keeps the local demo controller.
+    void (async () => {
+      if (isTauri()) {
+        try { await applyEngineAction(action); } catch (error) { announce(error instanceof Error ? error.message : 'Engine action failed'); }
+        await refreshStatus();
+        render();
+        return;
+      }
+      await perform(() => action === 'connect' ? controller.connect() : action === 'disconnect' ? controller.disconnect() : controller.reconnect());
+    })();
+  }
+  else if (action === 'refresh') void refreshStatus();
   else if (action === 'new-profile') { editingProfileId = 'new'; pendingProviderId = undefined; profileDraft = undefined; addingProviderFromProfile = false; render(); }
   else if (action === 'cancel-profile') { editingProfileId = undefined; pendingProviderId = undefined; profileDraft = undefined; addingProviderFromProfile = false; render(); }
   else if (action === 'new-provider') { providerReturnFocusContext = 'providers'; addingProvider = true; render(); }
@@ -305,7 +316,7 @@ app.addEventListener('click', event => {
   else if (action === 'new-provider-from-profile') { providerReturnFocusContext = 'profile'; const form = app.querySelector<HTMLFormElement>('#profile-form'); if (form) profileDraft = readProfileDraft(form); addingProviderFromProfile = true; render(); }
   else if (action === 'cancel-provider-profile') { addingProviderFromProfile = false; render(); }
   else if (action === 'edit-profile' && profileId) { editingProfileId = profileId; render(); }
-  else if (action === 'select-profile' && profileId) void perform(() => controller.selectProfile(profileId));
+  else if (action === 'select-profile' && profileId) void selectProfile(profileId);
   else if (action === 'duplicate-profile' && profileId) void perform(() => controller.duplicateProfile(profileId));
   else if (action === 'delete-profile' && profileId) void perform(() => controller.deleteProfile(profileId));
   else if (action === 'export-profile' && profileId) { download(`${profileId}.proxy-router.json`, controller.exportProfile(profileId)); announce('Profile export ready'); }
@@ -328,7 +339,7 @@ app.addEventListener('keydown', event => {
   if (element.matches('[data-profile-option]') && (event.key === 'Enter' || event.key === ' ')) {
     event.preventDefault();
     const profileId = element.dataset.profileOption;
-    if (profileId) { profileMenu(trigger, false); void perform(() => controller.selectProfile(profileId)); }
+    if (profileId) { profileMenu(trigger, false); void selectProfile(profileId); }
   } else if (event.key === 'Escape') {
     event.preventDefault(); profileMenu(trigger, false); trigger.focus();
   } else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
@@ -404,6 +415,14 @@ app.addEventListener('submit', event => {
   }
   if (form.id === 'profile-form') { event.preventDefault(); const data = readProfileDraft(form); const current = editingProfileId; void perform(async () => { const next = await controller.saveProfile(data, current === 'new' ? undefined : current); editingProfileId = undefined; pendingProviderId = undefined; profileDraft = undefined; return next; }); }
 });
+async function selectProfile(profileId: string): Promise<void> {
+  if (isTauri()) {
+    try { await applyProfileToEngine(profileId); } catch (error) { announce(error instanceof Error ? error.message : 'Profile switch failed'); }
+  }
+  await perform(() => controller.selectProfile(profileId));
+  if (isTauri()) { await refreshStatus(); render(); }
+}
+
 window.addEventListener('hashchange', () => navigate(true));
 navigate(false); requestAnimationFrame(reportPreviewFrame);
 
