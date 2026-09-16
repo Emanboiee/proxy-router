@@ -1,6 +1,7 @@
 """Unit tests for proxy_tray.py (stdlib only, no GUI deps — the
 module's pystray/PIL imports are guarded)."""
 import importlib.util
+import io
 import json
 import signal
 import subprocess
@@ -1704,6 +1705,46 @@ class DashboardTrayIntegrationTests(unittest.TestCase):
         app.action_rotate.assert_called_once_with()
         app.action_mode.assert_called_once_with("safe-list")
         app.action_setup.assert_called_once_with()
+
+
+class TrayOwnershipTests(unittest.TestCase):
+    """Issue #144: exactly one proxy-router menu-bar item — the dashboard app.
+
+    The tray agent must refuse to paint a second status item while the
+    dashboard bundle is installed; PROXY_ROUTER_TRAY_HEADLESS=0 keeps the
+    legacy icon for local debugging.
+    """
+
+    def test_installed_dashboard_forces_headless(self):
+        bundle = Path("/tmp/Proxy Router.app")
+        with mock.patch.object(tray, "_dashboard_bundle", return_value=bundle):
+            self.assertEqual(tray.tray_ownership("/tmp/root"), "headless")
+
+    def test_no_dashboard_bundle_keeps_the_legacy_icon(self):
+        with mock.patch.object(tray, "_dashboard_bundle", return_value=None), \
+                mock.patch.dict(tray.os.environ, {"PROXY_ROUTER_TRAY_HEADLESS": ""}):
+            self.assertEqual(tray.tray_ownership("/tmp/root"), "icon")
+
+    def test_explicit_opt_out_keeps_the_legacy_icon(self):
+        with mock.patch.object(tray, "_dashboard_bundle",
+                               return_value=Path("/tmp/Proxy Router.app")), \
+                mock.patch.dict(tray.os.environ, {"PROXY_ROUTER_TRAY_HEADLESS": "0"}):
+            self.assertEqual(tray.tray_ownership("/tmp/root"), "icon")
+
+    def test_main_refuses_the_icon_when_the_dashboard_owns_the_menubar(self):
+        stderr = io.StringIO()
+        with mock.patch.object(tray, "_dashboard_bundle",
+                               return_value=Path("/tmp/Proxy Router.app")), \
+                mock.patch.object(tray, "RouterClient") as client, \
+                mock.patch.object(tray, "TrayApp") as tray_app, \
+                mock.patch.object(sys, "stderr", stderr), \
+                mock.patch.object(sys, "argv",
+                                  ["proxy_tray.py", "--root", "/tmp/root"]):
+            rc = tray.main()
+        self.assertEqual(rc, 0)
+        client.assert_not_called()
+        tray_app.assert_not_called()
+        self.assertIn("not starting a second status item", stderr.getvalue())
 
 
 if __name__ == "__main__":

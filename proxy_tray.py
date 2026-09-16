@@ -731,6 +731,19 @@ def _launch_dashboard_app(app: Path) -> bool:
         return False
 
 
+def tray_ownership(root) -> str:
+    """Which side owns the single menu-bar item: ``"headless"`` or ``"icon"``.
+
+    The dashboard app registers its own status item (issue #144), so this agent
+    must never paint a second one while that app is installed. An explicit
+    ``PROXY_ROUTER_TRAY_HEADLESS=0`` opts back into the legacy icon for local
+    debugging.
+    """
+    if os.environ.get("PROXY_ROUTER_TRAY_HEADLESS", "").strip() == "0":
+        return "icon"
+    return "headless" if _dashboard_bundle(Path(root)) is not None else "icon"
+
+
 def open_dashboard(root) -> bool:
     """Open the Tauri dashboard from the tray, with a TUI fallback."""
     root = Path(root)
@@ -2485,6 +2498,12 @@ def main() -> int:
 
     if args.selftest:
         return selftest(args.root)
+
+    if tray_ownership(args.root) == "headless":
+        print("tray: dashboard app owns the menu bar; not starting a second "
+              "status item (set PROXY_ROUTER_TRAY_HEADLESS=0 to force)",
+              file=sys.stderr)
+        return 0
 
     if pystray is None or Image is None:
         print("pystray + pillow required (pip install pystray pillow)",
