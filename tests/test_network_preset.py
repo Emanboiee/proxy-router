@@ -381,3 +381,40 @@ def test_network_presets_state_handles_no_wifi_and_missing_marker(tmp_path):
     assert state["ssid"] is None
     assert state["mapped_preset"] is None
     assert state["last_applied"] == {}
+
+
+def test_cli_dispatch_loads_config_before_mutating(tmp_path):
+    router = load_router(tmp_path)
+    _write_config(tmp_path, mappings={"OfficeWiFi": "opencode"})
+
+    with mock.patch.object(router.sys, "argv", [
+        "router.py", "network-preset", "set", "--ssid", "SchoolWiFi", "--preset", "school-warp",
+    ]):
+        assert router.main() == 0
+
+    # The pre-existing mapping must survive: the command has to load the config
+    # before it writes, not mutate an empty in-memory vpn section.
+    saved = json.loads((tmp_path / "router.json").read_text())
+    assert saved["vpn"]["network_presets"] == {
+        "OfficeWiFi": "opencode",
+        "SchoolWiFi": "school-warp",
+    }
+
+
+def test_cli_dispatch_remove_and_auto(tmp_path):
+    router = load_router(tmp_path)
+    _write_config(tmp_path, network_auto=True, mappings={"OfficeWiFi": "opencode"})
+
+    with mock.patch.object(router.sys, "argv", [
+        "router.py", "network-preset", "remove", "--ssid", "OfficeWiFi",
+    ]):
+        assert router.main() == 0
+    saved = json.loads((tmp_path / "router.json").read_text())
+    assert saved["vpn"]["network_presets"] == {}
+
+    with mock.patch.object(router.sys, "argv", [
+        "router.py", "network-preset", "auto", "--state", "off",
+    ]):
+        assert router.main() == 0
+    saved = json.loads((tmp_path / "router.json").read_text())
+    assert saved["vpn"]["network_auto"] is False

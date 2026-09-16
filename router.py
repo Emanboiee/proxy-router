@@ -7810,6 +7810,11 @@ def main() -> int:
     if args.cmd == "network-reconnect":
         return cmd_network_reconnect()
     if args.cmd == "network-preset":
+        # Reads/writes vpn.network_presets, so the config must be loaded first -
+        # dispatching before load_config() left _vpn empty and reported an empty
+        # map (and made every mutation a silent no-op).
+        if load_config() != 0:
+            return 1
         if args.action == "set":
             return cmd_network_preset_set(args.ssid or "", args.preset or "")
         if args.action == "remove":
