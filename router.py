@@ -4498,6 +4498,148 @@ def apply_network_preset(*, reload_engine: bool = True, root: Path | None = None
     return {"applied": True, **result, "preset": preset, "checked_at": now}
 
 
+_BUILTIN_NETWORK_PRESETS = ("default", "opencode", "roblox", "school-warp")
+_PRESET_SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+
+
+def _valid_preset_name(name: str) -> str | None:
+    """Return why ``name`` cannot be applied as a preset, else None.
+
+    Mirrors setup_tui's built-ins (the tray keeps the same mirrored list) and
+    accepts any custom preset that exists as ``presets/<name>.json``.
+    """
+    if not isinstance(name, str) or not _PRESET_SLUG_RE.fullmatch(name):
+        return "preset name must be 1-64 characters of [A-Za-z0-9._-]"
+    if name in _BUILTIN_NETWORK_PRESETS:
+        return None
+    if (ROOT / "presets" / f"{name}.json").is_file():
+        return None
+    return (f"unknown preset '{name}' (built-ins: "
+            f"{', '.join(_BUILTIN_NETWORK_PRESETS)}; custom presets live in presets/)")
+
+
+def _vpn_network_mutate(presets: dict[str, str] | None = None,
+                        auto: bool | None = None) -> int:
+    """Persist vpn.network_presets / vpn.network_auto atomically (router.json).
+
+    Same convention as _routing_mutate: temp file + replace, mode 0600, refresh
+    the in-memory vpn state, and never reload or restart the engine.
+    """
+    try:
+        data = json.loads(CONFIG_FILE.read_text())
+        if not isinstance(data, dict):
+            return fail(f"bad {CONFIG_FILE.name}: top level must be an object")
+        vpn = data.get("vpn")
+        if not isinstance(vpn, dict):
+            vpn = {}
+            data["vpn"] = vpn
+        if presets is not None:
+            vpn["network_presets"] = {str(k): str(v) for k, v in sorted(presets.items())}
+        if auto is not None:
+            vpn["network_auto"] = bool(auto)
+        _atomic_write(CONFIG_FILE, json.dumps(data, indent=2) + "\n", 0o600)
+    except (json.JSONDecodeError, OSError, TypeError) as exc:
+        return fail(f"could not save network presets in {CONFIG_FILE.name}: {exc}")
+    if isinstance(_vpn, dict):
+        if presets is not None:
+            _vpn["network_presets"] = {str(k): str(v) for k, v in presets.items()}
+        if auto is not None:
+            _vpn["network_auto"] = bool(auto)
+    return 0
+
+
+def network_presets_state() -> dict:
+    """Effective SSID -> preset view for the CLI and the dashboard."""
+    marker: dict = {}
+    try:
+        loaded = json.loads(network_preset_marker().read_text())
+        if isinstance(loaded, dict):
+            marker = loaded
+    except (OSError, json.JSONDecodeError):
+        marker = {}
+    ssid = current_ssid()
+    mapping = network_preset_map()
+    return {
+        "ssid": ssid,
+        "connected": bool(ssid),
+        "auto": network_auto_enabled(),
+        "mapped_preset": mapping.get(ssid) if ssid else None,
+        "presets": dict(sorted(mapping.items())),
+        "last_applied": marker,
+    }
+
+
+def _print_network_presets(state: dict) -> None:
+    print(json.dumps(state, indent=2, sort_keys=True))
+    ssid = state.get("ssid") or "(no Wi-Fi)"
+    mapped = state.get("mapped_preset") or "(no preset)"
+    auto = "on" if state.get("auto") else "off"
+    print(f"network: {ssid} -> {mapped}; auto={auto}", file=sys.stderr)
+
+
+def cmd_network_preset_show(as_json: bool = False) -> int:
+    _print_network_presets(network_presets_state())
+    return 0
+
+
+def cmd_network_preset_set(ssid: str, preset: str) -> int:
+    """Map one Wi-Fi network to a preset (idempotent)."""
+    ssid = (ssid or "").strip()
+    if not ssid:
+        return fail("--ssid must name the Wi-Fi network")
+    if any(ch in ssid for ch in "\n\r\t"):
+        return fail("--ssid must not contain control characters")
+    if len(ssid) > 255:
+        return fail("--ssid must be 255 characters or fewer")
+    error = _valid_preset_name(preset or "")
+    if error is not None:
+        return fail(error)
+    mapping = network_preset_map()
+    if mapping.get(ssid) == preset:
+        print(f"network-preset: '{ssid}' already maps to '{preset}' (no change)",
+              file=sys.stderr)
+        _print_network_presets(network_presets_state())
+        return 0
+    mapping[ssid] = preset
+    if _vpn_network_mutate(presets=mapping) != 0:
+        return 1
+    _print_network_presets(network_presets_state())
+    return 0
+
+
+def cmd_network_preset_remove(ssid: str) -> int:
+    """Drop one Wi-Fi network's mapping (idempotent)."""
+    ssid = (ssid or "").strip()
+    if not ssid:
+        return fail("--ssid must name the Wi-Fi network")
+    mapping = network_preset_map()
+    if ssid not in mapping:
+        print(f"network-preset: no mapping for '{ssid}' (no change)", file=sys.stderr)
+        _print_network_presets(network_presets_state())
+        return 0
+    del mapping[ssid]
+    if _vpn_network_mutate(presets=mapping) != 0:
+        return 1
+    _print_network_presets(network_presets_state())
+    return 0
+
+
+def cmd_network_preset_auto(state: str) -> int:
+    """Enable or disable automatic preset switching on network change."""
+    normalized = (state or "").strip().lower()
+    if normalized not in ("on", "off"):
+        return fail("--state must be 'on' or 'off'")
+    desired = normalized == "on"
+    if network_auto_enabled() == desired:
+        print(f"network-preset: auto is already {normalized} (no change)", file=sys.stderr)
+        _print_network_presets(network_presets_state())
+        return 0
+    if _vpn_network_mutate(auto=desired) != 0:
+        return 1
+    _print_network_presets(network_presets_state())
+    return 0
+
+
 def cmd_network_check() -> int:
     """Auto-switch the routing preset for the current network (SSID)."""
     def apply() -> dict | int:
@@ -7644,6 +7786,17 @@ def main() -> int:
     network_status_parser.add_argument("--json", action="store_true", help="machine-readable JSON")
     sub.add_parser("network-disconnect", help="stop proxy-router until Wi-Fi returns")
     sub.add_parser("network-reconnect", help="reconnect after Wi-Fi returns")
+    network_preset_parser = sub.add_parser(
+        "network-preset",
+        help="show or map a Wi-Fi network (SSID) to a routing preset")
+    network_preset_parser.add_argument(
+        "action", nargs="?", default="show", choices=["show", "set", "remove", "auto"],
+        help="show mappings (default), map a network, drop a mapping, or toggle auto")
+    network_preset_parser.add_argument("--ssid", default=None, help="Wi-Fi network name")
+    network_preset_parser.add_argument("--preset", default=None, help="preset to apply on that network")
+    network_preset_parser.add_argument(
+        "--state", default=None, choices=["on", "off"],
+        help="for action 'auto': enable/disable automatic preset switching")
 
     args, passthrough = parser.parse_known_args()
     if args.cmd == "elevate":
@@ -7656,6 +7809,14 @@ def main() -> int:
         return cmd_network_disconnect()
     if args.cmd == "network-reconnect":
         return cmd_network_reconnect()
+    if args.cmd == "network-preset":
+        if args.action == "set":
+            return cmd_network_preset_set(args.ssid or "", args.preset or "")
+        if args.action == "remove":
+            return cmd_network_preset_remove(args.ssid or "")
+        if args.action == "auto":
+            return cmd_network_preset_auto(args.state or "")
+        return cmd_network_preset_show(as_json=bool(getattr(args, "json", False)))
     if _needs_elevation(args):
         return _elevate()
     def _delegated_setup_argv() -> list[str]:

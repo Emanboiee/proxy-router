@@ -246,3 +246,138 @@ def test_route_watcher_network_check_hop_runs_router_command(tmp_path):
         module._network_check_hop(tmp_path)
     assert calls
     assert calls[0][0][-1] == "network-check"
+
+
+def test_network_preset_set_persists_mapping(tmp_path):
+    router = load_router(tmp_path)
+    _write_config(tmp_path, mappings={"OfficeWiFi": "opencode"})
+    router._vpn = {"network_auto": False, "network_presets": {"OfficeWiFi": "opencode"}}
+
+    assert router.cmd_network_preset_set("SchoolWiFi", "school-warp") == 0
+
+    saved = json.loads((tmp_path / "router.json").read_text())
+    assert saved["vpn"]["network_presets"] == {
+        "OfficeWiFi": "opencode",
+        "SchoolWiFi": "school-warp",
+    }
+    assert router.network_preset_map() == {
+        "OfficeWiFi": "opencode",
+        "SchoolWiFi": "school-warp",
+    }
+
+
+def test_network_preset_set_updates_existing_mapping(tmp_path):
+    router = load_router(tmp_path)
+    _write_config(tmp_path, mappings={"OfficeWiFi": "opencode"})
+    router._vpn = {"network_presets": {"OfficeWiFi": "opencode"}}
+
+    assert router.cmd_network_preset_set("OfficeWiFi", "roblox") == 0
+
+    saved = json.loads((tmp_path / "router.json").read_text())
+    assert saved["vpn"]["network_presets"] == {"OfficeWiFi": "roblox"}
+
+
+def test_network_preset_set_rejects_unknown_preset_without_writing(tmp_path):
+    router = load_router(tmp_path)
+    _write_config(tmp_path, mappings={"OfficeWiFi": "opencode"})
+    router._vpn = {"network_presets": {"OfficeWiFi": "opencode"}}
+    before = (tmp_path / "router.json").read_text()
+
+    assert router.cmd_network_preset_set("SchoolWiFi", "not-a-preset") == 1
+
+    assert (tmp_path / "router.json").read_text() == before
+
+
+def test_network_preset_set_rejects_empty_ssid(tmp_path):
+    router = load_router(tmp_path)
+    _write_config(tmp_path, mappings={"OfficeWiFi": "opencode"})
+    before = (tmp_path / "router.json").read_text()
+
+    assert router.cmd_network_preset_set("   ", "opencode") == 1
+
+    assert (tmp_path / "router.json").read_text() == before
+
+
+def test_network_preset_set_is_idempotent(tmp_path):
+    router = load_router(tmp_path)
+    _write_config(tmp_path, mappings={"OfficeWiFi": "opencode"})
+    router._vpn = {"network_presets": {"OfficeWiFi": "opencode"}}
+    before = (tmp_path / "router.json").read_text()
+
+    assert router.cmd_network_preset_set("OfficeWiFi", "opencode") == 0
+
+    assert (tmp_path / "router.json").read_text() == before
+
+
+def test_network_preset_remove_drops_mapping_and_is_idempotent(tmp_path):
+    router = load_router(tmp_path)
+    _write_config(tmp_path, mappings={"OfficeWiFi": "opencode"})
+    router._vpn = {"network_presets": {"OfficeWiFi": "opencode", "Home": "default"}}
+
+    assert router.cmd_network_preset_remove("OfficeWiFi") == 0
+    saved = json.loads((tmp_path / "router.json").read_text())
+    assert saved["vpn"]["network_presets"] == {"Home": "default"}
+
+    # Removing a network that has no mapping is a no-op, not a failure.
+    assert router.cmd_network_preset_remove("OfficeWiFi") == 0
+    assert json.loads((tmp_path / "router.json").read_text())["vpn"]["network_presets"] == {
+        "Home": "default"
+    }
+
+
+def test_network_preset_auto_toggles_and_gates_preset_lookup(tmp_path):
+    router = load_router(tmp_path)
+    _write_config(tmp_path, network_auto=False, mappings={"SchoolWiFi": "school-warp"})
+    router._vpn = {"network_auto": False, "network_presets": {"SchoolWiFi": "school-warp"}}
+
+    with mock.patch.object(router, "current_ssid", return_value="SchoolWiFi"):
+        assert router.preset_for_current_network() is None
+
+        assert router.cmd_network_preset_auto("on") == 0
+        assert router.preset_for_current_network() == "school-warp"
+
+    saved = json.loads((tmp_path / "router.json").read_text())
+    assert saved["vpn"]["network_auto"] is True
+
+    assert router.cmd_network_preset_auto("off") == 0
+    assert json.loads((tmp_path / "router.json").read_text())["vpn"]["network_auto"] is False
+
+
+def test_network_preset_auto_rejects_bad_state(tmp_path):
+    router = load_router(tmp_path)
+    _write_config(tmp_path, mappings={"SchoolWiFi": "school-warp"})
+
+    assert router.cmd_network_preset_auto("maybe") == 1
+
+
+def test_network_presets_state_reports_mapping_and_last_applied(tmp_path):
+    router = load_router(tmp_path)
+    _write_config(tmp_path, network_auto=True, mappings={"SchoolWiFi": "school-warp"})
+    router._vpn = {"network_auto": True, "network_presets": {"SchoolWiFi": "school-warp"}}
+    marker = router.network_preset_marker(tmp_path)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps({"ssid": "SchoolWiFi", "preset": "school-warp", "at": 123}))
+
+    with mock.patch.object(router, "current_ssid", return_value="SchoolWiFi"):
+        state = router.network_presets_state()
+
+    assert state["ssid"] == "SchoolWiFi"
+    assert state["connected"] is True
+    assert state["auto"] is True
+    assert state["mapped_preset"] == "school-warp"
+    assert state["presets"] == {"SchoolWiFi": "school-warp"}
+    assert state["last_applied"]["preset"] == "school-warp"
+
+
+def test_network_presets_state_handles_no_wifi_and_missing_marker(tmp_path):
+    router = load_router(tmp_path)
+    _write_config(tmp_path, mappings={"SchoolWiFi": "school-warp"})
+    router._vpn = {"network_auto": True, "network_presets": {"SchoolWiFi": "school-warp"}}
+
+    with mock.patch.object(router, "current_ssid", return_value=None):
+        state = router.network_presets_state()
+
+    assert state["connected"] is False
+    assert state["ssid"] is None
+    assert state["mapped_preset"] is None
+    assert state["last_applied"] == {}
