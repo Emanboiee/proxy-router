@@ -2,7 +2,7 @@ import './tokens.css';
 import './style.css';
 import { LocalController, applyEngineAction, applyProfileToEngine, getLiveStatus, getPreviewStatus, reportPreviewFrame, setTrayStatus, states, type Accent, type Connection, type Density, type FallbackMode, type LayoutPreset, type MotionSpeed, type PreviewState, type Profile, type ProviderKind, type RouteMode, type Scheme, type Snapshot, type Status, type TailscaleMode } from './controller';
 import { isTauri } from '@tauri-apps/api/core';
-import { getConfig, getNetwork, presetChoices, removeNetworkPreset, runNetworkAction, setNetworkAuto, setNetworkPreset, type EngineConfig, type NetworkPresetState } from './controller';
+import { addRoute, applyPreset, getConfig, getNetwork, getRouting, presetChoices, removeNetworkPreset, removeRoute, runNetworkAction, setNetworkAuto, setNetworkPreset, setRoutingMode, type EngineConfig, type NetworkPresetState, type RoutingState } from './controller';
 
 const pages = ['Home', 'Profiles', 'Providers', 'Connectivity', 'Settings', 'Appearance', 'About'] as const;
 type Page = typeof pages[number];
@@ -24,6 +24,7 @@ let lastTrayState: PreviewState | undefined;
 let engineConfig: EngineConfig | null = null;
 let networkState: NetworkPresetState | null = null;
 let livePayload: Record<string, unknown> | null = null;
+let routingState: RoutingState | null = null;
 const app = document.querySelector<HTMLDivElement>('#app')!;
 
 const copy: Record<PreviewState, [string, string]> = {
@@ -107,7 +108,7 @@ function homePage(): string {
   const action = previewState === 'connected' ? button('Disconnect', 'disconnect', 'danger') : previewState === 'disconnected' ? button('Connect', 'connect', 'primary') : previewState === 'failed' || previewState === 'stale' ? button('Refresh preview', 'refresh', 'primary') : button('Reconnect', 'reconnect', 'primary');
   const routeInfo = profile.routeMode === 'selective' ? `${profile.domains.length} ${profile.domains.length === 1 ? 'site' : 'sites'}` : routeLabel(profile.routeMode);
   const compactStatus = `${provider.name} · ${provider.latency ?? '—'} ms · ${routeInfo} · ${fallbackLabel(profile.fallback)}`;
-  return `<section class="page-section home-page" data-state="${previewState}">
+  return `<section class="page-section home-page" data-state="${previewState}">${isTauri() ? livePresetRow() : ''}
     <div class="connection-hero">
       <div class="connection-emblem" aria-hidden="true"><img src="/gremlin-cat-goblin-cat.gif" alt="" width="220" height="242" decoding="async"></div>
       <h1 tabindex="-1">${title}</h1>
@@ -126,6 +127,7 @@ function profileForm(profile?: Profile): string {
 }
 
 function profilesPage(): string {
+  if (isTauri() && engineConfig) return liveProfilesPage();
   const cards = snapshot.profiles.map(profile => `<article class="profile-card ${profile.id === snapshot.activeProfileId ? 'selected' : ''}"><div class="panel-heading"><div><span class="label">${profile.id === snapshot.activeProfileId ? 'Active profile' : 'Profile'}</span><h2>${esc(profile.name)}</h2></div></div><p class="muted">${esc(profile.description || 'No description yet.')}</p><div class="profile-meta"><span>${profile.routeMode === 'full' ? 'Full tunnel' : profile.routeMode === 'direct' ? 'Direct' : `${profile.domains.length} routed sites`}</span><span>${profile.autoSubdomains ? 'Subdomains on' : 'Exact domains'}</span><span>${fallbackLabel(profile.fallback)}</span><span>${esc(snapshot.providers.find(provider => provider.id === profile.providerId)?.name ?? 'Provider')}</span></div><div class="card-actions">${profile.id === snapshot.activeProfileId ? '' : button('Use profile', 'select-profile', 'primary', `data-profile="${profile.id}"`)}${button('Edit', 'edit-profile', 'quiet', `data-profile="${profile.id}"`)}${button('Duplicate', 'duplicate-profile', 'quiet', `data-profile="${profile.id}"`)}${button('Export', 'export-profile', 'quiet', `data-profile="${profile.id}"`)}${button('Delete', 'delete-profile', 'quiet danger-text', `data-profile="${profile.id}"`)}</div></article>`).join('');
   return `<section class="page-section"><div class="section-heading"><div><h1 tabindex="-1">Profiles</h1><p class="lead">Create a profile, add its connection, and keep routing and fallback choices together.</p></div><div class="section-actions">${button('Create profile', 'new-profile', 'primary')}${button('Import', 'import-profile', 'quiet')}</div></div><div class="cards profile-cards">${cards}</div><article class="panel tip"><strong>Profiles are independent.</strong><span>Switching one changes the next connection action; it never edits another profile.</span></article></section>`;
 }
@@ -235,8 +237,58 @@ function liveConnectivityPage(): string {
 <div class="two-column"><article class="panel"><h2>Routes</h2><ul class="route-list" id="engine-routes">${routeRows}</ul></article><article class="panel"><h2>Providers</h2><ul class="route-list" id="engine-providers">${providerRows}</ul></article></div></section>`;
 }
 
+/** Home preset row: apply a real preset without opening another page. */
+function livePresetRow(): string {
+  const active = engineConfig?.preset ?? null;
+  const buttons = presetChoices.map(name => button(
+    active === name ? `${name} ✓` : name, 'preset-apply', active === name ? 'quiet' : 'primary',
+    `data-preset="${esc(name)}"`)).join('');
+  return `<article class="panel" id="home-presets"><div class="panel-heading"><div><span class="label">Routing preset</span><h2>Active preset</h2></div><span class="badge">${esc(active ?? 'none')}</span></div><div class="card-actions">${buttons}</div></article>`;
+}
+
+/** Profiles page in the desktop app: the engine's real configuration. */
+function liveProfilesPage(): string {
+  const active = engineConfig?.preset ?? null;
+  const routes = Array.isArray(engineConfig?.routes) ? engineConfig!.routes! : [];
+  const providers = Object.entries(engineConfig?.providers ?? {});
+  const presetButtons = presetChoices.map(name => button(
+    active === name ? `${name} ✓ active` : `Apply ${name}`, 'preset-apply',
+    active === name ? 'quiet' : 'primary', `data-preset="${esc(name)}"`)).join('');
+  const routeRows = routes.map(route => {
+    const domains = Array.isArray(route.domains) ? (route.domains as string[]) : [];
+    const id = String(route.id ?? '');
+    return `<tr><td><strong>${esc(id)}</strong></td><td>${esc(String(route.provider ?? 'direct'))}</td><td class="muted">${esc(domains.join(', '))}</td><td>${button('Remove', 'route-remove', 'quiet danger-text', `data-route-id="${esc(id)}"`)}</td></tr>`;
+  }).join('') || '<tr><td colspan="4" class="muted">No routes configured.</td></tr>';
+  const providerRows = providers.map(([name, spec]) => {
+    const chain = Array.isArray(spec.fallback_providers) ? (spec.fallback_providers as string[]).join(' → ') : '—';
+    return `<li><strong>${esc(name)}</strong> <span class="muted">fallback ${esc(chain)}</span></li>`;
+  }).join('') || '<li class="muted">No providers configured.</li>';
+  return `<section class="page-section"><div class="section-heading"><div><h1 tabindex="-1">Profiles</h1><p class="lead">Your engine configuration: the active preset, its routes, and the providers behind them.</p></div><span class="badge">preset: ${esc(active ?? 'none')}</span></div>
+<article class="panel"><div class="panel-heading"><div><span class="label">Presets</span><h2>Switch routing preset</h2></div></div><div class="card-actions">${presetButtons}</div></article>
+<article class="panel"><h2>Routes</h2><table class="route-table"><thead><tr><th>Route</th><th>Provider</th><th>Domains</th><th></th></tr></thead><tbody id="engine-route-rows">${routeRows}</tbody></table>
+<div class="provider-controls"><label for="route-domain">Add a domain</label><input id="route-domain" placeholder="example.com"><label for="route-provider">via</label><select id="route-provider">${Object.keys(engineConfig?.providers ?? {}).map(name => `<option value="${esc(name)}">${esc(name)}</option>`).join('')}</select>${button('Add route', 'route-add', 'primary')}</div></article>
+<article class="panel"><h2>Providers</h2><ul class="route-list" id="engine-provider-list">${providerRows}</ul></article></section>`;
+}
+
+/** Settings page in the desktop app: the engine's real values. */
+function liveSettingsPage(): string {
+  const vpn = (engineConfig?.vpn ?? {}) as Record<string, unknown>;
+  const net = networkState;
+  const mode = routingState?.mode ?? (engineConfig?.routing as Record<string, unknown> | undefined)?.mode ?? 'default';
+  const modes = ['safe-list', 'vpn-list', 'default'].map(name => button(
+    name === mode ? `${name} ✓` : name, 'routing-mode', name === mode ? 'quiet' : 'primary',
+    `data-mode="${esc(name)}"`)).join('');
+  const row = (label: string, value: unknown) => `<li><strong>${esc(label)}</strong> <span class="muted">${esc(String(value ?? '—'))}</span></li>`;
+  return `<section class="page-section"><div class="section-heading"><div><h1 tabindex="-1">Settings</h1><p class="lead">Values the engine is actually running with.</p></div><span class="badge">from router.json</span></div>
+<article class="panel"><h2>Routing mode</h2><div class="card-actions">${modes}</div><p class="muted">Current mode: <strong>${esc(String(mode))}</strong></p></article>
+<article class="panel"><h2>Engine</h2><ul class="route-list">${row('Proxy port', engineConfig?.port)}${row('Preset', engineConfig?.preset)}${row('VPN default mode', vpn.default_mode)}${row('Capture', vpn.capture)}${row('MTU', vpn.mtu)}${row('DNS transport', vpn.dns_transport)}</ul></article>
+<article class="panel"><h2>Network detection</h2><ul class="route-list">${row('Auto-switch on Wi-Fi change', net?.auto === true ? 'on' : 'off')}${row('Mapped networks', Object.keys(net?.presets ?? {}).length)}${row('Current network', net?.ssid ?? 'none')}</ul><div class="card-actions">${net?.auto ? button('Turn auto-switch off', 'network-auto', 'quiet', 'data-network-state="off"') : button('Turn auto-switch on', 'network-auto', 'quiet', 'data-network-state="on"')}<a class="text-link" href="#connectivity">Map a network <span aria-hidden="true">↗</span></a></div></article>
+<article class="panel"><h2>Rotation & keepalive</h2><ul class="route-list">${row('Rotate every (s)', (engineConfig?.rotation as Record<string, unknown> | undefined)?.interval_seconds)}${row('Rotation jitter (s)', (engineConfig?.rotation as Record<string, unknown> | undefined)?.jitter_seconds)}${row('Keepalive enabled', (engineConfig?.keepalive as Record<string, unknown> | undefined)?.enabled)}${row('Keepalive interval (s)', (engineConfig?.keepalive as Record<string, unknown> | undefined)?.interval)}</ul></article></section>`;
+}
+
 function toggle(name: string, label: string, checked: boolean, note: string): string { return `<label class="setting-row"><span><strong>${label}</strong><small>${note}</small></span><input type="checkbox" data-setting="${name}" ${checked ? 'checked' : ''}></label>`; }
 function settingsPage(): string {
+  if (isTauri() && engineConfig) return liveSettingsPage();
   return `<section class="page-section"><div class="section-heading"><div><h1 tabindex="-1">Settings</h1><p class="lead">Small defaults that make the local proxy feel like a normal VPN client.</p></div><span class="badge">Saved locally</span></div><div class="two-column"><article class="panel settings-panel"><h2>Window & connection</h2>${toggle('launchAtLogin', 'Launch at login', snapshot.settings.launchAtLogin, 'Start the tray helper when you sign in.')}${toggle('closeToTray', 'Close to tray', snapshot.settings.closeToTray, 'Closing the window hides it; the tray menu can reopen it.')}${toggle('disconnectOnNetworkLoss', 'Disconnect on Wi-Fi loss', snapshot.settings.disconnectOnNetworkLoss, 'Prevent stale routes while moving between networks.')}${toggle('autoSwitch', 'Auto-switch providers', snapshot.settings.autoSwitch, 'Try the healthiest provider after repeated TLS errors.')}${toggle('fullTunnel', 'Full tunnel mode', snapshot.settings.fullTunnel, 'Route all traffic instead of only selected domains.')}</article><article class="panel settings-panel"><h2>Router details</h2><label>Proxy port<input type="number" min="1024" max="65535" data-setting-number="proxyPort" value="${snapshot.settings.proxyPort}"></label><label>Switch after TLS errors<select data-setting-select="switchAfterErrors"><option value="3" ${snapshot.settings.switchAfterErrors === 3 ? 'selected' : ''}>3 errors</option><option value="5" ${snapshot.settings.switchAfterErrors === 5 ? 'selected' : ''}>5 errors</option><option value="8" ${snapshot.settings.switchAfterErrors === 8 ? 'selected' : ''}>8 errors</option></select></label><label>Log detail<select data-setting-select="logLevel"><option value="normal" ${snapshot.settings.logLevel === 'normal' ? 'selected' : ''}>Normal</option><option value="verbose" ${snapshot.settings.logLevel === 'verbose' ? 'selected' : ''}>Verbose</option></select></label><div class="setting-link"><a class="text-link" href="#appearance">Customize appearance <span aria-hidden="true">↗</span></a></div></article></div></section>`;
 }
 
@@ -304,6 +356,7 @@ async function refreshStatus(options?: { silent?: boolean }): Promise<void> {
 async function refreshEngineData(): Promise<void> {
   try { engineConfig = await getConfig(); } catch { /* keep the last good read */ }
   try { networkState = (await getNetwork()).presets; } catch { /* keep the last good read */ }
+  try { routingState = await getRouting(); } catch { /* keep the last good read */ }
 }
 function navigate(focus: boolean): void { const name = location.hash.slice(1).toLowerCase(); if (name === 'routing') { history.replaceState(null, '', '#profiles'); page = 'Profiles'; } else page = pages.find(item => item.toLowerCase() === name) ?? 'Home'; menu.setAttribute('aria-expanded', 'false'); render(); resetMainScroll(); if (focus) main.querySelector<HTMLElement>('h1')?.focus({ preventScroll: true }); }
 function formInput(form: HTMLFormElement, name: string): string { return (new FormData(form).get(name) as string | null ?? '').trim(); }
@@ -385,6 +438,10 @@ app.addEventListener('click', event => {
   else if (action === 'network-check' || action === 'network-reconnect' || action === 'network-disconnect') void networkAction(action);
   else if (action === 'network-auto') void networkAuto(target.dataset.networkState === 'on');
   else if (action === 'network-map') void networkMap();
+  else if (action === 'preset-apply' && target.dataset.preset) void applyPresetAction(target.dataset.preset);
+  else if (action === 'routing-mode' && target.dataset.mode) void routingModeAction(target.dataset.mode);
+  else if (action === 'route-add') void routeAddAction();
+  else if (action === 'route-remove' && target.dataset.routeId) void routeRemoveAction(target.dataset.routeId);
   else if (action === 'network-remove-mapping') void networkRemoveMapping();
   else if (action === 'theme-layout' && target.dataset.layout) void perform(() => controller.updateTheme({ layout: target.dataset.layout as LayoutPreset }));
   else if (action === 'theme-scheme' && target.dataset.scheme) void perform(() => controller.updateTheme({ scheme: target.dataset.scheme as Scheme }));
@@ -532,6 +589,54 @@ async function networkRemoveMapping(): Promise<void> {
   } catch (error) {
     announce(error instanceof Error ? error.message : 'Could not remove the mapping');
   }
+  render();
+}
+
+/** Preset, routing-mode and route actions against the real engine. */
+async function applyPresetAction(name: string): Promise<void> {
+  try {
+    await applyPreset(name);
+    announce(`Preset ${name} applied`);
+  } catch (error) {
+    announce(error instanceof Error ? error.message : 'Could not apply the preset');
+  }
+  await refreshStatus({ silent: true });
+  render();
+}
+
+async function routingModeAction(mode: string): Promise<void> {
+  try {
+    routingState = await setRoutingMode(mode as 'safe-list' | 'vpn-list' | 'default');
+    announce(`Routing mode: ${mode}`);
+  } catch (error) {
+    announce(error instanceof Error ? error.message : 'Could not change the routing mode');
+  }
+  render();
+}
+
+async function routeAddAction(): Promise<void> {
+  const domain = document.querySelector<HTMLInputElement>('#route-domain')?.value.trim() ?? '';
+  const provider = document.querySelector<HTMLSelectElement>('#route-provider')?.value ?? '';
+  if (!domain) { announce('Enter a domain to route'); return; }
+  if (!provider) { announce('Pick a provider for the route'); return; }
+  try {
+    await addRoute(domain, provider);
+    announce(`Route added: ${domain} via ${provider}`);
+  } catch (error) {
+    announce(error instanceof Error ? error.message : 'Could not add the route');
+  }
+  await refreshStatus({ silent: true });
+  render();
+}
+
+async function routeRemoveAction(id: string): Promise<void> {
+  try {
+    await removeRoute(id);
+    announce(`Route removed: ${id}`);
+  } catch (error) {
+    announce(error instanceof Error ? error.message : 'Could not remove the route');
+  }
+  await refreshStatus({ silent: true });
   render();
 }
 

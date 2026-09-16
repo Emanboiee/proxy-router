@@ -98,6 +98,12 @@ const desktopMock = () => {
           ],
         });
       }
+      if (name === 'get_routing') {
+        return Promise.resolve({
+          mode: 'default', default_provider: null,
+          direct_domains: [], vpn_domains: [], health_order: false,
+        });
+      }
       if (name === 'get_network') {
         return Promise.resolve({
           status: { connected: true, ssid: 'SchoolWiFi' },
@@ -166,4 +172,65 @@ test('desktop Network card saves, toggles and removes the mapping', async ({ pag
     .filter(entry => entry.command === 'run_router_action')
     .map(entry => (entry.payload as { action: string }).action));
   expect(actions).toContain('network-check');
+});
+
+
+test('desktop Home exposes the real preset row', async ({ page }) => {
+  await page.addInitScript(desktopMock);
+  await page.goto('/');
+
+  await expect(page.locator('#home-presets')).toBeVisible();
+  await expect(page.locator('#home-presets')).toContainText('opencode');
+  await page.locator('#home-presets button[data-preset="school-warp"]').click();
+  const applied = await page.evaluate(() => (window as unknown as { __invoke: { command: string; payload?: unknown }[] }).__invoke
+    .filter(entry => entry.command === 'apply_preset')
+    .map(entry => (entry.payload as { name: string }).name));
+  expect(applied).toContain('school-warp');
+});
+
+test('desktop Profiles shows the engine routes and mutates them', async ({ page }) => {
+  await page.addInitScript(desktopMock);
+  await page.goto('/#profiles');
+
+  // Real routes from router.json, not demo profiles.
+  await expect(page.locator('#engine-route-rows')).toContainText('opencode-zen');
+  await expect(page.locator('#engine-provider-list')).toContainText('proton');
+
+  // Removing a route calls the engine.
+  await page.locator('#engine-route-rows button[data-route-id="opencode-zen"]').click();
+  const removed = await page.evaluate(() => (window as unknown as { __invoke: { command: string; payload?: unknown }[] }).__invoke
+    .filter(entry => entry.command === 'remove_route')
+    .map(entry => (entry.payload as { id: string }).id));
+  expect(removed).toContain('opencode-zen');
+
+  // Adding a route calls the engine with the entered domain + provider.
+  await page.locator('#route-domain').fill('example.com');
+  await page.locator('#route-provider').selectOption('cloudflare');
+  await page.getByRole('button', { name: 'Add route', exact: true }).click();
+  const added = await page.evaluate(() => (window as unknown as { __invoke: { command: string; payload?: unknown }[] }).__invoke
+    .filter(entry => entry.command === 'add_route')
+    .map(entry => entry.payload));
+  expect(added).toContainEqual({ domain: 'example.com', provider: 'cloudflare', id: null });
+
+  // Presets are switchable from this page too.
+  await page.locator('button[data-preset="roblox"]').first().click();
+  const presets = await page.evaluate(() => (window as unknown as { __invoke: { command: string; payload?: unknown }[] }).__invoke
+    .filter(entry => entry.command === 'apply_preset')
+    .map(entry => (entry.payload as { name: string }).name));
+  expect(presets).toContain('roblox');
+});
+
+test('desktop Settings shows engine values and switches routing mode', async ({ page }) => {
+  await page.addInitScript(desktopMock);
+  await page.goto('/#settings');
+
+  await expect(page.locator('#main')).toContainText('from router.json');
+  await expect(page.locator('#main')).toContainText('Proxy port');
+  await expect(page.locator('#main')).toContainText('2080');
+
+  await page.locator('button[data-mode="vpn-list"]').click();
+  const modes = await page.evaluate(() => (window as unknown as { __invoke: { command: string; payload?: unknown }[] }).__invoke
+    .filter(entry => entry.command === 'set_routing_mode')
+    .map(entry => (entry.payload as { mode: string }).mode));
+  expect(modes).toContain('vpn-list');
 });

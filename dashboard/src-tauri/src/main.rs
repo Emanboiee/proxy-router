@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tauri::{
     image::Image,
-    menu::{Menu, MenuItem, PredefinedMenuItem},
+    menu::{Menu, MenuItem, PredefinedMenuItem, Submenu},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Manager, Runtime,
 };
@@ -278,6 +278,57 @@ fn remove_network_preset(ssid: String) -> Result<Value, String> {
     controller::json_command(&root, &["network-preset", "show"])
 }
 
+/// Effective routing mode and lists (`router.py routing show`).
+#[tauri::command]
+fn get_routing() -> Result<Value, String> {
+    let root = controller::router_root();
+    controller::json_command(&root, &["routing", "show"])
+}
+
+/// Switch the routing mode (safe-list | vpn-list | default).
+#[tauri::command]
+fn set_routing_mode(mode: String) -> Result<Value, String> {
+    if !matches!(mode.as_str(), "safe-list" | "vpn-list" | "default") {
+        return Err(format!("unsupported routing mode: {mode}"));
+    }
+    let root = controller::router_root();
+    controller::run_controller(&root, &["routing", "set", "--mode", &mode])?;
+    controller::json_command(&root, &["routing", "show"])
+}
+
+/// Add a domain route to a provider.
+#[tauri::command]
+fn add_route(domain: String, provider: String, id: Option<String>) -> Result<Value, String> {
+    if !valid_slug(&domain, 253) || domain.contains("..") {
+        return Err("domain must be a hostname of 1-253 characters".into());
+    }
+    if !valid_slug(&provider, 64) {
+        return Err("provider must be 1-64 characters of letters, digits, dot, dash or underscore".into());
+    }
+    let root = controller::router_root();
+    let mut args = vec!["add", "--domain", domain.as_str(), "--provider", provider.as_str()];
+    if let Some(id) = id.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        if !valid_slug(id, 64) {
+            return Err("route id must be 1-64 characters of letters, digits, dot, dash or underscore".into());
+        }
+        args.push("--id");
+        args.push(id);
+    }
+    controller::run_controller(&root, &args)?;
+    Ok(serde_json::json!({ "added": domain }))
+}
+
+/// Remove a route by id.
+#[tauri::command]
+fn remove_route(id: String) -> Result<Value, String> {
+    if !valid_slug(&id, 64) {
+        return Err("route id must be 1-64 characters of letters, digits, dot, dash or underscore".into());
+    }
+    let root = controller::router_root();
+    controller::run_controller(&root, &["remove", &id])?;
+    Ok(serde_json::json!({ "removed": id }))
+}
+
 #[tauri::command]
 fn set_tray_status<R: Runtime>(app: AppHandle<R>, state: String) -> Result<(), String> {
     apply_tray_state(&app, &state)
@@ -302,13 +353,32 @@ fn main() {
             let rotate = MenuItem::with_id(app, "rotate", "Rotate exit", true, None::<&str>)?;
             let sweep = MenuItem::with_id(app, "sweep", "Health sweep", true, None::<&str>)?;
             let refresh = MenuItem::with_id(app, "refresh", "Refresh status", true, None::<&str>)?;
+            // Presets and routing mode live in the tray too, so the classic
+            // actions do not require opening the window.
+            let mut preset_items = Vec::new();
+            for name in ALLOWED_PRESETS {
+                preset_items.push(MenuItem::with_id(
+                    app, format!("preset:{name}"), name, true, None::<&str>)?);
+            }
+            let preset_refs: Vec<&dyn tauri::menu::IsMenuItem<_>> =
+                preset_items.iter().map(|item| item as &dyn tauri::menu::IsMenuItem<_>).collect();
+            let presets_menu = Submenu::with_items(app, "Presets", true, &preset_refs)?;
+
+            let mut mode_items = Vec::new();
+            for mode in ["safe-list", "vpn-list", "default"] {
+                mode_items.push(MenuItem::with_id(
+                    app, format!("routing:{mode}"), mode, true, None::<&str>)?);
+            }
+            let mode_refs: Vec<&dyn tauri::menu::IsMenuItem<_>> =
+                mode_items.iter().map(|item| item as &dyn tauri::menu::IsMenuItem<_>).collect();
+            let routing_menu = Submenu::with_items(app, "Routing mode", true, &mode_refs)?;
             let separator = PredefinedMenuItem::separator(app)?;
             let quit = MenuItem::with_id(app, "quit", "Quit Proxy Router", true, None::<&str>)?;
             let menu = Menu::with_items(
                 app,
                 &[
-                    &open, &connect, &disconnect, &rotate, &sweep, &refresh, &separator,
-                    &quit,
+                    &open, &connect, &disconnect, &rotate, &sweep, &refresh,
+                    &presets_menu, &routing_menu, &separator, &quit,
                 ],
             )?;
 
@@ -326,6 +396,25 @@ fn main() {
                         "quit" => app.exit(0),
                         "refresh" => {
                             refresh_live_status(app);
+                        }
+                        _ if id.starts_with("preset:") => {
+                            let handle = app.clone();
+                            let name = id["preset:".len()..].to_string();
+                            std::thread::spawn(move || {
+                                if let Err(error) = apply_preset(handle.clone(), name) {
+                                    eprintln!("tray preset failed: {error}");
+                                }
+                            });
+                        }
+                        _ if id.starts_with("routing:") => {
+                            let handle = app.clone();
+                            let mode = id["routing:".len()..].to_string();
+                            std::thread::spawn(move || {
+                                if let Err(error) = set_routing_mode(mode) {
+                                    eprintln!("tray routing mode failed: {error}");
+                                }
+                                refresh_live_status(&handle);
+                            });
                         }
                         action => {
                             // Controller calls can block: never stall the menu.
@@ -373,6 +462,10 @@ fn main() {
             set_network_preset,
             set_network_auto,
             remove_network_preset,
+            get_routing,
+            set_routing_mode,
+            add_route,
+            remove_route,
             set_tray_status,
             preview_rendered
         ])

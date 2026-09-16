@@ -284,4 +284,36 @@ export async function runNetworkAction(action: 'network-check' | 'network-reconn
   await invoke('run_router_action', { action });
 }
 
+/** Effective routing mode and lists. */
+export interface RoutingState {
+  mode?: string;
+  default_provider?: string | null;
+  direct_domains?: string[];
+  vpn_domains?: string[];
+  health_order?: boolean;
+}
+
+/** Apply a named preset to the live config and reload (allowlisted engine-side). */
+export async function applyPreset(name: string): Promise<void> {
+  if (!isTauri()) return;
+  await invoke('apply_preset', { name });
+}
+
+export async function getRouting(): Promise<RoutingState> {
+  if (!isTauri()) throw new Error('Live routing requires the desktop app');
+  return await invoke<RoutingState>('get_routing');
+}
+
+export async function setRoutingMode(mode: 'safe-list' | 'vpn-list' | 'default'): Promise<RoutingState> {
+  return await invoke<RoutingState>('set_routing_mode', { mode });
+}
+
+export async function addRoute(domain: string, provider: string, id?: string): Promise<void> {
+  await invoke('add_route', { domain, provider, id: id ?? null });
+}
+
+export async function removeRoute(id: string): Promise<void> {
+  await invoke('remove_route', { id });
+}
+
 export function reportPreviewFrame(): void { if (isTauri()) void invoke('preview_rendered').catch(() => {}); }
