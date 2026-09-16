@@ -2,6 +2,7 @@ import './tokens.css';
 import './style.css';
 import { LocalController, applyEngineAction, applyProfileToEngine, getLiveStatus, getPreviewStatus, reportPreviewFrame, setTrayStatus, states, type Accent, type Connection, type Density, type FallbackMode, type LayoutPreset, type MotionSpeed, type PreviewState, type Profile, type ProviderKind, type RouteMode, type Scheme, type Snapshot, type Status, type TailscaleMode } from './controller';
 import { isTauri } from '@tauri-apps/api/core';
+import { getConfig, getNetwork, presetChoices, removeNetworkPreset, runNetworkAction, setNetworkAuto, setNetworkPreset, type EngineConfig, type NetworkPresetState } from './controller';
 
 const pages = ['Home', 'Profiles', 'Providers', 'Connectivity', 'Settings', 'Appearance', 'About'] as const;
 type Page = typeof pages[number];
@@ -20,6 +21,9 @@ let requestGeneration = 0;
 let busy = false;
 let actionQueue: Promise<void> = Promise.resolve();
 let lastTrayState: PreviewState | undefined;
+let engineConfig: EngineConfig | null = null;
+let networkState: NetworkPresetState | null = null;
+let livePayload: Record<string, unknown> | null = null;
 const app = document.querySelector<HTMLDivElement>('#app')!;
 
 const copy: Record<PreviewState, [string, string]> = {
@@ -180,8 +184,55 @@ function providersPage(): string {
 }
 
 function connectivityPage(): string {
+  if (isTauri() && (networkState || engineConfig)) return liveConnectivityPage();
   const cards = snapshot.providers.map(provider => `<article class="provider-card ${provider.id === activeProfile().providerId ? 'selected' : ''}"><div class="panel-heading"><div><span class="label">${provider.kind.toUpperCase()}</span><h2>${esc(provider.name)}</h2></div><span class="health-pill ${provider.status}">${provider.status[0].toUpperCase() + provider.status.slice(1)}</span></div><p><strong>${provider.latency ?? '—'} ms</strong> · ${esc(provider.server)}</p><div class="provider-controls"><select aria-label="${esc(provider.name)} server" data-server-provider="${provider.id}">${provider.servers.map(server => `<option ${server === provider.server ? 'selected' : ''}>${esc(server)}</option>`).join('')}</select>${provider.id === activeProfile().providerId ? '<span class="selected-note">In use by active profile</span>' : button('Use provider', 'choose-provider', 'quiet', `data-provider="${provider.id}"`)}</div><div class="card-actions">${provider.status === 'offline' ? button('Mark recovered', 'recover-provider', 'quiet', `data-provider="${provider.id}"`) : button('Simulate outage', 'outage-provider', 'quiet danger-text', `data-provider="${provider.id}"`)}</div></article>`).join('');
   return `<section class="page-section"><div class="section-heading"><div><h1 tabindex="-1">Connectivity</h1><p class="lead">Pick a provider, check its endpoint, and recover quickly when a path goes unhealthy.</p></div><div class="section-actions">${button('Refresh health', 'refresh-health', 'primary')}${button('Reconnect', 'reconnect', 'quiet')}</div></div><div class="cards provider-cards">${cards}</div><article class="panel info-row"><span class="status-dot" aria-hidden="true"></span><div><strong>Automatic recovery is ${snapshot.settings.autoSwitch ? 'on' : 'off'}.</strong><p class="muted">The router can try another provider after ${snapshot.settings.switchAfterErrors} TLS errors.</p></div><a class="text-link" href="#settings">Tune recovery <span aria-hidden="true">↗</span></a></article></section>`;
+}
+
+/**
+ * Desktop Connectivity: the real Wi-Fi network, its preset mapping, the engine's
+ * routes and providers. Everything here comes from router.py, never the demo
+ * fixture - the browser preview keeps the prototype markup.
+ */
+function liveConnectivityPage(): string {
+  const net = networkState;
+  const ssid = net?.ssid ?? null;
+  const mapped = net?.mapped_preset ?? null;
+  const auto = net?.auto ?? false;
+  const last = (net?.last_applied ?? {}) as Record<string, unknown>;
+  const options = presetChoices.map(
+    name => `<option value="${esc(name)}" ${mapped === name ? 'selected' : ''}>${esc(name)}</option>`
+  ).join('');
+  const detected = ssid
+    ? `Detected <strong>${esc(ssid)}</strong>${mapped ? ` — uses <strong>${esc(mapped)}</strong>` : ' — no preset mapped'}`
+    : 'No Wi-Fi network detected';
+
+  const routes = Array.isArray(engineConfig?.routes) ? engineConfig!.routes! : [];
+  const routeRows = routes.map(route => {
+    const domains = Array.isArray(route.domains) ? (route.domains as string[]) : [];
+    const shown = domains.slice(0, 4).join(', ');
+    const more = domains.length > 4 ? ` +${domains.length - 4} more` : '';
+    return `<li><strong>${esc(String(route.id ?? 'route'))}</strong> → ${esc(String(route.provider ?? 'direct'))}<span class="muted"> ${esc(shown)}${esc(more)}</span></li>`;
+  }).join('') || '<li class="muted">No routes configured.</li>';
+
+  const providers = Object.entries(engineConfig?.providers ?? {});
+  const providerRows = providers.map(([name, spec]) => {
+    const kind = spec.directory ? 'WireGuard' : spec.socks5 ? 'SOCKS5' : 'provider';
+    const chain = Array.isArray(spec.fallback_providers) ? (spec.fallback_providers as string[]).join(' → ') : '—';
+    return `<li><strong>${esc(name)}</strong> <span class="muted">${esc(kind)} · fallback ${esc(chain)}</span></li>`;
+  }).join('') || '<li class="muted">No providers configured.</li>';
+
+  const lanes = Array.isArray((livePayload ?? {}).degraded_lanes) ? ((livePayload ?? {}).degraded_lanes as string[]) : [];
+  const laneNote = lanes.length
+    ? `<p class="muted">Degraded lanes: ${esc(lanes.join('; '))}</p>`
+    : '';
+
+  return `<section class="page-section"><div class="section-heading"><div><h1 tabindex="-1">Connectivity</h1><p class="lead">The Wi-Fi network you are on, the preset it maps to, and the routes the engine is serving right now.</p></div><div class="section-actions">${button('Check network', 'network-check', 'primary')}${button('Reconnect', 'network-reconnect', 'quiet')}</div></div>
+<article class="panel" id="network-panel"><div class="panel-heading"><div><span class="label">Network detection</span><h2>This Wi-Fi network</h2></div><span class="badge">${auto ? 'Auto-switch on' : 'Auto-switch off'}</span></div><p>${detected}</p>${laneNote}
+<div class="provider-controls"><label for="network-preset-select">Preset for this network</label><select id="network-preset-select">${options}</select>${button('Save mapping', 'network-map', 'primary')}${mapped ? button('Remove mapping', 'network-remove-mapping', 'quiet') : ''}</div>
+<div class="card-actions">${auto ? button('Turn auto-switch off', 'network-auto', 'quiet', 'data-network-state="off"') : button('Turn auto-switch on', 'network-auto', 'quiet', 'data-network-state="on"')}${button('Disconnect until Wi-Fi returns', 'network-disconnect', 'quiet danger-text')}</div>
+<p class="muted">Last applied: ${esc(String(last.preset ?? 'never'))}${last.ssid ? ` on ${esc(String(last.ssid))}` : ''}</p></article>
+<div class="two-column"><article class="panel"><h2>Routes</h2><ul class="route-list" id="engine-routes">${routeRows}</ul></article><article class="panel"><h2>Providers</h2><ul class="route-list" id="engine-providers">${providerRows}</ul></article></div></section>`;
 }
 
 function toggle(name: string, label: string, checked: boolean, note: string): string { return `<label class="setting-row"><span><strong>${label}</strong><small>${note}</small></span><input type="checkbox" data-setting="${name}" ${checked ? 'checked' : ''}></label>`; }
@@ -239,12 +290,20 @@ async function refreshStatus(options?: { silent?: boolean }): Promise<void> {
       const live = await getLiveStatus();
       if (generation !== requestGeneration) return;
       previewState = (states as readonly string[]).includes(live.state) ? live.state : 'failed';
+      livePayload = live.status ?? null;
     } catch {
       if (generation !== requestGeneration) return;
       previewState = 'failed';
     }
+    await refreshEngineData();
   }
   render(); announce(copy[previewState][0]);
+}
+
+/** Poll the engine's config + network detection alongside the status feed. */
+async function refreshEngineData(): Promise<void> {
+  try { engineConfig = await getConfig(); } catch { /* keep the last good read */ }
+  try { networkState = (await getNetwork()).presets; } catch { /* keep the last good read */ }
 }
 function navigate(focus: boolean): void { const name = location.hash.slice(1).toLowerCase(); if (name === 'routing') { history.replaceState(null, '', '#profiles'); page = 'Profiles'; } else page = pages.find(item => item.toLowerCase() === name) ?? 'Home'; menu.setAttribute('aria-expanded', 'false'); render(); resetMainScroll(); if (focus) main.querySelector<HTMLElement>('h1')?.focus({ preventScroll: true }); }
 function formInput(form: HTMLFormElement, name: string): string { return (new FormData(form).get(name) as string | null ?? '').trim(); }
@@ -323,6 +382,10 @@ app.addEventListener('click', event => {
   else if (action === 'import-profile') { document.querySelector<HTMLTextAreaElement>('#profile-json')!.value = ''; importDialog.showModal(); }
   else if (action === 'choose-provider' && target.dataset.provider) void perform(() => controller.setProvider(target.dataset.provider!));
   else if (action === 'refresh-health') void perform(() => controller.refreshHealth());
+  else if (action === 'network-check' || action === 'network-reconnect' || action === 'network-disconnect') void networkAction(action);
+  else if (action === 'network-auto') void networkAuto(target.dataset.networkState === 'on');
+  else if (action === 'network-map') void networkMap();
+  else if (action === 'network-remove-mapping') void networkRemoveMapping();
   else if (action === 'theme-layout' && target.dataset.layout) void perform(() => controller.updateTheme({ layout: target.dataset.layout as LayoutPreset }));
   else if (action === 'theme-scheme' && target.dataset.scheme) void perform(() => controller.updateTheme({ scheme: target.dataset.scheme as Scheme }));
   else if (action === 'theme-accent' && target.dataset.accent) void perform(() => controller.updateTheme({ accent: target.dataset.accent as Accent }));
@@ -421,6 +484,55 @@ async function selectProfile(profileId: string): Promise<void> {
   }
   await perform(() => controller.selectProfile(profileId));
   if (isTauri()) { await refreshStatus(); render(); }
+}
+
+/** Network panel actions: engine verbs + the SSID->preset mapping. */
+async function networkAction(action: 'network-check' | 'network-reconnect' | 'network-disconnect'): Promise<void> {
+  if (!isTauri()) return;
+  try {
+    await runNetworkAction(action);
+    announce(action === 'network-check' ? 'Network checked' : action === 'network-reconnect' ? 'Reconnecting' : 'Disconnected until Wi-Fi returns');
+  } catch (error) {
+    announce(error instanceof Error ? error.message : 'Network action failed');
+  }
+  await refreshStatus({ silent: true });
+  render();
+}
+
+async function networkAuto(on: boolean): Promise<void> {
+  try {
+    networkState = await setNetworkAuto(on ? 'on' : 'off');
+    announce(on ? 'Auto-switch on' : 'Auto-switch off');
+  } catch (error) {
+    announce(error instanceof Error ? error.message : 'Could not change auto-switch');
+  }
+  render();
+}
+
+async function networkMap(): Promise<void> {
+  const ssid = networkState?.ssid;
+  const preset = document.querySelector<HTMLSelectElement>('#network-preset-select')?.value;
+  if (!ssid) { announce('No Wi-Fi network detected'); return; }
+  if (!preset) { announce('Pick a preset first'); return; }
+  try {
+    networkState = await setNetworkPreset(ssid, preset);
+    announce(`Saved: ${ssid} → ${preset}`);
+  } catch (error) {
+    announce(error instanceof Error ? error.message : 'Could not save the mapping');
+  }
+  render();
+}
+
+async function networkRemoveMapping(): Promise<void> {
+  const ssid = networkState?.ssid;
+  if (!ssid) { announce('No Wi-Fi network detected'); return; }
+  try {
+    networkState = await removeNetworkPreset(ssid);
+    announce(`Removed mapping for ${ssid}`);
+  } catch (error) {
+    announce(error instanceof Error ? error.message : 'Could not remove the mapping');
+  }
+  render();
 }
 
 window.addEventListener('hashchange', () => navigate(true));

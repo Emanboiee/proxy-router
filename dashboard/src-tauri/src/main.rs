@@ -157,6 +157,10 @@ fn action_args(action: &str, payload: Option<&Value>) -> Result<Vec<String>, Str
             }
         }
         "sweep" => Ok(vec!["egress".to_string(), "sweep".to_string()]),
+        // Network-detection verbs (read-only or recovery; no engine restart).
+        "network-check" => Ok(vec!["network-check".to_string()]),
+        "network-reconnect" => Ok(vec!["network-reconnect".to_string()]),
+        "network-disconnect" => Ok(vec!["network-disconnect".to_string()]),
         other => Err(format!("unsupported action: {other}")),
     }
 }
@@ -192,6 +196,86 @@ fn apply_preset(app: AppHandle, name: String) -> Result<String, String> {
     controller::run_controller(&root, &["reload"])?;
     refresh_live_status(&app);
     Ok(applied)
+}
+
+/// Config keys the dashboard may read. Explicit allowlist: router.json is
+/// handed to the webview, so no key is exposed implicitly.
+const CONFIG_KEYS: [&str; 8] = [
+    "port", "preset", "providers", "routes", "routing", "vpn", "keepalive", "rotation",
+];
+
+/// Preset/SSID slug rules, mirrored from the engine's validation.
+fn valid_slug(value: &str, max: usize) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && trimmed.len() <= max
+        && !trimmed.contains(|c: char| c.is_control())
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Redacted router.json view for Profiles / Providers / Routing / Settings.
+#[tauri::command]
+fn get_config() -> Result<Value, String> {
+    let root = controller::router_root();
+    let path = root.join("router.json");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let parsed: Value = serde_json::from_str(&raw)
+        .map_err(|error| format!("invalid router.json: {error}"))?;
+    let mut out = serde_json::Map::new();
+    for key in CONFIG_KEYS {
+        if let Some(value) = parsed.get(key) {
+            out.insert(key.to_string(), value.clone());
+        }
+    }
+    Ok(Value::Object(out))
+}
+
+/// Live network detection: current Wi-Fi + the SSID -> preset mapping.
+#[tauri::command]
+fn get_network() -> Result<Value, String> {
+    let root = controller::router_root();
+    let status = controller::json_command(&root, &["network-status", "--json"])?;
+    let presets = controller::json_command(&root, &["network-preset", "show"])?;
+    Ok(serde_json::json!({ "status": status, "presets": presets }))
+}
+
+/// Map the current (or a named) Wi-Fi network to a preset.
+#[tauri::command]
+fn set_network_preset(ssid: String, preset: String) -> Result<Value, String> {
+    if !valid_slug(&ssid, 255) {
+        return Err("network name must be 1-255 characters without control characters".into());
+    }
+    if !valid_slug(&preset, 64) {
+        return Err("preset name must be 1-64 characters of letters, digits, dot, dash or underscore".into());
+    }
+    let root = controller::router_root();
+    controller::run_controller(&root, &["network-preset", "set", "--ssid", &ssid, "--preset", &preset])?;
+    controller::json_command(&root, &["network-preset", "show"])
+}
+
+/// Enable or disable automatic preset switching on network change.
+#[tauri::command]
+fn set_network_auto(state: String) -> Result<Value, String> {
+    if state != "on" && state != "off" {
+        return Err("state must be 'on' or 'off'".into());
+    }
+    let root = controller::router_root();
+    controller::run_controller(&root, &["network-preset", "auto", "--state", &state])?;
+    controller::json_command(&root, &["network-preset", "show"])
+}
+
+/// Remove a Wi-Fi network's preset mapping.
+#[tauri::command]
+fn remove_network_preset(ssid: String) -> Result<Value, String> {
+    if !valid_slug(&ssid, 255) {
+        return Err("network name must be 1-255 characters without control characters".into());
+    }
+    let root = controller::router_root();
+    controller::run_controller(&root, &["network-preset", "remove", "--ssid", &ssid])?;
+    controller::json_command(&root, &["network-preset", "show"])
 }
 
 #[tauri::command]
@@ -284,6 +368,11 @@ fn main() {
             cached_live_status,
             run_router_action,
             apply_preset,
+            get_config,
+            get_network,
+            set_network_preset,
+            set_network_auto,
+            remove_network_preset,
             set_tray_status,
             preview_rendered
         ])

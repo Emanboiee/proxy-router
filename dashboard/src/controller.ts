@@ -231,4 +231,57 @@ export async function applyProfileToEngine(profileId: string): Promise<void> {
   if (preset) await invoke('apply_preset', { name: preset });
 }
 
+/** Redacted router.json view (allowlisted keys only). */
+export interface EngineConfig {
+  port?: number;
+  preset?: string;
+  providers?: Record<string, Record<string, unknown>>;
+  routes?: Array<Record<string, unknown>>;
+  routing?: Record<string, unknown>;
+  vpn?: Record<string, unknown>;
+  keepalive?: Record<string, unknown>;
+  rotation?: Record<string, unknown>;
+}
+
+/** Network detection: current Wi-Fi plus the SSID -> preset map. */
+export interface NetworkPresetState {
+  ssid: string | null;
+  connected: boolean;
+  auto: boolean;
+  mapped_preset: string | null;
+  presets: Record<string, string>;
+  last_applied: Record<string, unknown>;
+}
+
+/** Presets the dashboard may map a network to (mirrors the engine built-ins). */
+export const presetChoices = ['opencode', 'school-warp', 'roblox', 'default'] as const;
+
+export async function getConfig(): Promise<EngineConfig> {
+  if (!isTauri()) throw new Error('Live config requires the desktop app');
+  return await invoke<EngineConfig>('get_config');
+}
+
+export async function getNetwork(): Promise<{ status: Record<string, unknown>; presets: NetworkPresetState }> {
+  if (!isTauri()) throw new Error('Network detection requires the desktop app');
+  return await invoke<{ status: Record<string, unknown>; presets: NetworkPresetState }>('get_network');
+}
+
+export async function setNetworkPreset(ssid: string, preset: string): Promise<NetworkPresetState> {
+  return await invoke<NetworkPresetState>('set_network_preset', { ssid, preset });
+}
+
+export async function removeNetworkPreset(ssid: string): Promise<NetworkPresetState> {
+  return await invoke<NetworkPresetState>('remove_network_preset', { ssid });
+}
+
+export async function setNetworkAuto(state: 'on' | 'off'): Promise<NetworkPresetState> {
+  return await invoke<NetworkPresetState>('set_network_auto', { state });
+}
+
+/** Recovery verbs owned by the engine (no UI-side policy). */
+export async function runNetworkAction(action: 'network-check' | 'network-reconnect' | 'network-disconnect'): Promise<void> {
+  if (!isTauri()) return;
+  await invoke('run_router_action', { action });
+}
+
 export function reportPreviewFrame(): void { if (isTauri()) void invoke('preview_rendered').catch(() => {}); }
