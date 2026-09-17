@@ -1,0 +1,9 @@
+{
+  "name": "proxy-router-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {"dev": "vite --host 127.0.0.1", "build": "tsc && vite build", "tauri": "tauri", "test": "playwright test"},
+  "dependencies": {"@tauri-apps/api": "^2.0.0"},
+  "devDependencies": {"@tauri-apps/cli": "^2.0.0", "typescript": "^5.9.0", "vite": "^7.0.0", "@playwright/test": "^1.55.0", "@axe-core/playwright": "^4.10.0"}
+}

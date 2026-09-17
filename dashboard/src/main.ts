@@ -110,7 +110,7 @@ function homePage(): string {
   const compactStatus = `${provider.name} · ${provider.latency ?? '—'} ms · ${routeInfo} · ${fallbackLabel(profile.fallback)}`;
   return `<section class="page-section home-page" data-state="${previewState}">${isTauri() ? livePresetRow() : ''}
     <div class="connection-hero">
-      <div class="connection-emblem" aria-hidden="true"><img src="/gremlin-cat-goblin-cat.gif" alt="" width="220" height="242" decoding="async"></div>
+      <div class="connection-emblem" aria-hidden="true"><img src="/gremlin-cat-goblin-cat.gif" alt="" width="88" height="88" decoding="async"></div>
       <h1 tabindex="-1">${title}</h1>
       <p class="lead">${description}</p>
       <div class="hero-actions">${action}</div>

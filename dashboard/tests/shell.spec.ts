@@ -59,7 +59,11 @@ test('navigation resets the content scroll before showing Home', async ({ page }
   });
   expect(await main.evaluate(node => (node as HTMLElement).scrollTop)).toBeGreaterThan(0);
   await page.getByRole('link', { name: 'Home', exact: true }).click();
-  await expect(main.evaluate(node => (node as HTMLElement).scrollTop)).resolves.toBe(0);
+  // Clicking re-renders and calls scrollTo; the browser re-lays out in between,
+  // so poll the contract rather than reading scrollTop in the same tick.
+  await expect.poll(async () => main.evaluate(node => (node as HTMLElement).scrollTop), {
+    message: 'content scroll should settle back to the top on Home',
+  }).toBe(0);
 });
 for (const [width, height] of [[1440, 900], [390, 844]]) {
   test(`states, navigation, dialog and accessibility at ${width}`, async ({ page }) => {
