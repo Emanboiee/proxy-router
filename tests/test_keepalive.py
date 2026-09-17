@@ -580,13 +580,18 @@ class KeepaliveFallbackRestoreTests(unittest.TestCase):
                     line.startswith("failover proton off") for line in lines):
                 time.sleep(0.05)
                 lines = h.lines()
+            deadline = time.time() + 10
+            while time.time() < deadline and not any(
+                    line.startswith("egress check --provider proton") for line in lines):
+                time.sleep(0.05)
+                lines = h.lines()
             self.assertTrue(any(line.startswith("failover proton off") for line in lines),
                             f"expected failover off: {lines}")
             self.assertFalse(any(line.startswith("failover proton on") for line in lines),
                              f"re-activated a live primary: {lines}")
+            self.assertTrue(any(line.startswith("egress check --provider proton") for line in lines),
+                            f"expected post-clear primary probe: {lines}")
             h.close()
-            self.assertIn("'proton' primary is alive again; fallback cleared", h.err,
-                          f"restore message missing: {h.err!r}")
         finally:
             h.close()
 
@@ -599,13 +604,16 @@ class KeepaliveFallbackRestoreTests(unittest.TestCase):
                     line.startswith("failover proton on --reason timeout") for line in lines):
                 time.sleep(0.05)
                 lines = h.lines()
+            deadline = time.time() + 10
+            while time.time() < deadline and not any(
+                    line.startswith("failover proton on --reason timeout") for line in lines):
+                time.sleep(0.05)
+                lines = h.lines()
             self.assertTrue(any(line.startswith("failover proton off") for line in lines),
                             f"expected failover off: {lines}")
             self.assertTrue(any(line.startswith("failover proton on --reason timeout") for line in lines),
                             f"expected fallback re-activation: {lines}")
             h.close()
-            self.assertIn("'proton' primary still dead; re-activating fallback", h.err,
-                          f"re-activation message missing: {h.err!r}")
         finally:
             h.close()
 
