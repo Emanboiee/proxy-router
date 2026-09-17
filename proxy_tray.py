@@ -376,14 +376,31 @@ def _launch_terminal(root, script_args: list[str]) -> bool:
 
 
 def open_dashboard(root) -> bool:
-    """Open the full dashboard TUI in a terminal window (tray one-click).
+    """Open a built web dashboard, or the dashboard TUI (tray one-click).
 
     The tray menu is compact by design; the dashboard is where profiles,
     exits, fallbacks, routing, and presets get managed. macOS: Terminal runs
     setup_tui.py in the router root. Elsewhere: the first common terminal
     emulator that exists wins. Never raises — the tray must survive a
-    broken terminal setup."""
+    broken dashboard or terminal setup."""
     root = Path(root)
+    # The native dashboard is optional: installations without a build retain
+    # the existing terminal dashboard and its established behavior.
+    binary = root / "dashboard" / "src-tauri" / "target" / "release" / (
+        "proxy-router-dashboard.exe" if sys.platform == "win32"
+        else "proxy-router-dashboard"
+    )
+    if sys.platform == "darwin":
+        bundled = binary.parent / "bundle" / "macos" / "Proxy Router.app" / "Contents" / "MacOS" / binary.name
+        if bundled.is_file():
+            binary = bundled
+    if binary.is_file():
+        try:
+            subprocess.Popen([str(binary)], cwd=str(root),
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except OSError:
+            pass  # A broken shell must not break the terminal dashboard.
     if not (root / "setup_tui.py").is_file():
         print(f"dashboard: missing {root / 'setup_tui.py'}", file=sys.stderr)
         return False
