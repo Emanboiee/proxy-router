@@ -71,7 +71,7 @@
 #   PROXY_KEEPALIVE_MAX_ROTATIONS  max keepalive rotations per window  (2)
 #   PROXY_KEEPALIVE_SWEEP_EVERY    full-pool egress sweep every N seconds (1800)
 #   PROXY_KEEPALIVE_NETWORK_GRACE consecutive Wi-Fi misses before stop (1)
-#   PROXY_KEEPALIVE_WAKE_GAP       sleep/wake gap forcing recovery (2x interval)
+#   PROXY_KEEPALIVE_WAKE_GAP       sleep/wake gap forcing recovery (20x interval, min 600s)
 #   PROXY_KEEPALIVE_ENABLED        temporary on/off override               (config)
 set -uo pipefail
 
@@ -243,11 +243,21 @@ SWEEP_EVERY="${PROXY_KEEPALIVE_SWEEP_EVERY:-$(config_setting sweep_every 1800)}"
 NETWORK_GRACE="${PROXY_KEEPALIVE_NETWORK_GRACE:-$(config_setting network_grace 1)}"
 AUTODETECT_ENABLED="${PROXY_AUTODETECT_ENABLED:-$(autodetect_setting enabled 0)}"
 AUTODETECT_INTERVAL="${PROXY_AUTODETECT_INTERVAL:-$(autodetect_setting interval_seconds 300)}"
-WAKE_GAP="${PROXY_KEEPALIVE_WAKE_GAP:-$((INTERVAL * 2))}"
+# Sleep/wake detection must sit ABOVE the worst-case routine tick, not at 2x
+# the poll interval. The gap is measured against a top-of-loop timestamp, so a
+# tick's own work (`ensure` ~10s, a periodic `egress check` ~6s, the
+# autodetect/rotate subcalls, and a multi-profile sweep) counted as elapsed
+# sleep: ordinary maintenance crossed a 30s floor and was misread as a wake
+# event. Each false positive ran network-disconnect + network-reconnect, a
+# deliberate engine teardown that dropped every live connection. One month of
+# logs: 282 firings, 81% under 60s, max 302s, zero genuine sleeps.
+WAKE_GAP_DEFAULT=$((INTERVAL * 20))
+((WAKE_GAP_DEFAULT < 600)) && WAKE_GAP_DEFAULT=600
+WAKE_GAP="${PROXY_KEEPALIVE_WAKE_GAP:-$(config_setting wake_gap "$WAKE_GAP_DEFAULT")}"
 case "$WAKE_GAP" in
-  ''|*[!0-9]*) WAKE_GAP=$((INTERVAL * 2)) ;;
+  ''|*[!0-9]*) WAKE_GAP="$WAKE_GAP_DEFAULT" ;;
 esac
-((WAKE_GAP < 1)) && WAKE_GAP=1
+((WAKE_GAP < 1)) && WAKE_GAP="$WAKE_GAP_DEFAULT"
 
 backoff="$INTERVAL"
 boot=1
@@ -555,6 +565,14 @@ restore_fallbacks() {
   done
 }
 
+# One SSID capture through the pinned controller. Empty output means
+# unknown, which the wake decision treats as a change (fail-safe teardown).
+network_identity() {
+  controller network-status --json 2>/dev/null \
+    | sed -n 's/.*"ssid":[[:space:]]*"\([^"]*\)".*/\1/p' \
+    | head -n 1
+}
+
 while true; do
   tick_now=$(date +%s 2>/dev/null || echo 0)
   case "$tick_now" in ''|*[!0-9]*) tick_now=0 ;; esac
@@ -594,8 +612,24 @@ while true; do
   fi
   manual_quiet=0
   if [ "$wake_detected" -eq 1 ]; then
-    echo "$(date '+%Y-%m-%d %H:%M:%S') router: wake gap detected (${wake_elapsed}s); forcing network recovery" >&2
-    if controller network-status >/dev/null 2>&1; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') router: wake gap detected (${wake_elapsed}s); evaluating recovery" >&2
+    wake_ssid=$(network_identity)
+    wake_baseline=""
+    if [ -r "$ROOT/state/.wake-ssid" ]; then wake_baseline=$(cat "$ROOT/state/.wake-ssid"); fi
+    # Elapsed time is not evidence that the network changed. A gap whose fresh
+    # capture matches the PREVIOUS tick's recorded SSID (state/.wake-ssid, the
+    # baseline the per-tick guard last wrote) with no network-off latch skips
+    # the teardown and falls through to the normal ensure/probe tick, which
+    # self-heals a dead tunnel without dropping live connections. An unknown
+    # baseline or capture stays fail-safe and tears down.
+    if [ -n "$wake_baseline" ] && [ -n "$wake_ssid" ] \
+       && [ "$wake_ssid" = "$wake_baseline" ] && [ ! -f "$ROOT/state/network-off" ]; then
+      echo "$(date '+%Y-%m-%d %H:%M:%S') router: wake gap on an unchanged network; fast-path ensure/probe (no teardown)" >&2
+      boot=1
+      checks=0
+      strikes=0
+      backoff="$INTERVAL"
+    elif controller network-status >/dev/null 2>&1; then
       if controller network-disconnect >/dev/null 2>&1 \
          && controller network-reconnect >/dev/null 2>&1; then
         network_lost=0
@@ -616,8 +650,19 @@ while true; do
   # Network guard runs before ensure so a stale proxy cannot strand browsers
   # while Wi-Fi is off. `network-status` is read-only; the controller commands
   # own the durable marker and the teardown/reconnect transaction.
-  if controller network-status >/dev/null 2>&1; then
+  net_out=""
+  if net_out=$(controller network-status 2>/dev/null); then
     network_lost=0
+    # Record the current SSID as the wake baseline. Unparseable output
+    # records empty, which the wake decision treats as a change (fail-safe).
+    wake_seen=""
+    case "$net_out" in
+      "network: connected ("*")")
+        wake_seen="${net_out#network: connected (}"
+        wake_seen="${wake_seen%)}"
+        ;;
+    esac
+    printf '%s' "$wake_seen" > "$ROOT/state/.wake-ssid"
     if [ -f "$ROOT/state/network-off" ]; then
       if controller network-reconnect >/dev/null 2>&1; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') router: Wi-Fi returned; supervision resumed" >&2

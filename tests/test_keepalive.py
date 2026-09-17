@@ -33,7 +33,24 @@ case "$cmd" in
     if [ -n "${FAKE_ROUTER_NETWORK_FILE:-}" ] && [ -f "$FAKE_ROUTER_NETWORK_FILE" ]; then
       state=$(cat "$FAKE_ROUTER_NETWORK_FILE")
     fi
+    if [ "$2" = "--json" ]; then
+      ssid="${FAKE_ROUTER_SSID:-proto}"
+      if [ -n "${FAKE_ROUTER_SSID_FILE:-}" ] && [ -f "$FAKE_ROUTER_SSID_FILE" ]; then
+        ssid=$(cat "$FAKE_ROUTER_SSID_FILE")
+      fi
+      if [ "$state" = "disconnected" ]; then
+        printf '%s\n' '{"connected": false, "ssid": null}'
+        exit 1
+      fi
+      printf '{"connected": true, "ssid": "%s"}\n' "$ssid"
+      exit 0
+    fi
     [ "$state" = "disconnected" ] && exit 1
+    ssid="${FAKE_ROUTER_SSID:-proto}"
+    if [ -n "${FAKE_ROUTER_SSID_FILE:-}" ] && [ -f "$FAKE_ROUTER_SSID_FILE" ]; then
+      ssid=$(cat "$FAKE_ROUTER_SSID_FILE")
+    fi
+    printf 'network: connected (%s)\n' "$ssid"
     exit 0
     ;;
   network-disconnect)
@@ -146,7 +163,8 @@ class KeepaliveHarness:
     def __init__(self, *, interval="1", fail_ensures="", egress="alive",
                  probe_every="4", dead_strikes="2", storm_window="600",
                  max_rotations="2", fallback="", root=None, pinned_python="",
-                 mode="proxy", network="connected", wake_gap="", clock=None):
+                 mode="proxy", network="connected", wake_gap="", clock=None,
+                 ssid="proto"):
         self._tmp = None
         if root is None:
             self._tmp = tempfile.TemporaryDirectory()
@@ -192,6 +210,8 @@ class KeepaliveHarness:
             self.fallback_file.write_text(fallback)
         self.network_file = self.root / "network.state"
         self.network_file.write_text(network)
+        self.ssid_file = self.root / "ssid.state"
+        self.ssid_file.write_text(ssid)
         self.network_off_file = self.root / "state" / "network-off"
         env = dict(os.environ)
         env["PATH"] = f"{self.root / 'bin'}:" + env["PATH"]
@@ -207,7 +227,9 @@ class KeepaliveHarness:
         env["FAKE_ROUTER_EGRESS_FILE"] = str(self.egress_file)
         env["FAKE_ROUTER_FALLBACK_FILE"] = str(self.fallback_file)
         env["FAKE_ROUTER_NETWORK_FILE"] = str(self.network_file)
+        env["FAKE_ROUTER_NETWORK_FILE"] = str(self.network_file)
         env["FAKE_ROUTER_NETWORK_OFF_FILE"] = str(self.network_off_file)
+        env["FAKE_ROUTER_SSID_FILE"] = str(self.ssid_file)
         if wake_gap:
             env["PROXY_KEEPALIVE_WAKE_GAP"] = wake_gap
         if self.clock_file is not None:
@@ -609,6 +631,7 @@ class KeepaliveNetworkGuardTests(unittest.TestCase):
         h = KeepaliveHarness(interval="1", probe_every="99", wake_gap="5", clock=1000)
         try:
             baseline = len(h.wait_lines(4))
+            h.ssid_file.write_text("new-wifi")
             h.advance_clock(10)
             deadline = time.time() + 5
             lines = h.lines()
@@ -623,6 +646,53 @@ class KeepaliveNetworkGuardTests(unittest.TestCase):
             self.assertIn("network-reconnect", tail)
             self.assertIn("ensure", tail)
             self.assertIn("egress check", tail)
+            h.close()
+            self.assertIn("wake gap detected (10s)", h.err)
+        finally:
+            h.close()
+
+    def test_wake_gap_on_unchanged_network_skips_teardown(self):
+        h = KeepaliveHarness(interval="1", probe_every="99", wake_gap="5", clock=1000)
+        try:
+            baseline = len(h.wait_lines(4))
+            h.advance_clock(10)
+            deadline = time.time() + 5
+            lines = h.lines()
+            while time.time() < deadline:
+                lines = h.lines()
+                if "ensure" in lines[baseline:] and len(lines) >= baseline + 6:
+                    break
+                time.sleep(0.05)
+            tail = lines[baseline:]
+            h.close()
+            self.assertIn("wake gap on an unchanged network", h.err,
+                          f"wake evaluation never ran: {h.err!r}")
+            self.assertNotIn("wake recovery failed", h.err)
+            self.assertNotIn("network-disconnect", tail,
+                             f"unchanged network was torn down: {tail}")
+            self.assertNotIn("network-reconnect", tail,
+                             f"unchanged network was torn down: {tail}")
+            self.assertIn("ensure", tail, f"fast path skipped supervision: {tail}")
+        finally:
+            h.close()
+
+    def test_wake_gap_after_ssid_change_still_tears_down(self):
+        h = KeepaliveHarness(interval="1", probe_every="99", wake_gap="5", clock=1000)
+        try:
+            baseline = len(h.wait_lines(4))
+            h.ssid_file.write_text("school-wifi")
+            h.advance_clock(10)
+            deadline = time.time() + 5
+            lines = h.lines()
+            while time.time() < deadline:
+                lines = h.lines()
+                if "network-disconnect" in lines[baseline:]:
+                    break
+                time.sleep(0.05)
+            tail = lines[baseline:]
+            self.assertIn("network-disconnect", tail,
+                          f"SSID change did not tear down: {tail}")
+            self.assertIn("network-reconnect", tail)
             h.close()
             self.assertIn("wake gap detected (10s)", h.err)
         finally:
