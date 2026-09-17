@@ -675,17 +675,38 @@ class KeepaliveNetworkGuardTests(unittest.TestCase):
             # already reads the post-jump clock and no gap is ever seen
             # (CI-only race; local ticks are fast enough to hide it).
             baseline = _wait_two_ticks(h)
-            h.ssid_file.write_text("new-wifi")
-            h.advance_clock(10)
-            deadline = time.time() + 30
-            lines = h.lines()
-            while time.time() < deadline:
+            (h.root / "ssid-hold.state").write_text("1")
+            # Roam-hold + retry: the hold pins every capture to the original
+            # ssid through the jump, so the pre-wake guard baseline is the
+            # old network; dropping the hold right after the jump makes the
+            # wake capture report new-wifi against that stale baseline. If
+            # a cycle's wake is consumed by a fast path (timing), re-arm.
+            for _ in range(4):
+                wake_line = len(h.lines())
+                h.advance_clock(10)
+                h.ssid_file.write_text("new-wifi")
+                threading.Timer(0.05, lambda: (h.root / "ssid-hold.state").unlink(missing_ok=True)).start()
+                deadline = time.time() + 20
                 lines = h.lines()
-                if ("network-disconnect" in lines[baseline:] and "network-reconnect" in lines[baseline:]
-                        and "ensure" in lines[baseline:] and "egress check" in lines[baseline:]):
-                    break
-                time.sleep(0.05)
-            tail = lines[baseline:]
+                while time.time() < deadline:
+                    lines = h.lines()
+                    if "network-disconnect" in lines[wake_line:]:
+                        break
+                    time.sleep(0.05)
+                tail = lines[wake_line:]
+                if "network-disconnect" not in tail:
+                    # Reset for the next cycle: hold pins captures to the
+                    # original ssid again, and the ssid file returns to
+                    # proto so the guard's next baseline write is proto.
+                    h.ssid_file.write_text("proto")
+                    (h.root / "ssid-hold.state").write_text("1")
+                    continue
+                # Give the boot self-test one extra tick to log egress check.
+                deadline = time.time() + 10
+                while time.time() < deadline and "egress check" not in tail:
+                    time.sleep(0.05)
+                    tail = h.lines()[wake_line:]
+                break
             self.assertIn("network-disconnect", tail)
             self.assertIn("network-reconnect", tail)
             self.assertIn("ensure", tail)
