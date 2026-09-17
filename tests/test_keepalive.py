@@ -384,7 +384,7 @@ class KeepaliveEgressCheckTests(unittest.TestCase):
     def test_boot_self_test_healthy_logs_and_never_rotates(self):
         h = KeepaliveHarness(probe_every="2")
         try:
-            lines = h.wait_lines(20)
+            lines = h.wait_lines(30)
             h.close()
             self.assertIn("router: boot self-test ok", h.out,
                           f"healthy boot line missing:\nstdout={h.out!r}\nstderr={h.err!r}")
@@ -407,7 +407,8 @@ class KeepaliveEgressCheckTests(unittest.TestCase):
             }
             ticks = [line for i, line in enumerate(lines)
                      if i not in restore_probes
-                     and line not in {"network-status", "rotate --if-due", "egress sweep --json"}]
+                     and line not in {"network-status", "network-status --json",
+                                      "rotate --if-due", "egress sweep --json"}]
             check_lines = [i for i, line in enumerate(ticks) if line == "egress check"]
             gaps = [b - a for a, b in zip(check_lines, check_lines[1:])]
             # every PROBE_EVERY ensures triggers a check; log distance is
@@ -453,7 +454,7 @@ class KeepaliveEgressCheckTests(unittest.TestCase):
         h = KeepaliveHarness(egress="dead", probe_every="1", dead_strikes="2",
                              storm_window="3600", max_rotations="50")
         try:
-            h.wait_lines(14)
+            h.wait_lines(21)
             lines = h.lines()
             rotates = [line for line in lines if line.startswith("rotate proton")]
             self.assertGreaterEqual(len(rotates), 2, f"expected rotations: {lines}")

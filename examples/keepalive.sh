@@ -567,10 +567,21 @@ restore_fallbacks() {
 
 # One SSID capture through the pinned controller. Empty output means
 # unknown, which the wake decision treats as a change (fail-safe teardown).
+# JSON is decoded with the pinned interpreter so escaped or quoted SSIDs
+# compare as their literal values.
 network_identity() {
-  controller network-status --json 2>/dev/null \
-    | sed -n 's/.*"ssid":[[:space:]]*"\([^"]*\)".*/\1/p' \
-    | head -n 1
+  controller network-status --json > "$ROOT/state/.wake-ssid.json" 2>/dev/null || return 0
+  python_runner - "$ROOT/state/.wake-ssid.json" <<'PY' 2>/dev/null
+import json
+import sys
+
+try:
+    value = json.loads(open(sys.argv[1], encoding="utf-8").read())
+    ssid = (value.get("ssid") or "") if isinstance(value, dict) else ""
+    print(ssid)
+except (OSError, ValueError, TypeError):
+    raise SystemExit(1)
+PY
 }
 
 while true; do
@@ -651,17 +662,12 @@ while true; do
   # while Wi-Fi is off. `network-status` is read-only; the controller commands
   # own the durable marker and the teardown/reconnect transaction.
   net_out=""
-  if net_out=$(controller network-status 2>/dev/null); then
+  if controller network-status >/dev/null 2>&1; then
     network_lost=0
-    # Record the current SSID as the wake baseline. Unparseable output
-    # records empty, which the wake decision treats as a change (fail-safe).
-    wake_seen=""
-    case "$net_out" in
-      "network: connected ("*")")
-        wake_seen="${net_out#network: connected (}"
-        wake_seen="${wake_seen%)}"
-        ;;
-    esac
+    # Record the current SSID as the wake baseline via the same --json
+    # contract the wake comparison uses. Unparseable output records empty,
+    # which the wake decision treats as a change (fail-safe teardown).
+    wake_seen=$(network_identity)
     printf '%s' "$wake_seen" > "$ROOT/state/.wake-ssid"
     if [ -f "$ROOT/state/network-off" ]; then
       if controller network-reconnect >/dev/null 2>&1; then
