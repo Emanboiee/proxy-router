@@ -69,6 +69,8 @@ const defaultState: Snapshot = {
 };
 function clone<T>(value: T): T { return JSON.parse(JSON.stringify(value)) as T; }
 function storage(): Storage | null { try { return typeof localStorage === 'undefined' ? null : localStorage; } catch { return null; } }
+function readStored(key: string): string | null { try { return storage()?.getItem(key) ?? null; } catch { return null; } }
+function writeStored(key: string, value: string): void { try { storage()?.setItem(key, value); } catch { /* quota/blocked: state stays in memory */ } }
 
 export function parseWireGuardConfig(raw: string, fileName = 'wireguard.conf'): ProviderConnection & { kind: 'wireguard' } {
   if (!raw.trim() || raw.length > 128 * 1024) throw new Error('Choose a non-empty WireGuard configuration under 128 KB');
@@ -86,13 +88,13 @@ export function parseWireGuardConfig(raw: string, fileName = 'wireguard.conf'): 
 export class LocalController {
   private data: Snapshot;
   constructor() {
-    const saved = storage()?.getItem(STORAGE_KEY);
+    const saved = readStored(STORAGE_KEY);
     try {
       const initial = saved ? this.validate(JSON.parse(saved)) : clone(defaultState);
       // A saved UI snapshot is not proof that the router is still connected after relaunch.
       this.data = { ...initial, connection: 'disconnected' };
     } catch { this.data = clone(defaultState); }
-    storage()?.setItem(STORAGE_KEY, JSON.stringify(this.data));
+    writeStored(STORAGE_KEY, JSON.stringify(this.data));
   }
   private validate(value: unknown): Snapshot {
     if (!value || typeof value !== 'object') throw new Error('Invalid saved state');
@@ -107,7 +109,7 @@ export class LocalController {
   snapshot(): Snapshot { return clone(this.data); }
   private commit(message: string): Snapshot {
     this.data.lastAction = message; this.data.logs = [message, ...this.data.logs].slice(0, 30);
-    storage()?.setItem(STORAGE_KEY, JSON.stringify(this.data)); return this.snapshot();
+    writeStored(STORAGE_KEY, JSON.stringify(this.data)); return this.snapshot();
   }
   private async settle(message: string): Promise<Snapshot> { return this.commit(message); }
   async connect(): Promise<Snapshot> { this.data.connection = 'connected'; return this.settle('Connected'); }
@@ -164,8 +166,21 @@ export class LocalController {
   async updateTheme(patch: Partial<ThemeSettings>): Promise<Snapshot> { this.data.theme = { ...this.data.theme, ...patch }; return this.settle('Appearance saved'); }
   activeProfile(): Profile { return this.data.profiles.find(profile => profile.id === this.data.activeProfileId) ?? this.data.profiles[0]; }
   exportProfile(profileId = this.data.activeProfileId): string { const profile = this.data.profiles.find(item => item.id === profileId); if (!profile) throw new Error('Profile not found'); return JSON.stringify({ proxyRouterProfile: 1, profile }, null, 2); }
-  async importProfile(raw: string): Promise<Snapshot> { const value = JSON.parse(raw) as { proxyRouterProfile?: number; profile?: Partial<Omit<Profile, 'id' | 'updatedAt'>> }; const profile = value.profile; const name = profile?.name; if (value.proxyRouterProfile !== 1 || !profile || typeof name !== 'string') throw new Error('This is not a proxy-router profile export'); return this.saveProfile({ name, description: profile.description ?? '', fallback: profile.fallback ?? 'direct', routeMode: profile.routeMode ?? 'selective', domains: profile.domains ?? [], autoSubdomains: profile.autoSubdomains ?? false, providerId: profile.providerId ?? 'warp' }); }
-  reset(): Snapshot { this.data = clone(defaultState); storage()?.setItem(STORAGE_KEY, JSON.stringify(this.data)); return this.snapshot(); }
+  async importProfile(raw: string): Promise<Snapshot> {
+    const value = JSON.parse(raw) as { proxyRouterProfile?: number; profile?: Partial<Omit<Profile, 'id' | 'updatedAt'>> };
+    const profile = value.profile; const name = profile?.name;
+    if (value.proxyRouterProfile !== 1 || !profile || typeof name !== 'string') throw new Error('This is not a proxy-router profile export');
+    const fallback = profile.fallback ?? 'direct';
+    const routeMode = profile.routeMode ?? 'selective';
+    const domains = profile.domains ?? [];
+    const autoSubdomains = profile.autoSubdomains ?? false;
+    if (fallback !== 'direct' && fallback !== 'retry' && fallback !== 'block') throw new Error('Imported profile has an unknown fallback mode');
+    if (routeMode !== 'selective' && routeMode !== 'direct' && routeMode !== 'full') throw new Error('Imported profile has an unknown routing mode');
+    if (!Array.isArray(domains) || domains.some(domain => typeof domain !== 'string')) throw new Error('Imported profile has an invalid domain list');
+    if (typeof autoSubdomains !== 'boolean') throw new Error('Imported profile has an invalid subdomain flag');
+    return this.saveProfile({ name, description: typeof profile.description === 'string' ? profile.description : '', fallback, routeMode, domains, autoSubdomains, providerId: typeof profile.providerId === 'string' ? profile.providerId : 'warp' });
+  }
+  reset(): Snapshot { this.data = clone(defaultState); writeStored(STORAGE_KEY, JSON.stringify(this.data)); return this.snapshot(); }
 }
 
 export function parseStatus(value: unknown): Status {

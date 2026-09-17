@@ -320,7 +320,15 @@ function render(): void {
     const current = item === page;
     return `<a href="#${item.toLowerCase()}" class="${current ? 'current' : ''}"${current ? ' aria-current="page"' : ''}>${item}</a>`;
   }).join('');
-  main.innerHTML = page === 'Home' ? homePage() : page === 'Profiles' ? profilesPage() : page === 'Providers' ? providersPage() : page === 'Connectivity' ? connectivityPage() : page === 'Settings' ? settingsPage() : page === 'Appearance' ? appearancePage() : aboutPage();
+  // The 5s live poll re-renders through here; rebuilding main's DOM while the
+  // user is typing would wipe the input value, selection, and focus. Skip the
+  // rebuild for that tick - the next action-driven render picks the edit up.
+  const editing = document.activeElement instanceof HTMLElement
+    && main.contains(document.activeElement)
+    && document.activeElement.matches('input, textarea, select, [contenteditable="true"]');
+  if (!editing) {
+    main.innerHTML = page === 'Home' ? homePage() : page === 'Profiles' ? profilesPage() : page === 'Providers' ? providersPage() : page === 'Connectivity' ? connectivityPage() : page === 'Settings' ? settingsPage() : page === 'Appearance' ? appearancePage() : aboutPage();
+  }
   syncProfileDialog();
   syncProviderDialog();
   applyTheme();

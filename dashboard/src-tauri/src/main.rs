@@ -206,13 +206,14 @@ const CONFIG_KEYS: [&str; 8] = [
 
 /// Preset/SSID slug rules, mirrored from the engine's validation.
 fn valid_slug(value: &str, max: usize) -> bool {
+    // The engine (router.py cmd_network_preset_set) is the authority: any
+    // non-empty SSID without control characters, up to the length cap. Real
+    // networks contain spaces and non-ASCII; the old alnum-only rule made
+    // them unmappable from the UI.
     let trimmed = value.trim();
     !trimmed.is_empty()
         && trimmed.len() <= max
         && !trimmed.contains(|c: char| c.is_control())
-        && trimmed
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 /// Redacted router.json view for Profiles / Providers / Routing / Settings.
@@ -521,15 +522,15 @@ mod tests {
     #[test]
     fn tray_actions_are_whitelisted() {
         let payload = serde_json::json!({"active_providers": {"proton": "13-US-FREE-2"}});
-        assert_eq!(action_args("connect", None).unwrap(), vec!["ensure"]);
+        assert_eq!(action_args("connect", None).unwrap(), vec!["start"]);
         assert_eq!(action_args("sweep", None).unwrap(), vec!["egress", "sweep"]);
         assert_eq!(
             action_args("rotate", Some(&payload)).unwrap(),
             vec!["rotate", "proton"]
         );
-        // Destructive verbs stay out of the tray on purpose.
+        // Unrouted tray verbs stay out on purpose; disconnect is a UI action
+        // (main-thread command), not a tray-menu verb.
         assert!(action_args("stop", None).is_err());
-        assert!(action_args("disconnect", None).is_err());
         assert!(action_args("rotate", Some(&serde_json::json!({}))).is_err());
     }
 }

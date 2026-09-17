@@ -10,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -41,16 +42,7 @@ pub fn controller_path(root: &Path) -> PathBuf {
 
 /// Run a controller subcommand and return trimmed stdout.
 pub fn run_controller(root: &Path, args: &[&str]) -> Result<String, String> {
-    let script = controller_path(root);
-    if !script.is_file() {
-        return Err(format!("controller not found: {}", script.display()));
-    }
-    let output = Command::new(router_python())
-        .arg(&script)
-        .args(args)
-        .current_dir(root)
-        .output()
-        .map_err(|error| format!("could not run controller: {error}"))?;
+    let output = run_controller_raw(root, args, CONTROLLER_TIMEOUT)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let detail = stderr.trim();
@@ -65,7 +57,9 @@ pub fn run_controller(root: &Path, args: &[&str]) -> Result<String, String> {
 
 /// Parse `router.py status --json`.
 pub fn live_status(root: &Path) -> Result<Value, String> {
-    let out = run_controller(root, &["status", "--json"])?;
+    // `status --json` exits 1 while the engine is down but still prints the
+    // full JSON document; the exit code alone must not discard real state.
+    let out = run_controller_allow_nonzero(root, &["status", "--json"])?;
     serde_json::from_str::<Value>(&out)
         .map_err(|error| format!("invalid controller status: {error}"))
 }
@@ -76,17 +70,72 @@ pub fn live_status(root: &Path) -> Result<Value, String> {
 /// exits 1 while the engine is down and `network-status --json` exits 1 when
 /// Wi-Fi is unavailable. Treating those as failures would discard real data.
 pub fn run_controller_allow_nonzero(root: &Path, args: &[&str]) -> Result<String, String> {
+    let output = run_controller_raw(root, args, CONTROLLER_TIMEOUT)?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Ceiling for one controller invocation. A hung router.py must not wedge the
+/// tray poll thread or a Tauri command thread forever; the stateful commands
+/// all finish well inside this on a cold laptop.
+const CONTROLLER_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn run_controller_raw(
+    root: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
     let script = controller_path(root);
     if !script.is_file() {
         return Err(format!("controller not found: {}", script.display()));
     }
-    let output = Command::new(router_python())
+    let mut child = Command::new(router_python())
         .arg(&script)
         .args(args)
         .current_dir(root)
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|error| format!("could not run controller: {error}"))?;
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return output_with_status(child, status);
+            }
+            Ok(None) => {}
+            Err(error) => return Err(format!("could not run controller: {error}")),
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "controller timed out after {}s: {}",
+                timeout.as_secs(),
+                args.join(" ")
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn output_with_status(
+    mut child: std::process::Child,
+    status: std::process::ExitStatus,
+) -> Result<std::process::Output, String> {
+    use std::io::Read;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    if let Some(mut stream) = child.stdout.take() {
+        let _ = stream.read_to_end(&mut stdout);
+    }
+    if let Some(mut stream) = child.stderr.take() {
+        let _ = stream.read_to_end(&mut stderr);
+    }
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// Parse a read-only JSON subcommand's stdout.
