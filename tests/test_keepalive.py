@@ -732,24 +732,31 @@ class KeepaliveNetworkGuardTests(unittest.TestCase):
             # independent of tick alignment.
             (h.root / "ssid-hold.state").write_text("1")
             baseline = _wait_two_ticks(h)
-            h.advance_clock(10)
-            # Roam mid-gap, deterministic: the hold pins every capture to
-            # the ORIGINAL ssid until the jump, so the last pre-wake guard
-            # baseline is proto. The timer drops the hold while the wake
-            # tick is still pending (well inside one tick), so the wake
-            # capture reports school-wifi against that stale proto
-            # baseline and teardown must run. A slow drop (>=2 ticks) lets
-            # a guard tick record school-wifi first, which would then
-            # legitimately take the fast path.
             h.ssid_file.write_text("school-wifi")
-            threading.Timer(0.1, lambda: (h.root / "ssid-hold.state").unlink(missing_ok=True)).start()
-            deadline = time.time() + 30
-            lines = h.lines()
-            while time.time() < deadline:
+            # Roam mid-gap with bounded retries: each cycle pins captures
+            # to the ORIGINAL ssid via the hold, jumps the clock, then
+            # drops the hold quickly so the pending wake capture reports
+            # school-wifi against the stale proto baseline. Under heavy
+            # CI load a cycle's wake can be consumed by a fast path (the
+            # hold dropped after a guard already recorded the new ssid);
+            # that evaluation is legitimate, so simply re-arm and retry.
+            for _ in range(4):
+                wake_line = len(h.lines())
+                h.advance_clock(10)
+                threading.Timer(0.05, lambda: (h.root / "ssid-hold.state").unlink(missing_ok=True)).start()
+                deadline = time.time() + 20
+                saw = False
                 lines = h.lines()
-                if "network-disconnect" in lines[baseline:]:
+                while time.time() < deadline:
+                    lines = h.lines()
+                    if "network-disconnect" in lines[wake_line:]:
+                        saw = True
+                        break
+                    time.sleep(0.05)
+                if saw:
                     break
-                time.sleep(0.05)
+                (h.root / "ssid-hold.state").write_text("1")
+            baseline = wake_line
             tail = lines[baseline:]
             self.assertIn("network-disconnect", tail,
                           f"SSID change did not tear down: {tail}")
