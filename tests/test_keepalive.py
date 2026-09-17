@@ -574,8 +574,12 @@ class KeepaliveFallbackRestoreTests(unittest.TestCase):
     def test_restore_clears_fallback_when_primary_alive(self):
         h = KeepaliveHarness(egress="alive", fallback="proton")
         try:
-            h.wait_lines(7)
+            deadline = time.time() + 10
             lines = h.lines()
+            while time.time() < deadline and not any(
+                    line.startswith("failover proton off") for line in lines):
+                time.sleep(0.05)
+                lines = h.lines()
             self.assertTrue(any(line.startswith("failover proton off") for line in lines),
                             f"expected failover off: {lines}")
             self.assertFalse(any(line.startswith("failover proton on") for line in lines),
@@ -589,8 +593,12 @@ class KeepaliveFallbackRestoreTests(unittest.TestCase):
     def test_restore_reactivates_fallback_when_primary_still_dead(self):
         h = KeepaliveHarness(egress="dead", fallback="proton")
         try:
-            h.wait_lines(9)
+            deadline = time.time() + 10
             lines = h.lines()
+            while time.time() < deadline and not any(
+                    line.startswith("failover proton on --reason timeout") for line in lines):
+                time.sleep(0.05)
+                lines = h.lines()
             self.assertTrue(any(line.startswith("failover proton off") for line in lines),
                             f"expected failover off: {lines}")
             self.assertTrue(any(line.startswith("failover proton on --reason timeout") for line in lines),
