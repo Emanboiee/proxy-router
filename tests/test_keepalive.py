@@ -13,6 +13,7 @@ tests can assert on:
 """
 import json
 import os
+import threading
 import signal
 import subprocess
 import tempfile
@@ -37,6 +38,9 @@ case "$cmd" in
       ssid="${FAKE_ROUTER_SSID:-proto}"
       if [ -n "${FAKE_ROUTER_SSID_FILE:-}" ] && [ -f "$FAKE_ROUTER_SSID_FILE" ]; then
         ssid=$(cat "$FAKE_ROUTER_SSID_FILE")
+      fi
+      if [ -n "${FAKE_ROUTER_HOLD_FILE:-}" ] && [ -f "$FAKE_ROUTER_HOLD_FILE" ]; then
+        ssid="${FAKE_ROUTER_SSID:-proto}"
       fi
       if [ "$state" = "disconnected" ]; then
         printf '%s\n' '{"connected": false, "ssid": null}'
@@ -212,6 +216,8 @@ class KeepaliveHarness:
         self.network_file.write_text(network)
         self.ssid_file = self.root / "ssid.state"
         self.ssid_file.write_text(ssid)
+        self.ssid_flip_file = self.root / "ssid-flip.state"
+        self.ssid_flip_at = self.root / "ssid-flip.count" 
         self.network_off_file = self.root / "state" / "network-off"
         env = dict(os.environ)
         env["PATH"] = f"{self.root / 'bin'}:" + env["PATH"]
@@ -230,6 +236,7 @@ class KeepaliveHarness:
         env["FAKE_ROUTER_NETWORK_FILE"] = str(self.network_file)
         env["FAKE_ROUTER_NETWORK_OFF_FILE"] = str(self.network_off_file)
         env["FAKE_ROUTER_SSID_FILE"] = str(self.ssid_file)
+        env["FAKE_ROUTER_HOLD_FILE"] = str(self.root / "ssid-hold.state")
         if wake_gap:
             env["PROXY_KEEPALIVE_WAKE_GAP"] = wake_gap
         if self.clock_file is not None:
@@ -618,6 +625,22 @@ class KeepaliveFallbackRestoreTests(unittest.TestCase):
             h.close()
 
 
+def _wait_two_ticks(h, timeout: float = 30.0) -> int:
+    """Return the log length once two ticks have logged their first line.
+
+    Tick 1 can still be mid-flight when its first lines appear, so a clock
+    jump here would be absorbed by tick 1's top-of-loop sample. Waiting for
+    tick 2's 'network-status' guarantees tick 2's sample already happened
+    and the jump lands strictly between two samples."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        lines = h.lines()
+        if lines.count("network-status") >= 2:
+            return len(lines)
+        time.sleep(0.05)
+    return len(h.lines())
+
+
 class KeepaliveNetworkGuardTests(unittest.TestCase):
     def test_wifi_loss_disconnects_and_return_reconnects(self):
         h = KeepaliveHarness(interval="1", network="disconnected")
@@ -651,9 +674,7 @@ class KeepaliveNetworkGuardTests(unittest.TestCase):
             # lands while tick 1 is still working, the top-of-loop sample
             # already reads the post-jump clock and no gap is ever seen
             # (CI-only race; local ticks are fast enough to hide it).
-            h.wait_lines(4)
-            time.sleep(0.3)
-            baseline = len(h.lines())
+            baseline = _wait_two_ticks(h)
             h.ssid_file.write_text("new-wifi")
             h.advance_clock(10)
             deadline = time.time() + 30
@@ -677,9 +698,7 @@ class KeepaliveNetworkGuardTests(unittest.TestCase):
     def test_wake_gap_on_unchanged_network_skips_teardown(self):
         h = KeepaliveHarness(interval="1", probe_every="99", wake_gap="5", clock=1000)
         try:
-            h.wait_lines(4)
-            time.sleep(0.3)
-            baseline = len(h.lines())
+            baseline = _wait_two_ticks(h)
             h.advance_clock(10)
             deadline = time.time() + 30
             lines = h.lines()
@@ -704,11 +723,26 @@ class KeepaliveNetworkGuardTests(unittest.TestCase):
     def test_wake_gap_after_ssid_change_still_tears_down(self):
         h = KeepaliveHarness(interval="1", probe_every="99", wake_gap="5", clock=1000)
         try:
-            h.wait_lines(4)
-            time.sleep(0.3)
-            baseline = len(h.lines())
-            h.ssid_file.write_text("school-wifi")
+            # Model a Wi-Fi roam DURING the gap: while a hold marker
+            # exists the fake keeps reporting the ORIGINAL ssid, so the
+            # baseline stays proto. Flip the ssid file and drop the hold
+            # together with the clock jump: the wake tick's fresh capture
+            # then reports school-wifi against the stale proto baseline,
+            # so the identity check must fail and teardown must run -
+            # independent of tick alignment.
+            (h.root / "ssid-hold.state").write_text("1")
+            baseline = _wait_two_ticks(h)
             h.advance_clock(10)
+            # Roam mid-gap, deterministic: the hold pins every capture to
+            # the ORIGINAL ssid until the jump, so the last pre-wake guard
+            # baseline is proto. The timer drops the hold while the wake
+            # tick is still pending (well inside one tick), so the wake
+            # capture reports school-wifi against that stale proto
+            # baseline and teardown must run. A slow drop (>=2 ticks) lets
+            # a guard tick record school-wifi first, which would then
+            # legitimately take the fast path.
+            h.ssid_file.write_text("school-wifi")
+            threading.Timer(0.1, lambda: (h.root / "ssid-hold.state").unlink(missing_ok=True)).start()
             deadline = time.time() + 30
             lines = h.lines()
             while time.time() < deadline:
@@ -719,6 +753,10 @@ class KeepaliveNetworkGuardTests(unittest.TestCase):
             tail = lines[baseline:]
             self.assertIn("network-disconnect", tail,
                           f"SSID change did not tear down: {tail}")
+            deadline = time.time() + 10
+            while time.time() < deadline and "network-reconnect" not in tail:
+                time.sleep(0.05)
+                tail = h.lines()[baseline:]
             self.assertIn("network-reconnect", tail)
             h.close()
             self.assertIn("wake gap detected (10s)", h.err)
