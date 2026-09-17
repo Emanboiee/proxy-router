@@ -647,10 +647,16 @@ class KeepaliveNetworkGuardTests(unittest.TestCase):
     def test_wake_gap_forces_immediate_network_recovery(self):
         h = KeepaliveHarness(interval="1", probe_every="99", wake_gap="5", clock=1000)
         try:
-            baseline = len(h.wait_lines(4))
+            # Let the boot tick finish BEFORE the clock jump: if the jump
+            # lands while tick 1 is still working, the top-of-loop sample
+            # already reads the post-jump clock and no gap is ever seen
+            # (CI-only race; local ticks are fast enough to hide it).
+            h.wait_lines(4)
+            time.sleep(0.3)
+            baseline = len(h.lines())
             h.ssid_file.write_text("new-wifi")
             h.advance_clock(10)
-            deadline = time.time() + 5
+            deadline = time.time() + 30
             lines = h.lines()
             while time.time() < deadline:
                 lines = h.lines()
@@ -671,9 +677,11 @@ class KeepaliveNetworkGuardTests(unittest.TestCase):
     def test_wake_gap_on_unchanged_network_skips_teardown(self):
         h = KeepaliveHarness(interval="1", probe_every="99", wake_gap="5", clock=1000)
         try:
-            baseline = len(h.wait_lines(4))
+            h.wait_lines(4)
+            time.sleep(0.3)
+            baseline = len(h.lines())
             h.advance_clock(10)
-            deadline = time.time() + 5
+            deadline = time.time() + 30
             lines = h.lines()
             while time.time() < deadline:
                 lines = h.lines()
@@ -696,10 +704,12 @@ class KeepaliveNetworkGuardTests(unittest.TestCase):
     def test_wake_gap_after_ssid_change_still_tears_down(self):
         h = KeepaliveHarness(interval="1", probe_every="99", wake_gap="5", clock=1000)
         try:
-            baseline = len(h.wait_lines(4))
+            h.wait_lines(4)
+            time.sleep(0.3)
+            baseline = len(h.lines())
             h.ssid_file.write_text("school-wifi")
             h.advance_clock(10)
-            deadline = time.time() + 5
+            deadline = time.time() + 30
             lines = h.lines()
             while time.time() < deadline:
                 lines = h.lines()
