@@ -237,9 +237,6 @@ summary { display: flex; align-items: center; cursor: pointer; color: var(--mute
 .connection-hero h1 { font-size: clamp(1.9rem, 4vw, 2.6rem); }
 .connection-hero .lead { margin-top: var(--s1); }
 .connection-hero .hero-actions { justify-content: center; padding-top: var(--s3); }
-.preset-strip { display: flex; align-items: center; justify-content: center; gap: var(--s3); max-width: 42rem; margin: var(--s4) auto 0; padding: var(--s2) var(--s3); border: var(--border); border-radius: var(--radius, 12px); background: var(--raised); }
-.preset-strip .label { color: var(--muted); font-size: var(--text-sm); }
-.preset-strip-actions { display: flex; gap: var(--s2); flex-wrap: wrap; justify-content: center; }
 .mode-selector { display: grid; gap: var(--space-2); width: min(100%, 22rem); margin-top: var(--space-4); color: var(--muted); font-size: var(--text-sm); text-align: left; }
 .mode-selector .select-wrap { position: relative; display: block; }
 .select-trigger { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: var(--s4); text-align: left; background: var(--raised); }

@@ -108,7 +108,7 @@ function homePage(): string {
   const action = previewState === 'connected' ? button('Disconnect', 'disconnect', 'danger') : previewState === 'disconnected' ? button('Connect', 'connect', 'primary') : previewState === 'failed' || previewState === 'stale' ? button('Refresh preview', 'refresh', 'primary') : button('Reconnect', 'reconnect', 'primary');
   const routeInfo = profile.routeMode === 'selective' ? `${profile.domains.length} ${profile.domains.length === 1 ? 'site' : 'sites'}` : routeLabel(profile.routeMode);
   const compactStatus = `${provider.name} · ${provider.latency ?? '—'} ms · ${routeInfo} · ${fallbackLabel(profile.fallback)}`;
-  return `<section class="page-section home-page" data-state="${previewState}">${isTauri() ? livePresetRow() : ''}
+  return `<section class="page-section home-page" data-state="${previewState}">
     <div class="connection-hero">
       <div class="connection-emblem" aria-hidden="true"><img src="/gremlin-cat-goblin-cat.gif" alt="" width="88" height="88" decoding="async"></div>
       <h1 tabindex="-1">${title}</h1>
@@ -235,15 +235,6 @@ function liveConnectivityPage(): string {
 <div class="card-actions">${auto ? button('Turn auto-switch off', 'network-auto', 'quiet', 'data-network-state="off"') : button('Turn auto-switch on', 'network-auto', 'quiet', 'data-network-state="on"')}${button('Disconnect until Wi-Fi returns', 'network-disconnect', 'quiet danger-text')}</div>
 <p class="muted">Last applied: ${esc(String(last.preset ?? 'never'))}${last.ssid ? ` on ${esc(String(last.ssid))}` : ''}</p></article>
 <div class="two-column"><article class="panel"><h2>Routes</h2><ul class="route-list" id="engine-routes">${routeRows}</ul></article><article class="panel"><h2>Providers</h2><ul class="route-list" id="engine-providers">${providerRows}</ul></article></div></section>`;
-}
-
-/** Home preset row: apply a real preset without opening another page. */
-function livePresetRow(): string {
-  const active = engineConfig?.preset ?? null;
-  const buttons = presetChoices.map(name => button(
-    active === name ? `${name} ✓` : name, 'preset-apply', active === name ? 'quiet' : 'primary',
-    `data-preset="${esc(name)}"`)).join('');
-  return `<article class="panel" id="home-presets"><div class="panel-heading"><div><span class="label">Routing preset</span><h2>Active preset</h2></div><span class="badge">${esc(active ?? 'none')}</span></div><div class="card-actions">${buttons}</div></article>`;
 }
 
 /** Profiles page in the desktop app: the engine's real configuration. */

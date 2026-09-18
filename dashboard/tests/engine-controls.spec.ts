@@ -175,19 +175,6 @@ test('desktop Network card saves, toggles and removes the mapping', async ({ pag
 });
 
 
-test('desktop Home exposes the real preset row', async ({ page }) => {
-  await page.addInitScript(desktopMock);
-  await page.goto('/');
-
-  await expect(page.locator('#home-presets')).toBeVisible();
-  await expect(page.locator('#home-presets')).toContainText('opencode');
-  await page.locator('#home-presets button[data-preset="school-warp"]').click();
-  const applied = await page.evaluate(() => (window as unknown as { __invoke: { command: string; payload?: unknown }[] }).__invoke
-    .filter(entry => entry.command === 'apply_preset')
-    .map(entry => (entry.payload as { name: string }).name));
-  expect(applied).toContain('school-warp');
-});
-
 test('desktop Profiles shows the engine routes and mutates them', async ({ page }) => {
   await page.addInitScript(desktopMock);
   await page.goto('/#profiles');
