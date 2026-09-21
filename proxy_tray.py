@@ -68,11 +68,17 @@ _REAL_DARWIN_PYSTRAY = bool(
 
 POLL_SECONDS = 5.0  # live-enough menu state without spawning 24 CLI procs/min
 COMMAND_TIMEOUT = 20
+# Rotation legitimately runs long: SIGHUP reload (tun readiness budget 12s)
+# plus the post-switch egress probe (8s) plus a 60s probe settle window plus
+# possible rollback. A 20s kill murders a healthy rotation after it has
+# already mutated engine/markers, reporting a failed action with real work
+# half-applied (audit F13).
+ROTATION_TIMEOUT = 100
 DASHBOARD_WIDTH = 1120
 DASHBOARD_HEIGHT = 720
 # Quit waits at most this long for an in-flight mutation to finish before
 # stopping the engine anyway — a hung mutation must not make Quit unkillable.
-MUTATION_DRAIN_TIMEOUT = COMMAND_TIMEOUT + 5.0
+MUTATION_DRAIN_TIMEOUT = ROTATION_TIMEOUT + 5.0
 
 # Friendly, non-jargon labels for tray menu entries. The router CLI words
 # (safe-list / vpn-list / rotate / exit) stay in the terminal; the tray
@@ -766,13 +772,13 @@ class RouterClient:
         self.router = os.path.join(root, "router.py")
         self._active_provider: str | None = None
 
-    def _run(self, *args: str) -> tuple[int, str]:
+    def _run(self, *args: str, timeout: float = COMMAND_TIMEOUT) -> tuple[int, str]:
         cmd = [self.python, self.router, *args]
         env = dict(os.environ)
         try:
             p = subprocess.run(
                 cmd, capture_output=True, text=True,
-                timeout=COMMAND_TIMEOUT, env=env, cwd=self.root,
+                timeout=timeout, env=env, cwd=self.root,
             )
             out = (p.stdout or "") + ("\n" + p.stderr if p.stderr else "")
             return p.returncode, out.strip()
@@ -868,7 +874,7 @@ class RouterClient:
     def rotate(self) -> tuple[int, str]:
         if not self._active_provider:
             return 1, "no active provider"
-        return self._run("rotate", self._active_provider)
+        return self._run("rotate", self._active_provider, timeout=ROTATION_TIMEOUT)
 
     def rotate_to(self, provider: str, profile: str, force: bool = False) -> tuple[int, str]:
         cmd = ["rotate", provider, "--to", profile]
@@ -876,7 +882,7 @@ class RouterClient:
             # Explicit pick of an offline/SSL exit: try it anyway, ignoring
             # the cooldown its failed probe left behind.
             cmd.append("--force")
-        return self._run(*cmd)
+        return self._run(*cmd, timeout=ROTATION_TIMEOUT)
 
     def set_mode(self, mode: str, default_provider: str | None = None) -> tuple[int, str]:
         cmd = ["routing", "set", "--mode", mode]

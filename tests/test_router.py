@@ -959,6 +959,34 @@ class SystemProxyScopeTests(unittest.TestCase):
         self.assertEqual({service for _, service in sets}, {"Wi-Fi", "Ethernet"})
         all_fn.assert_called_once()
 
+    def test_proxy_off_aggregates_stale_service_clear_failure(self):
+        def failing_run(command, **kwargs):
+            if command[:2] == ["networksetup", "-setwebproxystate"] and command[2] == "Ethernet":
+                raise subprocess.CalledProcessError(1, command)
+            if command[:2] == ["scutil", "--proxy"]:
+                return SimpleNamespace(returncode=0, stdout="<dictionary> {\n}\n")
+            if command[0] == "networksetup" and command[1] in {"-getwebproxy", "-getsecurewebproxy"}:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="Enabled: Yes\nServer: 127.0.0.1\nPort: 2080\n",
+                )
+            return SimpleNamespace(returncode=0, stdout="")
+
+        stderr_text = ""
+        with mock.patch.object(router, "active_service_name", return_value="Wi-Fi"), \
+             mock.patch.object(router, "network_services", return_value=["Wi-Fi", "Ethernet"]), \
+             mock.patch.object(router, "_proxy_points_at_us",
+                               side_effect=lambda service: service == "Ethernet"), \
+             mock.patch("subprocess.run", side_effect=failing_run), \
+             io.StringIO() as out_buf, io.StringIO() as err_buf, \
+             mock.patch("sys.stdout", out_buf), mock.patch("sys.stderr", err_buf):
+            rc = router.system_proxy_off()
+            stderr_text = err_buf.getvalue()
+
+        self.assertNotEqual(rc, 0)
+        self.assertIn("could not fully disable system proxy", stderr_text)
+        self.assertIn("Ethernet", stderr_text)
+
     def _points_at_us(self, stdout):
         with mock.patch("subprocess.run", return_value=SimpleNamespace(stdout=stdout)):
             return router._proxy_points_at_us("Ethernet")
@@ -2883,7 +2911,9 @@ class LastGoodConfigTests(unittest.TestCase):
         router.LAST_GOOD_FILE.write_text(known_good)
         with mock.patch.object(router, "validate_config", side_effect=[False, True]), \
              mock.patch.object(router, "wait_engine", side_effect=[True]) as wait:
-            self.assertEqual(router.engine_reload(), 0)
+            # F04: the rollback recovered service on the OLD config, so the
+            # requested change must report as failed, not as reload success.
+            self.assertEqual(router.engine_reload(), 1)
         # restored file == last-good content
         self.assertEqual(router.SING_BOX_CONFIG.read_text(), known_good)
         seen_kills = [c for c in router.os.kill.mock_calls]  # noqa: F841
@@ -2917,7 +2947,8 @@ class LastGoodConfigTests(unittest.TestCase):
             # no pid file -> reload must start the engine
             router.PID_FILE.unlink(missing_ok=True)
             rc = router.engine_reload()
-        self.assertEqual(rc, 0)
+        # F04: restore_rc 0 means service is back, but the candidate never ran.
+        self.assertEqual(rc, 1)
         restore.assert_called_once()
 
     def test_successful_reload_refreshes_last_good(self):
@@ -2935,7 +2966,8 @@ class LastGoodConfigTests(unittest.TestCase):
         with mock.patch.object(router, "validate_config", side_effect=[False, True]), \
              mock.patch.object(router, "engine_start", return_value=0) as start:
             rc = router.engine_reload()
-        self.assertEqual(rc, 0)
+        # F04: engine is back on the last-good config; the reload still failed.
+        self.assertEqual(rc, 1)
         start.assert_called_once_with(use_existing_config=True)
 
 

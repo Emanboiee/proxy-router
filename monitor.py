@@ -24,6 +24,9 @@ from pathlib import Path
 from urllib.parse import urlsplit
 import ipaddress
 
+import net_safety
+import worker_lock
+
 ROOT = Path(os.environ.get("PROXY_ROUTER_ROOT") or Path(__file__).resolve().parent).resolve()
 DEFAULT_INTERVAL = 60
 DEFAULT_HTTP_URL = "https://www.cloudflare.com/cdn-cgi/trace"
@@ -51,21 +54,14 @@ DEFAULT_HEADERS = {
 # re-run against the *resolved* addresses right before connecting, which also
 # closes the DNS-rebinding window (config-time check passes on a public name,
 # resolution later returns 127.0.0.1 / 169.254.169.254).
-PRIVATE_TARGET_BYPASS_ENV = "PROXY_ROUTER_ALLOW_PRIVATE_TARGETS"
-_METADATA_HOSTNAMES = {"metadata", "metadata.google.internal"}
-_METADATA_ADDRESSES = {"169.254.169.254", "fd00:ec2::254"}
+PRIVATE_TARGET_BYPASS_ENV = net_safety.PRIVATE_TARGET_BYPASS_ENV
+_METADATA_HOSTNAMES = net_safety.METADATA_HOSTNAMES
+_METADATA_ADDRESSES = net_safety.METADATA_ADDRESSES
 
 
 def _addr_is_private(addr: str) -> bool:
     """True for loopback / private / link-local / reserved / multicast IPs."""
-    try:
-        parsed = ipaddress.ip_address(str(addr))
-    except ValueError:
-        return True  # cannot prove it public -> treat as private (fail closed)
-    return (
-        parsed.is_private or parsed.is_loopback or parsed.is_link_local
-        or parsed.is_reserved or parsed.is_multicast or parsed.is_unspecified
-    )
+    return net_safety.addr_is_private(addr)
 
 
 def target_violation(url: str, *, resolved_addresses=None) -> str | None:
@@ -120,28 +116,30 @@ def target_violation(url: str, *, resolved_addresses=None) -> str | None:
 
 
 def resolve_target_addresses(url: str) -> list[str]:
-    """Best-effort DNS resolution of ``url``'s hostname (empty list on error).
-
-    Used to validate resolved addresses at connection time (issue #64's DNS
-    rebinding criterion); failures simply yield no addresses, and callers then
-    rely on the pre-connect check plus urllib's own connection error handling.
-    Any exception counts as failure: sandboxed test runs actively block
-    sockets, and a broken resolver must never crash the worker.
-    """
-    import socket
-
-    try:
-        host = urlsplit(str(url)).hostname
-        if not host:
-            return []
-        return [info[4][0] for info in socket.getaddrinfo(host, None)][:8]
-    except Exception:  # noqa: BLE001 - best-effort: no addresses on any failure
-        return []
+    """Best-effort DNS resolution for connection-time target validation."""
+    return net_safety.resolve_target_addresses(url)
 
 
 def _reject_unsafe_url(url: str) -> str | None:
     """Config-time violation for ``url``, else None. No DNS here."""
     return target_violation(url)
+
+
+class _ValidatedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow a redirect only when the hop itself passes the SSRF check."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if target_violation(newurl) is not None:
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_SAFE_OPENER = urllib.request.build_opener(_ValidatedRedirectHandler)
+
+
+def _safe_urlopen(url, timeout=None):
+    """Default monitor transport: redirect-aware with per-hop validation."""
+    return _SAFE_OPENER.open(url, timeout=timeout)
 
 
 def validate_ping_host(host: str) -> str | None:
@@ -247,7 +245,7 @@ def _safe_target(url: str) -> str:
         return "configured-target"
 
 
-def measure_http_latency(url: str = DEFAULT_HTTP_URL, *, opener=urllib.request.urlopen,
+def measure_http_latency(url: str = DEFAULT_HTTP_URL, *, opener=_safe_urlopen,
                          clock=time.monotonic, timeout: float = 5) -> dict:
     started = clock()
     response = None
@@ -284,7 +282,7 @@ def _throughput(bytes_read: int, elapsed: float) -> float | None:
 
 
 def measure_download(url: str = DEFAULT_DOWNLOAD_URL, *, max_bytes: int = DEFAULT_MAX_BYTES,
-                     opener=urllib.request.urlopen, clock=time.monotonic,
+                     opener=_safe_urlopen, clock=time.monotonic,
                      timeout: float = DEFAULT_TIMEOUT) -> dict:
     max_bytes = max(1, int(max_bytes))
     started = clock()
@@ -314,7 +312,7 @@ def measure_download(url: str = DEFAULT_DOWNLOAD_URL, *, max_bytes: int = DEFAUL
 
 
 def measure_upload(url: str = DEFAULT_UPLOAD_URL, *, max_bytes: int = DEFAULT_MAX_BYTES,
-                   opener=urllib.request.urlopen, clock=time.monotonic,
+                   opener=_safe_urlopen, clock=time.monotonic,
                    timeout: float = DEFAULT_TIMEOUT) -> dict:
     max_bytes = max(1, int(max_bytes))
     payload = b"0" * max_bytes
@@ -436,7 +434,7 @@ def _monitor_settings(root: Path) -> dict:
     return settings
 
 
-def collect_sample(root: Path | None = None, *, opener=urllib.request.urlopen,
+def collect_sample(root: Path | None = None, *, opener=_safe_urlopen,
                    command_runner=subprocess.run, clock=time.monotonic,
                    include_speed: bool = True) -> dict:
     """Collect one bounded sample; this function is only called by check/worker."""
@@ -536,12 +534,24 @@ def worker_command(root: Path, interval: int) -> list[str]:
 
 def start(root: Path | None = None, *, interval: int | None = None) -> dict:
     root = Path(root) if root is not None else ROOT
+    try:
+        with worker_lock.exclusive(monitor_dir(root) / "start.lock"):
+            return _start_locked(root, interval)
+    except TimeoutError as exc:
+        return {"started": False, "error": str(exc)}
+
+
+def _start_locked(root: Path, interval: int | None) -> dict:
     current = status(root)
     if current["running"]:
         return {"started": False, "already_running": True, "pid": current["pid"]}
     interval = max(5, int(interval or _monitor_settings(root)["interval_seconds"]))
     directory = monitor_dir(root)
     directory.mkdir(parents=True, exist_ok=True)
+    # Enable marker first: the child must never observe a missing marker and
+    # exit during the parent/child spawn race.
+    enabled_file(root).write_text("enabled\n")
+    os.chmod(enabled_file(root), 0o600)
     command = worker_command(root, interval)
     try:
         proc = subprocess.Popen(
@@ -549,25 +559,32 @@ def start(root: Path | None = None, *, interval: int | None = None) -> dict:
             stderr=subprocess.DEVNULL, start_new_session=True,
         )
     except OSError as exc:
+        enabled_file(root).unlink(missing_ok=True)
         return {"started": False, "error": f"could not start monitor: {exc}"}
     pid_file(root).write_text(str(proc.pid))
-    enabled_file(root).write_text("enabled\n")
     os.chmod(pid_file(root), 0o600)
-    os.chmod(enabled_file(root), 0o600)
     return {"started": True, "pid": proc.pid, "interval_seconds": interval}
+
+
+STOP_CONFIRM_SECONDS = 3.0
 
 
 def stop(root: Path | None = None) -> dict:
     root = Path(root) if root is not None else ROOT
     pid = _read_pid(root)
+    confirmed = True
     if pid and _pid_running(pid, root):
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError:
             pass
+        deadline = time.monotonic() + STOP_CONFIRM_SECONDS
+        while time.monotonic() < deadline and _pid_running(pid, root):
+            time.sleep(0.1)
+        confirmed = not _pid_running(pid, root)
     pid_file(root).unlink(missing_ok=True)
     enabled_file(root).unlink(missing_ok=True)
-    return {"stopped": True, "pid": pid}
+    return {"stopped": True, "confirmed": confirmed, "pid": pid}
 
 
 def _rotate_samples_if_needed(path: Path) -> None:
@@ -601,7 +618,6 @@ def worker(root: Path, interval: int) -> int:
     """Worker entrypoint. It exits naturally when monitor off removes enabled."""
     root = Path(root)
     enabled_file(root).parent.mkdir(parents=True, exist_ok=True)
-    enabled_file(root).touch(mode=0o600, exist_ok=True)
     while enabled_file(root).is_file():
         try:
             append_sample(root, collect_sample(root))

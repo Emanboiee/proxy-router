@@ -39,7 +39,7 @@ RELEASE_TAG="${PROXY_ROUTER_RELEASE:-$(cat "$SCRIPT_DIR/VERSION" 2>/dev/null || 
 install_runtime() {
   local dest="$1"
   mkdir -p "$dest/bin"
-  for runtime_file in router.py setup_tui.py monitor.py route_watcher.py proxy_tray.py privileged_helper.py privileged_installer.py; do
+  for runtime_file in router.py setup_tui.py monitor.py route_watcher.py proxy_tray.py privileged_helper.py privileged_installer.py domain_autodetect.py egress.py state.py config_schema.py worker_lock.py providers_check.py net_safety.py; do
     cp "$SCRIPT_DIR/$runtime_file" "$dest/$runtime_file"
     chmod 755 "$dest/$runtime_file"
   done
@@ -106,14 +106,20 @@ install_runtime "$STAGE"
 chmod 700 "$PREFIX"
 
 # --- smoke test: the staged tree must actually run ------------------------
-# A staged release that cannot print its own status never becomes current.
+# Offline smoke: --help proves the release imports; status --json must emit
+# valid JSON from a throwaway root. A fresh install has no live engine, so a
+# nonzero status exit is not a failure.
 if [ -z "${PROXY_ROUTER_SKIP_SMOKE:-}" ]; then
-  if ! python3 "$STAGE/router.py" status --json >/dev/null 2>&1; then
-    printf 'error: staged release failed smoke test (router.py status --json); aborting\n' >&2
-    exit 1
-  fi
   if ! python3 "$STAGE/router.py" --help >/dev/null 2>&1; then
     printf 'error: staged release failed smoke test (router.py --help); aborting\n' >&2
+    exit 1
+  fi
+  smoke_root="$(mktemp -d)"
+  cp "$SCRIPT_DIR/router.example.json" "$smoke_root/router.json"
+  smoke_json="$(PROXY_ROUTER_ROOT="$smoke_root" python3 "$STAGE/router.py" status --json 2>/dev/null || true)"
+  rm -rf "$smoke_root"
+  if ! printf '%s' "$smoke_json" | python3 -c 'import json, sys; json.load(sys.stdin)' >/dev/null 2>&1; then
+    printf 'error: staged release failed smoke test (router.py status --json emitted no JSON); aborting\n' >&2
     exit 1
   fi
 fi
@@ -125,16 +131,20 @@ if [ -L "$CURRENT" ]; then
   OLD_TARGET=$(readlink "$CURRENT" | sed 's|^releases/||')
 fi
 
-ln -sfn "releases/$RELEASE_TAG" "$STAGE/final-name"
-FINAL="$STAGE_ROOT/release.$$"
-mv "$STAGE/final-name" "$FINAL"
+mkdir -p "$PREFIX/releases"
+if [ -e "$PREFIX/releases/$RELEASE_TAG" ]; then
+  printf 'error: release %s already exists under %s; refusing to overwrite an existing release\n' \
+    "$RELEASE_TAG" "$PREFIX/releases" >&2
+  exit 1
+fi
+# Move the STAGED DIRECTORY itself into releases/ (the previous code moved a
+# symlink named final-name, so releases/<tag> became a dangling self-link and
+# the real staged tree was discarded). Same-filesystem rename, so this is the
+# atomic commit point; everything before it could fail without touching the
+# running installation.
+mv "$STAGE" "$PREFIX/releases/$RELEASE_TAG"
 trap - EXIT
 rmdir "$STAGE_ROOT" 2>/dev/null || true
-
-mkdir -p "$PREFIX/releases"
-mv "$FINAL" "$PREFIX/releases/$RELEASE_TAG"
-# The rename above is the commit point; everything before it could fail
-# without touching the running installation.
 
 ln -sfn "releases/$RELEASE_TAG" "$CURRENT"
 
@@ -142,6 +152,7 @@ ln -sfn "releases/$RELEASE_TAG" "$CURRENT"
 # existing scripts and muscle memory keep working after the layout change.
 for f in router.py setup_tui.py monitor.py route_watcher.py proxy_tray.py \
          privileged_helper.py privileged_installer.py \
+         domain_autodetect.py egress.py state.py config_schema.py worker_lock.py providers_check.py net_safety.py \
          router.example.json README.md LICENSE sing-box-release.json; do
   ln -sfn "current/$f" "$PREFIX/$f"
 done

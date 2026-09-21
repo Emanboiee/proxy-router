@@ -167,6 +167,28 @@ class RouterClientLifecycleDelegationTests(unittest.TestCase):
             ],
         )
 
+    def test_rotation_gets_larger_budget_than_plain_commands(self):
+        with mock.patch.object(tray.subprocess, "run") as run:
+            run.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
+            self.client.rotate()
+            self.client.rotate_to("proton", "06-SG-FREE-4")
+            self.client.stop()
+        timeouts = [c.kwargs["timeout"] for c in run.call_args_list]
+        self.assertEqual(timeouts[0], tray.ROTATION_TIMEOUT)
+        self.assertEqual(timeouts[1], tray.ROTATION_TIMEOUT)
+        self.assertEqual(timeouts[2], tray.COMMAND_TIMEOUT)
+        self.assertGreater(tray.ROTATION_TIMEOUT, tray.COMMAND_TIMEOUT)
+
+    def test_rotation_budget_covers_worst_case_rotation_pipeline(self):
+        settle = 60
+        probe = 8
+        reload_budget = 12
+        self.assertGreaterEqual(
+            tray.ROTATION_TIMEOUT,
+            settle + probe + reload_budget + 5,
+            "budget must fit reload + probe + settle + rollback margin",
+        )
+
 
 class HumanizeTests(unittest.TestCase):
     def test_untouched_engine_shortcut_unchanged(self):
