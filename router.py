@@ -4192,13 +4192,32 @@ def _expected_engine_command() -> str | None:
     return f"{binary} run -c {SING_BOX_CONFIG}"
 
 
-def _command_is_our_engine(cmd: str) -> bool:
-    """Return true only for the exact resolved binary/argv command line."""
+_expected_engine_argv_cache: list[str] | None = None
+_expected_engine_argv_source: str | None = None
+
+
+def _expected_engine_argv() -> list[str] | None:
+    """``_expected_engine_command()`` split once, not per process-table row."""
+    global _expected_engine_argv_cache, _expected_engine_argv_source
     expected = _expected_engine_command()
     if expected is None:
+        return None
+    if _expected_engine_argv_source != expected:
+        try:
+            _expected_engine_argv_cache = shlex.split(expected)
+        except ValueError:
+            return None
+        _expected_engine_argv_source = expected
+    return _expected_engine_argv_cache
+
+
+def _command_is_our_engine(cmd: str) -> bool:
+    """Return true only for the exact resolved binary/argv command line."""
+    expected_argv = _expected_engine_argv()
+    if not expected_argv:
         return False
     try:
-        return shlex.split(str(cmd).strip()) == shlex.split(expected)
+        return shlex.split(str(cmd).strip()) == expected_argv
     except ValueError:
         return False
 
@@ -4210,9 +4229,10 @@ def _find_our_engine_pids() -> list[int]:
     fail-closed: an unavailable process table cannot be treated as proof that
     no owned engine exists.
     """
-    expected = _expected_engine_command()
-    if expected is None:
+    expected_argv = _expected_engine_argv()
+    if not expected_argv:
         raise EngineIdentityError("sing-box binary is unavailable; engine identity is unknown")
+    engine_binary = expected_argv[0]
     if os.name == "nt":
         # The privileged helper owns Windows lifecycle in supported installs;
         # retain a conservative no-result path for the cross-platform CLI.
@@ -4237,6 +4257,10 @@ def _find_our_engine_pids() -> list[int]:
             pid = int(parts[0])
             int(parts[1])  # Parse UID as part of the authenticated row.
         except ValueError:
+            continue
+        # Cheap prefilter: only a command line carrying the exact engine
+        # binary can match, so the ~1500 unrelated rows skip shlex entirely.
+        if engine_binary not in parts[2]:
             continue
         if pid > 1 and _command_is_our_engine(parts[2]):
             pids.append(pid)
@@ -5878,17 +5902,60 @@ def _launchd_agent_state(label: str) -> bool:
     """
     if sys.platform != "darwin":
         return False
+    return f"{label}" in _launchctl_list()
+
+
+_launchctl_list_cache: str | None = None
+
+
+def _launchctl_list_reset() -> None:
+    """Drop the cached `launchctl list` so the next read probes again."""
+    global _launchctl_list_cache
+    _launchctl_list_cache = None
+
+
+def _launchctl_list() -> str:
+    """`launchctl list` output, probed once per read pass.
+
+    A status read asks about the tray and keepalive agents in the same pass;
+    one spawn covers both instead of two identical `launchctl` calls.
+    """
+    global _launchctl_list_cache
+    if _launchctl_list_cache is None:
+        try:
+            probe = subprocess.run(
+                ["launchctl", "list"], capture_output=True, text=True, timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            _launchctl_list_cache = ""
+        else:
+            _launchctl_list_cache = probe.stdout or ""
+    return _launchctl_list_cache
+
+
+def status_json(*, fast: bool = False) -> dict:
+    """Full machine-readable status for `status --json`.
+
+    ``fast`` skips the elevation/launchd probes, which cost a `sudo -n`
+    round trip plus a `launchctl list` spawn and cannot change between polls;
+    pollers that only need engine/provider/routing state should use it.
+    """
+    # Open a lazy probe scope: the first of engine_alive / elevation /
+    # _sudoers_installed probes, the rest reuse it. Priming eagerly would
+    # bypass callers that replace _helper_status, and leaving the scope off
+    # makes all three call sites spawn `sudo -n` independently.
+    _helper_status_memo.clear()
+    _launchctl_list_reset()
+    if sys.platform == "darwin" and _effective_uid() != 0:
+        _helper_status_memo.append(_HELPER_STATUS_PENDING)
     try:
-        probe = subprocess.run(
-            ["launchctl", "list"], capture_output=True, text=True, timeout=10,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return f"{label}" in (probe.stdout or "")
+        return _status_json(fast=fast)
+    finally:
+        _helper_status_memo.clear()
+        _launchctl_list_reset()
 
 
-def status_json() -> dict:
-    """Full machine-readable status for `status --json`."""
+def _status_json(*, fast: bool = False) -> dict:
     rc, line = _status_report()
     data = {"up": rc == 0, "state": line, "mode": current_mode(), "port": _port,
             "sing_box": resolve_sing_box(), "schema_version": SCHEMA_VERSION}
@@ -5934,25 +6001,28 @@ def status_json() -> dict:
     # Issue #76: expose the startup-permission state so the tray (and any
     # dashboard) can tell a permission gap apart from a broken engine and
     # offer the one-click repair instead of a generic failure.
-    helper = None
-    if sys.platform == "darwin" and _effective_uid() != 0:
-        try:
-            helper = _helper_status()
-        except Exception:
-            helper = {"installed": False, "error": "helper status probe crashed"}
-    data["elevation"] = {
-        "platform": sys.platform,
-        "root_engine": _engine_runs_as_root(),
-        "helper_installed": bool(helper and helper.get("installed")),
-        "sudo_grant": _sudoers_installed(),
-        # The one-time fix every consumer should point at when any of the
-        # flags above shows the grant missing.
-        "fix_hint": _HELPER_FIX,
-    }
-    if sys.platform == "darwin":
-        data["elevation"]["tray_agent"] = _launchd_agent_state("com.proxy-router.tray")
-        data["elevation"]["keepalive_agent"] = _launchd_agent_state(
-            "com.proxy-router.keepalive")
+    if fast:
+        data["elevation"] = {"platform": sys.platform, "skipped": "fast"}
+    else:
+        helper = None
+        if sys.platform == "darwin" and _effective_uid() != 0:
+            try:
+                helper = _helper_status()
+            except Exception:
+                helper = {"installed": False, "error": "helper status probe crashed"}
+        data["elevation"] = {
+            "platform": sys.platform,
+            "root_engine": _engine_runs_as_root(),
+            "helper_installed": bool(helper and helper.get("installed")),
+            "sudo_grant": _sudoers_installed(),
+            # The one-time fix every consumer should point at when any of the
+            # flags above shows the grant missing.
+            "fix_hint": _HELPER_FIX,
+        }
+        if sys.platform == "darwin":
+            data["elevation"]["tray_agent"] = _launchd_agent_state("com.proxy-router.tray")
+            data["elevation"]["keepalive_agent"] = _launchd_agent_state(
+                "com.proxy-router.keepalive")
     rotation = {
         "interval_seconds": scheduled_interval(),
         "jitter_seconds": int(_rotation.get("jitter_seconds", DEFAULT_ROTATION_SETTINGS["jitter_seconds"]) or 0),
@@ -7369,7 +7439,15 @@ def _helper_command(operation: str, uid: int | None = None) -> list[str]:
     ]
 
 
-def _helper_status() -> dict | None:
+# A single status read asks for the helper three times (engine_alive, the
+# elevation block, and _sudoers_installed), and every miss spawns `sudo -n`
+# (~200ms under load). status_json() primes this so one pass probes once;
+# an empty list means "probe on demand" so direct callers stay uncached.
+_helper_status_memo: list = []
+_HELPER_STATUS_PENDING = object()
+
+
+def _probe_helper_status() -> dict | None:
     """Return canonical helper status, or None when exact NOPASSWD is absent."""
     try:
         result = subprocess.run(
@@ -7394,6 +7472,21 @@ def _helper_status() -> dict | None:
     required = {"installed", "running", "pid", "mode", "schema_version"}
     if not isinstance(value, dict) or not required <= set(value) or value.get("schema_version") != 1:
         return {"installed": False, "error": "helper status schema mismatch"}
+    return value
+
+
+def _helper_status() -> dict | None:
+    """Helper status, probed once per status pass (see ``status_json``).
+
+    Outside a pass this probes directly, so callers that replace this
+    function (tests, diagnostics) keep full control.
+    """
+    if not _helper_status_memo:
+        return _probe_helper_status()
+    value = _helper_status_memo[0]
+    if value is _HELPER_STATUS_PENDING:
+        value = _probe_helper_status()
+        _helper_status_memo[0] = value
     return value
 
 
@@ -7621,6 +7714,8 @@ def main() -> int:
     doctor_parser.add_argument("--network", action="store_true",
                                help="run bounded direct/routed connectivity and DNS checks")
     status.add_argument("--json", action="store_true", help="machine-readable status (JSON)")
+    status.add_argument("--fast", action="store_true",
+                        help="skip the elevation/launchd probes (for pollers)")
     sub.add_parser("reload")
     autodetect = sub.add_parser("autodetect", help="discover routed web-app dependency hostnames")
     autodetect.add_argument("source", nargs="?", default="twitch",
@@ -8054,21 +8149,24 @@ def main() -> int:
     if args.cmd == "status":
         if resolve_sing_box() is None:
             print(f"router: {_sing_box_missing_message()}", file=sys.stderr)
-        rc, line = _status_report()
         if args.json:
-            print(json.dumps(status_json(), indent=2, sort_keys=True))
-        else:
-            print(line)
-            try:
-                legacy = _legacy_launch_agents()
-            except Exception:
-                legacy = []
-            if legacy:
-                names = ", ".join(legacy)
-                print(f"router: legacy launch agent(s) still installed: {names}",
-                      file=sys.stderr)
-                print("router: migrate with `router.py elevate install` or remove "
-                      "them from ~/Library/LaunchAgents", file=sys.stderr)
+            # status_json already ran the report; reuse its verdict instead of
+            # paying a second _status_report() just for the exit code.
+            data = status_json(fast=args.fast)
+            print(json.dumps(data, indent=2, sort_keys=True))
+            return 0 if data["up"] else 1
+        rc, line = _status_report()
+        print(line)
+        try:
+            legacy = _legacy_launch_agents()
+        except Exception:
+            legacy = []
+        if legacy:
+            names = ", ".join(legacy)
+            print(f"router: legacy launch agent(s) still installed: {names}",
+                  file=sys.stderr)
+            print("router: migrate with `router.py elevate install` or remove "
+                  "them from ~/Library/LaunchAgents", file=sys.stderr)
         return rc
     if args.cmd == "reload":
         rc = _with_lock(engine_reload)

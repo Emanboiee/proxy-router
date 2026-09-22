@@ -461,6 +461,42 @@ class HelperPermissionUxTests(unittest.TestCase):
         self.addCleanup(platform.stop)
         self.assertFalse(router._launchd_agent_state("com.proxy-router.tray"))
 
+    def test_status_json_probes_helper_once_per_pass(self):
+        # engine_alive, the elevation block and _sudoers_installed all read the
+        # same helper; each miss spawns `sudo -n`, so one pass must probe once.
+        platform = mock.patch.object(router.sys, "platform", "darwin")
+        euid = mock.patch.object(router.os, "geteuid", return_value=501)
+        probe = mock.patch.object(
+            router, "_probe_helper_status",
+            side_effect=lambda: {"installed": True, "running": False})
+        root_engine = mock.patch.object(router, "_engine_runs_as_root", return_value=False)
+        launchd = mock.patch.object(router, "_launchd_agent_state", return_value=False)
+        report = mock.patch.object(router, "_status_report", return_value=(0, "up"))
+        for patcher in (platform, euid, probe, root_engine, launchd, report):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        data = router.status_json()
+        self.assertEqual(router._probe_helper_status.call_count, 1)
+        self.assertTrue(data["elevation"]["helper_installed"])
+        self.assertTrue(data["elevation"]["sudo_grant"])
+
+    def test_status_json_fast_skips_privileged_probes(self):
+        platform = mock.patch.object(router.sys, "platform", "darwin")
+        euid = mock.patch.object(router.os, "geteuid", return_value=501)
+        probe = mock.patch.object(router, "_probe_helper_status")
+        root_engine = mock.patch.object(router, "_engine_runs_as_root")
+        launchd = mock.patch.object(router, "_launchd_agent_state")
+        report = mock.patch.object(router, "_status_report", return_value=(0, "up"))
+        for patcher in (platform, euid, probe, root_engine, launchd, report):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        data = router.status_json(fast=True)
+        self.assertEqual(data["elevation"], {"platform": "darwin", "skipped": "fast"})
+        self.assertEqual(data["up"], True)
+        router._probe_helper_status.assert_not_called()
+        router._engine_runs_as_root.assert_not_called()
+        router._launchd_agent_state.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
