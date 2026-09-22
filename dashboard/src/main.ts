@@ -1,6 +1,6 @@
 import './tokens.css';
 import './style.css';
-import { LocalController, applyEngineAction, applyProfileToEngine, getLiveStatus, getPreviewStatus, reportPreviewFrame, setTrayStatus, states, type Accent, type Connection, type Density, type FallbackMode, type LayoutPreset, type MotionSpeed, type PreviewState, type Profile, type ProviderKind, type RouteMode, type Scheme, type Snapshot, type Status, type TailscaleMode } from './controller';
+import { LocalController, applyEngineAction, applyProfileToEngine, getCachedLiveStatus, getLiveStatus, getPreviewStatus, reportPreviewFrame, setTrayStatus, states, type Accent, type Connection, type Density, type FallbackMode, type LayoutPreset, type MotionSpeed, type PreviewState, type Profile, type ProviderKind, type RouteMode, type Scheme, type Snapshot, type Status, type TailscaleMode } from './controller';
 import { isTauri } from '@tauri-apps/api/core';
 import { addRoute, applyPreset, getConfig, getNetwork, getRouting, presetChoices, removeNetworkPreset, removeRoute, runNetworkAction, setNetworkAuto, setNetworkPreset, setRoutingMode, type EngineConfig, type NetworkPresetState, type RoutingState } from './controller';
 
@@ -329,7 +329,22 @@ function resetMainScroll(): void {
   main.scrollTo({ top: 0, left: 0, behavior: 'auto' });
 }
 
-async function refreshStatus(options?: { silent?: boolean }): Promise<void> {
+/** The poller's reading is served without a controller call while younger
+ *  than this; older than it, a tick falls back to a real fetch. */
+const LIVE_STALE_MS = 20000;
+
+function applyLive(live: { state: string; status?: Record<string, unknown> | null }): void {
+  previewState = (states as readonly string[]).includes(live.state)
+    ? (live.state as PreviewState) : 'failed';
+  livePayload = live.status ?? null;
+}
+
+/**
+ * Refresh the hero/rail. `poll` is the 5s tick: it paints the Rust cache
+ * immediately and only pays for a controller call once that cache goes stale,
+ * so the poller - not the UI - owns the poll cadence.
+ */
+async function refreshStatus(options?: { silent?: boolean; poll?: boolean }): Promise<void> {
   const generation = ++requestGeneration;
   if (!options?.silent) { previewState = 'loading'; render(); }
   try { status = await getPreviewStatus(); if (generation !== requestGeneration) return; }
@@ -337,16 +352,28 @@ async function refreshStatus(options?: { silent?: boolean }): Promise<void> {
   // In the desktop app the hero and the tray follow the real controller, not
   // the build-time fixture; an unreadable controller is a real failure (#144).
   if (isTauri()) {
+    if (options?.poll) {
+      try {
+        const cached = await getCachedLiveStatus();
+        if (generation !== requestGeneration) return;
+        if (cached.status) applyLive(cached);
+        const age = typeof cached.age_ms === 'number' ? cached.age_ms : Number.POSITIVE_INFINITY;
+        const fresh = age < LIVE_STALE_MS;
+        render();
+        if (fresh) return;
+      } catch { /* fall through to a real fetch */ }
+    }
     try {
-      const live = await getLiveStatus();
+      const live = await getLiveStatus({ force: !options?.poll });
       if (generation !== requestGeneration) return;
-      previewState = (states as readonly string[]).includes(live.state) ? live.state : 'failed';
-      livePayload = live.status ?? null;
+      applyLive(live);
     } catch {
       if (generation !== requestGeneration) return;
       previewState = 'failed';
     }
-    await refreshEngineData();
+    // Config/network/routing only change on an action, so a poll must not
+    // re-run those three controller calls.
+    if (!options?.poll) await refreshEngineData();
   }
   render(); announce(copy[previewState][0]);
 }
@@ -539,7 +566,7 @@ async function selectProfile(profileId: string): Promise<void> {
     try { await applyProfileToEngine(profileId); } catch (error) { announce(error instanceof Error ? error.message : 'Profile switch failed'); }
   }
   await perform(() => controller.selectProfile(profileId));
-  if (isTauri()) { await refreshStatus(); render(); }
+  if (isTauri()) { await refreshStatus({ silent: true }); render(); }
 }
 
 /** Network panel actions: engine verbs + the SSID->preset mapping. */
@@ -645,6 +672,14 @@ navigate(false); requestAnimationFrame(reportPreviewFrame);
 // The hero, the rail and the tray follow the real controller (#144):
 // refresh now and poll on the cadence the Rust backend already uses.
 if (isTauri()) {
-  void refreshStatus({ silent: true });
-  window.setInterval(() => { if (!busy) void refreshStatus({ silent: true }); }, 5000);
+  // Paint the poller's last reading before anything waits on the CLI, then
+  // reconcile in the background: the window never blocks on first paint.
+  void (async () => {
+    try {
+      const cached = await getCachedLiveStatus();
+      if (cached.status) { applyLive(cached); render(); }
+    } catch { /* first run: nothing cached yet */ }
+    await refreshStatus({ silent: true });
+  })();
+  window.setInterval(() => { if (!busy) void refreshStatus({ silent: true, poll: true }); }, 5000);
 }

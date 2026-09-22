@@ -29,10 +29,29 @@ struct LiveStatus {
     state: Mutex<String>,
     payload: Mutex<Option<Value>>,
     detail: Mutex<Option<String>>,
+    at: Mutex<Option<Instant>>,
+}
+
+impl LiveStatus {
+    /// One consistent read of the cache: state, payload, error, age.
+    fn snapshot(&self) -> (String, Option<Value>, Option<String>, Option<u128>) {
+        let state = self.state.lock().map(|s| s.clone()).unwrap_or_default();
+        let payload = self.payload.lock().ok().and_then(|p| p.clone());
+        let detail = self.detail.lock().ok().and_then(|d| d.clone());
+        let age = self.at.lock().ok().and_then(|a| *a).map(|t| t.elapsed().as_millis());
+        (state, payload, detail, age)
+    }
 }
 
 /// Seconds between live controller polls.
-const POLL_SECONDS: u64 = 5;
+///
+/// The poll spawns the Python CLI, so this is the engine's background cost:
+/// at 5s it was burning most of a core. The window refreshes on demand and
+/// the tray only needs a truthful icon, so 15s is the useful floor.
+const POLL_SECONDS: u64 = 15;
+
+/// A cached reading younger than this is served without re-running the CLI.
+const CACHE_FRESH_MS: u128 = 2500;
 
 #[tauri::command]
 fn preview_rendered(start: tauri::State<LaunchTime>) {
@@ -89,9 +108,16 @@ fn apply_tray_state<R: Runtime>(app: &AppHandle<R>, state: &str) -> Result<(), S
 }
 
 /// Poll the controller once and publish the result to the tray and the UI.
-fn refresh_live_status<R: Runtime>(app: &AppHandle<R>) -> (String, Option<Value>, Option<String>) {
+fn refresh_live_status<R: Runtime>(
+    app: &AppHandle<R>,
+    full: bool,
+) -> (String, Option<Value>, Option<String>) {
     let root = controller::router_root();
-    let result = controller::live_status(&root);
+    let result = if full {
+        controller::live_status(&root)
+    } else {
+        controller::live_status_fast(&root)
+    };
     let state = controller::state_for_result(&result).to_string();
     let (payload, detail) = match result {
         Ok(value) => (Some(value), None),
@@ -107,6 +133,9 @@ fn refresh_live_status<R: Runtime>(app: &AppHandle<R>) -> (String, Option<Value>
         if let Ok(mut slot) = live.detail.lock() {
             *slot = detail.clone();
         }
+        if let Ok(mut slot) = live.at.lock() {
+            *slot = Some(Instant::now());
+        }
     }
     if let Err(error) = apply_tray_state(app, &state) {
         eprintln!("tray: {error}");
@@ -114,11 +143,32 @@ fn refresh_live_status<R: Runtime>(app: &AppHandle<R>) -> (String, Option<Value>
     (state, payload, detail)
 }
 
+/// Live reading, served from the cache when it is still fresh.
+///
+/// `force` (menu "Refresh status", post-action reconciliation) always runs the
+/// controller; otherwise a reading younger than [`CACHE_FRESH_MS`] is returned
+/// as-is, so a click never waits on a CLI spawn the poller just paid for.
 #[tauri::command]
-fn get_live_status<R: Runtime>(app: AppHandle<R>) -> Result<Value, String> {
-    let (state, payload, detail) = refresh_live_status(&app);
+fn get_live_status<R: Runtime>(app: AppHandle<R>, force: Option<bool>) -> Result<Value, String> {
+    if !force.unwrap_or(false) {
+        if let Some(live) = app.try_state::<LiveStatus>() {
+            let (state, Some(payload), _, age) = live.snapshot() else {
+                return after_refresh(&app);
+            };
+            if age.map(|ms| ms < CACHE_FRESH_MS).unwrap_or(false) {
+                return Ok(serde_json::json!({
+                    "state": state, "status": payload, "age_ms": age,
+                }));
+            }
+        }
+    }
+    after_refresh(&app)
+}
+
+fn after_refresh<R: Runtime>(app: &AppHandle<R>) -> Result<Value, String> {
+    let (state, payload, detail) = refresh_live_status(app, false);
     match payload {
-        Some(value) => Ok(serde_json::json!({"state": state, "status": value})),
+        Some(value) => Ok(serde_json::json!({"state": state, "status": value, "age_ms": 0})),
         None => Err(detail.unwrap_or_else(|| "Controller unavailable".to_string())),
     }
 }
@@ -126,10 +176,8 @@ fn get_live_status<R: Runtime>(app: AppHandle<R>) -> Result<Value, String> {
 /// Cached reading, so the UI can paint before the next poll lands.
 #[tauri::command]
 fn cached_live_status(live: tauri::State<LiveStatus>) -> Value {
-    let state = live.state.lock().map(|s| s.clone()).unwrap_or_default();
-    let payload = live.payload.lock().ok().and_then(|p| p.clone());
-    let detail = live.detail.lock().ok().and_then(|d| d.clone());
-    serde_json::json!({"state": state, "status": payload, "error": detail})
+    let (state, payload, detail, age) = live.snapshot();
+    serde_json::json!({"state": state, "status": payload, "error": detail, "age_ms": age})
 }
 
 /// Tray/menu actions, whitelisted to explicit engine verbs.
@@ -174,7 +222,7 @@ fn run_router_action<R: Runtime>(app: AppHandle<R>, action: String) -> Result<St
     let root = controller::router_root();
     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
     let output = controller::run_controller(&root, &borrowed)?;
-    refresh_live_status(&app);
+    refresh_live_status(&app, false);
     Ok(output)
 }
 
@@ -194,7 +242,7 @@ fn apply_preset(app: AppHandle, name: String) -> Result<String, String> {
     let root = controller::router_root();
     let applied = controller::run_controller(&root, &["setup", "--preset", &name])?;
     controller::run_controller(&root, &["reload"])?;
-    refresh_live_status(&app);
+    refresh_live_status(&app, false);
     Ok(applied)
 }
 
@@ -396,7 +444,7 @@ fn main() {
                         "open" => show_dashboard(app),
                         "quit" => app.exit(0),
                         "refresh" => {
-                            refresh_live_status(app);
+                            refresh_live_status(app, true);
                         }
                         _ if id.starts_with("preset:") => {
                             let handle = app.clone();
@@ -414,7 +462,7 @@ fn main() {
                                 if let Err(error) = set_routing_mode(mode) {
                                     eprintln!("tray routing mode failed: {error}");
                                 }
-                                refresh_live_status(&handle);
+                                refresh_live_status(&handle, false);
                             });
                         }
                         action => {
@@ -447,7 +495,7 @@ fn main() {
             // dashboard window is hidden or closed.
             let handle = app.handle().clone();
             thread::spawn(move || loop {
-                refresh_live_status(&handle);
+                refresh_live_status(&handle, false);
                 thread::sleep(Duration::from_secs(POLL_SECONDS));
             });
             Ok(())

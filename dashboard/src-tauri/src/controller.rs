@@ -57,9 +57,22 @@ pub fn run_controller(root: &Path, args: &[&str]) -> Result<String, String> {
 
 /// Parse `router.py status --json`.
 pub fn live_status(root: &Path) -> Result<Value, String> {
+    land_status(root, &["status", "--json"])
+}
+
+/// Parse `router.py status --json --fast` (no elevation/launchd probes).
+///
+/// Every poll uses this: the skipped probes spawn `sudo -n` and `launchctl`,
+/// they cannot change between polls, and neither the tray state nor the
+/// dashboard reads them - so they were pure latency on the poll path.
+pub fn live_status_fast(root: &Path) -> Result<Value, String> {
+    land_status(root, &["status", "--json", "--fast"])
+}
+
+fn land_status(root: &Path, args: &[&str]) -> Result<Value, String> {
     // `status --json` exits 1 while the engine is down but still prints the
     // full JSON document; the exit code alone must not discard real state.
-    let out = run_controller_allow_nonzero(root, &["status", "--json"])?;
+    let out = run_controller_allow_nonzero(root, args)?;
     serde_json::from_str::<Value>(&out)
         .map_err(|error| format!("invalid controller status: {error}"))
 }

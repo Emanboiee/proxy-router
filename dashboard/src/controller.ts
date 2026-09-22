@@ -198,6 +198,10 @@ export function setTrayStatus(state: PreviewState): void {
 export interface LiveStatus {
   state: PreviewState;
   status: Record<string, unknown> | null;
+  /** Milliseconds since the reading was captured; null when never fetched. */
+  age_ms?: number | null;
+  /** Set by cached_live_status when the last controller call failed. */
+  error?: string | null;
 }
 
 /**
@@ -206,9 +210,18 @@ export interface LiveStatus {
  * The build-time fixture above only backs the browser preview; the tray and
  * the connection state must follow the actual router (#144).
  */
-export async function getLiveStatus(): Promise<LiveStatus> {
+export async function getLiveStatus(options?: { force?: boolean }): Promise<LiveStatus> {
   if (!isTauri()) throw new Error('Live status requires the desktop app');
-  return await invoke<LiveStatus>('get_live_status');
+  return await invoke<LiveStatus>('get_live_status', { force: options?.force ?? false });
+}
+
+/**
+ * The tray poller's last reading, straight from the Rust cache. Never runs the
+ * controller, so it is safe to call on first paint and on every UI tick.
+ */
+export async function getCachedLiveStatus(): Promise<LiveStatus> {
+  if (!isTauri()) throw new Error('Live status requires the desktop app');
+  return await invoke<LiveStatus>('cached_live_status');
 }
 /** Engine verbs the desktop app may run (mirrors the Rust allowlist). */
 export type EngineAction = 'connect' | 'disconnect' | 'reconnect';
