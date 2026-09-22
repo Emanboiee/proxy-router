@@ -571,6 +571,25 @@ class KeepaliveSweepStaggerTests(unittest.TestCase):
         finally:
             h.close()
 
+    def test_sweep_every_zero_disables_sweep_without_defer_noise(self):
+        import time as _time
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "router.json").write_text(
+                json.dumps({"keepalive": {"sweep_every": 0}}))
+            h = KeepaliveHarness(interval="1", root=root)
+            try:
+                rotation = h.root / "state" / "proton.rotation"
+                rotation.write_text(json.dumps({"profile": "a", "at": int(_time.time())}))
+                h.wait_lines(6)
+                self.assertNotIn("egress sweep --json", h.lines(),
+                                 "sweep_every 0 must not run the full-pool sweep")
+                h.close()
+                self.assertNotIn("sweep deferred", h.err,
+                                 f"sweep_every 0 must silence the stagger note: {h.err!r}")
+            finally:
+                h.close()
+
 
 class KeepaliveFallbackRestoreTests(unittest.TestCase):
     """restore_fallbacks(): on the sweep cadence, clear the runtime fallback

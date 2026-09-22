@@ -181,16 +181,18 @@ _BUILTIN_PRESETS: dict = {
                    _PRESET_ROUTES["reddit"]],
         "routing": {"mode": "default"},
         # Unfiltered home/default networks: plain UDP 53 DNS (fast path).
-        "vpn": {"dns_transport": "udp"},
+        "vpn": {"dns_transport": "udp", "dns_resolver": "provider"},
     },
     "school-warp": {
         "routes": [_PRESET_ROUTES["school"], _PRESET_ROUTES["reddit"]],
         "routing": {"mode": "vpn-list",
                     "vpn_domains": list(_PRESET_ROUTES["school"]["domains"])
                                   + list(_PRESET_ROUTES["reddit"]["domains"])},
-        # Filtered school/captive networks drop UDP 53; tunnel DNS must ride
-        # DoH there. Applying any other built-in preset restores UDP.
-        "vpn": {"dns_transport": "https"},
+        # Filtered school/captive networks drop UDP 53 to public resolvers and
+        # reset DoH to the public endpoint, but the network's own resolver
+        # answers; resolve tunneled domains there. Applying any other built-in
+        # preset restores the provider resolver.
+        "vpn": {"dns_transport": "https", "dns_resolver": "local"},
     },
 }
 

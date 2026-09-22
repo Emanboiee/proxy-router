@@ -120,7 +120,7 @@ try:
         print("1" if value not in (False, 0, "0", "false", "off") else "0")
     else:
         value = int(value)
-        if value < 1:
+        if value < 1 and not (key == "sweep_every" and value == 0):
             raise ValueError
         print(value)
 except (OSError, ValueError, TypeError, json.JSONDecodeError):
@@ -139,7 +139,7 @@ try:
         print("1" if value not in (False, 0, "0", "false", "off") else "0")
     else:
         value = int(value)
-        if value < 1:
+        if value < 1 and not (key == "sweep_every" and value == 0):
             raise ValueError
         print(value)
 except (OSError, ValueError, TypeError, json.JSONDecodeError):
@@ -778,6 +778,10 @@ while true; do
       [ "$rotated_at" -gt "$newest_rotation" ] && newest_rotation="$rotated_at"
     done
     if is_tun_mode; then
+      :
+    elif [ "$SWEEP_EVERY" -le 0 ]; then
+      # sweep_every 0 disables the automatic full-pool sweep: every profile hop
+      # is a hard reload, so it is operator-run only (`router.py egress sweep`).
       :
     elif [ "$newest_rotation" -gt 0 ] && [ $((sweep_now - newest_rotation)) -lt "$STAGGER" ]; then
       echo "router: sweep deferred (rotation ${STAGGER}s stagger window)" >&2
