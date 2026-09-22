@@ -167,14 +167,22 @@ _PRESET_ROUTES = {
 # A preset is a NAMED bundle of routes (domains -> provider) plus an optional
 # routing-mode section, applied by name with `setup --preset <name>`. Users
 # add their own with `setup --preset-add NAME --provider P --domain ...`.
+#
+# Every built-in preset carries Reddit (a shared, resilient route) and turns
+# routed dependency autodetection on, so each profile discovers the asset
+# hosts its sites need instead of routing only the bare apex domains.
+_PRESET_AUTODETECT = {"enabled": True, "auto_sources": True}
+
 _BUILTIN_PRESETS: dict = {
     "opencode": {
         "routes": [_PRESET_ROUTES["opencode-zen"], _PRESET_ROUTES["reddit"]],
         "routing": {"mode": "default"},
+        "autodetect": dict(_PRESET_AUTODETECT),
     },
     "roblox": {
         "routes": [_PRESET_ROUTES["roblox"], _PRESET_ROUTES["reddit"]],
         "routing": {"mode": "default"},
+        "autodetect": dict(_PRESET_AUTODETECT),
     },
     "default": {  # the classic combo: opencode via proton + roblox via warp
         "routes": [_PRESET_ROUTES["opencode-zen"], _PRESET_ROUTES["roblox"],
@@ -182,6 +190,7 @@ _BUILTIN_PRESETS: dict = {
         "routing": {"mode": "default"},
         # Unfiltered home/default networks: plain UDP 53 DNS (fast path).
         "vpn": {"dns_transport": "udp"},
+        "autodetect": dict(_PRESET_AUTODETECT),
     },
     "school-warp": {
         "routes": [_PRESET_ROUTES["school"], _PRESET_ROUTES["reddit"]],
@@ -191,6 +200,7 @@ _BUILTIN_PRESETS: dict = {
         # Filtered school/captive networks drop UDP 53; tunnel DNS must ride
         # DoH there. Applying any other built-in preset restores UDP.
         "vpn": {"dns_transport": "https"},
+        "autodetect": dict(_PRESET_AUTODETECT),
     },
 }
 
@@ -582,8 +592,10 @@ def apply_presets(config_path, opencode=True, warp_roblox=True) -> dict:
     """Add the safe route presets to ``router.json`` (idempotent, lossless).
 
     Adds providers ``proton``/``cloudflare`` and routes ``opencode-zen``
-    (opencode.ai -> proton) and ``roblox`` (Roblox domains -> cloudflare) when
-    missing, leaving every other key, provider, route, and value untouched.
+    (opencode.ai -> proton), ``roblox`` (Roblox domains -> cloudflare) and
+    ``reddit`` (Reddit domains -> cloudflare) when missing, and turns routed
+    dependency autodetection on unless it was explicitly disabled. Every other
+    key, provider, route, and value is left untouched.
     Returns ``{"added": [route ids created this call]}``.
     """
     config_path = Path(config_path)
@@ -618,6 +630,11 @@ def apply_presets(config_path, opencode=True, warp_roblox=True) -> dict:
     if not any(r.get("id") == "reddit" for r in routes):
         routes.append(dict(_PRESET_ROUTES["reddit"]))
         added.append("reddit")
+    autodetect = data.get("autodetect")
+    if not isinstance(autodetect, dict):
+        autodetect = {}
+    autodetect.setdefault("enabled", True)
+    data["autodetect"] = autodetect
     _atomic_write_config(config_path, data)
     return {"added": added}
 
@@ -722,9 +739,9 @@ def load_preset(root: Path, name: str) -> dict:
 def apply_preset_by_name(root: Path, name: str) -> dict:
     """Apply the preset ``name`` to ``root/router.json`` (idempotent, lossless).
 
-    Adds the preset's routes/providers and merges its ``routing`` section
-    (mode switch when the preset defines one; a ``default`` routing is left
-    untouched). Never starts the engine.
+    Adds the preset's routes/providers and merges its ``routing``, ``vpn`` and
+    ``autodetect`` sections (mode switch when the preset defines one; a
+    ``default`` routing is left untouched). Never starts the engine.
     Returns ``{"added": [...], "mode": ..., "preset": name}``.
     """
     config_path = root / "router.json"
@@ -770,6 +787,15 @@ def apply_preset_by_name(root: Path, name: str) -> dict:
         # section leaves the operator's current settings untouched.
         data["vpn"] = data.get("vpn") or {}
         data["vpn"].update(vpn)
+    autodetect = preset.get("autodetect") or {}
+    if autodetect:
+        # Merge only the preset's keys so operator-tuned intervals, timeouts,
+        # and explicit sources survive a preset apply.
+        current_autodetect = data.get("autodetect")
+        if not isinstance(current_autodetect, dict):
+            current_autodetect = {}
+        current_autodetect.update(autodetect)
+        data["autodetect"] = current_autodetect
     config_path.parent.mkdir(parents=True, exist_ok=True)
     # record the applied preset so `status` (and the tray) can show it
     data["preset"] = name
