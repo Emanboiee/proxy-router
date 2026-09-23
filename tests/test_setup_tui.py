@@ -269,6 +269,14 @@ class CustomPresetTests(unittest.TestCase):
         data = json.loads(self.config.read_text())
         self.assertEqual(data["vpn"]["dns_transport"], "udp")
 
+    def test_school_warp_resolves_locally_and_default_restores_provider(self):
+        setup_tui.apply_preset_by_name(self.root, "school-warp")
+        data = json.loads(self.config.read_text())
+        self.assertEqual(data["vpn"]["dns_resolver"], "local")
+        setup_tui.apply_preset_by_name(self.root, "default")
+        data = json.loads(self.config.read_text())
+        self.assertEqual(data["vpn"]["dns_resolver"], "provider")
+
     def test_apply_preset_idempotent(self):
         setup_tui.apply_preset_by_name(self.root, "school-warp")
         result = setup_tui.apply_preset_by_name(self.root, "school-warp")
