@@ -199,6 +199,7 @@ class KeepaliveHarness:
         target.write_text(KEEPALIVE_SRC.read_text())
         target.chmod(0o755)
         self.log = self.root / "router.log"
+        self.stderr_log = self.root / "stderr.log"
         self.count = self.root / "count"
         self.sleep_log = self.root / "sleeps.log"
         self.egress_file = self.root / "egress.state"
@@ -243,14 +244,25 @@ class KeepaliveHarness:
         if fail_ensures:
             env["FAKE_ROUTER_FAIL_ENSURES"] = fail_ensures
         self.env = env
+        self.stderr_file = self.stderr_log.open("w")
         self.proc = subprocess.Popen([str(target)], env=env,
-                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, stderr=self.stderr_file,
                                      text=True, start_new_session=(os.name == "posix"))
 
     def lines(self) -> list[str]:
         if not self.log.is_file():
             return []
         return [line for line in self.log.read_text().splitlines() if line.strip()]
+
+    def wait_stderr_contains(self, text: str, timeout: float = 20.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if text in self.stderr_log.read_text():
+                return True
+            if self.proc.poll() is not None:
+                break
+            time.sleep(0.05)
+        return text in self.stderr_log.read_text()
 
     def set_egress(self, state: str) -> None:
         self.egress_file.write_text(state)
@@ -306,7 +318,7 @@ class KeepaliveHarness:
         else:
             self.proc.terminate()
         try:
-            self.out, self.err = self.proc.communicate(timeout=5)
+            self.out, _ = self.proc.communicate(timeout=5)
         except subprocess.TimeoutExpired:
             if os.name == "posix":
                 try:
@@ -317,8 +329,10 @@ class KeepaliveHarness:
                     self.proc.kill()
             else:
                 self.proc.kill()
-            self.out, self.err = self.proc.communicate()
-        for stream in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
+            self.out, _ = self.proc.communicate()
+        self.stderr_file.flush()
+        self.err = self.stderr_log.read_text()
+        for stream in (self.proc.stdin, self.proc.stdout, self.proc.stderr, self.stderr_file):
             if stream is not None and not stream.closed:
                 stream.close()
         if self.proc.returncode is None:
@@ -338,11 +352,13 @@ class KeepaliveHarnessCleanupTests(unittest.TestCase):
         pid = h.proc.pid
         stdout = h.proc.stdout
         stderr = h.proc.stderr
+        stderr_file = h.stderr_file
         h.close()
 
         self.assertIsNotNone(h.proc.returncode)
         self.assertTrue(stdout is None or stdout.closed)
         self.assertTrue(stderr is None or stderr.closed)
+        self.assertTrue(stderr_file.closed)
         self.assertFalse(get_session_registry().is_registered(pid))
 
     def test_close_is_idempotent(self):
@@ -636,11 +652,11 @@ class KeepaliveFallbackRestoreCadenceTests(unittest.TestCase):
             h.wait_lines(4)
             baseline = len(h.lines())
             h.park("proton")
-            deadline = time.time() + 20
-            while time.time() < deadline:
-                if any(line.startswith("failover proton off") for line in h.lines()[baseline:]):
-                    break
-                time.sleep(0.05)
+            expected = "'proton' primary is alive again; fallback cleared"
+            self.assertTrue(
+                h.wait_stderr_contains(expected, timeout=20.0),
+                f"restore outcome not observed before timeout: {h.stderr_log.read_text()!r}",
+            )
             tail = h.lines()[baseline:]
             h.close()
             self.assertTrue(
@@ -649,7 +665,7 @@ class KeepaliveFallbackRestoreCadenceTests(unittest.TestCase):
             )
             self.assertEqual([line for line in tail if line == "egress sweep --json"], [],
                              f"restore must not require a sweep: {tail}")
-            self.assertIn("'proton' primary is alive again; fallback cleared", h.err,
+            self.assertIn(expected, h.err,
                           f"restore message missing: {h.err!r}")
         finally:
             h.close()
