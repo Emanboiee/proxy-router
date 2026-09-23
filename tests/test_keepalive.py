@@ -77,6 +77,11 @@ case "$cmd" in
           ;;
       esac
     fi
+    if [ "$2" = "sweep" ] && [ -n "$FAKE_SWEEP_ROTATION_FILE" ] \
+       && [ -n "$FAKE_SWEEP_ROTATION_AT" ]; then
+      mkdir -p "$(dirname "$FAKE_SWEEP_ROTATION_FILE")"
+      printf '{"profile":"b","at":%s}\n' "$FAKE_SWEEP_ROTATION_AT" > "$FAKE_SWEEP_ROTATION_FILE"
+    fi
     # While a fallback marker exists the router reports `fallback` instead of
     # probing the primary, so the keepalive never sees a dead primary.
     if [ -n "${FAKE_ROUTER_FALLBACK_FILE:-}" ] && [ -f "$FAKE_ROUTER_FALLBACK_FILE" ]; then
@@ -156,7 +161,8 @@ class KeepaliveHarness:
                  probe_every="4", dead_strikes="2", storm_window="600",
                  max_rotations="2", restore_every="", fallback="", root=None,
                  pinned_python="",
-                 mode="proxy", network="connected", wake_gap="", clock=None):
+                 mode="proxy", network="connected", wake_gap="", clock=None,
+                 sweep_rotation_at=""):
         self._tmp = None
         if root is None:
             self._tmp = tempfile.TemporaryDirectory()
@@ -227,6 +233,9 @@ class KeepaliveHarness:
             env["PROXY_KEEPALIVE_WAKE_GAP"] = wake_gap
         if self.clock_file is not None:
             env["FAKE_DATE_FILE"] = str(self.clock_file)
+        if sweep_rotation_at:
+            env["FAKE_SWEEP_ROTATION_FILE"] = str(self.root / "state" / "proton.rotation")
+            env["FAKE_SWEEP_ROTATION_AT"] = str(sweep_rotation_at)
         if pinned_python:
             pinned_bin = self.root / "bin" / "pinned-python"
             env["PROXY_ROUTER_PYTHON"] = str(pinned_bin)
@@ -661,6 +670,27 @@ class KeepaliveFallbackRestoreCadenceTests(unittest.TestCase):
                              f"parked-lane gate leaked probes: {lines}")
         finally:
             h.close()
+
+    def test_restore_defers_when_sweep_records_rotation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            h = KeepaliveHarness(
+                interval="1", restore_every="1", egress="alive", fallback="proton",
+                root=root, clock=1_000_000, sweep_rotation_at=1_000_000,
+            )
+            try:
+                lines = h.wait_lines(12)
+                rotation = root / "state" / "proton.rotation"
+                self.assertIn("egress sweep --json", lines)
+                self.assertTrue(rotation.is_file(), "fake sweep did not record rotation")
+                self.assertEqual(json.loads(rotation.read_text())["at"], 1_000_000)
+                self.assertFalse(
+                    any(line.startswith("failover proton off") for line in lines),
+                    f"restore ran immediately after sweep rotation: {lines}",
+                )
+                self.assertTrue((root / "state" / "fallback" / "proton.json").is_file())
+            finally:
+                h.close()
 
     def test_restore_defers_inside_the_rotation_stagger_window(self):
         # Drive the clock instead of racing it: the record is pre-seeded, so

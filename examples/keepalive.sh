@@ -553,6 +553,18 @@ fallback_marker_exists() {
   return 1
 }
 
+# Latest persisted rotation timestamp, or zero when there is no record.
+newest_rotation_at() {
+  local newest=0 rotation_file rotated_at
+  for rotation_file in "$ROOT"/state/*.rotation; do
+    [ -f "$rotation_file" ] || continue
+    rotated_at=$(sed -n 's/.*"at": *\([0-9]*\).*/\1/p' "$rotation_file" 2>/dev/null || echo 0)
+    case "$rotated_at" in ''|*[!0-9]*) rotated_at=0 ;; esac
+    [ "$rotated_at" -gt "$newest" ] && newest="$rotated_at"
+  done
+  printf '%s\n' "$newest"
+}
+
 # One bounded restore attempt per fallback-parked provider: clear the marker,
 # probe the primary live through the tunnel, keep the fallback cleared when the
 # primary answers, re-activate it when the primary is still dead. Runs on its
@@ -742,13 +754,7 @@ while true; do
     # hop away). PROXY_KEEPALIVE_STAGGER seconds after the newest rotation
     # record, the sweep defers to the next tick.
     STAGGER="${PROXY_KEEPALIVE_STAGGER:-300}"
-    newest_rotation=0
-    for rotation_file in "$ROOT"/state/*.rotation; do
-      [ -f "$rotation_file" ] || continue
-      rotated_at=$(sed -n 's/.*"at": *\([0-9]*\).*/\1/p' "$rotation_file" 2>/dev/null || echo 0)
-      case "$rotated_at" in ''|*[!0-9]*) rotated_at=0 ;; esac
-      [ "$rotated_at" -gt "$newest_rotation" ] && newest_rotation="$rotated_at"
-    done
+    newest_rotation=$(newest_rotation_at)
     if is_tun_mode; then
       :
     elif [ "$newest_rotation" -gt 0 ] && [ $((sweep_now - newest_rotation)) -lt "$STAGGER" ]; then
@@ -767,6 +773,9 @@ while true; do
     # green while routed domains are dead. Only attempt work when a marker
     # exists, and honour the same rotation-stagger window as the sweep so a
     # fresh rotation is never chased by a restore.
+    # The full-pool sweep can switch profiles and record a rotation; refresh
+    # the marker timestamp before deciding whether fallback restore can run.
+    newest_rotation=$(newest_rotation_at)
     restore_now=$(date +%s)
     if is_tun_mode; then
       :
