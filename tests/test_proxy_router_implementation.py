@@ -162,6 +162,7 @@ def test_disconnect_restores_bypass_domains_after_config_reload(tmp_path, monkey
     state_file = tmp_path / "system-proxy.json"
     monkeypatch.setattr(router, "SYSTEM_PROXY_STATE_FILE", state_file)
     monkeypatch.setattr(router, "_proxy_bypass_domains", ["before.example"])
+    monkeypatch.setattr(router, "_port", 2080)
 
     assert router.system_proxy_on(runner=runner) == 0
     record = json.loads(state_file.read_text())
@@ -179,6 +180,7 @@ def test_disconnect_legacy_record_falls_back_to_current_bypass_domains(tmp_path,
     state_file = tmp_path / "system-proxy.json"
     monkeypatch.setattr(router, "SYSTEM_PROXY_STATE_FILE", state_file)
     monkeypatch.setattr(router, "_proxy_bypass_domains", ["legacy.example"])
+    monkeypatch.setattr(router, "_port", 2080)
 
     assert router.system_proxy_on(runner=runner) == 0
     record = json.loads(state_file.read_text())
