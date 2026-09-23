@@ -30,3 +30,9 @@ wgcf-account.toml.*
 wgcf-profile.conf
 .omo/
 examples/_tmp_pyinfo.py
+
+# Local build/test output, backups, and nested checkouts
+/dashboard-ui/
+/worktrees/
+/test-results/
+router.json.bak-*

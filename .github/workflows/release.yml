@@ -212,6 +212,59 @@ jobs:
             proxy-router-${{ github.ref_name }}-${{ matrix.suffix }}.${{ matrix.archive }}.sha256
           if-no-files-found: error
 
+  dashboard:
+    name: dashboard macOS app
+    runs-on: macos-15-arm64
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - name: Install dashboard dependencies
+        working-directory: dashboard
+        run: npm ci
+
+      - name: Install Playwright browser
+        working-directory: dashboard
+        run: npx playwright install chromium
+
+      - name: Run dashboard checks
+        working-directory: dashboard
+        run: |
+          npm run build
+          npm test
+          cargo test --locked --manifest-path src-tauri/Cargo.toml
+          npm run tauri -- build --bundles app
+
+      - name: Verify and archive app bundle
+        run: |
+          set -euo pipefail
+          app="dashboard/src-tauri/target/release/bundle/macos/Proxy Router.app"
+          executable="$app/Contents/MacOS/proxy-router-dashboard"
+          test -x "$executable"
+          file "$executable"
+          archive="proxy-router-dashboard-$GITHUB_REF_NAME-darwin-arm64.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$app" "$archive"
+          shasum -a 256 "$archive" > "$archive.sha256"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bundle-dashboard
+          path: |
+            proxy-router-dashboard-${{ github.ref_name }}-darwin-arm64.zip
+            proxy-router-dashboard-${{ github.ref_name }}-darwin-arm64.zip.sha256
+          if-no-files-found: error
+
   source:
     name: source
     runs-on: ubuntu-24.04
@@ -224,7 +277,7 @@ jobs:
           set -euo pipefail
           mkdir -p dist/proxy-router
           cp router.py setup_tui.py monitor.py route_watcher.py proxy_tray.py domain_autodetect.py egress.py state.py config_schema.py worker_lock.py providers_check.py net_safety.py README.md LICENSE .gitignore router.example.json pyproject.toml requirements-dev.txt dist/proxy-router/
-          cp -R tests examples guides rulesets install.sh install.ps1 .github dist/proxy-router/
+          cp -R tests examples guides rulesets install.sh install.ps1 .github dashboard dist/proxy-router/
           cp privileged_helper.py privileged_installer.py sing-box-release.json VERSION dist/proxy-router/
           tar -czf "proxy-router-${GITHUB_REF_NAME}-source.tar.gz" -C dist proxy-router
 
@@ -256,7 +309,7 @@ jobs:
 
   publish:
     name: publish release (gated)
-    needs: [build, source, test-gate]
+    needs: [build, dashboard, source, test-gate]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -275,10 +328,13 @@ jobs:
             proxy-router-${GITHUB_REF_NAME}-darwin-amd64.tar.gz \
             proxy-router-${GITHUB_REF_NAME}-linux-amd64.tar.gz \
             proxy-router-${GITHUB_REF_NAME}-windows-amd64.zip \
-            proxy-router-${GITHUB_REF_NAME}-source.tar.gz; do
+            proxy-router-${GITHUB_REF_NAME}-source.tar.gz \
+            proxy-router-dashboard-${GITHUB_REF_NAME}-darwin-arm64.zip \
+            proxy-router-dashboard-${GITHUB_REF_NAME}-darwin-arm64.zip.sha256; do
             [ -f "dist/$f" ] || { echo "missing artifact: $f" >&2; exit 1; }
           done
           count=$(find dist -name '*.tar.gz' -o -name '*.zip' | wc -l | tr -d ' ')
+          [ "$count" -eq 6 ] || { echo "expected 6 release archives, found $count" >&2; exit 1; }
           echo "artifact archives: $count"
       - uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
         with:
