@@ -20,7 +20,6 @@ seed or additional owned asset roots.
         "route_id": "school",
         "provider": "cloudflare",
         "roots": ["twitch.tv", "jtvnw.net", "ttvnw.net"],
-        "extra_roots": ["cdn.prod.example-cdn.com"],
         "ttl_seconds": 1800
       }
     }
@@ -38,11 +37,8 @@ rotation.
 
 The roots are both an allowlist and the route suffixes used while the source is
 configured. Use `extra_roots` for a cross-origin asset CDN that the application
-owns or requires; those suffixes are learned and routed through the same
-provider. Use the narrowest owned suffix possible: shared roots such as
-`cloudfront.net` or `website-files.com` can serve unrelated tenants and would
-route their traffic too. Set `auto_sources` to `false` to require explicit
-sources, and use `router.py status --json` to inspect generated sources, roots,
-and learned hosts. In `vpn-list` mode, enabled autodetection adds configured
-roots and learned hosts to the effective VPN allowlist so discovered assets do
-not silently fall back to a direct connection.
+owns or requires; those suffixes are learned and added to the same route. Shared
+roots such as `cloudfront.net` are not added automatically because they can serve
+unrelated sites. Set `auto_sources` to `false` to require explicit sources, and
+use `router.py status --json` to inspect generated sources, roots, and learned
+hosts.
