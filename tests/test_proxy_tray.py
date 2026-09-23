@@ -1,7 +1,9 @@
 """Unit tests for proxy_tray.py (stdlib only, no GUI deps — the
 module's pystray/PIL imports are guarded)."""
 import importlib.util
+import io
 import json
+import plistlib
 import signal
 import subprocess
 import sys
@@ -73,12 +75,15 @@ class MainInitializationTests(unittest.TestCase):
             def run(self):
                 return None
 
-        with mock.patch.object(tray, "RouterClient", return_value=client), \
-             mock.patch.object(tray, "TrayApp", FakeApp), \
-             mock.patch.object(tray, "make_icon", return_value=object()) as make_icon, \
-             mock.patch.object(tray, "pystray", object()), \
-             mock.patch.object(tray, "Image", object()), \
-             mock.patch.object(tray.sys, "argv", ["proxy_tray.py", "--root", "/tmp"]):
+        with (
+            mock.patch.object(tray, "RouterClient", return_value=client),
+            mock.patch.object(tray, "TrayApp", FakeApp),
+            mock.patch.object(tray, "make_icon", return_value=object()) as make_icon,
+            mock.patch.object(tray, "pystray", object()),
+            mock.patch.object(tray, "Image", object()),
+            mock.patch.object(tray, "_dashboard_bundle", return_value=None),
+            mock.patch.object(tray.sys, "argv", ["proxy_tray.py", "--root", "/tmp"]),
+        ):
             self.assertEqual(tray.main(), 0)
 
         self.assertIs(created["client"], client)
@@ -164,6 +169,28 @@ class RouterClientLifecycleDelegationTests(unittest.TestCase):
                 ("rotate", "proton"),
                 ("rotate", "proton", "--to", "06-SG-FREE-4", "--force"),
             ],
+        )
+
+    def test_rotation_gets_larger_budget_than_plain_commands(self):
+        with mock.patch.object(tray.subprocess, "run") as run:
+            run.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
+            self.client.rotate()
+            self.client.rotate_to("proton", "06-SG-FREE-4")
+            self.client.stop()
+        timeouts = [c.kwargs["timeout"] for c in run.call_args_list]
+        self.assertEqual(timeouts[0], tray.ROTATION_TIMEOUT)
+        self.assertEqual(timeouts[1], tray.ROTATION_TIMEOUT)
+        self.assertEqual(timeouts[2], tray.COMMAND_TIMEOUT)
+        self.assertGreater(tray.ROTATION_TIMEOUT, tray.COMMAND_TIMEOUT)
+
+    def test_rotation_budget_covers_worst_case_rotation_pipeline(self):
+        settle = 60
+        probe = 8
+        reload_budget = 12
+        self.assertGreaterEqual(
+            tray.ROTATION_TIMEOUT,
+            settle + probe + reload_budget + 5,
+            "budget must fit reload + probe + settle + rollback margin",
         )
 
 
@@ -327,6 +354,42 @@ class StatusMenuPresentationTests(unittest.TestCase):
         labels = [item.text for item in app.build_menu()]
         self.assertIn("▲ Degraded (system_proxy_mismatch)", labels)
         self.assertNotIn("● Connected", labels)
+
+    def test_fail_open_parked_lane_is_degraded(self):
+        app = tray.TrayApp(SimpleNamespace(root="/tmp"), None)
+        app.latest = tray.RouterStatus(
+            up=True, mode="proxy", port=2080,
+            degraded_lanes=["school (cloudflare down, failing open to direct)"])
+        labels = [item.text for item in app.build_menu()]
+        self.assertIn(
+            "▲ Degraded (school (cloudflare down, failing open to direct))", labels)
+        self.assertNotIn("● Connected", labels)
+
+    def test_degraded_lane_changes_render_signature_and_warns_icon(self):
+        app = tray.TrayApp(SimpleNamespace(root="/tmp"), None)
+        connected = tray.RouterStatus(up=True, mode="proxy", port=2080)
+        degraded = tray.RouterStatus(
+            up=True, mode="proxy", port=2080, degraded_lanes=["school: direct fallback"])
+
+        self.assertNotEqual(app._status_signature(connected),
+                            app._status_signature(degraded))
+        self.assertEqual(tray._status_icon_color(degraded), "#ff9800")
+
+    def test_mutation_drain_budget_includes_status_refresh(self):
+        self.assertGreaterEqual(
+            tray.MUTATION_DRAIN_TIMEOUT,
+            tray.ROTATION_TIMEOUT + tray.COMMAND_TIMEOUT + 5.0,
+        )
+
+    def test_degraded_lanes_survive_status_payload(self):
+        status = tray.RouterStatus.from_cli(0, json.dumps({
+            "up": True, "mode": "proxy", "port": 2080,
+            "degraded_lanes": ["school (cloudflare down, failing open to direct)"],
+        }))
+        self.assertEqual(
+            status.degraded_lanes,
+            ["school (cloudflare down, failing open to direct)"])
+        self.assertIn("degraded", status.headline())
 
     def test_dns_degradation_shows_recovery_path(self):
         app = tray.TrayApp(SimpleNamespace(root="/tmp"), None)
@@ -1194,7 +1257,7 @@ class PermissionErrorMappingTests(unittest.TestCase):
 
 
 class DashboardOpenerTests(unittest.TestCase):
-    """Tray one-click: open the full TUI in a terminal window."""
+    """Tray one-click prefers the Tauri dashboard over the legacy TUI."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -1204,17 +1267,54 @@ class DashboardOpenerTests(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
+    def test_prefers_tauri_dashboard_bundle(self):
+        app = self.root / "Proxy Router.app"
+        macos = app / "Contents" / "MacOS"
+        macos.mkdir(parents=True)
+        executable = "proxy-router-dashboard"
+        with (app / "Contents" / "Info.plist").open("wb") as handle:
+            plistlib.dump({"CFBundleExecutable": executable}, handle)
+        binary = macos / executable
+        binary.write_text("#!/bin/sh\\n")
+        binary.chmod(0o755)
+        calls = []
+
+        def fake_popen(argv, **kwargs):
+            calls.append(argv)
+            return mock.Mock()
+
+        with (
+            mock.patch.dict(
+                tray.os.environ, {"PROXY_ROUTER_DASHBOARD": str(app)}, clear=False
+            ),
+            mock.patch.object(tray.sys, "platform", "darwin"),
+            mock.patch.object(
+                tray, "_dashboard_bundle_candidates", return_value=[app]
+            ),
+            mock.patch.object(tray.subprocess, "Popen", side_effect=fake_popen),
+        ):
+            self.assertTrue(tray.open_dashboard(self.root))
+
+        self.assertEqual(calls[0][:2], ["open", "-a"])
+        self.assertEqual(calls[0][2], str(app))
+
     def test_missing_tui_fails_quietly(self):
         (self.root / "setup_tui.py").unlink()
-        self.assertFalse(tray.open_dashboard(self.root))
+        with mock.patch.object(tray, "_dashboard_bundle", return_value=None):
+            self.assertFalse(tray.open_dashboard(self.root))
 
     @unittest.skipUnless(sys.platform == "darwin", "macOS Terminal path")
     def test_macos_opens_terminal_with_tui(self):
         calls = []
+
         def fake_popen(argv, **kwargs):
             calls.append(argv)
             return mock.Mock()
-        with mock.patch.object(tray.subprocess, "Popen", side_effect=fake_popen):
+
+        with (
+            mock.patch.object(tray, "_dashboard_bundle", return_value=None),
+            mock.patch.object(tray.subprocess, "Popen", side_effect=fake_popen),
+        ):
             self.assertTrue(tray.open_dashboard(self.root))
         self.assertEqual(calls[0][0], "osascript")
         self.assertIn("setup_tui.py", " ".join(calls[0]))
@@ -1392,6 +1492,30 @@ class DashboardViewModelTests(unittest.TestCase):
         self.assertEqual(model.watcher_label, "Route watcher active")
         self.assertEqual(model.route_health, "Healthy")
 
+
+    def test_degraded_connected_model_warns_instead_of_showing_healthy(self):
+        status = tray.RouterStatus(
+            up=True,
+            mode="proxy",
+            providers={
+                "proton": {
+                    "active": "01-NL",
+                    "profiles": ["01-NL"],
+                    "egress": {"01-NL": {"ok": True, "latency_ms": 18}},
+                }
+            },
+            degraded_lanes=["proton"],
+        )
+
+        model = tray.DashboardViewModel.from_status(status)
+
+        self.assertEqual(model.title, "Degraded")
+        self.assertEqual(model.route_health, "Needs attention")
+        self.assertEqual(model.primary_action, "disconnect")
+        self.assertEqual(
+            tray._dashboard_indicator(status), ("▲", (242, 157, 76)))
+        self.assertIn("proton", model.explanation)
+
     def test_error_model_renders_actionable_error_without_crashing(self):
         model = tray.DashboardViewModel.from_status(
             tray.RouterStatus(error="status exit 7"))
@@ -1468,6 +1592,45 @@ class DashboardLifecycleTests(unittest.TestCase):
         self.assertIsNone(controller.window)
 
 
+class DashboardRenderTests(unittest.TestCase):
+    """The dashboard must survive a real AppKit repaint.
+
+    A Python exception raised inside drawRect: escapes the draw callback, so
+    AppKit terminates the whole process (SIGTRAP via +[NSApplication
+    _crashOnException:]). Observed live as the tray icon vanishing on click
+    because AppKit.NSRectFill_ is absent from current PyObjC builds.
+    """
+
+    def setUp(self):
+        if not tray._REAL_DARWIN_PYSTRAY:
+            self.skipTest("Cocoa/pystray unavailable")
+
+    def render(self, root):
+        bounds = root.bounds()
+        image = tray.AppKit.NSImage.alloc().initWithSize_(bounds.size)
+        image.lockFocus()
+        try:
+            if tray.AppKit.NSGraphicsContext.currentContext() is None:
+                self.skipTest("no graphics context (headless)")
+            root.drawRect_(bounds)
+        finally:
+            image.unlockFocus()
+
+    def test_window_draw_survives_repaint(self):
+        client = tray.RouterClient("/tmp")
+        app = tray.TrayApp(client, None)
+        try:
+            window = app.dashboard.window_factory(
+                client, app._dispatch_dashboard_action,
+                tray.RouterStatus(up=True, port=2080))
+        except Exception as exc:
+            self.skipTest(f"no window server: {exc}")
+
+        self.render(window.root)
+        self.render(window.root)
+
+
+
 class DashboardClickRoutingTests(unittest.TestCase):
     def test_left_click_opens_dashboard_and_right_click_opens_existing_menu(self):
         calls = []
@@ -1494,6 +1657,29 @@ class DashboardClickRoutingTests(unittest.TestCase):
         for expected in ("Open Dashboard (Terminal setup)", "Connect", "Disconnect",
                          "Routing mode", "Setup", "Presets", "Quit"):
             self.assertIn(expected, labels)
+
+    def test_primary_click_prefers_the_tauri_app(self):
+        opened = []
+        native = []
+        with mock.patch.object(tray, "_dashboard_bundle",
+                               return_value=Path("/tmp/Proxy Router.app")), \
+             mock.patch.object(tray, "_launch_dashboard_app",
+                               side_effect=lambda app: opened.append(app) or True):
+            app = tray.TrayApp(SimpleNamespace(root="/tmp"), None)
+            app.dashboard.show = lambda status: native.append(status) or True
+            self.assertTrue(app._open_primary_dashboard())
+
+        self.assertEqual([str(p) for p in opened], ["/tmp/Proxy Router.app"])
+        self.assertEqual(native, [])
+
+    def test_primary_click_falls_back_to_the_native_window(self):
+        native = []
+        with mock.patch.object(tray, "_dashboard_bundle", return_value=None):
+            app = tray.TrayApp(SimpleNamespace(root="/tmp"), None)
+            app.dashboard.show = lambda status: native.append(status) or True
+            self.assertTrue(app._open_primary_dashboard())
+
+        self.assertEqual(len(native), 1)
 
 
 class DarwinStatusButtonTests(unittest.TestCase):
@@ -1603,6 +1789,88 @@ class DashboardTrayIntegrationTests(unittest.TestCase):
         app.action_rotate.assert_called_once_with()
         app.action_mode.assert_called_once_with("safe-list")
         app.action_setup.assert_called_once_with()
+
+
+class TrayOwnershipTests(unittest.TestCase):
+    """Issue #144: exactly one proxy-router menu-bar item — the dashboard app."""
+
+    def _bundle(self, root: Path, name: str, *, executable=None, include_binary=True):
+        app = root / name
+        macos = app / "Contents" / "MacOS"
+        macos.mkdir(parents=True)
+        if executable is not None:
+            with (app / "Contents" / "Info.plist").open("wb") as handle:
+                plistlib.dump({"CFBundleExecutable": executable}, handle)
+            if include_binary:
+                binary = macos / executable
+                binary.write_text("#!/bin/sh\n")
+                binary.chmod(0o755)
+        return app
+
+    def test_empty_bundle_does_not_count_as_installed_dashboard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self._bundle(Path(directory), "Empty.app")
+            self.assertFalse(tray._is_complete_dashboard_bundle(app))
+
+    def test_bundle_requires_declared_executable_to_exist(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self._bundle(
+                Path(directory), "Incomplete.app",
+                executable="proxy-router-dashboard", include_binary=False,
+            )
+            self.assertFalse(tray._is_complete_dashboard_bundle(app))
+
+    def test_complete_bundle_owns_the_tray(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self._bundle(
+                Path(directory), "Proxy Router.app",
+                executable="proxy-router-dashboard",
+            )
+            self.assertTrue(tray._is_complete_dashboard_bundle(app))
+            with mock.patch.object(
+                tray, "_dashboard_bundle_candidates", return_value=[app]
+            ):
+                self.assertEqual(tray._dashboard_bundle(Path(directory)), app)
+
+    def test_installed_dashboard_forces_headless(self):
+        bundle = Path("/tmp/Proxy Router.app")
+        with mock.patch.object(tray, "_dashboard_bundle", return_value=bundle):
+            self.assertEqual(tray.tray_ownership("/tmp/root"), "headless")
+
+    def test_no_dashboard_bundle_keeps_the_legacy_icon(self):
+        with (
+            mock.patch.object(tray, "_dashboard_bundle", return_value=None),
+            mock.patch.dict(tray.os.environ, {"PROXY_ROUTER_TRAY_HEADLESS": ""}),
+        ):
+            self.assertEqual(tray.tray_ownership("/tmp/root"), "icon")
+
+    def test_explicit_opt_out_keeps_the_legacy_icon(self):
+        with (
+            mock.patch.object(
+                tray, "_dashboard_bundle", return_value=Path("/tmp/Proxy Router.app")
+            ),
+            mock.patch.dict(tray.os.environ, {"PROXY_ROUTER_TRAY_HEADLESS": "0"}),
+        ):
+            self.assertEqual(tray.tray_ownership("/tmp/root"), "icon")
+
+    def test_main_refuses_the_icon_when_the_dashboard_owns_the_menubar(self):
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                tray, "_dashboard_bundle", return_value=Path("/tmp/Proxy Router.app")
+            ),
+            mock.patch.object(tray, "RouterClient") as client,
+            mock.patch.object(tray, "TrayApp") as tray_app,
+            mock.patch.object(sys, "stderr", stderr),
+            mock.patch.object(
+                sys, "argv", ["proxy_tray.py", "--root", "/tmp/root"]
+            ),
+        ):
+            rc = tray.main()
+        self.assertEqual(rc, 0)
+        client.assert_not_called()
+        tray_app.assert_not_called()
+        self.assertIn("not starting a second status item", stderr.getvalue())
 
 
 if __name__ == "__main__":

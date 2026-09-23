@@ -139,6 +139,10 @@ _PRESET_ROUTES = {
             "discordapp.net",
             "discord.media",
             "twitch.tv",
+            "jtvnw.net",
+            "ttvnw.net",
+            "twitchsvc.net",
+            "ext-twitch.tv",
             "facebook.com",
             "fbcdn.net",
             "instagram.com",
@@ -156,6 +160,11 @@ _PRESET_ROUTES = {
         ],
         "provider": "cloudflare",
     },
+    "reddit": {
+        "id": "reddit",
+        "domains": ["reddit.com", "redd.it", "redditstatic.com", "redditmedia.com"],
+        "provider": "cloudflare",
+    },
 }
 
 # Built-in preset definitions: name -> {"routes": [..], "routing": {...}}.
@@ -164,23 +173,25 @@ _PRESET_ROUTES = {
 # add their own with `setup --preset-add NAME --provider P --domain ...`.
 _BUILTIN_PRESETS: dict = {
     "opencode": {
-        "routes": [_PRESET_ROUTES["opencode-zen"]],
+        "routes": [_PRESET_ROUTES["opencode-zen"], _PRESET_ROUTES["reddit"]],
         "routing": {"mode": "default"},
     },
     "roblox": {
-        "routes": [_PRESET_ROUTES["roblox"]],
+        "routes": [_PRESET_ROUTES["roblox"], _PRESET_ROUTES["reddit"]],
         "routing": {"mode": "default"},
     },
     "default": {  # the classic combo: opencode via proton + roblox via warp
-        "routes": [_PRESET_ROUTES["opencode-zen"], _PRESET_ROUTES["roblox"]],
+        "routes": [_PRESET_ROUTES["opencode-zen"], _PRESET_ROUTES["roblox"],
+                   _PRESET_ROUTES["reddit"]],
         "routing": {"mode": "default"},
         # Unfiltered home/default networks: plain UDP 53 DNS (fast path).
         "vpn": {"dns_transport": "udp"},
     },
     "school-warp": {
-        "routes": [_PRESET_ROUTES["school"]],
+        "routes": [_PRESET_ROUTES["school"], _PRESET_ROUTES["reddit"]],
         "routing": {"mode": "vpn-list",
-                    "vpn_domains": list(_PRESET_ROUTES["school"]["domains"])},
+                    "vpn_domains": list(_PRESET_ROUTES["school"]["domains"])
+                                  + list(_PRESET_ROUTES["reddit"]["domains"])},
         # Filtered school/captive networks drop UDP 53; tunnel DNS must ride
         # DoH there. Applying any other built-in preset restores UDP.
         "vpn": {"dns_transport": "https"},
@@ -605,6 +616,12 @@ def apply_presets(config_path, opencode=True, warp_roblox=True) -> dict:
         if not any(r.get("id") == "roblox" for r in routes):
             routes.append(dict(_PRESET_ROUTES["roblox"]))
             added.append("roblox")
+    providers.setdefault(
+        "cloudflare", {"directory": "providers/cloudflare", "cooldown_seconds": 60}
+    )
+    if not any(r.get("id") == "reddit" for r in routes):
+        routes.append(dict(_PRESET_ROUTES["reddit"]))
+        added.append("reddit")
     _atomic_write_config(config_path, data)
     return {"added": added}
 
@@ -814,6 +831,8 @@ def check(root) -> dict:
         data = json.loads(config_file.read_text())
     except (json.JSONDecodeError, OSError) as exc:
         return {"ok": False, "issues": [f"bad {config_file.name}: {exc}"]}
+    if not isinstance(data, dict):
+        return {"ok": False, "issues": [f"bad {config_file.name}: top level must be an object"]}
     providers = data.get("providers") or {}
     if not providers:
         return {"ok": False, "issues": ["no providers configured in router.json"]}

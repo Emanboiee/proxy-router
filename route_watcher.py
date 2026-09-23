@@ -26,6 +26,8 @@ import time
 from pathlib import Path
 from typing import Callable, Iterable
 
+import worker_lock
+
 ROOT = Path(os.environ.get("PROXY_ROUTER_ROOT") or Path(__file__).resolve().parent).resolve()
 LOG_FILE_NAME = "logs/sing-box.log"
 STATE_DIR_NAME = "state/route-watcher"
@@ -166,6 +168,8 @@ def critical_domains(root: Path) -> tuple[str, ...]:
     mode: str | None = None
     try:
         config = json.loads((Path(root) / "router.json").read_text())
+        if not isinstance(config, dict):
+            config = {}
         routing = config.get("routing") or {}
         mode = routing.get("mode") if isinstance(routing, dict) else None
         vpn_domains = routing.get("vpn_domains") or [] if isinstance(routing, dict) else []
@@ -203,7 +207,7 @@ def router_port(root: Path | None = None) -> int:
         port = int(json.loads((root / "router.json").read_text(encoding="utf-8")).get("port", 2080))
         if 1 <= port <= 65535:
             return port
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    except (OSError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
         pass
     return 2080
 
@@ -766,6 +770,14 @@ def status(root: Path | None = None) -> dict:
 
 def start(root: Path | None = None, *, interval: float = DEFAULT_INTERVAL) -> dict:
     root = Path(root) if root is not None else ROOT
+    try:
+        with worker_lock.exclusive(state_dir(root) / "start.lock"):
+            return _start_locked(root, interval)
+    except TimeoutError as exc:
+        return {"started": False, "error": str(exc)}
+
+
+def _start_locked(root: Path, interval: float) -> dict:
     current = status(root)
     if current["running"]:
         return {"started": False, "already_running": True, "pid": current["pid"]}

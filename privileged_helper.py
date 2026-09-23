@@ -19,6 +19,7 @@ import re
 import secrets
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -913,6 +914,62 @@ def _wait_started(pid: int, metadata: RuntimeMetadata) -> bool:
     return False
 
 
+def _inbound_listen_port(metadata: RuntimeMetadata) -> int | None:
+    """Proxy listener port of the checked runtime config, if any.
+
+    A tun-mode engine has no loopback listener; a proxy-mode engine's mixed
+    inbound is the only bounded proof that a SIGHUP actually applied, because
+    identity alone survives a reload that never took effect.
+    """
+    try:
+        config = _read_runtime_config(metadata)
+    except (SecurityError, ValidationError, OSError):
+        return None
+    for inbound in config.get("inbounds") or []:
+        if isinstance(inbound, dict) and inbound.get("type") == "mixed":
+            port = inbound.get("listen_port")
+            if isinstance(port, int) and 0 < port < 65536:
+                return port
+    return None
+
+
+def _probe_tcp_connect(port: int, *, timeout: float = 0.25) -> bool:
+    try:
+        with socket.socket() as probe:
+            probe.settimeout(timeout)
+            probe.connect(("127.0.0.1", port))
+            return True
+    except OSError:
+        return False
+
+
+def _wait_ready(
+    pid: int,
+    metadata: RuntimeMetadata,
+    *,
+    runner=subprocess.run,
+    probe=_probe_tcp_connect,
+    deadline_seconds: float = 12.0,
+) -> bool:
+    """Identity AND listener readiness after a SIGHUP (issue audit F10).
+
+    A surviving PID proves nothing (the reload may have failed silently), so a
+    proxy-mode engine must answer a TCP connect on its configured mixed
+    inbound before the reload is reported. Tun-mode engines have no listener;
+    identity is their gate. Callers may inject ``probe`` where sockets are
+    unavailable so the identity gate still decides.
+    """
+    deadline = time.monotonic() + deadline_seconds
+    port = _inbound_listen_port(metadata)
+    while time.monotonic() < deadline:
+        if not process_matches(pid, metadata, runner=runner):
+            return False
+        if port is None or probe(port):
+            return True
+        time.sleep(0.1)
+    return False
+
+
 def _stage_checked_config(install: InstallMetadata, runtime: RuntimeMetadata, checker) -> None:
     raw = read_user_config(install)
     try:
@@ -994,6 +1051,7 @@ def reload_engine(
     runner=subprocess.run,
     killer=os.kill,
     waiter=_wait_started,
+    readiness=None,
     starter=start_engine,
 ) -> dict:
     """Install checked config and SIGHUP only the exact trusted engine."""
@@ -1007,6 +1065,12 @@ def reload_engine(
     killer(pid, signal.SIGHUP)
     if not waiter(pid, runtime):
         raise SecurityError("installed engine did not recover after SIGHUP")
+    if readiness is None:
+        ready = _wait_ready(pid, runtime, runner=runner)
+    else:
+        ready = readiness(pid, runtime)
+    if not ready:
+        raise SecurityError("reloaded engine did not reach a ready state")
     return {"reloaded": True, "pid": pid}
 
 
