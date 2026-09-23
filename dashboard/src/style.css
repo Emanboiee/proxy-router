@@ -472,8 +472,8 @@ dialog#profile-dialog .form-actions {
   }
 }
 
-/* Provider health is reported by the controller; preview outage actions stay out of the client UI. */
-.provider-cards .provider-card .card-actions {
+/* Keep prototype outage controls out of the client UI; desktop provider CRUD stays visible. */
+.provider-cards .provider-card:not(.dashboard-provider) .card-actions {
   display: none;
 }
 

@@ -5831,12 +5831,54 @@ def main() -> int:
     profile_copy_parser.add_argument("--provider", required=True,
                                     help="configured destination provider (e.g. proton)")
 
+    dashboard = sub.add_parser("dashboard", help=argparse.SUPPRESS)
+    dashboard_sub = dashboard.add_subparsers(dest="dashboard_action", required=True)
+    dashboard_sub.add_parser("state", help=argparse.SUPPRESS)
+    for action in ("profile-save", "provider-save"):
+        command = dashboard_sub.add_parser(action, help=argparse.SUPPRESS)
+        command.add_argument("--json", required=True, help=argparse.SUPPRESS)
+        command.add_argument("--id", default=None, help=argparse.SUPPRESS)
+        if action == "provider-save":
+            command.add_argument("--path", default=None, help=argparse.SUPPRESS)
+    for action in ("profile-delete", "profile-apply", "provider-delete"):
+        command = dashboard_sub.add_parser(action, help=argparse.SUPPRESS)
+        command.add_argument("--id", required=True, help=argparse.SUPPRESS)
+
     elevate = sub.add_parser("elevate", help="one-time passwordless-sudo grant (install|uninstall|status)")
     elevate.add_argument("action", choices=["install", "uninstall", "status"])
 
     sub.add_parser("network-check", help="auto-switch routing preset for the current Wi-Fi network")
 
     args, passthrough = parser.parse_known_args()
+    if args.cmd == "dashboard":
+        import dashboard_profile_manager as dashboard_profiles
+
+        def run_dashboard_action() -> int:
+            try:
+                if args.dashboard_action == "state":
+                    value = dashboard_profiles.state(ROOT)
+                elif args.dashboard_action == "profile-save":
+                    value = dashboard_profiles.save_profile(
+                        ROOT, json.loads(args.json), args.id,
+                    )
+                elif args.dashboard_action == "profile-delete":
+                    value = dashboard_profiles.delete_profile(ROOT, args.id)
+                elif args.dashboard_action == "profile-apply":
+                    value = dashboard_profiles.apply_profile(ROOT, args.id)
+                elif args.dashboard_action == "provider-save":
+                    value = dashboard_profiles.save_provider(
+                        ROOT, json.loads(args.json), args.id, args.path,
+                    )
+                elif args.dashboard_action == "provider-delete":
+                    value = dashboard_profiles.delete_provider(ROOT, args.id)
+                else:
+                    return fail("unsupported dashboard operation")
+            except (dashboard_profiles.DashboardError, json.JSONDecodeError) as exc:
+                return fail(str(exc))
+            print(json.dumps(value, separators=(",", ":")))
+            return 0
+
+        return _with_lock(run_dashboard_action, timeout=5.0)
     if args.cmd == "elevate":
         return cmd_elevate(args.action)
     if args.cmd == "network-check":
