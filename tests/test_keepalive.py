@@ -60,7 +60,15 @@ case "$cmd" in
         printf '%s\n' '{"connected": false, "ssid": null}'
         exit 1
       fi
-      printf '{"connected": true, "ssid": "%s"}\n' "$ssid"
+      case "$ssid" in
+        *[!a-zA-Z0-9._-]*)
+          ssid_json=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$ssid")
+          ;;
+        *)
+          ssid_json="\"$ssid\""
+          ;;
+      esac
+      printf '{"connected": true, "ssid": %s}\n' "$ssid_json"
       exit 0
     fi
     [ "$state" = "disconnected" ] && exit 1
@@ -787,7 +795,8 @@ class KeepaliveNetworkGuardTests(unittest.TestCase):
             h.close()
 
     def test_wake_gap_on_unchanged_network_skips_teardown(self):
-        h = KeepaliveHarness(interval="1", probe_every="99", wake_gap="5", clock=1000)
+        ssid = 'office "guest" \\ café (5GHz)'
+        h = KeepaliveHarness(interval="1", probe_every="99", wake_gap="5", clock=1000, ssid=ssid)
         try:
             baseline = _wait_two_ticks(h)
             _trigger_wake(h)
