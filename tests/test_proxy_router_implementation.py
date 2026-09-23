@@ -159,6 +159,8 @@ def test_connect_records_ownership_and_disconnect_uses_recorded_port(tmp_path, m
 
 def test_disconnect_restores_bypass_domains_after_config_reload(tmp_path, monkeypatch):
     runner = ProxyRunner()
+    original_domains = ["operator.example", "*.corp"]
+    runner.bypass_domains = original_domains.copy()
     state_file = tmp_path / "system-proxy.json"
     monkeypatch.setattr(router, "SYSTEM_PROXY_STATE_FILE", state_file)
     monkeypatch.setattr(router, "_proxy_bypass_domains", ["before.example"])
@@ -172,7 +174,7 @@ def test_disconnect_restores_bypass_domains_after_config_reload(tmp_path, monkey
 
     monkeypatch.setattr(router, "_proxy_bypass_domains", ["after.example"])
     assert router.system_proxy_off(runner=runner) == 0
-    assert runner.bypass_domains == []
+    assert runner.bypass_domains == original_domains
 
 
 def test_disconnect_legacy_record_falls_back_to_current_bypass_domains(tmp_path, monkeypatch):
