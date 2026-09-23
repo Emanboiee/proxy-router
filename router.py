@@ -865,6 +865,9 @@ def write_default_config(force: bool = False) -> int:
                 "storm_window": 600,
                 "max_rotations": 2,
                 "sweep_every": 1800,
+                # Parked-lane restore clock, independent of sweep_every: a
+                # fail-open park must not wait hours for the full sweep (#139).
+                "fallback_restore_every": 300,
             },
             "error_policy": {
                 "default": {"action": "cooldown", "seconds": 300},
