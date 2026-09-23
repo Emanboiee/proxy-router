@@ -552,6 +552,26 @@ python3 proxy_tray.py --selftest   # no GUI needed: validates CLI contract + dis
 python3 proxy_tray.py              # run it in the foreground
 ```
 
+### Native dashboard app (macOS)
+
+The macOS app is published as
+`proxy-router-dashboard-<version>-darwin-arm64.zip` with the CLI release.
+Extract it into `~/Applications`, then use **Open Dashboard** in the tray.
+Install the Python router with the CLI installer first.
+
+To build and test from a clean checkout on macOS:
+
+```sh
+cd dashboard
+npm ci
+npm test
+npm run tauri -- build --bundles app
+```
+
+The source archive includes the dashboard source, locked npm and Rust
+dependencies, and required assets. CI runs the frontend build, Playwright and
+Rust tests, then verifies the packaged app executable.
+
 macOS login autostart (launchd agent):
 
 ```sh
