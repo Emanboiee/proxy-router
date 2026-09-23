@@ -10,7 +10,8 @@ cooldowns, and keepalive semantics stay exactly where they are.
 Design rules:
 - Reads: `router.py status --json` polled in a background thread (2.5s).
 - Actions: `ensure` / `stop` / `routing set --mode` / `rotate` via the CLI.
-- macOS: runs as an accessory (menu-bar only, no Dock icon).
+- macOS: runs as an accessory (menu-bar only, no Dock icon); left-click opens
+  a custom dark Cocoa dashboard and right-click opens the existing action menu.
 - Windows: pystray falls back to the taskbar notification area automatically.
 
 Usage:
@@ -25,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import plistlib
 import re
 import shlex
 import shutil
@@ -42,11 +44,42 @@ except ImportError:  # --selftest and --help must work without the GUI stack
     pystray = None
     Image = ImageDraw = None
 
+# AppKit is already pulled in by pystray's Darwin backend. Keep the import
+# separate and optional so status/selftest still work on Linux, Windows, and
+# headless build machines. The dashboard never becomes a hard dependency of
+# the router CLI.
+try:
+    if sys.platform == "darwin":
+        import AppKit
+        import Foundation
+        import objc
+        _COCOA_AVAILABLE = True
+    else:
+        AppKit = Foundation = objc = None
+        _COCOA_AVAILABLE = False
+except Exception:  # pragma: no cover - depends on the host Python
+    AppKit = Foundation = objc = None
+    _COCOA_AVAILABLE = False
+
+_REAL_DARWIN_PYSTRAY = bool(
+    _COCOA_AVAILABLE
+    and pystray is not None
+    and callable(getattr(getattr(pystray, "Icon", None), "_create_menu", None))
+)
+
 POLL_SECONDS = 5.0  # live-enough menu state without spawning 24 CLI procs/min
 COMMAND_TIMEOUT = 20
+# Rotation legitimately runs long: SIGHUP reload (tun readiness budget 12s)
+# plus the post-switch egress probe (8s) plus a 60s probe settle window plus
+# possible rollback. A 20s kill murders a healthy rotation after it has
+# already mutated engine/markers, reporting a failed action with real work
+# half-applied (audit F13).
+ROTATION_TIMEOUT = 100
+DASHBOARD_WIDTH = 1120
+DASHBOARD_HEIGHT = 720
 # Quit waits at most this long for an in-flight mutation to finish before
 # stopping the engine anyway — a hung mutation must not make Quit unkillable.
-MUTATION_DRAIN_TIMEOUT = COMMAND_TIMEOUT + 5.0
+MUTATION_DRAIN_TIMEOUT = ROTATION_TIMEOUT + COMMAND_TIMEOUT + 5.0
 
 # Friendly, non-jargon labels for tray menu entries. The router CLI words
 # (safe-list / vpn-list / rotate / exit) stay in the terminal; the tray
@@ -195,7 +228,11 @@ class RouterStatus:
     active_providers: dict = field(default_factory=dict)
     providers: dict = field(default_factory=dict)  # name -> {active, profiles, egress}
     routing_mode: str = "default"
+    default_provider: str | None = None
     preset: str | None = None
+    system_proxy_status: str = "ok"
+    network_status: str = "unknown"
+    degraded_lanes: list = field(default_factory=list)
     error: str | None = None
 
     @classmethod
@@ -209,8 +246,15 @@ class RouterStatus:
         try:
             payload = stdout[stdout.find("{"):] if "{" in stdout else stdout
             d = json.JSONDecoder().raw_decode(payload)[0]
-        except (json.JSONDecodeError, ValueError) as e:
+            if not isinstance(d, dict):
+                raise ValueError("status payload is not an object")
+        except (json.JSONDecodeError, ValueError, TypeError) as e:
             return cls(error=f"status exit {rc}" if rc else f"bad json: {e}")
+        state = str(d.get("state") or "")
+        diagnostic = stdout.lower()
+        if ("unusable config" in state.lower()
+                and "missing router.json" not in diagnostic):
+            return cls(error="unusable router configuration")
         providers = {}
         provider_map = {}
         for name, info in (d.get("providers") or {}).items():
@@ -237,7 +281,17 @@ class RouterStatus:
                 "egress": egress,
             }
         routing = d.get("routing") or {}
+        if not isinstance(routing, dict):
+            routing = {}
         watcher = d.get("watcher") or {}
+        if not isinstance(watcher, dict):
+            watcher = {}
+        system_proxy = d.get("system_proxy") or {}
+        if not isinstance(system_proxy, dict):
+            system_proxy = {}
+        network = d.get("network") or {}
+        if not isinstance(network, dict):
+            network = {}
         return cls(
             up=bool(d.get("up")),
             mode=str(d.get("mode") or "unknown"),
@@ -247,7 +301,13 @@ class RouterStatus:
             active_providers=providers,
             providers=provider_map,
             routing_mode=str(routing.get("mode") or "default"),
+            default_provider=routing.get("default_provider") or None,
             preset=d.get("preset") or None,
+            system_proxy_status=str(system_proxy.get("status") or (
+                "unknown" if d.get("up") and d.get("mode") == "proxy" else "skipped")),
+            network_status=str(network.get("status") or "unknown"),
+            degraded_lanes=[str(lane) for lane in (d.get("degraded_lanes") or [])
+                            if isinstance(lane, str) and lane],
         )
 
     def provider_label(self, name: str) -> str:
@@ -311,15 +371,283 @@ class RouterStatus:
             return " · ok"
         return ""
 
+    def engine_label(self) -> str:
+        """Describe the current engine mode without implying provider choice."""
+        if self.mode == "tun":
+            return "router: TUN"
+        if self.mode == "proxy":
+            port = f" :{self.port}" if self.port else ""
+            return f"router: proxy{port}"
+        return f"router: {self.mode}"
+
     def headline(self) -> str:
         if self.error:
             return f"proxy-router: error ({self.error})"
-        state = "connected" if self.up else "disconnected"
-        detail = self.mode
-        if self.up and self.port:
-            detail = f"proxy :{self.port}"
+        degraded = self.up and self.mode == "proxy" and (
+            self.system_proxy_status not in {"ok", "skipped"}
+            or self.network_status not in {"ok", "unknown", "skipped"}
+            or bool(self.degraded_lanes))
+        state = "degraded" if degraded else ("connected" if self.up else "disconnected")
+        detail = self.engine_label().removeprefix("router: ") if self.up else self.mode
+        if degraded:
+            reason = (", ".join(self.degraded_lanes) if self.degraded_lanes
+                      else (self.system_proxy_status
+                            if self.system_proxy_status not in {"ok", "skipped"}
+                            else self.network_status))
+            detail += f" · {reason}"
         watcher = "watcher on" if self.watcher else "watcher off"
         return f"proxy {state} · {detail} · {watcher}"
+
+
+_DASHBOARD_MODES = (
+    ("safe-list", "Home"),
+    ("vpn-list", "School"),
+    ("default", "Default"),
+)
+_DASHBOARD_MODE_LABELS = dict(_DASHBOARD_MODES)
+
+
+def _dashboard_indicator(status: RouterStatus) -> tuple[str, tuple[int, int, int]]:
+    """Return a truthful symbol and color for the native dashboard state."""
+    if status.error:
+        return "!", (242, 157, 76)
+    if status.up and status.degraded_lanes:
+        return "▲", (242, 157, 76)
+    if status.up:
+        return "●", (77, 205, 139)
+    return "○", (134, 147, 166)
+
+
+@dataclass(frozen=True)
+class DashboardViewModel:
+    """Small, UI-safe projection of router status for the native window."""
+
+    title: str
+    explanation: str
+    primary_label: str
+    primary_action: str
+    mode: str
+    mode_label: str
+    provider_rows: tuple[str, ...]
+    provider_summary: str
+    route_health: str
+    port_label: str
+    watcher_label: str
+    error: str | None = None
+
+    @classmethod
+    def from_status(cls, status: RouterStatus) -> "DashboardViewModel":
+        providers = status.providers or {}
+        mode = status.routing_mode if status.routing_mode in _DASHBOARD_MODE_LABELS else "default"
+        mode_label = _DASHBOARD_MODE_LABELS[mode]
+        if status.error:
+            title = "Router unavailable"
+            explanation = "The dashboard could not read proxy-router status. Try Connect again or open Setup."
+        elif status.up and status.degraded_lanes:
+            title = "Degraded"
+            explanation = f"Some routed connections need attention: {', '.join(status.degraded_lanes)}."
+        elif not providers:
+            title = "No VPN profile yet"
+            explanation = "Add a provider profile from Setup, then Connect to start routing traffic."
+        elif status.up:
+            title = "Connected"
+            explanation = "Your selected routes are using the proxy-router engine."
+        else:
+            title = "Disconnected"
+            explanation = "Your VPN profiles are ready. Connect when you want routed traffic."
+
+        if status.up:
+            primary_label = "Disconnect"
+            primary_action = "disconnect"
+        elif providers:
+            primary_label = "Connect"
+            primary_action = "connect"
+        else:
+            primary_label = "Open Setup"
+            primary_action = "setup"
+
+        rows = []
+        for name in sorted(providers):
+            info = providers.get(name) or {}
+            active = info.get("active")
+            if active:
+                try:
+                    health = status.profile_health(name, active)
+                except Exception:
+                    health = ""
+                suffix = health.strip() if isinstance(health, str) and health else "ready"
+                rows.append(f"{name.title()}   {active}   {suffix}")
+            else:
+                rows.append(f"{name.title()}   no active server")
+        if not rows:
+            rows.append("No providers configured")
+
+        provider_summary = ", ".join(name.title() for name in sorted(providers))
+        if not provider_summary:
+            provider_summary = "No provider"
+        if status.error:
+            route_health = "Unavailable"
+        elif status.up and status.degraded_lanes:
+            route_health = "Needs attention"
+        elif not providers:
+            route_health = "Not configured"
+        else:
+            records = [
+                ((info.get("egress") or {}).get(info.get("active")) or {})
+                for info in (providers.get(name) or {}
+                             for name in providers)
+                if info.get("active")
+            ]
+            if any(record.get("upstream_error") or record.get("blocked")
+                   or record.get("exhausted") for record in records):
+                route_health = "Needs attention"
+            elif any(record.get("ok") for record in records):
+                route_health = "Healthy"
+            else:
+                route_health = "Waiting"
+        port_label = f"Proxy :{status.port}" if status.up and status.port else "Not running"
+        watcher_label = "Route watcher active" if status.watcher else "Route watcher idle"
+
+        return cls(
+            title=title,
+            explanation=explanation,
+            primary_label=primary_label,
+            primary_action=primary_action,
+            mode=mode,
+            mode_label=mode_label,
+            provider_rows=tuple(rows),
+            provider_summary=provider_summary,
+            route_health=route_health,
+            port_label=port_label,
+            watcher_label=watcher_label,
+            error=status.error,
+        )
+
+
+class DashboardController:
+    """Thread-safe lifecycle/data bridge for the optional dashboard window.
+
+    The controller owns no router behavior. It only stores the latest status,
+    creates/focuses one window, and forwards button intent to TrayApp's
+    existing action methods. A factory keeps this path testable without a
+    Cocoa session and makes missing AppKit fail closed.
+    """
+
+    def __init__(self, client, action_handler, window_factory=None,
+                 initial_status=None):
+        self.client = client
+        self.action_handler = action_handler
+        self.window_factory = window_factory or _make_macos_dashboard_window
+        self._window = None
+        self._window_create_lock = threading.Lock()
+        self._status = initial_status if initial_status is not None else RouterStatus()
+        self._last_action: str | None = None
+        self._lock = threading.RLock()
+
+    @property
+    def window(self):
+        with self._lock:
+            return self._window
+
+    @property
+    def latest_model(self) -> DashboardViewModel:
+        with self._lock:
+            return DashboardViewModel.from_status(self._status)
+
+    def show(self, status: RouterStatus) -> bool:
+        with self._lock:
+            self._status = status
+            window = self._window
+        if window is None:
+            with self._window_create_lock:
+                with self._lock:
+                    window = self._window
+                if window is None:
+                    try:
+                        created = self.window_factory(
+                            self.client, self.action_handler, status)
+                    except Exception as exc:
+                        print(f"dashboard: unavailable: {exc}", file=sys.stderr)
+                        return False
+                    if created is None:
+                        return False
+                    with self._lock:
+                        self._window = window = created
+        with self._lock:
+            display_status = self._status
+            last_action = self._last_action
+        try:
+            window.update_status(display_status)
+            if last_action is not None:
+                window.update_action(last_action)
+            window.show()
+        except Exception as exc:
+            print(f"dashboard: could not show window: {exc}", file=sys.stderr)
+            try:
+                window.close()
+            except Exception as close_exc:
+                print(f"dashboard: failed to close broken window: {close_exc}",
+                      file=sys.stderr)
+            with self._lock:
+                if self._window is window:
+                    self._window = None
+            return False
+        return True
+
+    def update(self, status: RouterStatus) -> None:
+        with self._lock:
+            self._status = status
+            window = self._window
+        if window is not None:
+            try:
+                window.update_status(status)
+            except Exception as exc:
+                print(f"dashboard: status update skipped: {exc}", file=sys.stderr)
+
+    def update_action(self, result: str | None) -> None:
+        with self._lock:
+            self._last_action = result
+            window = self._window
+        if window is not None:
+            try:
+                window.update_action(result)
+            except Exception as exc:
+                print(f"dashboard: action update skipped: {exc}", file=sys.stderr)
+
+    def close(self) -> None:
+        with self._window_create_lock:
+            with self._lock:
+                window = self._window
+        if window is not None:
+            try:
+                window.close()
+            except Exception as exc:
+                print(f"dashboard: close skipped: {exc}", file=sys.stderr)
+
+
+def _route_macos_click(kind: str, open_dashboard: Callable,
+                       open_menu: Callable, event=None):
+    """Route status-item clicks without changing pystray's menu descriptors.
+
+    pystray's Darwin backend assigns the status button to ``activate:`` and
+    calls the icon, which normally opens its menu for every click. The custom
+    macOS icon detaches that menu so left-click can open the dashboard while
+    right-click explicitly pops the same generated menu. Unknown events pass
+    through untouched.
+    """
+    if kind == "left":
+        try:
+            open_dashboard()
+        except Exception as exc:
+            print(f"dashboard: click failed: {exc}", file=sys.stderr)
+        return None
+    if kind == "right":
+        try:
+            open_menu()
+        except Exception as exc:
+            print(f"dashboard: menu click failed: {exc}", file=sys.stderr)
+        return None
+    return event
 
 
 def _launch_terminal(root, script_args: list[str]) -> bool:
@@ -375,32 +703,118 @@ def _launch_terminal(root, script_args: list[str]) -> bool:
     return False
 
 
-def open_dashboard(root) -> bool:
-    """Open a built web dashboard, or the dashboard TUI (tray one-click).
+def _dashboard_bundle_candidates(root: Path) -> list[Path]:
+    """Find dashboard bundle locations without assuming a developer path."""
+    override = os.environ.get("PROXY_ROUTER_DASHBOARD")
+    candidates: list[Path] = []
+    if override:
+        candidates.append(Path(override).expanduser())
 
-    The tray menu is compact by design; the dashboard is where profiles,
-    exits, fallbacks, routing, and presets get managed. macOS: Terminal runs
-    setup_tui.py in the router root. Elsewhere: the first common terminal
-    emulator that exists wins. Never raises — the tray must survive a
-    broken dashboard or terminal setup."""
+    layouts = (
+        root / "dashboard" / "src-tauri",
+        root.parent / "proxy-router-ui" / "dashboard" / "src-tauri",
+        Path(__file__).resolve().parent / "dashboard" / "src-tauri",
+        Path.home() / "Applications",
+        Path("/Applications"),
+    )
+    for base in layouts:
+        if base.name == "Applications":
+            candidates.append(base / "Proxy Router.app")
+            continue
+        for profile in ("release", "debug"):
+            candidates.append(
+                base / "target" / profile / "bundle" / "macos" / "Proxy Router.app"
+            )
+    return candidates
+
+
+def _is_complete_dashboard_bundle(app: Path) -> bool:
+    """Require the bundle metadata and executable before suppressing the tray."""
+    app = Path(app)
+    if not app.is_dir():
+        return False
+    contents = app / "Contents"
+    try:
+        with (contents / "Info.plist").open("rb") as handle:
+            metadata = plistlib.load(handle)
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return False
+    if not isinstance(metadata, dict):
+        return False
+    executable = metadata.get("CFBundleExecutable")
+    if not isinstance(executable, str) or not executable:
+        return False
+    if Path(executable).name != executable:
+        return False
+    binary = contents / "MacOS" / executable
+    try:
+        return binary.is_file() and bool(binary.stat().st_mode & 0o111)
+    except OSError:
+        return False
+
+
+def _dashboard_bundle(root: Path) -> Path | None:
+    """Find a complete built Tauri dashboard bundle."""
+    for app in _dashboard_bundle_candidates(root):
+        if _is_complete_dashboard_bundle(app):
+            return app
+    return None
+
+
+def _launch_dashboard_app(app: Path) -> bool:
+    """Open the Tauri dashboard asynchronously and never block the tray."""
+    try:
+        if sys.platform == "darwin":
+            subprocess.Popen(
+                ["open", "-a", str(app)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        else:
+            subprocess.Popen(
+                [str(app)],
+                cwd=str(app.parent),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        return True
+    except OSError as exc:
+        print(f"dashboard: could not open {app}: {exc}", file=sys.stderr)
+        return False
+
+
+def tray_ownership(root) -> str:
+    """Which side owns the single menu-bar item: ``"headless"`` or ``"icon"``.
+
+    The dashboard app registers its own status item (issue #144), so this agent
+    must never paint a second one while that app is installed. An explicit
+    ``PROXY_ROUTER_TRAY_HEADLESS=0`` opts back into the legacy icon for local
+    debugging.
+    """
+    if os.environ.get("PROXY_ROUTER_TRAY_HEADLESS", "").strip() == "0":
+        return "icon"
+    return "headless" if _dashboard_bundle(Path(root)) is not None else "icon"
+
+
+def open_dashboard(root) -> bool:
+    """Open the Tauri dashboard from the tray, with a TUI fallback."""
     root = Path(root)
-    # The native dashboard is optional: installations without a build retain
-    # the existing terminal dashboard and its established behavior.
+    app = _dashboard_bundle(root)
+    if app is not None:
+        return _launch_dashboard_app(app)
+    # Keep supporting direct release binaries on platforms that do not bundle
+    # the app as a macOS .app directory.
     binary = root / "dashboard" / "src-tauri" / "target" / "release" / (
         "proxy-router-dashboard.exe" if sys.platform == "win32"
         else "proxy-router-dashboard"
     )
-    if sys.platform == "darwin":
-        bundled = binary.parent / "bundle" / "macos" / "Proxy Router.app" / "Contents" / "MacOS" / binary.name
-        if bundled.is_file():
-            binary = bundled
     if binary.is_file():
         try:
             subprocess.Popen([str(binary)], cwd=str(root),
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return True
         except OSError:
-            pass  # A broken shell must not break the terminal dashboard.
+            pass
     if not (root / "setup_tui.py").is_file():
         print(f"dashboard: missing {root / 'setup_tui.py'}", file=sys.stderr)
         return False
@@ -416,13 +830,13 @@ class RouterClient:
         self.router = os.path.join(root, "router.py")
         self._active_provider: str | None = None
 
-    def _run(self, *args: str) -> tuple[int, str]:
+    def _run(self, *args: str, timeout: float = COMMAND_TIMEOUT) -> tuple[int, str]:
         cmd = [self.python, self.router, *args]
         env = dict(os.environ)
         try:
             p = subprocess.run(
                 cmd, capture_output=True, text=True,
-                timeout=COMMAND_TIMEOUT, env=env, cwd=self.root,
+                timeout=timeout, env=env, cwd=self.root,
             )
             out = (p.stdout or "") + ("\n" + p.stderr if p.stderr else "")
             return p.returncode, out.strip()
@@ -434,9 +848,11 @@ class RouterClient:
     def status(self) -> RouterStatus:
         rc, out = self._run("status", "--json")
         st = RouterStatus.from_cli(rc, out)
-        if st.active_providers:
-            # remember the carrying provider for bare "Rotate exit"
-            self._active_provider = next(iter(st.active_providers))
+        # The cache mirrors the latest valid payload, including an empty
+        # provider set. Keeping an old provider after disconnect/error can make
+        # the generic Switch server action target an unrelated lane.
+        if not st.error:
+            self._active_provider = next(iter(st.active_providers), None)
         return st
 
     def ensure(self) -> tuple[int, str]:
@@ -514,7 +930,9 @@ class RouterClient:
         return self._run("stop")
 
     def rotate(self) -> tuple[int, str]:
-        return self._run("rotate", self._active_provider)
+        if not self._active_provider:
+            return 1, "no active provider"
+        return self._run("rotate", self._active_provider, timeout=ROTATION_TIMEOUT)
 
     def rotate_to(self, provider: str, profile: str, force: bool = False) -> tuple[int, str]:
         cmd = ["rotate", provider, "--to", profile]
@@ -522,7 +940,7 @@ class RouterClient:
             # Explicit pick of an offline/SSL exit: try it anyway, ignoring
             # the cooldown its failed probe left behind.
             cmd.append("--force")
-        return self._run(*cmd)
+        return self._run(*cmd, timeout=ROTATION_TIMEOUT)
 
     def set_mode(self, mode: str, default_provider: str | None = None) -> tuple[int, str]:
         cmd = ["routing", "set", "--mode", mode]
@@ -575,6 +993,17 @@ class RouterClient:
         return self._run(*args)
 
 
+def _status_icon_color(st: RouterStatus, action_result: str | None = None) -> str:
+    """Choose green/red/orange from current state plus the latest action."""
+    action_failed = bool(action_result and ": failed" in action_result.lower())
+    if action_failed or st.error or (st.up and (
+            st.degraded_lanes or (st.mode == "proxy" and (
+                st.system_proxy_status not in {"ok", "skipped"}
+                or st.network_status not in {"ok", "unknown", "skipped"})))):
+        return "#ff9800"
+    return "#4caf50" if st.up else "#e53935"
+
+
 def make_icon(color: str, size: int = 64) -> "Image.Image":
     """Small filled-circle status icon (green=up, red=down, orange=warn)."""
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
@@ -587,17 +1016,615 @@ def make_icon(color: str, size: int = 64) -> "Image.Image":
     return img
 
 
+
+
+
+if _REAL_DARWIN_PYSTRAY:
+    def _dashboard_color(red: int, green: int, blue: int, alpha: float = 1.0):
+        return AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(
+            red / 255.0, green / 255.0, blue / 255.0, alpha)
+
+
+    def _dashboard_font(size: float, weight=None):
+        if weight is not None:
+            return AppKit.NSFont.systemFontOfSize_weight_(size, weight)
+        return AppKit.NSFont.systemFontOfSize_(size)
+
+
+    def _dashboard_label(text: str, size: float, color, *, bold=False,
+                         align=None, wrap=False):
+        label = AppKit.NSTextField.labelWithString_(text)
+        label.setFont_(_dashboard_font(
+            size, AppKit.NSFontWeightSemibold if bold else None))
+        label.setTextColor_(color)
+        label.setSelectable_(False)
+        label.setEditable_(False)
+        label.setBezeled_(False)
+        label.setDrawsBackground_(False)
+        label.setLineBreakMode_(
+            AppKit.NSLineBreakByWordWrapping
+            if wrap else AppKit.NSLineBreakByTruncatingTail)
+        if wrap:
+            label.setMaximumNumberOfLines_(2)
+        if align is not None:
+            label.setAlignment_(align)
+        return label
+
+
+    def _dashboard_button(title: str, target, action: str, *, primary=False):
+        button = AppKit.NSButton.alloc().initWithFrame_(AppKit.NSZeroRect)
+        button.setTitle_(title)
+        button.setTarget_(target)
+        button.setAction_(action)
+        button.setBezelStyle_(AppKit.NSBezelStyleRounded)
+        button.setBordered_(True)
+        button.setFont_(_dashboard_font(
+            14, AppKit.NSFontWeightSemibold if primary else AppKit.NSFontWeightMedium))
+        button.setContentTintColor_(_dashboard_color(248, 250, 252))
+        if primary:
+            button.setBezelColor_(_dashboard_color(43, 116, 238))
+        else:
+            button.setBezelColor_(_dashboard_color(42, 48, 60))
+        return button
+
+
+    class _DashboardRootView(AppKit.NSView):
+        def initWithController_(self, controller):
+            self = objc.super(_DashboardRootView, self).initWithFrame_(
+                AppKit.NSMakeRect(0, 0, DASHBOARD_WIDTH, DASHBOARD_HEIGHT))
+            if self:
+                self.controller = controller
+                self.setPostsFrameChangedNotifications_(True)
+            return self
+
+        def isFlipped(self):
+            return True
+
+        def drawRect_(self, rect):
+            width = self.bounds().size.width
+            height = self.bounds().size.height
+            background = _dashboard_color(14, 17, 23)
+            rail = _dashboard_color(17, 21, 28)
+            panel = _dashboard_color(25, 30, 40)
+            border = _dashboard_color(46, 54, 68)
+
+            self._fill_rect(self.bounds(), background)
+            self._fill_rect(AppKit.NSMakeRect(0, 0, 196, height), rail)
+
+            separator = AppKit.NSMakeRect(195, 0, 1, height)
+            self._fill_rect(separator, border)
+
+            content_x = 228
+            content_width = max(420, width - content_x - 32)
+            hero_y = 72
+            hero_height = min(270, max(218, height * 0.38))
+            mode_y = hero_y + hero_height + 22
+            mode_height = 106
+            health_y = mode_y + mode_height + 22
+            health_height = max(132, height - health_y - 28)
+            self._round_fill(
+                AppKit.NSMakeRect(content_x, hero_y, content_width, hero_height),
+                18, panel, border)
+            self._round_fill(
+                AppKit.NSMakeRect(content_x, mode_y, content_width, mode_height),
+                16, panel, border)
+            self._round_fill(
+                AppKit.NSMakeRect(content_x, health_y, content_width, health_height),
+                16, panel, border)
+
+        @staticmethod
+        def _fill_rect(rect, color):
+            # NSRectFill_ is absent from current PyObjC builds; raising inside
+            # drawRect: escapes the draw callback and AppKit aborts the process.
+            color.set()
+            AppKit.NSBezierPath.bezierPathWithRect_(rect).fill()
+
+        @staticmethod
+        def _round_fill(rect, radius, fill, stroke=None):
+            path = AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                rect, radius, radius)
+            fill.set()
+            path.fill()
+            if stroke is not None:
+                stroke.set()
+                path.setLineWidth_(1.0)
+                path.stroke()
+
+        def layout(self):
+            objc.super(_DashboardRootView, self).layout()
+            self.controller._layout_dashboard(self.bounds().size.width,
+                                              self.bounds().size.height)
+
+
+    class _DashboardDispatcher(Foundation.NSObject):
+        def initWithOwner_(self, owner):
+            self = objc.super(_DashboardDispatcher, self).init()
+            if self:
+                self.owner = owner
+            return self
+
+        @objc.namedSelector(b"drainDashboardUI:")
+        def drain_dashboard_ui(self, _sender):
+            self.owner._drain_pending_ui()
+
+
+    class _DashboardWindowDelegate(Foundation.NSObject):
+        def initWithOwner_(self, owner):
+            self = objc.super(_DashboardWindowDelegate, self).init()
+            if self:
+                self.owner = owner
+            return self
+
+        @objc.namedSelector(b"windowWillClose:")
+        def window_will_close(self, _notification):
+            self.owner._window_closed()
+
+
+    class MacDashboardWindow(Foundation.NSObject):
+        """Native dark macOS window; it is intentionally not an NSPanel/menu."""
+
+        def initWithClient_action_status_(self, client, action_handler, status):
+            self = objc.super(MacDashboardWindow, self).init()
+            if self:
+                self.client = client
+                self.action_handler = action_handler
+                self._status_lock = threading.Lock()
+                self._pending_status = status
+                self._pending_action: str | None = None
+                self._ui_dispatch_queued = False
+                self._model = DashboardViewModel.from_status(status)
+                self._visible = False
+                self._build_window()
+                self._apply_status(status)
+            return self
+
+        def _build_window(self):
+            style = (
+                AppKit.NSWindowStyleMaskTitled
+                | AppKit.NSWindowStyleMaskClosable
+                | AppKit.NSWindowStyleMaskMiniaturizable
+                | AppKit.NSWindowStyleMaskResizable
+            )
+            frame = AppKit.NSMakeRect(0, 0, DASHBOARD_WIDTH, DASHBOARD_HEIGHT)
+            self.window = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+                frame, style, AppKit.NSBackingStoreBuffered, False)
+            self.window.setTitle_("proxy-router")
+            self.window.setTitleVisibility_(AppKit.NSWindowTitleHidden)
+            self.window.setTitlebarAppearsTransparent_(True)
+            self.window.setMovableByWindowBackground_(True)
+            self.window.setReleasedWhenClosed_(False)
+            self.window.setRestorable_(False)
+            self.window.setMinSize_(AppKit.NSMakeSize(860, 620))
+            self.window.setBackgroundColor_(_dashboard_color(14, 17, 23))
+            self.window.setOpaque_(True)
+            self.window.setHasShadow_(True)
+            self.window.center()
+
+            self._window_delegate = _DashboardWindowDelegate.alloc().initWithOwner_(self)
+            self.window.setDelegate_(self._window_delegate)
+            self._dispatcher = _DashboardDispatcher.alloc().initWithOwner_(self)
+
+            self.root = _DashboardRootView.alloc().initWithController_(self)
+            self.window.setContentView_(self.root)
+            self.root.setAutoresizingMask_(
+                AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
+
+            white = _dashboard_color(242, 245, 249)
+            muted = _dashboard_color(151, 161, 176)
+            quiet = _dashboard_color(112, 123, 140)
+            blue = _dashboard_color(82, 143, 255)
+
+            self.brand = _dashboard_label("proxy-router", 16, white, bold=True)
+            self.brand_caption = _dashboard_label("CONTROL CENTER", 9, quiet, bold=True)
+            self.page_title = _dashboard_label("Home", 20, white, bold=True)
+            self.page_caption = _dashboard_label("Private routing, without the mystery", 12, muted)
+            # Navigation pages are not implemented yet; do not render a dead
+            # home button while the dashboard has a single page.
+            self.home_button = None
+            # These pages are not implemented yet; do not render dead controls.
+            self.servers_button = None
+            self.routing_button = None
+            self.settings_button = None
+
+            self.hero_dot = _dashboard_label("●", 42, blue, bold=True,
+                                            align=AppKit.NSCenterTextAlignment)
+            self.hero_title = _dashboard_label(self._model.title, 30, white, bold=True,
+                                               align=AppKit.NSCenterTextAlignment)
+            self.hero_explanation = _dashboard_label(
+                self._model.explanation, 14, muted,
+                align=AppKit.NSCenterTextAlignment, wrap=True)
+            self.primary_button = _dashboard_button(
+                self._model.primary_label, self, "primaryAction:", primary=True)
+            self.rotate_button = _dashboard_button(
+                "Switch server", self, "rotateAction:", primary=False)
+            self.action_label = _dashboard_label("", 11, quiet, align=AppKit.NSCenterTextAlignment)
+
+            self.mode_title = _dashboard_label("Traffic mode", 14, white, bold=True)
+            self.mode_hint = _dashboard_label(
+                "Choose which destinations use the tunnel.", 12, muted)
+            self.mode_popup = AppKit.NSPopUpButton.alloc().initWithFrame_pullsDown_(
+                AppKit.NSZeroRect, False)
+            for _mode, label in _DASHBOARD_MODES:
+                self.mode_popup.addItemWithTitle_(label)
+            self.mode_popup.setTarget_(self)
+            self.mode_popup.setAction_("modeChanged:")
+            self.mode_popup.setFont_(_dashboard_font(13, AppKit.NSFontWeightMedium))
+            self.mode_popup.setContentTintColor_(white)
+
+            self.health_title = _dashboard_label("Provider health", 14, white, bold=True)
+            self.health_summary = _dashboard_label(
+                self._model.route_health, 13, blue, bold=True)
+            self.route_label = _dashboard_label(
+                f"{self._model.provider_summary} · {self._model.port_label} · "
+                f"{self._model.watcher_label}", 12, muted)
+            self.provider_labels = []
+            for child in (
+                self.brand, self.brand_caption, self.page_title, self.page_caption,
+                self.hero_dot, self.hero_title,
+                self.hero_explanation, self.primary_button, self.rotate_button,
+                self.action_label, self.mode_title, self.mode_hint, self.mode_popup,
+                self.health_title, self.route_label,
+                self.health_summary,
+            ):
+                self.root.addSubview_(child)
+
+        def _layout_dashboard(self, width: float, height: float):
+            content_x = 228
+            content_width = max(420, width - content_x - 32)
+            hero_y = 72
+            hero_height = min(270, max(218, height * 0.38))
+            mode_y = hero_y + hero_height + 22
+            health_y = mode_y + 106 + 22
+            health_height = max(132, height - health_y - 28)
+
+            def frame(view, x, y, w, h):
+                view.setFrame_(AppKit.NSMakeRect(x, y, max(0, w), max(0, h)))
+
+            frame(self.brand, 24, 24, 148, 24)
+            frame(self.brand_caption, 24, 50, 148, 16)
+            frame(self.page_title, content_x, 26, 300, 28)
+            frame(self.page_caption, content_x, 52, 430, 20)
+            center = content_x + content_width / 2
+            frame(self.hero_dot, center - 34, hero_y + 26, 68, 56)
+            frame(self.hero_title, content_x + 24, hero_y + 88, content_width - 48, 42)
+            frame(self.hero_explanation, content_x + 100, hero_y + 132,
+                  content_width - 200, 44)
+            button_width = 150
+            frame(self.primary_button, center - button_width - 8,
+                  hero_y + hero_height - 58, button_width, 38)
+            frame(self.rotate_button, center + 8, hero_y + hero_height - 58,
+                  button_width, 38)
+            frame(self.action_label, content_x + 40, hero_y + hero_height - 20,
+                  content_width - 80, 16)
+
+            frame(self.mode_title, content_x + 24, mode_y + 20, 160, 22)
+            frame(self.mode_hint, content_x + 24, mode_y + 49,
+                  max(260, content_width - 240), 20)
+            frame(self.mode_popup, content_x + content_width - 194,
+                  mode_y + 26, 170, 34)
+
+            frame(self.health_title, content_x + 24, health_y + 20, 180, 22)
+            frame(self.health_summary, content_x + 220, health_y + 20, 180, 22)
+            frame(self.route_label, content_x + 24, health_y + 48,
+                  content_width - 48, 22)
+            row_y = health_y + 78
+            visible_rows = max(0, int((health_height - 78) // 28))
+            for index, label in enumerate(self.provider_labels):
+                label.setHidden_(index >= visible_rows)
+                if index >= visible_rows:
+                    continue
+                frame(label, content_x + 24, row_y, content_width - 48, 23)
+                row_y += 28
+
+        def _schedule_ui_refresh(self):
+            if Foundation.NSThread.isMainThread():
+                self._drain_pending_ui()
+                return
+            with self._status_lock:
+                if self._ui_dispatch_queued:
+                    return
+                self._ui_dispatch_queued = True
+            try:
+                self._dispatcher.performSelectorOnMainThread_withObject_waitUntilDone_(
+                    "drainDashboardUI:", None, False)
+            except Exception:
+                with self._status_lock:
+                    self._ui_dispatch_queued = False
+
+        def update_status(self, status: RouterStatus):
+            with self._status_lock:
+                self._pending_status = status
+            self._schedule_ui_refresh()
+
+        def update_action(self, result: str | None):
+            with self._status_lock:
+                self._pending_action = result
+            self._schedule_ui_refresh()
+
+        def _drain_pending_ui(self):
+            with self._status_lock:
+                status = self._pending_status
+                action = self._pending_action
+                self._pending_status = None
+                self._pending_action = None
+                self._ui_dispatch_queued = False
+            if status is not None:
+                self._apply_status(status)
+            if action is not None:
+                self._apply_action(action)
+
+        def _apply_status(self, status: RouterStatus):
+            self._model = DashboardViewModel.from_status(status)
+            self.hero_title.setStringValue_(self._model.title)
+            self.hero_explanation.setStringValue_(self._model.explanation)
+            self.primary_button.setTitle_(self._model.primary_label)
+            mode_index = next(
+                (index for index, (mode, _label) in enumerate(_DASHBOARD_MODES)
+                 if mode == self._model.mode),
+                len(_DASHBOARD_MODES) - 1,
+            )
+            self.mode_popup.selectItemAtIndex_(mode_index)
+            self.mode_popup.setEnabled_(bool(status.providers))
+            indicator, rgb = _dashboard_indicator(status)
+            self.hero_dot.setStringValue_(indicator)
+            self.hero_dot.setTextColor_(_dashboard_color(*rgb))
+            self.health_summary.setStringValue_(self._model.route_health)
+            self.route_label.setStringValue_(
+                f"{self._model.provider_summary} · {self._model.port_label} · "
+                f"{self._model.watcher_label}")
+
+            for label in self.provider_labels:
+                label.removeFromSuperview()
+            self.provider_labels = []
+            rows = list(self._model.provider_rows[:4])
+            if len(self._model.provider_rows) > len(rows):
+                rows[-1] = (
+                    f"{rows[-1]} · +{len(self._model.provider_rows) - len(rows)} more"
+                )
+            for row in rows:
+                label = _dashboard_label(row, 12, _dashboard_color(190, 198, 210))
+                self.provider_labels.append(label)
+                self.root.addSubview_(label)
+            self.root.setNeedsDisplay_(True)
+            self.root.setNeedsLayout_(True)
+
+        def _apply_action(self, result: str):
+            self.action_label.setStringValue_(result)
+            self.root.setNeedsLayout_(True)
+
+        def _invoke_action(self, kind: str, value=None):
+            try:
+                if callable(self.action_handler):
+                    self.action_handler(kind, value)
+                    return
+                methods = {
+                    "connect": ("action_connect", ()),
+                    "disconnect": ("action_disconnect", ()),
+                    "rotate": ("action_rotate", ()),
+                    "mode": ("action_mode", (value,)),
+                    "setup": ("action_setup", ()),
+                }
+                method_name, args = methods[kind]
+                getattr(self.action_handler, method_name)(*args)
+            except Exception as exc:
+                self.update_action(f"{kind}: failed ({exc})")
+
+        @objc.namedSelector(b"primaryAction:")
+        def primary_action(self, _sender):
+            self._invoke_action(self._model.primary_action)
+
+        @objc.namedSelector(b"rotateAction:")
+        def rotate_action(self, _sender):
+            self._invoke_action("rotate")
+
+        @objc.namedSelector(b"modeChanged:")
+        def mode_changed(self, sender):
+            index = sender.indexOfSelectedItem()
+            if index < 0 or index >= len(_DASHBOARD_MODES):
+                return
+            mode = _DASHBOARD_MODES[index][0]
+            self._invoke_action("mode", mode)
+
+        def show(self):
+            if not Foundation.NSThread.isMainThread():
+                self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                    "showOnMainThread:", None, True)
+                return
+            self._show_now()
+
+        @objc.namedSelector(b"showOnMainThread:")
+        def show_on_main_thread(self, _sender):
+            self._show_now()
+
+        def _show_now(self):
+            self._visible = True
+            self.window.makeKeyAndOrderFront_(None)
+            AppKit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+
+        @objc.namedSelector(b"closeOnMainThread:")
+        def close_on_main_thread(self, _sender):
+            self._close_now()
+
+        def _close_now(self):
+            self._visible = False
+            self.window.orderOut_(None)
+
+        def close(self):
+            if not Foundation.NSThread.isMainThread():
+                self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                    "closeOnMainThread:", None, False)
+                return
+            self._close_now()
+
+        def _window_closed(self):
+            self._visible = False
+
+else:
+    MacDashboardWindow = None
+
+
+def _make_macos_dashboard_window(client, action_handler, status):
+    if not _REAL_DARWIN_PYSTRAY:
+        return None
+    return MacDashboardWindow.alloc().initWithClient_action_status_(
+        client, action_handler, status)
+
+
+def _event_type(event):
+    """Read an NSEvent type while keeping click routing mockable in tests."""
+    value = getattr(event, "type", None)
+    return value() if callable(value) else value
+
+
+def _is_right_click_event(event) -> bool:
+    if not _COCOA_AVAILABLE or event is None:
+        return False
+    click_types = {
+        getattr(AppKit, "NSRightMouseDown", None),
+        getattr(AppKit, "NSRightMouseUp", None),
+    }
+    click_types.discard(None)
+    if _event_type(event) in click_types:
+        return True
+    flags = getattr(event, "modifierFlags", None)
+    flags = flags() if callable(flags) else flags
+    control_mask = getattr(
+        AppKit, "NSEventModifierFlagControl",
+        getattr(AppKit, "NSControlKeyMask", 0),
+    )
+    return bool(flags and control_mask and flags & control_mask)
+
+
+if _REAL_DARWIN_PYSTRAY:
+    class _DashboardIconDelegate(Foundation.NSObject):
+        def initWithOwner_(self, owner):
+            self = objc.super(_DashboardIconDelegate, self).init()
+            if self:
+                self.owner = owner
+            return self
+
+        @objc.namedSelector(b"activateDashboard:")
+        def activate_dashboard(self, _sender):
+            event = AppKit.NSApp.currentEvent()
+            self.owner._route_status_button_event(event)
+
+
+    class _DarwinDashboardIcon(pystray.Icon):
+        """pystray Darwin icon with explicit left/right click routing.
+
+        pystray's normal Darwin backend assigns its NSMenu to NSStatusItem,
+        which makes both button clicks open the menu. This subclass keeps the
+        generated menu descriptors and callbacks, but leaves the status item
+        menu unset and handles right-click popup explicitly. That gives the
+        dashboard a real left-click entry point without changing menu actions.
+        """
+
+        def __init__(self, *args, dashboard_callback=None, **kwargs):
+            self._dashboard_callback = dashboard_callback
+            self._native_menu = None
+            self._menu_handle = None
+            super().__init__(*args, **kwargs)
+            self._dashboard_delegate = _DashboardIconDelegate.alloc().initWithOwner_(self)
+            self._bind_status_button()
+
+        def _bind_status_button(self):
+            status_item = getattr(self, "_status_item", None)
+            delegate = getattr(self, "_dashboard_delegate", None)
+            if status_item is None or delegate is None:
+                return
+            button = status_item.button()
+            if button is None:
+                return
+            button.setTarget_(delegate)
+            button.setAction_(b"activateDashboard:")
+            try:
+                button.sendActionOn_(
+                    AppKit.NSLeftMouseUpMask | AppKit.NSRightMouseUpMask)
+            except Exception:
+                # Older AppKit/PyObjC still delivers the default left action;
+                # right-click remains best-effort rather than breaking startup.
+                pass
+            status_item.setMenu_(None)
+
+        def _update_menu(self):
+            self._bind_status_button()
+            create_menu = getattr(self, "_create_menu", None)
+            if not callable(create_menu):
+                self._menu_handle = None
+                return
+            callbacks = []
+            try:
+                self._native_menu = create_menu(self.menu, callbacks)
+            except Exception as exc:
+                self._native_menu = None
+                self._menu_handle = None
+                print(f"tray: native menu rebuild skipped: {exc}", file=sys.stderr)
+                return
+            self._menu_handle = (
+                (self._native_menu, callbacks)
+                if self._native_menu is not None else None)
+            # The menu is intentionally not assigned to NSStatusItem. AppKit
+            # would consume left-click before the button target can route it.
+            status_item = getattr(self, "_status_item", None)
+            if status_item is not None:
+                status_item.setMenu_(None)
+
+        def _route_status_button_event(self, event):
+            kind = "right" if _is_right_click_event(event) else "left"
+            callback = self._dashboard_callback or (lambda: None)
+            _route_macos_click(
+                kind, callback,
+                lambda: self._show_native_menu(event), event=event)
+
+        def _show_native_menu(self, event):
+            menu_handle = getattr(self, "_menu_handle", None)
+            if not menu_handle:
+                print("tray: native menu unavailable", file=sys.stderr)
+                return
+            menu = menu_handle[0]
+            status_item = getattr(self, "_status_item", None)
+            if status_item is None:
+                return
+            button = status_item.button()
+            try:
+                AppKit.NSMenu.popUpContextMenu_withEvent_forView_(
+                    menu, event, button)
+            except Exception:
+                # Keep a compatibility fallback for AppKit versions that do
+                # not expose the context-popup selector through PyObjC.
+                try:
+                    bounds = button.bounds()
+                    menu.popUpMenuPositioningItem_atLocation_inView_(
+                        None, AppKit.NSMakePoint(0, bounds.size.height), button)
+                except Exception as fallback_exc:
+                    print(f"dashboard: native menu popup failed: {fallback_exc}",
+                          file=sys.stderr)
+                    return
+
+else:
+    class _DarwinDashboardIcon:
+        """Unavailable placeholder used on non-macOS or without pystray."""
+
+        pass
+
+
 class TrayApp:
-    def __init__(self, client: RouterClient, icon_image: "Image.Image"):
+    def __init__(self, client: RouterClient, icon_image: "Image.Image",
+                 initial_status: RouterStatus | None = None):
         self.client = client
         self.icon_image = icon_image
-        self.latest: RouterStatus = RouterStatus()
+        self.latest: RouterStatus = (
+            initial_status if initial_status is not None else RouterStatus())
         self.lock = threading.Lock()
         self.last_action_result: str | None = None
         self.quit_flag = threading.Event()
         self.tray = None
+        self.dashboard = DashboardController(
+            client, self._dispatch_dashboard_action,
+            initial_status=self.latest)
         self._menu_sig: str | None = None
         self._icon_sig: str | None = None
+        self._menu_lock = threading.Lock()
 
         # Issue #60: mutations used to run on independent daemon threads, so
         # two clicks raced each other inside router.py and an older
@@ -654,13 +1681,33 @@ class TrayApp:
             "up": st.up, "error": st.error, "mode": st.mode, "port": st.port,
             "watcher": st.watcher, "routing": st.routing_mode,
             "preset": st.preset,
+            "system_proxy": st.system_proxy_status,
+            "network": st.network_status,
+            "degraded_lanes": list(st.degraded_lanes or []),
             "active": st.active_providers,
             "profiles": {n: list((i or {}).get("profiles") or [])
                          for n, i in (st.providers or {}).items()},
             "health": health,
+            "custom_presets": self._custom_preset_signature(),
             "action": self.last_action_result,
-            "epoch": self._status_epoch,
         })
+
+    def _refresh_icon(self) -> None:
+        """Update the tray icon from the current snapshot and action state."""
+        if self.tray is None:
+            return
+        with self.lock:
+            st = self.latest
+            color = _status_icon_color(st, self.last_action_result)
+            if color == self._icon_sig:
+                return
+            try:
+                self.tray.icon = make_icon(color)
+            except Exception as exc:
+                print(f"tray: icon refresh failed: {type(exc).__name__}",
+                      file=sys.stderr)
+                return
+            self._icon_sig = color
 
     def _publish_status(self, st: RouterStatus, epoch: int | None = None) -> None:
         """Install a new status snapshot unless a NEWER one already landed.
@@ -677,17 +1724,34 @@ class TrayApp:
             if epoch is not None:
                 self._status_epoch = max(self._status_epoch, epoch)
             self.latest = st
+        self._refresh_icon()
+        self._dashboard_update_status(st)
         self._refresh_menu()
 
     def _refresh_menu(self) -> None:
-        """Rebuild the tray menu from live state (no-op without a tray)."""
+        """Rebuild the tray menu only when rendered state changed."""
         if self.tray is None:
             return
-        self._menu_sig = None
-        self.tray.menu = self.build_menu()
+        # pystray replaces the native menu tree on assignment. Serialize that
+        # operation and publish the signature only after the new tree exists so
+        # a poll/action pair cannot tear down the menu under a click.
+        try:
+            with self._menu_lock:
+                with self.lock:
+                    st = self.latest
+                    signature = self._status_signature(st)
+                if signature == self._menu_sig:
+                    return
+                self.tray.menu = self.build_menu()
+                self._menu_sig = signature
+        except Exception as exc:
+            self._menu_sig = None
+            print(f"tray: menu refresh failed: {type(exc).__name__}",
+                  file=sys.stderr)
 
     def poll_loop(self) -> None:
         while not self.quit_flag.is_set():
+            epoch: int | None = None
             try:
                 # Claim the epoch BEFORE fetching (issue #60): a poll that
                 # fetched pre-action but publishes post-action must lose to
@@ -698,29 +1762,29 @@ class TrayApp:
                     self._status_epoch = epoch
                 st = self.client.status()
                 self._publish_status(st, epoch)
-                if self.tray is not None:
-                    icon_color = (
-                        "#4caf50" if st.up
-                        else ("#ff9800" if st.error else "#e53935")
-                    )
-                    if icon_color != self._icon_sig:
-                        self._icon_sig = icon_color
-                        self.tray.icon = make_icon(icon_color)
-                    sig = self._status_signature(st)
-                    if sig != self._menu_sig:
-                        self._menu_sig = sig
-                        # Rebuild the menu from the live snapshot: pystray's
-                        # update_menu() re-renders the OLD menu tree, so
-                        # without reassigning .menu the status/action labels
-                        # stay frozen at whatever was captured at startup.
-                        self.tray.menu = self.build_menu()
             except Exception as e:  # keep the tray alive on any poll failure
-                self._publish_status(RouterStatus(error=str(e)[:80]))
+                # Keep the poll's epoch so a late failure cannot overwrite a
+                # newer action snapshot that landed while status() was out.
+                self._publish_status(RouterStatus(error=str(e)[:80]), epoch)
             self.quit_flag.wait(POLL_SECONDS)
 
     def _snapshot(self) -> RouterStatus:
         with self.lock:
             return self.latest
+
+    def _dashboard_update_status(self, status: RouterStatus) -> None:
+        """Dashboard rendering is optional and must never affect routing."""
+        try:
+            self.dashboard.update(status)
+        except Exception as exc:
+            print(f"dashboard: status update skipped: {exc}", file=sys.stderr)
+
+    def _dashboard_update_action(self, result: str | None) -> None:
+        """Keep a closed/broken UI from interrupting a CLI action."""
+        try:
+            self.dashboard.update_action(result)
+        except Exception as exc:
+            print(f"dashboard: action update skipped: {exc}", file=sys.stderr)
 
     # ---- actions ---------------------------------------------------------
     def _do(self, fn, label: str):
@@ -738,6 +1802,7 @@ class TrayApp:
                 return  # quitting: stop accepting mutations before they queue
             with self.lock:
                 self.last_action_result = f"{label}: working…"
+            self._dashboard_update_action(self.last_action_result)
             self._refresh_menu()
 
             with self._pending_lock:
@@ -767,30 +1832,104 @@ class TrayApp:
                 label, fn = self._pending_mutations.pop(0)
                 self._mutation_active = True
             try:
-                rc, out = fn()
-            except Exception as e:
-                rc, out = -1, f"{type(e).__name__}: {e}"
-            detail = _humanize(out)
-            result = f"{label}: {'done' if rc == 0 else 'failed'}"
-            if detail:
-                result += f" — {detail}"
-            try:
-                refreshed = self.client.status()
-            except Exception as e:
-                refreshed = RouterStatus(error=str(e)[:80])
-            with self.lock:
-                self.last_action_result = result
-                epoch = self._status_epoch + 1
-                self._status_epoch = epoch
-            with self._idle_cond:
-                self._mutation_active = False
-                self._idle_cond.notify_all()
-            self._publish_status(refreshed, epoch)
+                try:
+                    rc, out = fn()
+                except Exception as e:
+                    rc, out = -1, f"{type(e).__name__}: {e}"
+                detail = _humanize(out)
+                result = f"{label}: {'done' if rc == 0 else 'failed'}"
+                if detail:
+                    result += f" — {detail}"
+                try:
+                    refreshed = self.client.status()
+                except Exception as e:
+                    refreshed = RouterStatus(error=str(e)[:80])
+                with self.lock:
+                    self.last_action_result = result
+                    epoch = self._status_epoch + 1
+                    self._status_epoch = epoch
+                try:
+                    self._dashboard_update_action(result)
+                except Exception as exc:
+                    print(f"dashboard: action update skipped: {exc}", file=sys.stderr)
+                try:
+                    self._publish_status(refreshed, epoch)
+                except Exception as exc:
+                    refresh_note = f"{result} — status refresh failed"
+                    with self.lock:
+                        self.last_action_result = refresh_note
+                    self._dashboard_update_action(refresh_note)
+                    print(f"tray: status publish skipped: {exc}", file=sys.stderr)
+            finally:
+                # A dashboard/UI failure must not leave the mutation gate
+                # permanently active or make Quit wait for a dead worker.
+                with self._idle_cond:
+                    self._mutation_active = False
+                    self._idle_cond.notify_all()
+
+    def _dispatch_dashboard_action(self, kind: str, value=None):
+        """Route dashboard intent back through existing tray/CLI actions."""
+        if kind == "connect":
+            self.action_connect()
+        elif kind == "disconnect":
+            self.action_disconnect()
+        elif kind == "rotate":
+            self.action_rotate()
+        elif kind == "mode" and value in {"safe-list", "vpn-list", "default"}:
+            self.action_mode(value)
+        elif kind == "setup":
+            self.action_setup()
+        else:
+            print(f"dashboard: unknown action {kind!r}", file=sys.stderr)
 
     def action_dashboard(self):
+        # Preserve the existing right-click menu action: its Dashboard entry
+        # opens the full setup wizard in Terminal. The status-item left-click
+        # uses _show_native_dashboard and never takes this path.
         ok = open_dashboard(self.client.root)
+        result = "dashboard opened" if ok else "dashboard: no terminal"
         with self.lock:
-            self.last_action_result = "dashboard opened" if ok else "dashboard: no terminal"
+            self.last_action_result = result
+        self._dashboard_update_action(result)
+        self._refresh_menu()
+
+    def _open_primary_dashboard(self):
+        """Left-click: launch the Tauri dashboard, else the native window.
+
+        Right-click keeps the classic tray menu, so this is only the icon's
+        primary click action.
+        """
+        app = _dashboard_bundle(Path(self.client.root))
+        if app is not None and _launch_dashboard_app(app):
+            result = "dashboard opened"
+            with self.lock:
+                self.last_action_result = result
+            self._dashboard_update_action(result)
+            self._refresh_menu()
+            return True
+        return self._show_native_dashboard()
+
+    def _show_native_dashboard(self):
+        """Open or focus the custom macOS dashboard without engine changes."""
+        shown = self.dashboard.show(self._snapshot())
+        if not shown:
+            opened = open_dashboard(self.client.root)
+            result = ("dashboard unavailable; opened terminal dashboard"
+                      if opened else
+                "dashboard unavailable; use Open Setup in Terminal from the menu")
+            with self.lock:
+                self.last_action_result = result
+            self._dashboard_update_action(result)
+            self._refresh_menu()
+        return shown
+
+    def action_setup(self):
+        """Open the existing setup wizard without duplicating its logic."""
+        opened = open_dashboard(self.client.root)
+        result = "setup opened in Terminal" if opened else "setup: no terminal"
+        with self.lock:
+            self.last_action_result = result
+        self._dashboard_update_action(result)
         self._refresh_menu()
 
     def action_connect(self):
@@ -802,12 +1941,23 @@ class TrayApp:
         self._do(self.client.stop, "disconnect")
 
     def action_toggle_vpn(self):
-        """Full-tunnel (TUN) on/off switch: click turns the tunnel on when
-        off and off when on (home/school switch)."""
-        with self.lock:
-            on = self.latest.mode == "tun"
-        self._do(lambda: self.client.vpn("off" if on else "on"),
-                 f"full tunnel {'off' if on else 'on'}")
+        """Toggle full-tunnel mode from a fresh status snapshot.
+
+        The menu snapshot may be several seconds old—or an external CLI may
+        have changed mode since it was rendered. Resolve the direction inside
+        the serialized worker immediately before issuing the lifecycle command.
+        """
+        def toggle():
+            status = self.client.status()
+            if status.error:
+                return 1, f"cannot determine current tunnel mode: {status.error}"
+            if status.mode not in {"proxy", "tun"}:
+                return 1, f"cannot determine current tunnel mode: {status.mode}"
+            target = "off" if status.mode == "tun" else "on"
+            rc, out = self.client.vpn(target)
+            return rc, f"{target}: {out}" if out else target
+
+        self._do(toggle, "full tunnel")
 
     def action_rotate(self):
         self._do(self.client.rotate, "switch server")
@@ -816,12 +1966,12 @@ class TrayApp:
         provider = None
         if mode == "safe-list":
             # safe-list routes everything NOT on the direct list through
-            # ONE provider. If the config has no default_provider yet, fall
-            # back to the currently active provider so the click just works
-            # instead of returning a raw "needs default_provider" rc=1.
+            # ONE provider. Prefer the persisted default even while the engine
+            # is down; active exits are empty in that state by design.
             with self.lock:
-                active = self.latest.active_providers
-            provider = next(iter(active), None) if active else None
+                st = self.latest
+                provider = (getattr(st, "default_provider", None)
+                            or next(iter(st.active_providers), None))
         self._do(lambda: self.client.set_mode(mode, provider),
                  f"mode {_ROUTING_MODE_LABELS.get(mode, mode)}")
 
@@ -862,9 +2012,20 @@ class TrayApp:
         keeps running) and the toast reports the combined result.
         """
         def _apply_and_reload():
+            try:
+                current = self.client.status()
+            except Exception as exc:
+                return 1, f"cannot determine engine state; preset not applied: {exc}"
+            if current.error:
+                return 1, ("cannot determine engine state; preset not applied: "
+                            f"{current.error}")
             rc, out = self.client.setup_preset(name)
             if rc != 0:
                 return rc, out
+            if not current.up:
+                # router.py reload starts a missing engine. A disconnected tray
+                # preset click is configuration-only; Connect applies it later.
+                return 0, (out + "\nengine is untouched — Connect to apply").strip()
             return self.client.reload()
         self._do(_apply_and_reload, f"preset {name}")
 
@@ -903,6 +2064,7 @@ class TrayApp:
             self.last_action_result = (
                 "permission repair: follow the Terminal window"
                 if opened else "permission repair: no terminal available")
+        self._dashboard_update_action(self.last_action_result)
         self._refresh_menu()
 
     def action_quit(self):
@@ -933,6 +2095,7 @@ class TrayApp:
                 with self.lock:
                     self.last_action_result = (
                         "quit: waiting for active action — retry when it finishes")
+                self._dashboard_update_action(self.last_action_result)
                 with self._action_accept_lock:
                     with self.lock:
                         self._quit_pending = False
@@ -952,6 +2115,7 @@ class TrayApp:
                 with self.lock:
                     self.last_action_result = "quit: failed" + (
                         f" — {detail}" if detail else "")
+                self._dashboard_update_action(self.last_action_result)
                 with self._action_accept_lock:
                     with self.lock:
                         self._quit_pending = False
@@ -961,6 +2125,7 @@ class TrayApp:
                 with self.lock:
                     self._quit_pending = False
                 self.quit_flag.set()
+            self.dashboard.close()
             if self.tray is not None:
                 self.tray.stop()
 
@@ -972,6 +2137,8 @@ class TrayApp:
             st = self.latest
             last_action_result = self.last_action_result
             mutation_active = self._mutation_active
+        can_disconnect = bool(st.up or st.pid is not None or st.error)
+        single_provider_lane = len(st.active_providers) == 1
         items = []
 
         # Issue #60: while one mutation executes, further engine mutations
@@ -988,19 +2155,34 @@ class TrayApp:
         first_run = not st.providers and not st.up and not st.error
         if first_run:
             state = "● No VPN set up yet"
-        elif st.up:
+        elif st.up and (st.mode != "proxy" or (
+                st.system_proxy_status in {"ok", "skipped"}
+                and st.network_status in {"ok", "unknown", "skipped"}
+                and not st.degraded_lanes)):
             state = "● Connected"
+        elif st.up:
+            reason = (", ".join(st.degraded_lanes) if st.degraded_lanes
+                      else (st.system_proxy_status
+                            if st.system_proxy_status not in {"ok", "skipped"}
+                            else st.network_status))
+            state = f"▲ Degraded ({reason})"
         elif st.error:
             state = "! Error"
         else:
             state = "○ Disconnected"
         items.append(pystray.MenuItem(state, None))
+        if st.network_status == "direct_dns_unavailable":
+            items.append(pystray.MenuItem(
+                "Recovery: restore DHCP DNS → reload → doctor --network", None,
+                enabled=False))
         if first_run:
             items.append(pystray.MenuItem(
                 "Start here: Setup → Add a profile (.conf)", None))
         if st.active_providers:
             prov = ", ".join(f"{k} → {v}" for k, v in st.active_providers.items())
             items.append(pystray.MenuItem(prov, None))
+        if st.mode in {"proxy", "tun"}:
+            items.append(pystray.MenuItem(st.engine_label(), None))
         if st.routing_mode != "default":
             items.append(pystray.MenuItem(
                 f"mode: {_ROUTING_MODE_LABELS.get(st.routing_mode, st.routing_mode)}",
@@ -1008,8 +2190,9 @@ class TrayApp:
         if st.preset:
             items.append(pystray.MenuItem(
                 f"preset: {st.preset}", None))
-        if last_action_result:
-            items.append(pystray.MenuItem(last_action_result, None))
+        if last_action_result and not mutation_active:
+            items.append(pystray.MenuItem(
+                f"last action: {last_action_result}", None))
         # Issue #76: when the failure was a permission gap, surface the
         # repair right where the error appeared instead of leaving a toast
         # the user cannot act on.
@@ -1019,11 +2202,11 @@ class TrayApp:
 
         items.append(pystray.Menu.SEPARATOR)
 
-        # The dashboard is the tray's default action: the bold first menu
-        # entry (macOS trays open their menu on click; the bold item is the
-        # one-click path) opens the full TUI in a Terminal window.
+        # The dashboard is the tray's explicit home action. On Darwin the
+        # status-button left click calls it directly; on other platforms this
+        # entry remains the normal pystray menu action.
         items.append(pystray.MenuItem(
-            "Open Dashboard", self.action_dashboard, default=True))
+            "Open Dashboard (Terminal setup)", self.action_dashboard, default=True))
 
         # Actions — terse, no CLI flags. Connect is only offered once at
         # least one provider exists; on a fresh install the banner above
@@ -1036,7 +2219,7 @@ class TrayApp:
             and not mutation_active))
         items.append(pystray.MenuItem(
             "Switch VPN server", self.action_rotate,
-            enabled=st.up and not mutation_active))
+            enabled=st.up and single_provider_lane and not mutation_active))
 
         # Provider picker — like Tailscale/Proton: pick a provider, then an exit
         if st.providers and st.up:
@@ -1045,12 +2228,12 @@ class TrayApp:
                                           enabled=not mutation_active))
         items.append(pystray.MenuItem(
             "Disconnect", self.action_disconnect,
-            enabled=st.up and not mutation_active))
+            enabled=can_disconnect and not mutation_active))
         # Full tunnel (TUN) — checked when on. Clicking toggles it, which on
         # macOS pops the standard admin dialog (the engine/utun needs root).
         items.append(pystray.MenuItem(
-            "Full tunnel (WARP): on" if st.mode == "tun"
-            else "Full tunnel (WARP): off",
+            "Full tunnel (TUN): on" if st.mode == "tun"
+            else "Full tunnel (TUN): off",
             self.action_toggle_vpn,
             checked=lambda item: st.mode == "tun",
             enabled=not mutation_active))
@@ -1110,18 +2293,35 @@ class TrayApp:
         preset_items = []
         for name, label in _BUILTIN_PRESETS:
             preset_items.append(pystray.MenuItem(
-                label, lambda n=name: self.action_apply_preset(n),
-                checked=lambda item, n=name: st.preset == n))
+                label, lambda *_, n=name: self.action_apply_preset(n),
+                checked=lambda *_, n=name: st.preset == n))
         for name in self._custom_preset_names():
             preset_items.append(pystray.MenuItem(
                 self._custom_preset_label(name),
-                lambda n=name: self.action_apply_preset(n),
-                checked=lambda item, n=name: st.preset == n))
+                lambda *_, n=name: self.action_apply_preset(n),
+                checked=lambda *_, n=name: st.preset == n))
         items.append(pystray.MenuItem("Presets", pystray.Menu(*preset_items),
                                       enabled=not mutation_active))
         items.append(pystray.Menu.SEPARATOR)
         items.append(pystray.MenuItem("Quit", self.action_quit))
         return pystray.Menu(*items)
+
+    def _custom_preset_signature(self) -> tuple[tuple[str, int, int], ...]:
+        """Return a stable filesystem signature for custom preset files."""
+        root = getattr(self.client, "root", None)
+        if not root:
+            return ()
+        try:
+            entries = []
+            for path in Path(root, "presets").glob("*.json"):
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                entries.append((path.name, stat.st_mtime_ns, stat.st_size))
+            return tuple(sorted(entries))
+        except OSError:
+            return ()
 
     def _custom_preset_names(self) -> list[str]:
         """Custom preset names from ``root/presets/*.json`` (read-only)."""
@@ -1220,6 +2420,24 @@ class TrayApp:
         entries.append(pystray.MenuItem("Click a location to switch to it", None, enabled=False))
         return pystray.Menu(*entries)
 
+    def _make_tray_icon(self):
+        menu = self.build_menu()
+        if _REAL_DARWIN_PYSTRAY:
+            if not callable(getattr(pystray.Icon, "_create_menu", None)):
+                print("tray: native dashboard unavailable: unsupported pystray",
+                      file=sys.stderr)
+                return pystray.Icon(
+                    "proxy-router", self.icon_image, "proxy-router", menu=menu)
+            try:
+                return _DarwinDashboardIcon(
+                    "proxy-router", self.icon_image, "proxy-router", menu=menu,
+                    dashboard_callback=self._open_primary_dashboard,
+                )
+            except Exception as exc:
+                print(f"tray: native dashboard unavailable: {exc}", file=sys.stderr)
+        return pystray.Icon(
+            "proxy-router", self.icon_image, "proxy-router", menu=menu)
+
     def run(self) -> None:
         if pystray is None:
             print("pystray is required; pip install pystray pillow", file=sys.stderr)
@@ -1238,20 +2456,39 @@ class TrayApp:
         def on_ready(icon):
             # Custom setup replaces pystray's default setup; explicitly show
             # the status item or the agent runs invisibly on macOS.
+            bind = getattr(icon, "_bind_status_button", None)
+            if callable(bind):
+                bind()
             icon.visible = True
             threading.Thread(target=self.poll_loop, daemon=True,
                              name="tray-status").start()
 
-        self.tray = pystray.Icon(
-            "proxy-router", self.icon_image, "proxy-router",
-            menu=self.build_menu(),
-        )
+        self.tray = self._make_tray_icon()
         # NOTE: use blocking run(), NOT run_detached(). On the Darwin backend
         # run_detached() only marks the icon ready and never starts the
         # NSApplication event loop, so the status item is created but never
         # painted and the tray runs invisibly. run() blocks on the main
         # thread driving the Cocoa loop until stop() is called.
         self.tray.run(setup=on_ready)
+
+
+def _default_root() -> str:
+    """Resolve the runtime root for canonical and legacy bundle layouts."""
+    override = os.environ.get("PROXY_ROUTER_ROOT")
+    if override:
+        return override
+
+    here = Path(__file__).resolve().parent
+    if (here / "router.py").is_file():
+        return str(here)
+
+    # Older checkouts kept the tray under examples/ while router.py lived at
+    # the repository root. Keep that layout usable without weakening an
+    # explicit --root or PROXY_ROUTER_ROOT override.
+    legacy_root = here.parent
+    if (legacy_root / "router.py").is_file():
+        return str(legacy_root)
+    return str(here)
 
 
 def selftest(root: str) -> int:
@@ -1267,6 +2504,22 @@ def selftest(root: str) -> int:
     if st.error:
         print(f"status parse FAIL: {st.error}")
         return 1
+    model = DashboardViewModel.from_status(st)
+    if model.primary_action not in {"connect", "disconnect", "setup"}:
+        print(f"dashboard model FAIL: invalid primary action {model.primary_action!r}")
+        return 1
+    click_probe = []
+    _route_macos_click(
+        "left", lambda: click_probe.append("dashboard"),
+        lambda: click_probe.append("menu"))
+    _route_macos_click(
+        "right", lambda: click_probe.append("dashboard"),
+        lambda: click_probe.append("menu"))
+    if click_probe != ["dashboard", "menu"]:
+        print(f"dashboard click routing FAIL: {click_probe}")
+        return 1
+    print(f"dashboard: model={model.title!r} cocoa={_COCOA_AVAILABLE} "
+          "left=window right=menu")
     # verify every menu action's CLI entry exists (--help exits 0)
     for label, args in [
         ("ensure", ["ensure", "--help"]),
@@ -1282,11 +2535,22 @@ def selftest(root: str) -> int:
     return 0
 
 
+def _default_root() -> str:
+    override = os.environ.get("PROXY_ROUTER_ROOT")
+    if override:
+        return override
+    here = Path(__file__).resolve().parent
+    if (here / "router.py").is_file():
+        return str(here)
+    parent = here.parent
+    if (parent / "router.py").is_file():
+        return str(parent)
+    return str(here)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="proxy-router tray agent")
-    ap.add_argument("--root", default=os.environ.get(
-        "PROXY_ROUTER_ROOT",
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    ap.add_argument("--root", default=_default_root())
     ap.add_argument("--selftest", action="store_true",
                     help="validate CLI contract, no GUI")
     args = ap.parse_args()
@@ -1294,14 +2558,22 @@ def main() -> int:
     if args.selftest:
         return selftest(args.root)
 
+    if tray_ownership(args.root) == "headless":
+        print("tray: dashboard app owns the menu bar; not starting a second "
+              "status item (set PROXY_ROUTER_TRAY_HEADLESS=0 to force)",
+              file=sys.stderr)
+        return 0
+
     if pystray is None or Image is None:
         print("pystray + pillow required (pip install pystray pillow)",
               file=sys.stderr)
         return 2
 
     client = RouterClient(args.root)
-    client.latest = client.status()  # warm first status for the menu
-    app = TrayApp(client, make_icon("#e53935"))
+    # Let the first poll publish real state; status can block for COMMAND_TIMEOUT.
+    initial_color = _status_icon_color(RouterStatus())
+    app = TrayApp(client, make_icon(initial_color))
+    app._icon_sig = initial_color
     app.run()
     return 0
 

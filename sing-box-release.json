@@ -19,5 +19,18 @@
       "sha256": "31ee722237d95774e101fbffeae6be6776249c5f7db229ad8ff00b45b22e6a00",
       "archive_root": "sing-box-1.13.19-darwin-amd64"
     }
+  },
+  "platforms": {
+    "linux": {
+      "architectures": {
+        "x86_64": {
+          "name": "sing-box-1.13.19-linux-amd64-glibc.tar.gz",
+          "url": "https://github.com/SagerNet/sing-box/releases/download/v1.13.19/sing-box-1.13.19-linux-amd64-glibc.tar.gz",
+          "size": 24727716,
+          "sha256": "77e26226c111b8a269f559aec7999f6f5ae1961f25374b58b126d06405d4f516",
+          "archive_root": "sing-box-1.13.19-linux-amd64-glibc"
+        }
+      }
+    }
   }
 }

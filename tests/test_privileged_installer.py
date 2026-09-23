@@ -42,6 +42,34 @@ class SudoersPolicyTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_linux_layout_uses_canonical_system_paths(self):
+        layout = installer.InstallLayout.for_platform("linux")
+
+        self.assertEqual(layout.helper_parent, Path("/usr/local/libexec"))
+        self.assertEqual(layout.helper_base, Path("/usr/local/libexec/proxy-router"))
+        self.assertEqual(layout.state_base, Path("/var/lib/proxy-router"))
+        self.assertEqual(layout.sudoers_file, Path("/etc/sudoers.d/91-proxy-router"))
+        self.assertEqual(
+            layout.helper_path,
+            Path("/usr/local/libexec/proxy-router/current/privileged_helper.py"),
+        )
+
+    def test_linux_policy_uses_only_the_canonical_linux_helper(self):
+        helper_path = installer.LINUX_EXPECTED_HELPER
+        policy = installer.render_sudoers("alice", 501, helper_path)
+
+        self.assertIn(str(helper_path), policy)
+        self.assertNotIn(str(installer.EXPECTED_HELPER), policy)
+        self.assertEqual(
+            installer.classify_policy(
+                policy,
+                "/opt/anaconda3/bin/python3",
+                "/Users/alice/proxy-router/router.py",
+                helper_path=helper_path,
+            ),
+            "v2",
+        )
+
     def test_policy_classifier_distinguishes_legacy_v2_and_foreign_content(self):
         python = "/opt/anaconda3/bin/python3"
         router = "/Users/alice/proxy-router/router.py"
@@ -88,6 +116,33 @@ class BundleInstallTests(unittest.TestCase):
             self.assertEqual((version / "sing-box").read_bytes(), b"trusted-sing-box")
             self.assertEqual(stat.S_IMODE(version.stat().st_mode), 0o555)
             self.assertEqual(stat.S_IMODE((version / "sing-box").stat().st_mode), 0o555)
+
+    def test_stage_bundle_creates_one_missing_helper_parent_safely(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            parent = root / "usr-local"
+            parent.mkdir(mode=0o700)
+            helper_parent = parent / "libexec"
+            layout = installer.InstallLayout(
+                helper_parent=helper_parent,
+                helper_base=helper_parent / "proxy-router",
+                state_base=root / "var-db",
+                sudoers_file=root / "sudoers.d" / "91-proxy-router",
+            )
+
+            installer.stage_bundle(
+                layout,
+                helper_bytes=b"helper\n",
+                installer_bytes=b"installer\n",
+                manifest_bytes=b"{}\n",
+                binary_bytes=b"trusted-sing-box",
+                owner_uid=os.getuid(),
+                owner_gid=os.getgid(),
+            )
+
+            self.assertTrue(helper_parent.is_dir())
+            self.assertEqual(stat.S_IMODE(helper_parent.stat().st_mode), 0o755)
+            self.assertEqual(helper_parent.stat().st_uid, os.getuid())
 
     def test_stage_failure_removes_all_partial_bundle_artifacts(self):
         with tempfile.TemporaryDirectory() as temporary:

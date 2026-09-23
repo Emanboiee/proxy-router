@@ -28,7 +28,49 @@ def load_router(tmp_path):
     module.LOCK_FILE = tmp_path / "state" / "engine.lock"
     module.MODE_FILE = tmp_path / "state" / "mode"
     module.MANUAL_OFF_FILE = tmp_path / "state" / "manual-off"
+    module.SYSTEM_PROXY_STATE_FILE = tmp_path / "state" / "system-proxy.json"
+    module.NETWORK_DIAGNOSTIC_FILE = tmp_path / "state" / "network-diagnostic.json"
     return module
+
+
+def test_routing_add_reloads_config_to_preserve_concurrent_update(tmp_path):
+    router = load_router(tmp_path)
+    router.CONFIG_FILE.write_text(json.dumps({
+        "port": 2080,
+        "providers": {"proton": {"directory": "providers/proton"}},
+        "routes": [],
+        "routing": {"mode": "vpn-list", "vpn_domains": ["a.example"]},
+    }))
+    router._providers = {"proton": {}}
+    router._routing = {"mode": "vpn-list", "vpn_domains": []}
+
+    assert router.routing_cli_add("vpn-list", "b.example") == 0
+
+    saved = json.loads(router.CONFIG_FILE.read_text())
+    assert saved["routing"]["vpn_domains"] == ["a.example", "b.example"]
+
+
+def test_routes_add_reloads_config_to_preserve_concurrent_update(tmp_path):
+    router = load_router(tmp_path)
+    router.CONFIG_FILE.write_text(json.dumps({
+        "port": 2080,
+        "providers": {"proton": {"directory": "providers/proton"}},
+        "routes": [
+            {"id": "existing", "domains": ["existing.example"], "provider": "proton"}
+        ],
+        "routing": {"mode": "default"},
+    }))
+    router._providers = {"proton": {}}
+    router._routes = []
+    args = SimpleNamespace(domain="new.example", ip=None, id="new", provider="proton")
+
+    with mock.patch.object(router, "engine_reload", return_value=0), \
+         mock.patch.object(router, "routes_list", return_value=0):
+        assert router.routes_add(args) == 0
+
+    saved = json.loads(router.CONFIG_FILE.read_text())
+    ids = [route["id"] for route in saved["routes"]]
+    assert "existing" in ids and "new" in ids
 
 
 def test_vpn_list_filters_provider_routes_to_vpn_domains(tmp_path):
@@ -766,7 +808,7 @@ def test_tray_fresh_install_is_not_error_and_shows_setup_banner(tmp_path):
         "port": None, "providers": {}, "routes": [],
         "routing": {"mode": None, "direct_domains": [], "vpn_domains": [],
                     "default_provider": None},
-    })
+    }) + "\nrouter: missing router.json; run 'router.py init' first\n"
     st = module.RouterStatus.from_cli(1, fresh)
     assert st.error is None
     assert st.up is False
@@ -965,11 +1007,11 @@ def test_tray_menu_offers_dashboard_default_action(tmp_path):
     assert any("Open Dashboard" in t for t in texts)
     # the bold default action is the first actionable top-level entry:
     # before Connect/Reconnect in the raw item order
-    raw = [getattr(i, "text", None) for i in items.items]
-    actionable = [t for t in raw if t and not t.startswith(("●", "○", "!"))]
+    actionable = [getattr(i, "text", None) for i in items.items
+                  if getattr(i, "action", None) is not None]
     first_action = actionable[0] if actionable else None
     assert first_action and "Open Dashboard" in first_action, f"first action: {first_action!r}"
-    assert "onnect" in actionable[1], actionable[:4]  # Reconnect when up
+    assert actionable[1] and "onnect" in actionable[1], actionable[:4]  # Reconnect when up
 
 
 def test_tray_exit_picker_sorts_healthy_first(tmp_path):
@@ -1500,6 +1542,7 @@ def test_stop_bypasses_invalid_config_and_publishes_manual_off_before_lock(tmp_p
         AssertionError("stop must not load semantic configuration")))
     monkeypatch.setattr(router, "route_watcher_stop", lambda: None)
     monkeypatch.setattr(router, "engine_stop", lambda: 0)
+    monkeypatch.setattr(router, "_find_our_engine_pids", lambda: [])
     observed = []
 
     def locked(action, timeout=None):
@@ -1697,6 +1740,49 @@ def test_restore_last_good_permission_error_on_sighup_only(tmp_path, monkeypatch
     assert router.PID_FILE.read_text() == "4242"
 
 
+def test_engine_reload_rejected_candidate_reports_failed_change_not_restore_success(tmp_path, monkeypatch):
+    """Audit F04: a candidate that fails validation must never read as a
+    successful reload just because the last-good rollback recovered service.
+    The restore returning 0 is 'service restored on the OLD config' — the
+    requested change was NOT applied, so engine_reload reports nonzero."""
+    router = load_router(tmp_path)
+    router.resolve_sing_box = lambda: Path("/bin/true")
+    router.sing_box_at_least = lambda v: True
+    router.build_singbox_config = lambda overrides=None: ({"inbounds": []}, {"proton": Path("p")})
+    router.write_sing_box = lambda c: None
+    router.validate_config = lambda: False
+    router.LAST_GOOD_FILE.write_text("{}")
+    start_calls = []
+    monkeypatch.setattr(router, "engine_start", lambda **k: start_calls.append(k) or 0)
+    monkeypatch.setattr(router.os, "kill", lambda pid, sig: None)
+
+    assert router.engine_reload() == 1
+
+
+def test_engine_reload_rejected_candidate_message_names_the_old_config(tmp_path, monkeypatch, capsys):
+    """The honest-outcome wrapper tells the operator the change did not apply."""
+    router = load_router(tmp_path)
+    router.resolve_sing_box = lambda: Path("/bin/true")
+    router.sing_box_at_least = lambda v: True
+    router.build_singbox_config = lambda overrides=None: ({"inbounds": []}, {"proton": Path("p")})
+    router.write_sing_box = lambda c: None
+    validations = {"count": 0}
+
+    def candidate_fails_restored_last_good_passes() -> bool:
+        validations["count"] += 1
+        return validations["count"] > 1
+
+    router.validate_config = candidate_fails_restored_last_good_passes
+    router.LAST_GOOD_FILE.write_text("{}")
+    monkeypatch.setattr(router, "engine_start", lambda **k: 0)
+    monkeypatch.setattr(router.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(router, "wait_engine", lambda *a, **k: True)
+
+    assert router.engine_reload() == 1
+    captured = capsys.readouterr()
+    assert "the requested change was NOT applied" in captured.err
+
+
 def test_tray_full_tunnel_toggle_checked_when_tun(tmp_path):
     """The tray must expose the full-tunnel (TUN) state as a checked menu
     item so the user can see "on" and click to turn it off from the menu."""
@@ -1704,8 +1790,8 @@ def test_tray_full_tunnel_toggle_checked_when_tun(tmp_path):
     app = _tray_app(module, tmp_path, up=True, mode="tun")
     rows = _flatten(app.build_menu().items)
     labels = [text for _, text, _, _ in rows]
-    assert "Full tunnel (WARP): on" in labels
-    toggle = next(r for r in rows if r[1].startswith("Full tunnel (WARP)"))
+    assert "Full tunnel (TUN): on" in labels
+    toggle = next(r for r in rows if r[1].startswith("Full tunnel (TUN)"))
     assert toggle[3] is True  # checked
 
 
@@ -1715,8 +1801,8 @@ def test_tray_full_tunnel_toggle_unchecked_when_proxy(tmp_path):
     module = load_tray(tmp_path)
     app = _tray_app(module, tmp_path, up=True, mode="proxy")
     rows = _flatten(app.build_menu().items)
-    toggle = next(r for r in rows if r[1].startswith("Full tunnel (WARP)"))
-    assert toggle[1] == "Full tunnel (WARP): off"
+    toggle = next(r for r in rows if r[1].startswith("Full tunnel (TUN)"))
+    assert toggle[1] == "Full tunnel (TUN): off"
     assert toggle[3] is False
 
 
@@ -1727,6 +1813,7 @@ def test_tray_full_tunnel_toggle_invokes_vpn_action(tmp_path, monkeypatch):
     module = load_tray(tmp_path)
     app = _tray_app(module, tmp_path, up=True, mode="tun")
     calls = []
+    monkeypatch.setattr(app.client, "status", lambda: app.latest)
     monkeypatch.setattr(app.client, "vpn", lambda a: calls.append(a) or (0, ""))
     monkeypatch.setattr(app, "_do", lambda action, _label: action())
     app.action_toggle_vpn()
@@ -1734,6 +1821,7 @@ def test_tray_full_tunnel_toggle_invokes_vpn_action(tmp_path, monkeypatch):
 
     app2 = _tray_app(module, tmp_path, up=True, mode="proxy")
     calls2 = []
+    monkeypatch.setattr(app2.client, "status", lambda: app2.latest)
     monkeypatch.setattr(app2.client, "vpn", lambda a: calls2.append(a) or (0, ""))
     monkeypatch.setattr(app2, "_do", lambda action, _label: action())
     app2.action_toggle_vpn()

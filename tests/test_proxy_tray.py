@@ -1,6 +1,9 @@
 """Unit tests for proxy_tray.py (stdlib only, no GUI deps — the
 module's pystray/PIL imports are guarded)."""
 import importlib.util
+import io
+import json
+import plistlib
 import signal
 import subprocess
 import sys
@@ -27,6 +30,67 @@ def _load_tray():
 
 
 tray = _load_tray()
+
+
+class DefaultRootTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+
+    def _root_for(self, tray_path: Path) -> str:
+        with mock.patch.object(tray, "__file__", str(tray_path)):
+            return tray._default_root()
+
+    def test_canonical_root_level_tray_uses_its_directory(self):
+        (self.base / "router.py").touch()
+        got = self._root_for(self.base / "proxy_tray.py")
+        self.assertEqual(got, str(self.base.resolve()))
+
+    def test_legacy_examples_tray_uses_repository_parent(self):
+        (self.base / "router.py").touch()
+        examples = self.base / "examples"
+        examples.mkdir()
+        got = self._root_for(examples / "proxy_tray.py")
+        self.assertEqual(got, str(self.base.resolve()))
+
+    def test_environment_override_wins(self):
+        override = self.base / "selected-root"
+        with mock.patch.dict(tray.os.environ, {"PROXY_ROUTER_ROOT": str(override)}):
+            got = self._root_for(self.base / "proxy_tray.py")
+        self.assertEqual(got, str(override))
+
+
+class MainInitializationTests(unittest.TestCase):
+    def test_main_starts_tray_before_initial_status_fetch(self):
+        client = mock.Mock()
+        created = {}
+
+        class FakeApp:
+            def __init__(self, actual_client, _icon):
+                created["client"] = actual_client
+                created["app"] = self
+                self.latest = tray.RouterStatus()
+
+            def run(self):
+                return None
+
+        with (
+            mock.patch.object(tray, "RouterClient", return_value=client),
+            mock.patch.object(tray, "TrayApp", FakeApp),
+            mock.patch.object(tray, "make_icon", return_value=object()) as make_icon,
+            mock.patch.object(tray, "pystray", object()),
+            mock.patch.object(tray, "Image", object()),
+            mock.patch.object(tray, "_dashboard_bundle", return_value=None),
+            mock.patch.object(tray.sys, "argv", ["proxy_tray.py", "--root", "/tmp"]),
+        ):
+            self.assertEqual(tray.main(), 0)
+
+        self.assertIs(created["client"], client)
+        client.status.assert_not_called()
+        self.assertFalse(created["app"].latest.up)
+        self.assertEqual(created["app"]._icon_sig, "#e53935")
+        make_icon.assert_called_once_with("#e53935")
 
 
 class RouterClientEngineOwnerTests(unittest.TestCase):
@@ -105,6 +169,28 @@ class RouterClientLifecycleDelegationTests(unittest.TestCase):
                 ("rotate", "proton"),
                 ("rotate", "proton", "--to", "06-SG-FREE-4", "--force"),
             ],
+        )
+
+    def test_rotation_gets_larger_budget_than_plain_commands(self):
+        with mock.patch.object(tray.subprocess, "run") as run:
+            run.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
+            self.client.rotate()
+            self.client.rotate_to("proton", "06-SG-FREE-4")
+            self.client.stop()
+        timeouts = [c.kwargs["timeout"] for c in run.call_args_list]
+        self.assertEqual(timeouts[0], tray.ROTATION_TIMEOUT)
+        self.assertEqual(timeouts[1], tray.ROTATION_TIMEOUT)
+        self.assertEqual(timeouts[2], tray.COMMAND_TIMEOUT)
+        self.assertGreater(tray.ROTATION_TIMEOUT, tray.COMMAND_TIMEOUT)
+
+    def test_rotation_budget_covers_worst_case_rotation_pipeline(self):
+        settle = 60
+        probe = 8
+        reload_budget = 12
+        self.assertGreaterEqual(
+            tray.ROTATION_TIMEOUT,
+            settle + probe + reload_budget + 5,
+            "budget must fit reload + probe + settle + rollback margin",
         )
 
 
@@ -186,6 +272,19 @@ class RunElevatedFallbackTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[0][0], self.client.python)
         self.assertEqual(run.call_count, 1)
 
+    def test_rotate_without_active_provider_returns_safe_error(self):
+        self.client._active_provider = None
+        with mock.patch.object(self.client, "_run") as run:
+            self.assertEqual(self.client.rotate(), (1, "no active provider"))
+        run.assert_not_called()
+
+    def test_status_clears_cached_provider_when_payload_has_none(self):
+        payload = json.dumps({"up": False, "mode": "proxy", "providers": {}})
+        self.client._active_provider = "proton"
+        with mock.patch.object(self.client, "_run", return_value=(1, payload)):
+            self.client.status()
+        self.assertIsNone(self.client._active_provider)
+
 
 class TransientProbePresentationTests(unittest.TestCase):
     def _status(self, record):
@@ -225,6 +324,221 @@ class TransientProbePresentationTests(unittest.TestCase):
         })
         self.assertIn("▲", status.provider_label("proton"))
         self.assertIn("rate-limited", status.profile_health("proton", "06-SG-FREE-4"))
+
+
+class StatusMenuPresentationTests(unittest.TestCase):
+    def test_failed_tun_attempt_is_distinguished_from_current_proxy_state(self):
+        app = tray.TrayApp(SimpleNamespace(root="/tmp"), None)
+        app.latest = tray.RouterStatus(
+            up=True,
+            mode="proxy",
+            port=2080,
+            preset="school-warp",
+        )
+        app.last_action_result = (
+            "full tunnel on: failed — selective tun: could not resolve route domains"
+        )
+        labels = [item.text for item in app.build_menu()]
+        self.assertIn("● Connected", labels)
+        self.assertIn("router: proxy :2080", labels)
+        self.assertIn("Full tunnel (TUN): off", labels)
+        self.assertIn(
+            "last action: full tunnel on: failed — selective tun: could not resolve route domains",
+            labels,
+        )
+
+    def test_listener_up_with_proxy_mismatch_is_degraded(self):
+        app = tray.TrayApp(SimpleNamespace(root="/tmp"), None)
+        app.latest = tray.RouterStatus(
+            up=True, mode="proxy", port=2080, system_proxy_status="system_proxy_mismatch")
+        labels = [item.text for item in app.build_menu()]
+        self.assertIn("▲ Degraded (system_proxy_mismatch)", labels)
+        self.assertNotIn("● Connected", labels)
+
+    def test_fail_open_parked_lane_is_degraded(self):
+        app = tray.TrayApp(SimpleNamespace(root="/tmp"), None)
+        app.latest = tray.RouterStatus(
+            up=True, mode="proxy", port=2080,
+            degraded_lanes=["school (cloudflare down, failing open to direct)"])
+        labels = [item.text for item in app.build_menu()]
+        self.assertIn(
+            "▲ Degraded (school (cloudflare down, failing open to direct))", labels)
+        self.assertNotIn("● Connected", labels)
+
+    def test_degraded_lane_changes_render_signature_and_warns_icon(self):
+        app = tray.TrayApp(SimpleNamespace(root="/tmp"), None)
+        connected = tray.RouterStatus(up=True, mode="proxy", port=2080)
+        degraded = tray.RouterStatus(
+            up=True, mode="proxy", port=2080, degraded_lanes=["school: direct fallback"])
+
+        self.assertNotEqual(app._status_signature(connected),
+                            app._status_signature(degraded))
+        self.assertEqual(tray._status_icon_color(degraded), "#ff9800")
+
+    def test_mutation_drain_budget_includes_status_refresh(self):
+        self.assertGreaterEqual(
+            tray.MUTATION_DRAIN_TIMEOUT,
+            tray.ROTATION_TIMEOUT + tray.COMMAND_TIMEOUT + 5.0,
+        )
+
+    def test_degraded_lanes_survive_status_payload(self):
+        status = tray.RouterStatus.from_cli(0, json.dumps({
+            "up": True, "mode": "proxy", "port": 2080,
+            "degraded_lanes": ["school (cloudflare down, failing open to direct)"],
+        }))
+        self.assertEqual(
+            status.degraded_lanes,
+            ["school (cloudflare down, failing open to direct)"])
+        self.assertIn("degraded", status.headline())
+
+    def test_dns_degradation_shows_recovery_path(self):
+        app = tray.TrayApp(SimpleNamespace(root="/tmp"), None)
+        app.latest = tray.RouterStatus(
+            up=True, mode="proxy", port=2080, network_status="direct_dns_unavailable")
+        labels = [item.text for item in app.build_menu()]
+        self.assertIn("▲ Degraded (direct_dns_unavailable)", labels)
+        self.assertIn("Recovery: restore DHCP DNS → reload → doctor --network", labels)
+
+
+class RouterStatusProxyDiagnosticsTests(unittest.TestCase):
+    def test_cli_payload_preserves_proxy_and_network_diagnostics(self):
+        status = tray.RouterStatus.from_cli(0, json.dumps({
+            "up": True, "mode": "proxy", "port": 2080,
+            "system_proxy": {"status": "system_proxy_mismatch"},
+            "network": {"status": "direct_dns_unavailable"},
+        }))
+        self.assertEqual(status.system_proxy_status, "system_proxy_mismatch")
+        self.assertEqual(status.network_status, "direct_dns_unavailable")
+
+
+class RouterStatusContractTests(unittest.TestCase):
+    def test_unusable_config_payload_is_error_not_first_run(self):
+        payload = json.dumps({
+            "up": False,
+            "state": "down (unusable config; see error above)",
+            "mode": None,
+            "port": None,
+            "providers": {},
+            "routes": [],
+            "routing": {"mode": None, "default_provider": None},
+        })
+        status = tray.RouterStatus.from_cli(1, payload)
+        self.assertFalse(status.up)
+        self.assertIn("unusable", status.error or "")
+        app = tray.TrayApp(SimpleNamespace(root="/tmp"), None)
+        app.latest = status
+        labels = [item.text for item in app.build_menu()]
+        self.assertIn("! Error", labels)
+        self.assertNotIn("● No VPN set up yet", labels)
+
+    def test_tun_headline_does_not_claim_proxy_listener(self):
+        headline = tray.RouterStatus(up=True, mode="tun", port=2080).headline()
+        self.assertIn("TUN", headline)
+        self.assertNotIn("proxy :2080", headline)
+
+    def test_disconnect_stays_available_for_degraded_engine_states(self):
+        for status in (
+            tray.RouterStatus(up=False, mode="tun", pid=4242,
+                              providers={"proton": {"active": "a"}}),
+            tray.RouterStatus(error="status command failed"),
+        ):
+            with self.subTest(status=status):
+                app = tray.TrayApp(SimpleNamespace(root="/tmp"), None)
+                app.latest = status
+                item = next(item for item in app.build_menu()
+                            if item.text == "Disconnect")
+                self.assertTrue(item.enabled)
+
+
+class FreshActionStateTests(unittest.TestCase):
+    def _wait_until(self, predicate, timeout=2.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.005)
+        return predicate()
+
+    def test_toggle_uses_fresh_mode_not_cached_snapshot(self):
+        calls = []
+        current = tray.RouterStatus(up=True, mode="tun", port=2080)
+
+        class Client:
+            root = "/tmp"
+
+            def status(self):
+                return current
+
+            def vpn(self, target):
+                calls.append(target)
+                return 0, "ok"
+
+        app = tray.TrayApp(Client(), None)
+        app.latest = tray.RouterStatus(up=True, mode="proxy", port=2080)
+        app.action_toggle_vpn()
+        self.assertTrue(self._wait_until(lambda: calls == ["off"]))
+
+    def test_safe_list_uses_configured_default_when_disconnected(self):
+        calls = []
+        status = tray.RouterStatus(
+            up=False,
+            routing_mode="default",
+            default_provider="proton",
+            providers={"proton": {"active": None, "profiles": ["a"]}},
+        )
+
+        class Client:
+            root = "/tmp"
+
+            def status(self):
+                return status
+
+            def set_mode(self, mode, provider=None):
+                calls.append((mode, provider))
+                return 0, "ok"
+
+        app = tray.TrayApp(Client(), None)
+        app.latest = status
+        app.action_mode("safe-list")
+        self.assertTrue(self._wait_until(lambda: calls == [("safe-list", "proton")]))
+
+    def test_preset_apply_does_not_reload_or_start_when_disconnected(self):
+        calls = []
+        status = tray.RouterStatus(up=False, mode="proxy", providers={"proton": {}})
+
+        class Client:
+            root = "/tmp"
+
+            def status(self):
+                return status
+
+            def setup_preset(self, name):
+                calls.append(("preset", name))
+                return 0, "preset saved"
+
+            def reload(self):
+                calls.append(("reload",))
+                return 0, "reloaded"
+
+        app = tray.TrayApp(Client(), None)
+        app.latest = status
+        app.action_apply_preset("school-warp")
+        self.assertTrue(self._wait_until(lambda: calls == [("preset", "school-warp")]))
+        self.assertNotIn(("reload",), calls)
+
+    def test_generic_switch_is_disabled_when_multiple_provider_lanes_are_active(self):
+        app = tray.TrayApp(SimpleNamespace(root="/tmp"), None)
+        app.latest = tray.RouterStatus(
+            up=True,
+            active_providers={"cloudflare": "warp", "proton": "nl"},
+            providers={
+                "cloudflare": {"active": "warp", "profiles": ["warp"]},
+                "proton": {"active": "nl", "profiles": ["nl"]},
+            },
+        )
+        item = next(item for item in app.build_menu()
+                    if item.text == "Switch VPN server")
+        self.assertFalse(item.enabled)
 
 
 class MutationSerializationTests(unittest.TestCase):
@@ -296,6 +610,16 @@ class MutationSerializationTests(unittest.TestCase):
             and "failed" in app.last_action_result))
         self.assertIn("RuntimeError", app.last_action_result)
 
+    def test_dashboard_update_failure_does_not_stick_mutation_active(self):
+        app = self._make_app()
+
+        def fail_publish(*_args):
+            raise RuntimeError("dashboard closed")
+
+        app._publish_status = fail_publish
+        app._do(lambda: (0, "ok"), "connect")
+        self.assertTrue(self._wait_until(lambda: not app._mutation_active))
+
     def test_stale_poll_cannot_overwrite_newer_post_action_snapshot(self):
         # Deliberately inverted completion driven through the REAL poll
         # loop: the poll claims its slot and fetches status BEFORE the
@@ -340,6 +664,67 @@ class MutationSerializationTests(unittest.TestCase):
             app.latest.up,
             "stale poll overwrote the post-action snapshot")
 
+    def test_signature_changes_when_custom_preset_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "presets").mkdir()
+            app = tray.TrayApp(SimpleNamespace(root=str(root)), None)
+            status = tray.RouterStatus()
+            before = app._status_signature(status)
+            (root / "presets" / "games.json").write_text(
+                '{"routes": [{"domains": ["example.com"], "provider": "proton"}]}')
+            after = app._status_signature(status)
+        self.assertNotEqual(before, after)
+
+    def test_publish_status_refreshes_icon_immediately(self):
+        app = self._make_app()
+        app.tray = SimpleNamespace(menu=None, icon=None)
+        icon = object()
+        with mock.patch.object(tray, "make_icon", return_value=icon), \
+             mock.patch.object(app, "build_menu", return_value=object()):
+            app._publish_status(
+                tray.RouterStatus(up=True, mode="proxy", port=2080), 1)
+        self.assertIs(app.tray.icon, icon)
+        self.assertEqual(app._icon_sig, "#4caf50")
+
+    def test_icon_render_failure_does_not_escape_publish_status(self):
+        app = self._make_app()
+        app.tray = SimpleNamespace(menu=None, icon=None)
+        with mock.patch.object(tray, "make_icon", side_effect=RuntimeError("icon broken")), \
+             mock.patch.object(app, "build_menu", return_value=object()):
+            app._publish_status(
+                tray.RouterStatus(up=True, mode="proxy", port=2080), 1)
+        self.assertTrue(app.latest.up)
+
+    def test_poll_error_cannot_overwrite_newer_snapshot(self):
+        class OneIterationEvent:
+            def __init__(self):
+                self.done = False
+
+            def is_set(self):
+                return self.done
+
+            def wait(self, _seconds):
+                self.done = True
+                return True
+
+        class ErrorAfterNewerSnapshotClient:
+            def __init__(self, app):
+                self.app = app
+
+            def status(self):
+                self.app._publish_status(
+                    tray.RouterStatus(up=True, mode="proxy", port=2080), 3)
+                raise RuntimeError("stale status failure")
+
+        app = tray.TrayApp(None, None)
+        app._publish_status(tray.RouterStatus(up=False), 1)
+        app.client = ErrorAfterNewerSnapshotClient(app)
+        app.quit_flag = OneIterationEvent()
+        app.poll_loop()
+        self.assertTrue(app.latest.up)
+        self.assertIsNone(app.latest.error)
+
     @staticmethod
     def _guarded_poll(app):
         def run():
@@ -378,6 +763,36 @@ class MutationSerializationTests(unittest.TestCase):
         self.assertNotEqual(
             app._status_signature(plain),
             app._status_signature(tray.RouterStatus(providers=marked)))
+
+    def test_render_signature_ignores_poll_epoch(self):
+        app = self._make_app()
+        status = tray.RouterStatus(up=True, mode="proxy", port=2080)
+        with app.lock:
+            app._status_epoch = 1
+        first = app._status_signature(status)
+        with app.lock:
+            app._status_epoch = 2
+        second = app._status_signature(status)
+        self.assertEqual(first, second)
+
+    def test_refresh_menu_skips_identical_render(self):
+        app = self._make_app()
+        app.tray = SimpleNamespace(menu=None)
+        sentinel = object()
+        with mock.patch.object(app, "build_menu", return_value=sentinel) as build:
+            app._refresh_menu()
+            app._refresh_menu()
+        self.assertEqual(build.call_count, 1)
+        self.assertIs(app.tray.menu, sentinel)
+
+    def test_menu_render_failure_does_not_escape_publish_status(self):
+        app = self._make_app()
+        app.tray = SimpleNamespace(menu=None, icon=None)
+        with mock.patch.object(tray, "make_icon", return_value=object()), \
+             mock.patch.object(app, "build_menu", side_effect=RuntimeError("menu broken")):
+            app._publish_status(
+                tray.RouterStatus(up=True, mode="proxy", port=2080), 1)
+        self.assertTrue(app.latest.up)
 
     def test_publish_status_without_epoch_always_installs(self):
         # Error snapshots from poll failures carry no epoch; they install
@@ -842,7 +1257,7 @@ class PermissionErrorMappingTests(unittest.TestCase):
 
 
 class DashboardOpenerTests(unittest.TestCase):
-    """Tray one-click: open the full TUI in a terminal window."""
+    """Tray one-click prefers the Tauri dashboard over the legacy TUI."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -852,17 +1267,73 @@ class DashboardOpenerTests(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
+    def test_prefers_tauri_dashboard_bundle(self):
+        app = self.root / "Proxy Router.app"
+        macos = app / "Contents" / "MacOS"
+        macos.mkdir(parents=True)
+        executable = "proxy-router-dashboard"
+        with (app / "Contents" / "Info.plist").open("wb") as handle:
+            plistlib.dump({"CFBundleExecutable": executable}, handle)
+        binary = macos / executable
+        binary.write_text("#!/bin/sh\\n")
+        binary.chmod(0o755)
+        calls = []
+
+        def fake_popen(argv, **kwargs):
+            calls.append(argv)
+            return mock.Mock()
+
+        with (
+            mock.patch.dict(
+                tray.os.environ, {"PROXY_ROUTER_DASHBOARD": str(app)}, clear=False
+            ),
+            mock.patch.object(tray.sys, "platform", "darwin"),
+            mock.patch.object(
+                tray, "_dashboard_bundle_candidates", return_value=[app]
+            ),
+            mock.patch.object(tray.subprocess, "Popen", side_effect=fake_popen),
+        ):
+            self.assertTrue(tray.open_dashboard(self.root))
+
+        self.assertEqual(calls[0][:2], ["open", "-a"])
+        self.assertEqual(calls[0][2], str(app))
+
+    def test_launches_direct_release_binary_when_no_bundle_exists(self):
+        binary = self.root / "dashboard" / "src-tauri" / "target" / "release" / "proxy-router-dashboard"
+        binary.parent.mkdir(parents=True)
+        binary.write_text("dashboard")
+        calls = []
+
+        def fake_popen(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return mock.Mock()
+
+        with (
+            mock.patch.object(tray.sys, "platform", "linux"),
+            mock.patch.object(tray, "_dashboard_bundle", return_value=None),
+            mock.patch.object(tray.subprocess, "Popen", side_effect=fake_popen),
+        ):
+            self.assertTrue(tray.open_dashboard(self.root))
+
+        self.assertEqual(calls[0][0], [str(binary)])
+
     def test_missing_tui_fails_quietly(self):
         (self.root / "setup_tui.py").unlink()
-        self.assertFalse(tray.open_dashboard(self.root))
+        with mock.patch.object(tray, "_dashboard_bundle", return_value=None):
+            self.assertFalse(tray.open_dashboard(self.root))
 
     @unittest.skipUnless(sys.platform == "darwin", "macOS Terminal path")
     def test_macos_opens_terminal_with_tui(self):
         calls = []
+
         def fake_popen(argv, **kwargs):
             calls.append(argv)
             return mock.Mock()
-        with mock.patch.object(tray.subprocess, "Popen", side_effect=fake_popen):
+
+        with (
+            mock.patch.object(tray, "_dashboard_bundle", return_value=None),
+            mock.patch.object(tray.subprocess, "Popen", side_effect=fake_popen),
+        ):
             self.assertTrue(tray.open_dashboard(self.root))
         self.assertEqual(calls[0][0], "osascript")
         self.assertIn("setup_tui.py", " ".join(calls[0]))
@@ -906,7 +1377,7 @@ class DashboardActionTests(unittest.TestCase):
         with mock.patch.object(tray, "open_dashboard", return_value=True), \
              mock.patch.object(self.app, "build_menu", return_value=sentinel) as build:
             self.app.action_dashboard()
-        self.assertIsNone(self.app._menu_sig)
+        self.assertIsNotNone(self.app._menu_sig)
         self.assertIs(self.app.tray.menu, sentinel)
         build.assert_called_once_with()
 
@@ -944,7 +1415,9 @@ class PresetApplyReloadTests(unittest.TestCase):
         def fake_do(fn, label):
             captured["rc"] = fn()
             captured["label"] = label
-        with mock.patch.object(self.client, "_run",
+        with mock.patch.object(self.client, "status",
+                               return_value=tray.RouterStatus(up=True)), \
+             mock.patch.object(self.client, "_run",
                                side_effect=[(1, "boom"), (0, "reloaded")]) as run:
             bound = tray.TrayApp.action_apply_preset.__get__(app)
             real_do = tray.TrayApp._do.__get__(app)
@@ -953,6 +1426,470 @@ class PresetApplyReloadTests(unittest.TestCase):
             bound("school-warp")
         run.assert_called_once_with("setup", "--preset", "school-warp")
         self.assertEqual(captured["rc"], (1, "boom"))
+
+
+class PresetMenuCallbackTests(unittest.TestCase):
+    def test_preset_activation_keeps_captured_name_instead_of_icon(self):
+        calls = []
+
+        class FakeClient:
+            root = "/tmp"
+
+            def status(self):
+                return tray.RouterStatus(
+                    up=True,
+                    providers={"proton": {"active": "nl", "profiles": ["nl"], "egress": {}}},
+                    preset="school-warp",
+                )
+
+            def setup_preset(self, name):
+                calls.append(("setup", name))
+                return 0, "preset applied"
+
+            def reload(self):
+                calls.append(("reload",))
+                return 0, "reloaded"
+
+        app = tray.TrayApp(FakeClient(), None)
+        captured = {}
+
+        def fake_do(fn, label):
+            captured["label"] = label
+            captured["result"] = fn()
+
+        app._do = fake_do
+        menu = app.build_menu()
+        presets = next(item for item in menu if item.text == "Presets").submenu
+        preset = next(item for item in presets if "school-warp" in item.text)
+        preset(object())
+        self.assertEqual(captured["label"], "preset school-warp")
+        self.assertEqual(calls, [("setup", "school-warp"), ("reload",)])
+
+
+class DashboardViewModelTests(unittest.TestCase):
+    def test_disconnected_model_binds_primary_connect_and_route_health(self):
+        status = tray.RouterStatus(
+            up=False,
+            routing_mode="safe-list",
+            providers={
+                "proton": {
+                    "active": "01-NL",
+                    "profiles": ["01-NL"],
+                    "egress": {"01-NL": {"ok": True, "latency_ms": 42}},
+                }
+            },
+        )
+        model = tray.DashboardViewModel.from_status(status)
+        self.assertEqual(model.title, "Disconnected")
+        self.assertEqual(model.primary_action, "connect")
+        self.assertEqual(model.primary_label, "Connect")
+        self.assertEqual(model.mode_label, "Home")
+        self.assertEqual(model.provider_summary, "Proton")
+        self.assertEqual(model.route_health, "Healthy")
+        self.assertEqual(model.port_label, "Not running")
+
+    def test_connected_model_binds_disconnect_and_route_details(self):
+        status = tray.RouterStatus(
+            up=True,
+            mode="proxy",
+            port=2080,
+            watcher=True,
+            routing_mode="vpn-list",
+            providers={
+                "proton": {
+                    "active": "01-NL",
+                    "profiles": ["01-NL"],
+                    "egress": {"01-NL": {"ok": True, "latency_ms": 18}},
+                }
+            },
+        )
+        model = tray.DashboardViewModel.from_status(status)
+        self.assertEqual(model.title, "Connected")
+        self.assertEqual(model.primary_action, "disconnect")
+        self.assertEqual(model.mode_label, "School")
+        self.assertEqual(model.port_label, "Proxy :2080")
+        self.assertEqual(model.watcher_label, "Route watcher active")
+        self.assertEqual(model.route_health, "Healthy")
+
+
+    def test_degraded_connected_model_warns_instead_of_showing_healthy(self):
+        status = tray.RouterStatus(
+            up=True,
+            mode="proxy",
+            providers={
+                "proton": {
+                    "active": "01-NL",
+                    "profiles": ["01-NL"],
+                    "egress": {"01-NL": {"ok": True, "latency_ms": 18}},
+                }
+            },
+            degraded_lanes=["proton"],
+        )
+
+        model = tray.DashboardViewModel.from_status(status)
+
+        self.assertEqual(model.title, "Degraded")
+        self.assertEqual(model.route_health, "Needs attention")
+        self.assertEqual(model.primary_action, "disconnect")
+        self.assertEqual(
+            tray._dashboard_indicator(status), ("▲", (242, 157, 76)))
+        self.assertIn("proton", model.explanation)
+
+    def test_error_model_renders_actionable_error_without_crashing(self):
+        model = tray.DashboardViewModel.from_status(
+            tray.RouterStatus(error="status exit 7"))
+        self.assertEqual(model.title, "Router unavailable")
+        self.assertIn("status exit 7", model.error)
+        self.assertEqual(model.route_health, "Unavailable")
+
+    def test_none_provider_entry_is_treated_as_unconfigured(self):
+        model = tray.DashboardViewModel.from_status(
+            tray.RouterStatus(providers={"proton": None}))
+        self.assertEqual(model.provider_rows, ("Proton   no active server",))
+        self.assertEqual(model.route_health, "Waiting")
+
+    def test_none_provider_map_is_treated_as_unconfigured(self):
+        model = tray.DashboardViewModel.from_status(
+            tray.RouterStatus(providers=None))
+        self.assertEqual(model.provider_summary, "No provider")
+        self.assertEqual(model.route_health, "Not configured")
+
+    def test_none_egress_record_is_treated_as_waiting(self):
+        model = tray.DashboardViewModel.from_status(
+            tray.RouterStatus(providers={
+                "proton": {"active": "01-NL", "egress": {"01-NL": None}},
+            }))
+        self.assertEqual(model.route_health, "Waiting")
+
+
+class DashboardLifecycleTests(unittest.TestCase):
+    class FakeWindow:
+        def __init__(self):
+            self.statuses = []
+            self.actions = []
+            self.shown = 0
+            self.closed = 0
+
+        def update_status(self, status):
+            self.statuses.append(status)
+
+        def update_action(self, action):
+            self.actions.append(action)
+
+        def show(self):
+            self.shown += 1
+
+        def close(self):
+            self.closed += 1
+
+    def test_show_reuses_and_focuses_one_window_then_closes_it(self):
+        windows = []
+
+        def factory(*_args):
+            window = self.FakeWindow()
+            windows.append(window)
+            return window
+
+        controller = tray.DashboardController(
+            object(), object(), window_factory=factory)
+        first = tray.RouterStatus(up=False)
+        second = tray.RouterStatus(up=True)
+        self.assertTrue(controller.show(first))
+        self.assertTrue(controller.show(second))
+        self.assertEqual(len(windows), 1)
+        self.assertEqual(windows[0].shown, 2)
+        self.assertEqual(windows[0].statuses, [first, second])
+        controller.update_action("connect: working")
+        self.assertEqual(windows[0].actions[-1], "connect: working")
+        controller.close()
+        self.assertEqual(windows[0].closed, 1)
+
+    def test_missing_cocoa_factory_fails_closed(self):
+        controller = tray.DashboardController(
+            object(), object(), window_factory=lambda *_args: None)
+        self.assertFalse(controller.show(tray.RouterStatus()))
+        self.assertIsNone(controller.window)
+
+
+class DashboardRenderTests(unittest.TestCase):
+    """The dashboard must survive a real AppKit repaint.
+
+    A Python exception raised inside drawRect: escapes the draw callback, so
+    AppKit terminates the whole process (SIGTRAP via +[NSApplication
+    _crashOnException:]). Observed live as the tray icon vanishing on click
+    because AppKit.NSRectFill_ is absent from current PyObjC builds.
+    """
+
+    def setUp(self):
+        if not tray._REAL_DARWIN_PYSTRAY:
+            self.skipTest("Cocoa/pystray unavailable")
+
+    def render(self, root):
+        bounds = root.bounds()
+        image = tray.AppKit.NSImage.alloc().initWithSize_(bounds.size)
+        image.lockFocus()
+        try:
+            if tray.AppKit.NSGraphicsContext.currentContext() is None:
+                self.skipTest("no graphics context (headless)")
+            root.drawRect_(bounds)
+        finally:
+            image.unlockFocus()
+
+    def test_window_draw_survives_repaint(self):
+        client = tray.RouterClient("/tmp")
+        app = tray.TrayApp(client, None)
+        try:
+            window = app.dashboard.window_factory(
+                client, app._dispatch_dashboard_action,
+                tray.RouterStatus(up=True, port=2080))
+        except Exception as exc:
+            self.skipTest(f"no window server: {exc}")
+
+        self.render(window.root)
+        self.render(window.root)
+
+
+
+class DashboardClickRoutingTests(unittest.TestCase):
+    def test_left_click_opens_dashboard_and_right_click_opens_existing_menu(self):
+        calls = []
+        token = object()
+        self.assertIsNone(tray._route_macos_click(
+            "left", lambda: calls.append("dashboard"),
+            lambda: calls.append("menu")))
+        self.assertIsNone(tray._route_macos_click(
+            "right", lambda: calls.append("dashboard"),
+            lambda: calls.append("menu")))
+        self.assertEqual(calls, ["dashboard", "menu"])
+        self.assertIs(tray._route_macos_click(
+            "other", lambda: None, lambda: None, event=token), token)
+
+    def test_menu_creation_keeps_existing_right_click_actions(self):
+        class RootedClient:
+            root = "/tmp"
+
+            def status(self):
+                return tray.RouterStatus()
+
+        app = tray.TrayApp(RootedClient(), None)
+        labels = [item.text for item in app.build_menu()]
+        for expected in ("Open Dashboard (Terminal setup)", "Connect", "Disconnect",
+                         "Routing mode", "Setup", "Presets", "Quit"):
+            self.assertIn(expected, labels)
+
+    def test_primary_click_prefers_the_tauri_app(self):
+        opened = []
+        native = []
+        with mock.patch.object(tray, "_dashboard_bundle",
+                               return_value=Path("/tmp/Proxy Router.app")), \
+             mock.patch.object(tray, "_launch_dashboard_app",
+                               side_effect=lambda app: opened.append(app) or True):
+            app = tray.TrayApp(SimpleNamespace(root="/tmp"), None)
+            app.dashboard.show = lambda status: native.append(status) or True
+            self.assertTrue(app._open_primary_dashboard())
+
+        self.assertEqual([str(p) for p in opened], ["/tmp/Proxy Router.app"])
+        self.assertEqual(native, [])
+
+    def test_primary_click_falls_back_to_the_native_window(self):
+        native = []
+        with mock.patch.object(tray, "_dashboard_bundle", return_value=None):
+            app = tray.TrayApp(SimpleNamespace(root="/tmp"), None)
+            app.dashboard.show = lambda status: native.append(status) or True
+            self.assertTrue(app._open_primary_dashboard())
+
+        self.assertEqual(len(native), 1)
+
+
+class DarwinStatusButtonTests(unittest.TestCase):
+    """Verify the private pystray-Darwin adapter without opening a window."""
+
+    class Event:
+        def __init__(self, event_type, modifier_flags=0):
+            self._event_type = event_type
+            self._modifier_flags = modifier_flags
+
+        def type(self):
+            return self._event_type
+
+        def modifierFlags(self):
+            return self._modifier_flags
+
+    def test_native_button_routes_left_to_dashboard_and_right_to_menu(self):
+        if not tray._REAL_DARWIN_PYSTRAY:
+            self.skipTest("Cocoa unavailable")
+        icon = object.__new__(tray._DarwinDashboardIcon)
+        icon._visible = False
+        icon._dashboard_callback = mock.Mock()
+        icon._show_native_menu = mock.Mock()
+        left = self.Event(tray.AppKit.NSLeftMouseUp)
+        right = self.Event(tray.AppKit.NSRightMouseUp)
+
+        icon._route_status_button_event(left)
+        icon._route_status_button_event(right)
+
+        icon._dashboard_callback.assert_called_once_with()
+        icon._show_native_menu.assert_called_once_with(right)
+
+    def test_control_click_opens_existing_menu(self):
+        if not tray._REAL_DARWIN_PYSTRAY:
+            self.skipTest("Cocoa unavailable")
+        control_mask = getattr(
+            tray.AppKit, "NSEventModifierFlagControl",
+            getattr(tray.AppKit, "NSControlKeyMask", 0),
+        )
+        if not control_mask:
+            self.skipTest("Cocoa control modifier unavailable")
+        event = self.Event(tray.AppKit.NSLeftMouseUp, control_mask)
+        self.assertTrue(tray._is_right_click_event(event))
+
+    def test_native_menu_rebuild_keeps_status_item_menu_unset(self):
+        if not tray._REAL_DARWIN_PYSTRAY:
+            self.skipTest("Cocoa unavailable")
+        icon = object.__new__(tray._DarwinDashboardIcon)
+        icon._visible = False
+        icon._menu_handle = None
+        icon._native_menu = None
+        icon._menu = object()
+        icon._dashboard_delegate = object()
+        button = SimpleNamespace(
+            setTarget_=mock.Mock(),
+            setAction_=mock.Mock(),
+            sendActionOn_=mock.Mock(),
+        )
+        icon._status_item = SimpleNamespace(
+            button=lambda: button, setMenu_=mock.Mock())
+        native_menu = object()
+        icon._create_menu = mock.Mock(return_value=native_menu)
+
+        icon._update_menu()
+
+        self.assertIs(icon._menu_handle[0], native_menu)
+        self.assertTrue(icon._status_item.setMenu_.call_args_list)
+        self.assertTrue(all(call.args == (None,)
+                            for call in icon._status_item.setMenu_.call_args_list))
+
+
+class DashboardTrayIntegrationTests(unittest.TestCase):
+    def test_left_click_entry_uses_native_callback_but_menu_entry_stays_legacy(self):
+        class RootedClient:
+            root = "/tmp"
+
+            def status(self):
+                return tray.RouterStatus()
+
+        app = tray.TrayApp(RootedClient(), None)
+        app.dashboard = mock.Mock()
+        with mock.patch.object(tray, "open_dashboard", return_value=True) as legacy:
+            app.action_dashboard()
+        legacy.assert_called_once_with("/tmp")
+
+        app.dashboard.show.reset_mock()
+        app._show_native_dashboard()
+        app.dashboard.show.assert_called_once_with(app.latest)
+
+    def test_dashboard_action_dispatch_reuses_existing_tray_methods(self):
+        app = object.__new__(tray.TrayApp)
+        app.action_connect = mock.Mock()
+        app.action_disconnect = mock.Mock()
+        app.action_rotate = mock.Mock()
+        app.action_mode = mock.Mock()
+        app.action_setup = mock.Mock()
+
+        app._dispatch_dashboard_action("connect")
+        app._dispatch_dashboard_action("disconnect")
+        app._dispatch_dashboard_action("rotate")
+        app._dispatch_dashboard_action("mode", "safe-list")
+        app._dispatch_dashboard_action("setup")
+        app._dispatch_dashboard_action("mode", "not-a-mode")
+
+        app.action_connect.assert_called_once_with()
+        app.action_disconnect.assert_called_once_with()
+        app.action_rotate.assert_called_once_with()
+        app.action_mode.assert_called_once_with("safe-list")
+        app.action_setup.assert_called_once_with()
+
+
+class TrayOwnershipTests(unittest.TestCase):
+    """Issue #144: exactly one proxy-router menu-bar item — the dashboard app."""
+
+    def _bundle(self, root: Path, name: str, *, executable=None, include_binary=True):
+        app = root / name
+        macos = app / "Contents" / "MacOS"
+        macos.mkdir(parents=True)
+        if executable is not None:
+            with (app / "Contents" / "Info.plist").open("wb") as handle:
+                plistlib.dump({"CFBundleExecutable": executable}, handle)
+            if include_binary:
+                binary = macos / executable
+                binary.write_text("#!/bin/sh\n")
+                binary.chmod(0o755)
+        return app
+
+    def test_empty_bundle_does_not_count_as_installed_dashboard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self._bundle(Path(directory), "Empty.app")
+            self.assertFalse(tray._is_complete_dashboard_bundle(app))
+
+    def test_bundle_requires_declared_executable_to_exist(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self._bundle(
+                Path(directory), "Incomplete.app",
+                executable="proxy-router-dashboard", include_binary=False,
+            )
+            self.assertFalse(tray._is_complete_dashboard_bundle(app))
+
+    def test_complete_bundle_owns_the_tray(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self._bundle(
+                Path(directory), "Proxy Router.app",
+                executable="proxy-router-dashboard",
+            )
+            self.assertTrue(tray._is_complete_dashboard_bundle(app))
+            with mock.patch.object(
+                tray, "_dashboard_bundle_candidates", return_value=[app]
+            ):
+                self.assertEqual(tray._dashboard_bundle(Path(directory)), app)
+
+    def test_installed_dashboard_forces_headless(self):
+        bundle = Path("/tmp/Proxy Router.app")
+        with mock.patch.object(tray, "_dashboard_bundle", return_value=bundle):
+            self.assertEqual(tray.tray_ownership("/tmp/root"), "headless")
+
+    def test_no_dashboard_bundle_keeps_the_legacy_icon(self):
+        with (
+            mock.patch.object(tray, "_dashboard_bundle", return_value=None),
+            mock.patch.dict(tray.os.environ, {"PROXY_ROUTER_TRAY_HEADLESS": ""}),
+        ):
+            self.assertEqual(tray.tray_ownership("/tmp/root"), "icon")
+
+    def test_explicit_opt_out_keeps_the_legacy_icon(self):
+        with (
+            mock.patch.object(
+                tray, "_dashboard_bundle", return_value=Path("/tmp/Proxy Router.app")
+            ),
+            mock.patch.dict(tray.os.environ, {"PROXY_ROUTER_TRAY_HEADLESS": "0"}),
+        ):
+            self.assertEqual(tray.tray_ownership("/tmp/root"), "icon")
+
+    def test_main_refuses_the_icon_when_the_dashboard_owns_the_menubar(self):
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                tray, "_dashboard_bundle", return_value=Path("/tmp/Proxy Router.app")
+            ),
+            mock.patch.object(tray, "RouterClient") as client,
+            mock.patch.object(tray, "TrayApp") as tray_app,
+            mock.patch.object(sys, "stderr", stderr),
+            mock.patch.object(
+                sys, "argv", ["proxy_tray.py", "--root", "/tmp/root"]
+            ),
+        ):
+            rc = tray.main()
+        self.assertEqual(rc, 0)
+        client.assert_not_called()
+        tray_app.assert_not_called()
+        self.assertIn("not starting a second status item", stderr.getvalue())
 
 
 if __name__ == "__main__":
