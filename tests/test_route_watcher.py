@@ -444,6 +444,19 @@ class RouteWatcherTests(unittest.TestCase):
         with self.assertRaisesRegex(w.RouterConfigError, "port must be an integer"):
             w.router_port(root)
 
+    def test_start_rejects_invalid_router_port_before_marking_or_spawning(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        (root / "router.json").write_text(json.dumps({"port": "2081"}))
+
+        with mock.patch.object(w.subprocess, "Popen") as popen:
+            with self.assertRaisesRegex(w.RouterConfigError, "port must be an integer"):
+                w.start(root)
+
+        popen.assert_not_called()
+        self.assertFalse(w.enabled_file(root).exists())
+        self.assertFalse(w.pid_file(root).exists())
+
     def test_router_port_reads_custom_port(self):
         root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, root, ignore_errors=True)

@@ -423,29 +423,11 @@ def _monitor_settings(root: Path) -> dict:
         raise MonitorConfigError("invalid router.json: monitor.ping_hosts must be an array of strings")
 
     for key in ("http_url", "download_url", "upload_url"):
-        value = settings[key]
-        try:
-            parsed = urlsplit(value) if isinstance(value, str) else None
-        except ValueError:
-            parsed = None
-        if parsed is None or parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            settings[key] = {
-                "http_url": DEFAULT_HTTP_URL,
-                "download_url": DEFAULT_DOWNLOAD_URL,
-                "upload_url": DEFAULT_UPLOAD_URL,
-            }[key]
-        else:
-            # Issue #64: config-time target validation. A URL that aims the
-            # worker at loopback/LAN/link-local/metadata (or a non-http
-            # scheme smuggled past the check above) falls back to the safe
-            # default instead of being probed.
-            violation = _reject_unsafe_url(settings[key])
-            if violation is not None:
-                settings[key] = {
-                    "http_url": DEFAULT_HTTP_URL,
-                    "download_url": DEFAULT_DOWNLOAD_URL,
-                    "upload_url": DEFAULT_UPLOAD_URL,
-                }[key]
+        violation = _reject_unsafe_url(settings[key])
+        if violation is not None:
+            raise MonitorConfigError(
+                f"invalid router.json: monitor.{key} is unsafe: {violation}"
+            )
     settings["interval_seconds"] = max(5, int(settings["interval_seconds"]))
     settings["max_bytes"] = min(max(1, int(settings["max_bytes"])), 10_000_000)
     settings["timeout_seconds"] = min(max(1, float(settings["timeout_seconds"])), 60)

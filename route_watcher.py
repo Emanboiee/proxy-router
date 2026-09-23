@@ -816,6 +816,7 @@ def start(root: Path | None = None, *, interval: float = DEFAULT_INTERVAL) -> di
     current = status(root)
     if current["running"]:
         return {"started": False, "already_running": True, "pid": current["pid"]}
+    router_port(root)
     state_dir(root).mkdir(parents=True, exist_ok=True)
     # Publish the start intent before spawning so the child cannot observe a
     # missing enable marker and exit during the tiny parent/child race.

@@ -128,6 +128,8 @@ class ProbeTests(unittest.TestCase):
             root = Path(tmp)
             settings = monitor._monitor_settings(root)
         self.assertEqual(settings["http_url"], monitor.DEFAULT_HTTP_URL)
+        self.assertEqual(settings["download_url"], monitor.DEFAULT_DOWNLOAD_URL)
+        self.assertEqual(settings["upload_url"], monitor.DEFAULT_UPLOAD_URL)
         self.assertEqual(settings["interval_seconds"], monitor.DEFAULT_INTERVAL)
         self.assertEqual(settings["ping_hosts"], list(monitor.DEFAULT_PING_HOSTS))
 
@@ -291,20 +293,16 @@ class ValidatedTargetTests(unittest.TestCase):
         for result in (download, upload):
             self.assertIn("unsafe monitor target", result["error"])
 
-    def test_settings_fall_back_to_defaults_for_unsafe_urls(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "router.json").write_text(json.dumps({
-                "monitor": {
-                    "http_url": "file:///etc/passwd",
-                    "download_url": "http://192.168.0.1/speed",
-                    "upload_url": "https://169.254.169.254/up",
-                }
-            }))
-            settings = monitor._monitor_settings(root)
-        self.assertEqual(settings["http_url"], monitor.DEFAULT_HTTP_URL)
-        self.assertEqual(settings["download_url"], monitor.DEFAULT_DOWNLOAD_URL)
-        self.assertEqual(settings["upload_url"], monitor.DEFAULT_UPLOAD_URL)
+    def test_settings_reject_malformed_or_unsafe_configured_urls(self):
+        invalid_urls = ("https://[invalid", "http://127.0.0.1/speed")
+        with mock.patch.dict(os.environ, {monitor.PRIVATE_TARGET_BYPASS_ENV: ""}):
+            for key in ("http_url", "download_url", "upload_url"):
+                for url in invalid_urls:
+                    with self.subTest(key=key, url=url), tempfile.TemporaryDirectory() as tmp:
+                        root = Path(tmp)
+                        (root / "router.json").write_text(json.dumps({"monitor": {key: url}}))
+                        with self.assertRaisesRegex(monitor.MonitorConfigError, f"monitor\\.{key}"):
+                            monitor._monitor_settings(root)
 
 
 class PingHostValidationTests(unittest.TestCase):
