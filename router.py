@@ -219,6 +219,18 @@ _port: int = DEFAULT_PORT
 _vpn: dict = {}
 _routing: dict = {}
 _autodetect: dict = {}
+_proxy_bypass_domains: list[str] = []
+DEFAULT_BYPASS_DOMAINS = ("*.local", "localhost", "127.0.0.1", "::1")
+
+
+def _bypass_domains() -> list[str]:
+    """macOS proxy bypass list: loopback defaults plus configured domains.
+
+    Bypassed hosts never reach the engine, so long-lived app traffic (Drive
+    uploads, Colab kernels) cannot be dropped by an engine reload mid-flight.
+    """
+    configured = [d.strip() for d in (_proxy_bypass_domains or []) if d.strip()]
+    return sorted(set(DEFAULT_BYPASS_DOMAINS) | set(configured))
 _egress_settings: dict = {}
 _error_policy: dict | None = None
 _PROVIDER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
@@ -588,7 +600,7 @@ def _load_autodetect(data: dict, routes: list, providers: dict) -> dict:
 
 
 def load_config() -> int:
-    global _providers, _routes, _port, _vpn, _routing, _autodetect
+    global _providers, _routes, _port, _vpn, _routing, _autodetect, _proxy_bypass_domains
     if not CONFIG_FILE.is_file():
         return fail(f"missing {CONFIG_FILE.name}; run 'router.py init' first")
     try:
@@ -608,6 +620,15 @@ def load_config() -> int:
         return fail("no providers configured")
     if not isinstance(vpn, dict):
         return fail(f"bad {CONFIG_FILE.name}: vpn must be an object")
+    bypass_domains = data.get("proxy_bypass_domains", [])
+    if bypass_domains is None:
+        bypass_domains = []
+    if not isinstance(bypass_domains, list) or not all(
+        isinstance(domain, str) and domain.strip() for domain in bypass_domains
+    ):
+        return fail(
+            f"bad {CONFIG_FILE.name}: proxy_bypass_domains must be a list of non-empty strings"
+        )
     capture = vpn.get("capture")
     if capture is not None and capture not in ("ruleset", "routes"):
         return fail(f"bad {CONFIG_FILE.name}: vpn.capture must be 'ruleset' or 'routes'")
@@ -774,6 +795,7 @@ def load_config() -> int:
     _vpn = vpn
     _routing = dict(routing)
     _autodetect = autodetect
+    _proxy_bypass_domains = [domain.strip() for domain in bypass_domains]
     return 0
 
 
@@ -6816,7 +6838,11 @@ def system_proxy_on(runner=None) -> int:
     if conflicts:
         return fail("foreign system proxy conflict: " + "; ".join(conflicts))
 
+    # Freeze the exact list that Connect will apply so Disconnect can restore
+    # the captured pre-Connect list even after a config reload.
+    bypass_domains = _bypass_domains()
     state = {"version": 1, "endpoint": {"server": "127.0.0.1", "port": _port},
+             "proxy_bypass_domains": bypass_domains,
              "services": snapshots, "changed_at": int(time.time())}
     try:
         # Persist the ownership intent before the first mutation.  A crash or
@@ -6835,7 +6861,7 @@ def system_proxy_on(runner=None) -> int:
                 # 127.0.0.1:2080 for GUI apps.
                 ["networksetup", "-setautoproxystate", service, "off"],
                 ["networksetup", "-setproxyautodiscovery", service, "off"],
-                ["networksetup", "-setproxybypassdomains", service, "*.local", "localhost", "127.0.0.1", "::1"],
+                ["networksetup", "-setproxybypassdomains", service, *bypass_domains],
             ]
             for index, command in enumerate(commands):
                 _run_result(run, command, check=True, capture_output=True, timeout=10)
@@ -6908,7 +6934,7 @@ def system_proxy_on(runner=None) -> int:
             if "bypass" in aux and aux["bypass"].get("domains") is not None:
                 try:
                     _run_result(run, ["networksetup", "-setproxybypassdomains", service,
-                                      *aux["bypass"].get("domains", [])], check=True,
+                                      *(aux["bypass"].get("domains") or ["Empty"])], check=True,
                                 capture_output=True, timeout=10)
                 except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError, TypeError) as rollback_exc:
                     rollback_errors.append(f"{service} bypass: {rollback_exc}")
@@ -7057,9 +7083,15 @@ def system_proxy_off(runner=None) -> int:
             if before_domains is not None:
                 try:
                     current_domains = _capture_proxy_aux(service, run).get("bypass", {}).get("domains")
-                    ours_domains = ["*.local", "localhost", "127.0.0.1", "::1"]
+                    if "proxy_bypass_domains" in state:
+                        ours_domains = state["proxy_bypass_domains"]
+                    else:
+                        # Compatibility with ownership records written before
+                        # Connect persisted the applied bypass list.
+                        ours_domains = _bypass_domains()
                     if current_domains == ours_domains and current_domains != before_domains:
-                        _run_result(run, ["networksetup", "-setproxybypassdomains", service, *before_domains],
+                        _run_result(run, ["networksetup", "-setproxybypassdomains", service,
+                                          *(before_domains or ["Empty"])],
                                     check=True, capture_output=True, timeout=10)
                 except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError, TypeError) as exc:
                     failures.append(f"{service} bypass: {exc}")
