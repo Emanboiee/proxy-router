@@ -802,7 +802,19 @@ def open_dashboard(root) -> bool:
     app = _dashboard_bundle(root)
     if app is not None:
         return _launch_dashboard_app(app)
-
+    # Keep supporting direct release binaries on platforms that do not bundle
+    # the app as a macOS .app directory.
+    binary = root / "dashboard" / "src-tauri" / "target" / "release" / (
+        "proxy-router-dashboard.exe" if sys.platform == "win32"
+        else "proxy-router-dashboard"
+    )
+    if binary.is_file():
+        try:
+            subprocess.Popen([str(binary)], cwd=str(root),
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except OSError:
+            pass
     if not (root / "setup_tui.py").is_file():
         print(f"dashboard: missing {root / 'setup_tui.py'}", file=sys.stderr)
         return False

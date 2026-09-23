@@ -1298,6 +1298,25 @@ class DashboardOpenerTests(unittest.TestCase):
         self.assertEqual(calls[0][:2], ["open", "-a"])
         self.assertEqual(calls[0][2], str(app))
 
+    def test_launches_direct_release_binary_when_no_bundle_exists(self):
+        binary = self.root / "dashboard" / "src-tauri" / "target" / "release" / "proxy-router-dashboard"
+        binary.parent.mkdir(parents=True)
+        binary.write_text("dashboard")
+        calls = []
+
+        def fake_popen(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return mock.Mock()
+
+        with (
+            mock.patch.object(tray.sys, "platform", "linux"),
+            mock.patch.object(tray, "_dashboard_bundle", return_value=None),
+            mock.patch.object(tray.subprocess, "Popen", side_effect=fake_popen),
+        ):
+            self.assertTrue(tray.open_dashboard(self.root))
+
+        self.assertEqual(calls[0][0], [str(binary)])
+
     def test_missing_tui_fails_quietly(self):
         (self.root / "setup_tui.py").unlink()
         with mock.patch.object(tray, "_dashboard_bundle", return_value=None):
