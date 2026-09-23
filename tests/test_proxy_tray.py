@@ -3,6 +3,7 @@ module's pystray/PIL imports are guarded)."""
 import importlib.util
 import io
 import json
+import plistlib
 import signal
 import subprocess
 import sys
@@ -74,12 +75,15 @@ class MainInitializationTests(unittest.TestCase):
             def run(self):
                 return None
 
-        with mock.patch.object(tray, "RouterClient", return_value=client), \
-             mock.patch.object(tray, "TrayApp", FakeApp), \
-             mock.patch.object(tray, "make_icon", return_value=object()) as make_icon, \
-             mock.patch.object(tray, "pystray", object()), \
-             mock.patch.object(tray, "Image", object()), \
-             mock.patch.object(tray.sys, "argv", ["proxy_tray.py", "--root", "/tmp"]):
+        with (
+            mock.patch.object(tray, "RouterClient", return_value=client),
+            mock.patch.object(tray, "TrayApp", FakeApp),
+            mock.patch.object(tray, "make_icon", return_value=object()) as make_icon,
+            mock.patch.object(tray, "pystray", object()),
+            mock.patch.object(tray, "Image", object()),
+            mock.patch.object(tray, "_dashboard_bundle", return_value=None),
+            mock.patch.object(tray.sys, "argv", ["proxy_tray.py", "--root", "/tmp"]),
+        ):
             self.assertEqual(tray.main(), 0)
 
         self.assertIs(created["client"], client)
@@ -360,6 +364,22 @@ class StatusMenuPresentationTests(unittest.TestCase):
         self.assertIn(
             "▲ Degraded (school (cloudflare down, failing open to direct))", labels)
         self.assertNotIn("● Connected", labels)
+
+    def test_degraded_lane_changes_render_signature_and_warns_icon(self):
+        app = tray.TrayApp(SimpleNamespace(root="/tmp"), None)
+        connected = tray.RouterStatus(up=True, mode="proxy", port=2080)
+        degraded = tray.RouterStatus(
+            up=True, mode="proxy", port=2080, degraded_lanes=["school: direct fallback"])
+
+        self.assertNotEqual(app._status_signature(connected),
+                            app._status_signature(degraded))
+        self.assertEqual(tray._status_icon_color(degraded), "#ff9800")
+
+    def test_mutation_drain_budget_includes_status_refresh(self):
+        self.assertGreaterEqual(
+            tray.MUTATION_DRAIN_TIMEOUT,
+            tray.ROTATION_TIMEOUT + tray.COMMAND_TIMEOUT + 5.0,
+        )
 
     def test_degraded_lanes_survive_status_payload(self):
         status = tray.RouterStatus.from_cli(0, json.dumps({
@@ -1249,17 +1269,29 @@ class DashboardOpenerTests(unittest.TestCase):
 
     def test_prefers_tauri_dashboard_bundle(self):
         app = self.root / "Proxy Router.app"
-        (app / "Contents" / "MacOS").mkdir(parents=True)
+        macos = app / "Contents" / "MacOS"
+        macos.mkdir(parents=True)
+        executable = "proxy-router-dashboard"
+        with (app / "Contents" / "Info.plist").open("wb") as handle:
+            plistlib.dump({"CFBundleExecutable": executable}, handle)
+        binary = macos / executable
+        binary.write_text("#!/bin/sh\\n")
+        binary.chmod(0o755)
         calls = []
 
         def fake_popen(argv, **kwargs):
             calls.append(argv)
             return mock.Mock()
 
-        with mock.patch.dict(
-            tray.os.environ, {"PROXY_ROUTER_DASHBOARD": str(app)}, clear=False
-        ), mock.patch.object(tray.sys, "platform", "darwin"), mock.patch.object(
-            tray.subprocess, "Popen", side_effect=fake_popen
+        with (
+            mock.patch.dict(
+                tray.os.environ, {"PROXY_ROUTER_DASHBOARD": str(app)}, clear=False
+            ),
+            mock.patch.object(tray.sys, "platform", "darwin"),
+            mock.patch.object(
+                tray, "_dashboard_bundle_candidates", return_value=[app]
+            ),
+            mock.patch.object(tray.subprocess, "Popen", side_effect=fake_popen),
         ):
             self.assertTrue(tray.open_dashboard(self.root))
 
@@ -1268,15 +1300,21 @@ class DashboardOpenerTests(unittest.TestCase):
 
     def test_missing_tui_fails_quietly(self):
         (self.root / "setup_tui.py").unlink()
-        self.assertFalse(tray.open_dashboard(self.root))
+        with mock.patch.object(tray, "_dashboard_bundle", return_value=None):
+            self.assertFalse(tray.open_dashboard(self.root))
 
     @unittest.skipUnless(sys.platform == "darwin", "macOS Terminal path")
     def test_macos_opens_terminal_with_tui(self):
         calls = []
+
         def fake_popen(argv, **kwargs):
             calls.append(argv)
             return mock.Mock()
-        with mock.patch.object(tray.subprocess, "Popen", side_effect=fake_popen):
+
+        with (
+            mock.patch.object(tray, "_dashboard_bundle", return_value=None),
+            mock.patch.object(tray.subprocess, "Popen", side_effect=fake_popen),
+        ):
             self.assertTrue(tray.open_dashboard(self.root))
         self.assertEqual(calls[0][0], "osascript")
         self.assertIn("setup_tui.py", " ".join(calls[0]))
@@ -1453,6 +1491,30 @@ class DashboardViewModelTests(unittest.TestCase):
         self.assertEqual(model.port_label, "Proxy :2080")
         self.assertEqual(model.watcher_label, "Route watcher active")
         self.assertEqual(model.route_health, "Healthy")
+
+
+    def test_degraded_connected_model_warns_instead_of_showing_healthy(self):
+        status = tray.RouterStatus(
+            up=True,
+            mode="proxy",
+            providers={
+                "proton": {
+                    "active": "01-NL",
+                    "profiles": ["01-NL"],
+                    "egress": {"01-NL": {"ok": True, "latency_ms": 18}},
+                }
+            },
+            degraded_lanes=["proton"],
+        )
+
+        model = tray.DashboardViewModel.from_status(status)
+
+        self.assertEqual(model.title, "Degraded")
+        self.assertEqual(model.route_health, "Needs attention")
+        self.assertEqual(model.primary_action, "disconnect")
+        self.assertEqual(
+            tray._dashboard_indicator(status), ("▲", (242, 157, 76)))
+        self.assertIn("proton", model.explanation)
 
     def test_error_model_renders_actionable_error_without_crashing(self):
         model = tray.DashboardViewModel.from_status(
@@ -1738,6 +1800,44 @@ class TrayOwnershipTests(unittest.TestCase):
         self.owner_file = self.root / tray.DASHBOARD_OWNER_FILE
         self.owner_file.parent.mkdir(parents=True, exist_ok=True)
         self.addCleanup(self.tmp.cleanup)
+
+    def _bundle(self, root: Path, name: str, *, executable=None, include_binary=True):
+        app = root / name
+        macos = app / "Contents" / "MacOS"
+        macos.mkdir(parents=True)
+        if executable is not None:
+            with (app / "Contents" / "Info.plist").open("wb") as handle:
+                plistlib.dump({"CFBundleExecutable": executable}, handle)
+            if include_binary:
+                binary = macos / executable
+                binary.write_text("#!/bin/sh\n")
+                binary.chmod(0o755)
+        return app
+
+    def test_empty_bundle_does_not_count_as_installed_dashboard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self._bundle(Path(directory), "Empty.app")
+            self.assertFalse(tray._is_complete_dashboard_bundle(app))
+
+    def test_bundle_requires_declared_executable_to_exist(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self._bundle(
+                Path(directory), "Incomplete.app",
+                executable="proxy-router-dashboard", include_binary=False,
+            )
+            self.assertFalse(tray._is_complete_dashboard_bundle(app))
+
+    def test_complete_bundle_is_discovered_for_launch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self._bundle(
+                Path(directory), "Proxy Router.app",
+                executable="proxy-router-dashboard",
+            )
+            self.assertTrue(tray._is_complete_dashboard_bundle(app))
+            with mock.patch.object(
+                tray, "_dashboard_bundle_candidates", return_value=[app]
+            ):
+                self.assertEqual(tray._dashboard_bundle(Path(directory)), app)
 
     def _write_owner(self, at, owner_root=None):
         self.owner_file.write_text(json.dumps({
