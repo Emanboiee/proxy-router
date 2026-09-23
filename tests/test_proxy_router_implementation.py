@@ -90,7 +90,10 @@ class ProxyRunner:
         elif command[0] == "networksetup" and command[1] == "-setsecurewebproxystate" and command[3] == "off":
             self.https["enabled"] = False
         elif command[0] == "networksetup" and command[1] == "-setproxybypassdomains":
-            self.bypass_domains = command[3:]
+            domains = command[3:]
+            if not domains:
+                return SimpleNamespace(returncode=1, stdout="", stderr="missing bypass list")
+            self.bypass_domains = [] if domains == ["Empty"] else domains
         return SimpleNamespace(returncode=0, stdout="")
 
 
@@ -177,6 +180,21 @@ def test_disconnect_restores_bypass_domains_after_config_reload(tmp_path, monkey
     assert runner.bypass_domains == original_domains
 
 
+def test_disconnect_restores_empty_bypass_domains_with_empty_marker(tmp_path, monkeypatch):
+    runner = ProxyRunner()
+    state_file = tmp_path / "system-proxy.json"
+    monkeypatch.setattr(router, "SYSTEM_PROXY_STATE_FILE", state_file)
+    monkeypatch.setattr(router, "_proxy_bypass_domains", ["configured.example"])
+    monkeypatch.setattr(router, "_port", 2080)
+
+    assert router.system_proxy_on(runner=runner) == 0
+    assert runner.bypass_domains
+    assert router.system_proxy_off(runner=runner) == 0
+
+    assert runner.bypass_domains == []
+    assert ["networksetup", "-setproxybypassdomains", "Campus Wi-Fi", "Empty"] in runner.commands
+
+
 def test_disconnect_legacy_record_falls_back_to_current_bypass_domains(tmp_path, monkeypatch):
     runner = ProxyRunner()
     state_file = tmp_path / "system-proxy.json"
@@ -222,6 +240,23 @@ def test_never_converging_effective_state_rolls_back_and_returns_failure(tmp_pat
          mock.patch.object(router.time, "sleep"):
         assert router.system_proxy_on(runner=runner) == 1
     assert runner.http["enabled"] is False and runner.https["enabled"] is False
+    assert runner.bypass_domains == []
+    assert ["networksetup", "-setproxybypassdomains", "Campus Wi-Fi", "Empty"] in runner.commands
+
+
+def test_failed_config_load_preserves_proxy_bypass_domains(tmp_path, monkeypatch):
+    config_file = tmp_path / "router.json"
+    config_file.write_text(json.dumps({
+        "providers": {"vpn": {"directory": "providers/vpn"}},
+        "routes": [],
+        "vpn": {"capture": "invalid"},
+        "proxy_bypass_domains": ["new.example"],
+    }))
+    monkeypatch.setattr(router, "CONFIG_FILE", config_file)
+    monkeypatch.setattr(router, "_proxy_bypass_domains", ["existing.example"])
+
+    assert router.load_config() == 1
+    assert router._proxy_bypass_domains == ["existing.example"]
 
 
 def test_partial_connect_command_failure_rolls_back_owned_http(tmp_path, monkeypatch):

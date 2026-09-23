@@ -629,7 +629,6 @@ def load_config() -> int:
         return fail(
             f"bad {CONFIG_FILE.name}: proxy_bypass_domains must be a list of non-empty strings"
         )
-    _proxy_bypass_domains = [domain.strip() for domain in bypass_domains]
     capture = vpn.get("capture")
     if capture is not None and capture not in ("ruleset", "routes"):
         return fail(f"bad {CONFIG_FILE.name}: vpn.capture must be 'ruleset' or 'routes'")
@@ -796,6 +795,7 @@ def load_config() -> int:
     _vpn = vpn
     _routing = dict(routing)
     _autodetect = autodetect
+    _proxy_bypass_domains = [domain.strip() for domain in bypass_domains]
     return 0
 
 
@@ -6934,7 +6934,7 @@ def system_proxy_on(runner=None) -> int:
             if "bypass" in aux and aux["bypass"].get("domains") is not None:
                 try:
                     _run_result(run, ["networksetup", "-setproxybypassdomains", service,
-                                      *aux["bypass"].get("domains", [])], check=True,
+                                      *(aux["bypass"].get("domains") or ["Empty"])], check=True,
                                 capture_output=True, timeout=10)
                 except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError, TypeError) as rollback_exc:
                     rollback_errors.append(f"{service} bypass: {rollback_exc}")
@@ -7090,7 +7090,8 @@ def system_proxy_off(runner=None) -> int:
                         # Connect persisted the applied bypass list.
                         ours_domains = _bypass_domains()
                     if current_domains == ours_domains and current_domains != before_domains:
-                        _run_result(run, ["networksetup", "-setproxybypassdomains", service, *before_domains],
+                        _run_result(run, ["networksetup", "-setproxybypassdomains", service,
+                                          *(before_domains or ["Empty"])],
                                     check=True, capture_output=True, timeout=10)
                 except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError, TypeError) as exc:
                     failures.append(f"{service} bypass: {exc}")
