@@ -611,8 +611,9 @@ closed.
 
 The macOS app is published as
 `proxy-router-dashboard-<version>-darwin-arm64.zip` with the CLI release.
-Extract it into `~/Applications`, then use **Open Dashboard** in the tray.
-Install the Python router with the CLI installer first.
+Extract it into `~/Applications` and launch the app directly. Its own
+menu-bar icon provides the dashboard controls. Install the Python router with
+the CLI installer first.
 
 To build and test from a clean checkout on macOS:
 
