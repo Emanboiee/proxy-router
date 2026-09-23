@@ -190,6 +190,19 @@ class ApplyPresetsTests(unittest.TestCase):
         setup_tui.apply_presets(self.config)
         self.assertIn("roblox", [r["id"] for r in json.loads(self.config.read_text())["routes"]])
 
+    def test_enables_autodetect_by_default(self):
+        setup_tui.apply_presets(self.config)
+        data = json.loads(self.config.read_text())
+        self.assertTrue(data["autodetect"]["enabled"])
+
+    def test_preserves_explicit_autodetect_opt_out(self):
+        config = json.loads(self.config.read_text())
+        config["autodetect"] = {"enabled": False}
+        self.config.write_text(json.dumps(config))
+        setup_tui.apply_presets(self.config)
+        data = json.loads(self.config.read_text())
+        self.assertFalse(data["autodetect"]["enabled"])
+
     def test_idempotent_does_not_duplicate(self):
         setup_tui.apply_presets(self.config)
         result = setup_tui.apply_presets(self.config)
@@ -236,6 +249,49 @@ class CustomPresetTests(unittest.TestCase):
         names = setup_tui.preset_names(self.root)
         self.assertIn("school-warp", names)
         self.assertIn("default", names)
+
+    def test_every_builtin_preset_includes_reddit(self):
+        for name, preset in setup_tui._BUILTIN_PRESETS.items():
+            with self.subTest(preset=name):
+                self.assertIn("reddit", [route.get("id") for route in preset.get("routes", [])])
+
+    def test_every_builtin_preset_enables_autodetect(self):
+        for name, preset in setup_tui._BUILTIN_PRESETS.items():
+            with self.subTest(preset=name):
+                self.assertEqual(
+                    preset.get("autodetect"), {"enabled": True, "auto_sources": True}
+                )
+
+    def test_apply_builtin_preset_enables_autodetect(self):
+        for name in setup_tui._BUILTIN_PRESETS:
+            with self.subTest(preset=name):
+                setup_tui.apply_preset_by_name(self.root, name)
+                data = json.loads(self.config.read_text())
+                self.assertTrue(data["autodetect"]["enabled"])
+                self.assertTrue(data["autodetect"]["auto_sources"])
+
+    def test_apply_preset_keeps_tuned_autodetect_settings(self):
+        self.config.write_text(json.dumps({
+            "providers": {"cloudflare": {"directory": "providers/cloudflare"}},
+            "routes": [],
+            "autodetect": {
+                "enabled": False,
+                "interval_seconds": 900,
+                "sources": {
+                    "twitch": {
+                        "seed": "https://www.twitch.tv/",
+                        "route_id": "school",
+                        "provider": "cloudflare",
+                        "roots": ["twitch.tv"],
+                    }
+                },
+            },
+        }))
+        setup_tui.apply_preset_by_name(self.root, "school-warp")
+        data = json.loads(self.config.read_text())
+        self.assertTrue(data["autodetect"]["enabled"])
+        self.assertEqual(data["autodetect"]["interval_seconds"], 900)
+        self.assertIn("twitch", data["autodetect"]["sources"])
 
     def test_apply_school_warp_sets_vpn_list(self):
         result = setup_tui.apply_preset_by_name(self.root, "school-warp")
