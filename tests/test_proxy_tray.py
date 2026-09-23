@@ -361,6 +361,22 @@ class StatusMenuPresentationTests(unittest.TestCase):
             "▲ Degraded (school (cloudflare down, failing open to direct))", labels)
         self.assertNotIn("● Connected", labels)
 
+    def test_degraded_lane_changes_render_signature_and_warns_icon(self):
+        app = tray.TrayApp(SimpleNamespace(root="/tmp"), None)
+        connected = tray.RouterStatus(up=True, mode="proxy", port=2080)
+        degraded = tray.RouterStatus(
+            up=True, mode="proxy", port=2080, degraded_lanes=["school: direct fallback"])
+
+        self.assertNotEqual(app._status_signature(connected),
+                            app._status_signature(degraded))
+        self.assertEqual(tray._status_icon_color(degraded), "#ff9800")
+
+    def test_mutation_drain_budget_includes_status_refresh(self):
+        self.assertGreaterEqual(
+            tray.MUTATION_DRAIN_TIMEOUT,
+            tray.ROTATION_TIMEOUT + tray.COMMAND_TIMEOUT + 5.0,
+        )
+
     def test_degraded_lanes_survive_status_payload(self):
         status = tray.RouterStatus.from_cli(0, json.dumps({
             "up": True, "mode": "proxy", "port": 2080,

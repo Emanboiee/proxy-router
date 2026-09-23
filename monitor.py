@@ -571,6 +571,14 @@ STOP_CONFIRM_SECONDS = 3.0
 
 def stop(root: Path | None = None) -> dict:
     root = Path(root) if root is not None else ROOT
+    try:
+        with worker_lock.exclusive(monitor_dir(root) / "start.lock"):
+            return _stop_locked(root)
+    except TimeoutError as exc:
+        return {"stopped": False, "confirmed": False, "error": str(exc)}
+
+
+def _stop_locked(root: Path) -> dict:
     pid = _read_pid(root)
     confirmed = True
     if pid and _pid_running(pid, root):

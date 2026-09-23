@@ -498,6 +498,12 @@ class ReleaseArtifactTests(unittest.TestCase):
             )
 
 
+class TcpProbeTests(unittest.TestCase):
+    def test_socket_creation_failure_is_a_readiness_failure(self):
+        with mock.patch.object(helper.socket, "socket", side_effect=OSError("fd limit")):
+            self.assertFalse(helper._probe_tcp_connect(2080))
+
+
 class HelperLifecycleTests(unittest.TestCase):
     def runtime(self, root: Path):
         bundle = root / "bundle"
@@ -872,17 +878,20 @@ class HelperLifecycleTests(unittest.TestCase):
                 "identity mismatch must fail readiness immediately",
             )
 
-            mixed = {
-                "inbounds": [
-                    {"type": "tun", "tag": "tun-in", "address": ["172.19.0.1/30"]},
-                ],
-            }
-            runtime.config.write_text(json.dumps(mixed), encoding="utf-8")
+            tun_config = _generated_config("tun")
+            runtime.config.write_text(json.dumps(tun_config), encoding="utf-8")
             runtime.config.chmod(0o600)
+            self.assertEqual(helper._read_runtime_config(runtime), tun_config)
+            tun_port = helper._inbound_listen_port(runtime)
+            self.assertEqual(tun_port, 2080)
+            tun_probe = mock.Mock(side_effect=[False, True])
             self.assertTrue(
-                helper._wait_ready(4242, runtime, runner=runner, deadline_seconds=0.2),
-                "tun mode has no listener; identity alone must gate readiness",
+                helper._wait_ready(
+                    4242, runtime, runner=runner, probe=tun_probe, deadline_seconds=1.0,
+                ),
+                "second probe should confirm the listener in the valid generated TUN config",
             )
+            self.assertEqual(tun_probe.call_args_list, [mock.call(2080), mock.call(2080)])
 
     def test_failed_config_check_preserves_previous_root_config(self):
         with tempfile.TemporaryDirectory() as temporary:

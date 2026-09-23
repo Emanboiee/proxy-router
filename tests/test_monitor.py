@@ -7,6 +7,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import urllib.request
 from pathlib import Path
@@ -176,6 +177,52 @@ class StateTests(unittest.TestCase):
             monitor.stop(self.root)
         kill.assert_not_called()
         self.assertFalse(path.exists())
+
+    def test_stop_waits_for_start_to_publish_pid(self):
+        spawn_entered = threading.Event()
+        finish_spawn = threading.Event()
+        stop_done = threading.Event()
+        start_results = []
+        stop_results = []
+
+        def spawn(*_args, **_kwargs):
+            spawn_entered.set()
+            if not finish_spawn.wait(3):
+                raise AssertionError("test did not release fake spawn")
+            return mock.Mock(pid=4321)
+
+        with mock.patch.object(monitor.subprocess, "Popen", side_effect=spawn), \
+             mock.patch.object(monitor, "_pid_running", return_value=False):
+            starter = threading.Thread(
+                target=lambda: start_results.append(monitor.start(self.root, interval=77)))
+            stopper = threading.Thread(
+                target=lambda: (stop_results.append(monitor.stop(self.root)),
+                                stop_done.set()))
+            starter.start()
+            self.assertTrue(spawn_entered.wait(2))
+            stopper.start()
+            self.assertFalse(stop_done.wait(0.1), "stop raced past the active start transaction")
+            finish_spawn.set()
+            starter.join(3)
+            stopper.join(3)
+
+        self.assertFalse(starter.is_alive())
+        self.assertFalse(stopper.is_alive())
+        self.assertTrue(start_results[0]["started"])
+        self.assertEqual(stop_results[0]["pid"], 4321)
+        self.assertFalse(monitor.pid_file(self.root).exists())
+        self.assertFalse(monitor.enabled_file(self.root).exists())
+
+    def test_stop_reports_lock_timeout_without_clearing_start_state(self):
+        monitor.enabled_file(self.root).parent.mkdir(parents=True, exist_ok=True)
+        monitor.enabled_file(self.root).touch()
+        with mock.patch.object(
+            monitor.worker_lock, "exclusive", side_effect=TimeoutError("worker lock busy")
+        ):
+            result = monitor.stop(self.root)
+        self.assertFalse(result["stopped"])
+        self.assertIn("worker lock busy", result["error"])
+        self.assertTrue(monitor.enabled_file(self.root).exists())
 
     def test_logs_tail_is_bounded(self):
         path = self.root / "state" / "monitor" / "samples.jsonl"

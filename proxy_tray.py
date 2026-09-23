@@ -78,7 +78,7 @@ DASHBOARD_WIDTH = 1120
 DASHBOARD_HEIGHT = 720
 # Quit waits at most this long for an in-flight mutation to finish before
 # stopping the engine anyway — a hung mutation must not make Quit unkillable.
-MUTATION_DRAIN_TIMEOUT = ROTATION_TIMEOUT + 5.0
+MUTATION_DRAIN_TIMEOUT = ROTATION_TIMEOUT + COMMAND_TIMEOUT + 5.0
 
 # Friendly, non-jargon labels for tray menu entries. The router CLI words
 # (safe-list / vpn-list / rotate / exit) stay in the terminal; the tray
@@ -938,9 +938,10 @@ class RouterClient:
 def _status_icon_color(st: RouterStatus, action_result: str | None = None) -> str:
     """Choose green/red/orange from current state plus the latest action."""
     action_failed = bool(action_result and ": failed" in action_result.lower())
-    if action_failed or st.error or (st.up and st.mode == "proxy" and (
-            st.system_proxy_status not in {"ok", "skipped"}
-            or st.network_status not in {"ok", "unknown", "skipped"})):
+    if action_failed or st.error or (st.up and (
+            st.degraded_lanes or (st.mode == "proxy" and (
+                st.system_proxy_status not in {"ok", "skipped"}
+                or st.network_status not in {"ok", "unknown", "skipped"})))):
         return "#ff9800"
     return "#4caf50" if st.up else "#e53935"
 
@@ -1631,6 +1632,7 @@ class TrayApp:
             "preset": st.preset,
             "system_proxy": st.system_proxy_status,
             "network": st.network_status,
+            "degraded_lanes": list(st.degraded_lanes or []),
             "active": st.active_providers,
             "profiles": {n: list((i or {}).get("profiles") or [])
                          for n, i in (st.providers or {}).items()},
