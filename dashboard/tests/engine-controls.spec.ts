@@ -44,28 +44,89 @@ test('desktop connect and disconnect drive the engine, not local state', async (
   expect(actions).toContain('disconnect');
 });
 
-test('desktop profile switch applies the matching preset preset', async ({ page }) => {
+test('desktop Home reflects the engine preset and routes', async ({ page }) => {
+  await page.addInitScript(desktopMock);
+  await page.goto('/');
+  await expect(page.locator('#active-preset')).toHaveText('opencode');
+  await expect(page.locator('#home-engine-routes')).toContainText('opencode-zen');
+  await expect(page.locator('#home-engine-routes')).toContainText('proton');
+  await expect(page.locator('#main')).toContainText('Routes: 2 routes · 6 domains');
+  await expect(page.locator('#main')).toContainText('Latency: Unknown');
+  await expect(page.locator('#home-profile')).toHaveCount(0);
+  await expect(page.locator('#rail-status')).toHaveText('Connected');
+
+  await page.getByRole('link', { name: 'Profiles', exact: true }).click();
+  await page.getByRole('button', { name: 'Apply roblox', exact: true }).click();
+  const presets = await page.evaluate(() => (window as unknown as { __invoke: { command: string; payload?: unknown }[] }).__invoke
+    .filter(entry => entry.command === 'apply_preset')
+    .map(entry => (entry.payload as { name: string }).name));
+  expect(presets).toContain('roblox');
+});
+
+test('failed preset apply keeps the confirmed preset and outside changes refresh Home', async ({ page }) => {
   await page.addInitScript(() => {
-    const state = window as unknown as { __invoke: { command: string; payload?: unknown }[] };
+    const state = window as unknown as {
+      __invoke: { command: string; payload?: unknown }[];
+      __engineConfig: Record<string, unknown>;
+      __rejectPreset: boolean;
+    };
     state.__invoke = [];
+    state.__rejectPreset = true;
+    state.__engineConfig = {
+      port: 2080,
+      preset: 'opencode',
+      providers: { proton: { fallback_providers: ['proton2'] }, cloudflare: {} },
+      routes: [{ id: 'opencode-zen', provider: 'proton', domains: ['opencode.ai'] }],
+    };
     Object.defineProperty(window, 'isTauri', { value: true });
     Object.defineProperty(window, '__TAURI_INTERNALS__', { value: {
       invoke: (command: unknown, payload?: unknown) => {
-        state.__invoke.push({ command: String(command), payload });
-        if (String(command) === 'get_live_status') {
-          return Promise.resolve({ state: 'connected', status: { up: true, mode: 'proxy', port: 2080, degraded_lanes: [], error: null } });
+        const name = String(command);
+        state.__invoke.push({ command: name, payload });
+        if (name === 'get_cached_live_status' || name === 'get_live_status') {
+          return Promise.resolve({ state: 'connected', status: { up: true, mode: 'proxy', port: 2080, degraded_lanes: [], error: null }, age_ms: 0 });
         }
+        if (name === 'get_config') return Promise.resolve(state.__engineConfig);
+        if (name === 'apply_preset') {
+          if (state.__rejectPreset) return Promise.reject(new Error('preset rejected'));
+          const preset = (payload as { name: string }).name;
+          state.__engineConfig.preset = preset;
+          state.__engineConfig.routes = [{
+            id: `${preset}-games`, provider: 'cloudflare', domains: [`${preset}.example`],
+          }];
+          return Promise.resolve('ok');
+        }
+        if (name === 'get_network') return Promise.resolve({ status: {}, presets: {} });
+        if (name === 'get_routing') return Promise.resolve({ mode: 'default' });
         return Promise.resolve('ok');
       },
     }, configurable: true });
   });
+
   await page.goto('/');
-  await page.locator('#home-profile').click();
-  await page.getByRole('option', { name: 'OpenCode only', exact: true }).click();
-  const presets = await page.evaluate(() => (window as unknown as { __invoke: { command: string; payload?: unknown }[] }).__invoke
-    .filter(entry => entry.command === 'apply_preset')
-    .map(entry => (entry.payload as { name: string }).name));
-  expect(presets).toContain('opencode');
+  await expect(page.locator('#active-preset')).toHaveText('opencode');
+  await page.getByRole('link', { name: 'Profiles', exact: true }).click();
+  await page.getByRole('button', { name: 'Apply roblox', exact: true }).click();
+  await expect(page.locator('button[data-preset="opencode"]')).toContainText('active');
+
+  await page.evaluate(() => {
+    (window as unknown as { __rejectPreset: boolean }).__rejectPreset = false;
+  });
+  await page.getByRole('button', { name: 'Apply roblox', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'roblox ✓ active', exact: true })).toBeVisible();
+  await page.getByRole('link', { name: 'Home', exact: true }).click();
+  await expect(page.locator('#active-preset')).toHaveText('roblox');
+
+  await page.evaluate(() => {
+    const state = window as unknown as { __engineConfig: Record<string, unknown> };
+    state.__engineConfig.preset = 'school-warp';
+    state.__engineConfig.routes = [{ id: 'school-lane', provider: 'proton', domains: ['school.example'] }];
+    const actualNow = Date.now.bind(Date);
+    Date.now = () => actualNow() + 20000;
+  });
+  await expect(page.locator('#active-preset')).toHaveText('school-warp', { timeout: 8000 });
+  await expect(page.locator('#home-engine-routes')).toContainText('school-lane');
+  await expect(page.locator('#rail-status')).toHaveText('Connected');
 });
 
 

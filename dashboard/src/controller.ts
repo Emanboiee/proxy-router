@@ -247,7 +247,8 @@ export async function applyEngineAction(action: EngineAction): Promise<void> {
  * Apply the real routing for a profile choice.
  *
  * `direct` stops the engine (no routed sites); the other built-in profiles
- * apply their matching preset. Unknown profiles stay local-only.
+ * apply their matching preset. Unknown local profiles are not installed in
+ * the engine and must be rejected instead of appearing active.
  */
 export async function applyProfileToEngine(profileId: string): Promise<void> {
   if (!isTauri()) return;
@@ -257,6 +258,7 @@ export async function applyProfileToEngine(profileId: string): Promise<void> {
   }
   const preset = PROFILE_PRESET[profileId];
   if (preset) await invoke('apply_preset', { name: preset });
+  else throw new Error(`Profile “${profileId}” is not installed in the router`);
 }
 
 /** Redacted router.json view (allowlisted keys only). */

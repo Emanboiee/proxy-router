@@ -22,6 +22,8 @@ let busy = false;
 let actionQueue: Promise<void> = Promise.resolve();
 let lastTrayState: PreviewState | undefined;
 let engineConfig: EngineConfig | null = null;
+let engineConfigUnavailable = false;
+let engineConfigCheckedAt = 0;
 let networkState: NetworkPresetState | null = null;
 let livePayload: Record<string, unknown> | null = null;
 let routingState: RoutingState | null = null;
@@ -50,6 +52,8 @@ const profileDialog = document.querySelector<HTMLDialogElement>('#profile-dialog
 const providerDialog = document.querySelector<HTMLDialogElement>('#provider-dialog')!;
 const scenario = document.querySelector<HTMLSelectElement>('#scenario')!;
 const menu = document.querySelector<HTMLButtonElement>('#menu')!;
+app.querySelector('#toast')?.removeAttribute('role');
+app.querySelector('#toast')?.removeAttribute('aria-live');
 
 function esc(value: string): string { return value.replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character] ?? character)); }
 function activeProfile(): Profile { return controller.activeProfile(); }
@@ -104,6 +108,7 @@ function moveProfileOption(trigger: HTMLElement, direction: number): void {
 }
 
 function homePage(): string {
+  if (isTauri()) return liveHomePage();
   const [title, description] = statusTitle(); const profile = activeProfile(); const provider = activeProvider();
   const action = previewState === 'connected' ? button('Disconnect', 'disconnect', 'danger') : previewState === 'disconnected' ? button('Connect', 'connect', 'primary') : previewState === 'failed' || previewState === 'stale' ? button('Refresh preview', 'refresh', 'primary') : button('Reconnect', 'reconnect', 'primary');
   const routeInfo = profile.routeMode === 'selective' ? `${profile.domains.length} ${profile.domains.length === 1 ? 'site' : 'sites'}` : routeLabel(profile.routeMode);
@@ -120,6 +125,52 @@ function homePage(): string {
   </section>`;
 }
 
+/** Desktop Home reports only values read from the engine configuration. */
+function liveHomePage(): string {
+  const [title, description] = statusTitle();
+  const hasCurrentConfig = engineConfig !== null && !engineConfigUnavailable;
+  const preset = hasCurrentConfig && typeof engineConfig?.preset === 'string'
+    ? engineConfig.preset : 'Unknown';
+  const routes = hasCurrentConfig && Array.isArray(engineConfig?.routes)
+    ? engineConfig.routes : [];
+  const routeProviders = [...new Set(routes.flatMap(route =>
+    typeof route.provider === 'string' ? [route.provider] : []
+  ))];
+  const providerSummary = hasCurrentConfig
+    ? routeProviders.length ? routeProviders.map(esc).join(', ') : 'No route providers'
+    : 'Unknown';
+  const domainCount = routes.reduce((total, route) =>
+    total + (Array.isArray(route.domains) ? route.domains.filter(domain => typeof domain === 'string').length : 0), 0
+  );
+  const routeSummary = hasCurrentConfig
+    ? `${routes.length} ${routes.length === 1 ? 'route' : 'routes'} · ${domainCount} ${domainCount === 1 ? 'domain' : 'domains'}`
+    : 'Unknown';
+  const reportedLatency = livePayload?.latency_ms;
+  const latency = typeof reportedLatency === 'number' && Number.isFinite(reportedLatency)
+    ? `${reportedLatency} ms` : 'Unknown';
+  const routeRows = routes.map(route => {
+    const routeId = typeof route.id === 'string' ? route.id : 'Route';
+    const provider = typeof route.provider === 'string' ? route.provider : 'Unknown';
+    const domains = Array.isArray(route.domains)
+      ? route.domains.filter((domain): domain is string => typeof domain === 'string') : [];
+    return `<li><strong>${esc(routeId)}</strong><span class="route-provider">${esc(provider)}</span><span class="route-domains">${esc(domains.length ? domains.join(', ') : 'No domains listed')}</span></li>`;
+  }).join('');
+  const configNote = hasCurrentConfig
+    ? ''
+    : `<p class="muted">${engineConfigUnavailable ? 'Could not read the current engine configuration. Preset and route values are unknown.' : 'Checking the current engine configuration. Preset and route values are unknown.'}</p>`;
+  const action = previewState === 'connected' ? button('Disconnect', 'disconnect', 'danger') : previewState === 'disconnected' ? button('Connect', 'connect', 'primary') : previewState === 'failed' || previewState === 'stale' ? button('Refresh status', 'refresh', 'primary') : button('Reconnect', 'reconnect', 'primary');
+  return `<section class="page-section home-page" data-state="${previewState}">
+    <div class="connection-hero">
+      <div class="connection-emblem" aria-hidden="true"><img src="/gremlin-cat-goblin-cat.gif" alt="" width="88" height="88" decoding="async"></div>
+      <h1 tabindex="-1">${title}</h1>
+      <p class="lead">${description}</p>
+      <div class="hero-actions">${action}</div>
+      <p class="connection-status" aria-label="Live engine configuration"><span>Preset: <strong id="active-preset">${esc(preset)}</strong> · Providers: ${providerSummary} · Routes: ${esc(routeSummary)} · Latency: ${esc(latency)}</span><a class="text-link" href="#profiles">Manage routes <span aria-hidden="true">↗</span></a></p>
+    </div>
+    <article class="panel"><div class="panel-heading"><div><span class="label">Engine routes</span><h2>Current routing</h2></div></div>${configNote}<ul class="route-list" id="home-engine-routes">${routeRows || (hasCurrentConfig ? '<li class="muted">No routes configured.</li>' : '')}</ul></article>
+  </section>`;
+}
+
 function profileForm(profile?: Profile): string {
   const value = profileDraft ?? profile ?? { name: '', description: '', providerId: activeProvider().id, routeMode: 'selective' as RouteMode, domains: [] as string[], autoSubdomains: false, fallback: 'direct' as FallbackMode };
   const selectedProviderId = pendingProviderId ?? value.providerId;
@@ -127,7 +178,9 @@ function profileForm(profile?: Profile): string {
 }
 
 function profilesPage(): string {
-  if (isTauri() && engineConfig) return liveProfilesPage();
+  if (isTauri()) return engineConfig && !engineConfigUnavailable
+    ? liveProfilesPage()
+    : `<section class="page-section"><div class="section-heading"><div><h1 tabindex="-1">Profiles</h1><p class="lead">${engineConfigUnavailable ? 'The current engine configuration could not be read.' : 'Checking the current engine configuration.'} Preset and route values are unknown.</p></div></div><button type="button" class="primary" data-action="refresh">Retry</button></section>`;
   const cards = snapshot.profiles.map(profile => `<article class="profile-card ${profile.id === snapshot.activeProfileId ? 'selected' : ''}"><div class="panel-heading"><div><span class="label">${profile.id === snapshot.activeProfileId ? 'Active profile' : 'Profile'}</span><h2>${esc(profile.name)}</h2></div></div><p class="muted">${esc(profile.description || 'No description yet.')}</p><div class="profile-meta"><span>${profile.routeMode === 'full' ? 'Full tunnel' : profile.routeMode === 'direct' ? 'Direct' : `${profile.domains.length} routed sites`}</span><span>${profile.autoSubdomains ? 'Subdomains on' : 'Exact domains'}</span><span>${fallbackLabel(profile.fallback)}</span><span>${esc(snapshot.providers.find(provider => provider.id === profile.providerId)?.name ?? 'Provider')}</span></div><div class="card-actions">${profile.id === snapshot.activeProfileId ? '' : button('Use profile', 'select-profile', 'primary', `data-profile="${profile.id}"`)}${button('Edit', 'edit-profile', 'quiet', `data-profile="${profile.id}"`)}${button('Duplicate', 'duplicate-profile', 'quiet', `data-profile="${profile.id}"`)}${button('Export', 'export-profile', 'quiet', `data-profile="${profile.id}"`)}${button('Delete', 'delete-profile', 'quiet danger-text', `data-profile="${profile.id}"`)}</div></article>`).join('');
   return `<section class="page-section"><div class="section-heading"><div><h1 tabindex="-1">Profiles</h1><p class="lead">Create a profile, add its connection, and keep routing and fallback choices together.</p></div><div class="section-actions">${button('Create profile', 'new-profile', 'primary')}${button('Import', 'import-profile', 'quiet')}</div></div><div class="cards profile-cards">${cards}</div><article class="panel tip"><strong>Profiles are independent.</strong><span>Switching one changes the next connection action; it never edits another profile.</span></article></section>`;
 }
@@ -305,7 +358,7 @@ function render(): void {
   app.dataset.page = page.toLowerCase();
   if (!isTauri() && lastTrayState !== previewState) { lastTrayState = previewState; setTrayStatus(previewState); }
   document.querySelector('#page-label')!.textContent = page; document.title = `${page} — Proxy router`;
-  document.querySelector('#rail-status')!.textContent = busy ? 'Saving…' : previewState === 'failed' ? 'Controller unavailable' : `${snapshot.connection[0].toUpperCase()}${snapshot.connection.slice(1)}`;
+  document.querySelector('#rail-status')!.textContent = busy ? 'Saving…' : previewState === 'failed' ? 'Controller unavailable' : `${previewState[0].toUpperCase()}${previewState.slice(1)}`;
   const nav = document.querySelector<HTMLElement>('#nav')!;
   nav.innerHTML = pages.map(item => {
     const current = item === page;
@@ -332,6 +385,7 @@ function resetMainScroll(): void {
 /** The poller's reading is served without a controller call while younger
  *  than this; older than it, a tick falls back to a real fetch. */
 const LIVE_STALE_MS = 20000;
+const ENGINE_CONFIG_REFRESH_MS = 15000;
 
 function applyLive(live: { state: string; status?: Record<string, unknown> | null }): void {
   previewState = (states as readonly string[]).includes(live.state)
@@ -346,6 +400,7 @@ function applyLive(live: { state: string; status?: Record<string, unknown> | nul
  */
 async function refreshStatus(options?: { silent?: boolean; poll?: boolean }): Promise<void> {
   const generation = ++requestGeneration;
+  const previousState = previewState;
   if (!options?.silent) { previewState = 'loading'; render(); }
   try { status = await getPreviewStatus(); if (generation !== requestGeneration) return; }
   catch { if (generation !== requestGeneration) return; if (!options?.silent) { previewState = 'failed'; } }
@@ -359,8 +414,15 @@ async function refreshStatus(options?: { silent?: boolean; poll?: boolean }): Pr
         if (cached.status) applyLive(cached);
         const age = typeof cached.age_ms === 'number' ? cached.age_ms : Number.POSITIVE_INFINITY;
         const fresh = age < LIVE_STALE_MS;
+        if (fresh && Date.now() - engineConfigCheckedAt >= ENGINE_CONFIG_REFRESH_MS) {
+          await refreshEngineConfig();
+          if (generation !== requestGeneration) return;
+        }
         render();
-        if (fresh) return;
+        if (fresh) {
+          if (previousState !== previewState) announce(copy[previewState][0]);
+          return;
+        }
       } catch { /* fall through to a real fetch */ }
     }
     try {
@@ -371,16 +433,23 @@ async function refreshStatus(options?: { silent?: boolean; poll?: boolean }): Pr
       if (generation !== requestGeneration) return;
       previewState = 'failed';
     }
-    // Config/network/routing only change on an action, so a poll must not
-    // re-run those three controller calls.
     if (!options?.poll) await refreshEngineData();
+    else if (Date.now() - engineConfigCheckedAt >= ENGINE_CONFIG_REFRESH_MS) await refreshEngineConfig();
   }
-  render(); announce(copy[previewState][0]);
+  render();
+  if (!options?.poll || previousState !== previewState) announce(copy[previewState][0]);
 }
 
-/** Poll the engine's config + network detection alongside the status feed. */
+/** Poll the engine config periodically so outside preset changes stay visible. */
+async function refreshEngineConfig(): Promise<void> {
+  engineConfigCheckedAt = Date.now();
+  try { engineConfig = await getConfig(); engineConfigUnavailable = false; }
+  catch { engineConfigUnavailable = true; }
+}
+
+/** Refresh the engine's config + network detection after dashboard actions. */
 async function refreshEngineData(): Promise<void> {
-  try { engineConfig = await getConfig(); } catch { /* keep the last good read */ }
+  await refreshEngineConfig();
   try { networkState = (await getNetwork()).presets; } catch { /* keep the last good read */ }
   try { routingState = await getRouting(); } catch { /* keep the last good read */ }
 }
@@ -563,10 +632,14 @@ app.addEventListener('submit', event => {
 });
 async function selectProfile(profileId: string): Promise<void> {
   if (isTauri()) {
-    try { await applyProfileToEngine(profileId); } catch (error) { announce(error instanceof Error ? error.message : 'Profile switch failed'); }
+    try { await applyProfileToEngine(profileId); }
+    catch (error) { announce(error instanceof Error ? error.message : 'Profile switch failed'); return; }
+    await refreshEngineConfig();
+    await refreshStatus({ silent: true });
+    render();
+    return;
   }
   await perform(() => controller.selectProfile(profileId));
-  if (isTauri()) { await refreshStatus({ silent: true }); render(); }
 }
 
 /** Network panel actions: engine verbs + the SSID->preset mapping. */
@@ -626,6 +699,7 @@ async function applyPresetAction(name: string): Promise<void> {
   } catch (error) {
     announce(error instanceof Error ? error.message : 'Could not apply the preset');
   }
+  await refreshEngineConfig();
   await refreshStatus({ silent: true });
   render();
 }
