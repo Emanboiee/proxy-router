@@ -64,7 +64,10 @@ class RedirectHopTests(unittest.TestCase):
         self.assertIsNone(self._redirect("http://169.254.169.254/latest/meta-data/"))
 
     def test_public_hop_still_follows(self):
-        redirected = self._redirect("https://example.org/")
+        with mock.patch.object(
+            self.monitor, "resolve_target_addresses", return_value=["93.184.216.34"]
+        ):
+            redirected = self._redirect("https://example.org/")
         self.assertIsNotNone(redirected)
         self.assertEqual(redirected.full_url, "https://example.org/")
 
