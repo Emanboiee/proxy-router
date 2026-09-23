@@ -120,7 +120,7 @@ examples/keepalive.sh        re-arms the engine if the listener dies
 examples/com.proxy-router.keepalive.plist.template   launchd agent loading keepalive
 examples/hermes-opencode.sh  bounded model-run wrapper with automatic rotation
 examples/proxy-manager.sh   bridge for the Hermes opencode-server-rotation plugin
-tests/                       unit tests (unittest, no deps)
+tests/                       unit tests (pytest; see Development)
 providers/<provider>/        WireGuard configs, one file per profile (chmod 600)
 state/                       active profile + cooldown markers (gitignored)
 logs/                       sing-box runtime logs and rotations (gitignored)
@@ -424,6 +424,25 @@ default. `selective`/`selective_provider` is an optional IP-CIDR capture
 list from `rulesets/<name>.json` — only use it when you want TUN to
 capture exactly one site; with it set, all other domains fall out to
 direct and are NOT tunneled.
+
+### What TUN capture can and cannot enforce
+
+Capture is destination-IP based, resolved from route hostnames at
+build/reload time. It is not process-aware, and it is **not a kill
+switch** — traffic outside the captured set leaves directly, and a
+provider with no live exits simply stops carrying its captured domains
+(the proxy-mode `fail_open_direct` policy does not apply in TUN).
+
+| Routing mode | `capture: routes` (default) | `capture: ruleset` + `selective` |
+|---|---|---|
+| `default` | route domains captured via their resolved IPs | only the ruleset's CIDRs are captured |
+| `vpn-list` | captured domains intersected with `vpn_domains` | cannot express a domain list — use `routes` |
+| `safe-list` | not enforceable: "everything but the direct list" needs full capture | not enforceable |
+
+A DNS answer can change without a reload, so re-run `router.py reload`
+after a DNS change. SOCKS-backed providers cannot ride TUN at all: the
+engine rejects that combination at build time, because a TCP-only SOCKS
+hop would silently bypass UDP.
 
 Two more knobs in `"vpn"` control address-family policy:
 
@@ -837,8 +856,12 @@ multiple providers) fails closed with exit 2 instead of guessing. Set
 
 ## Development
 
+The suite runs under pytest with the socket-disabling safety layer, so invoke it
+through pytest rather than `unittest discover`:
+
 ```sh
-python3 -m unittest discover tests
+python3 -m pip install -r requirements-dev.txt
+python3 -m pytest tests -q --randomly-seed=58
 ```
 
 ## License

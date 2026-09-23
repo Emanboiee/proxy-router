@@ -33,6 +33,46 @@ def load_router(tmp_path):
     return module
 
 
+def test_routing_add_reloads_config_to_preserve_concurrent_update(tmp_path):
+    router = load_router(tmp_path)
+    router.CONFIG_FILE.write_text(json.dumps({
+        "port": 2080,
+        "providers": {"proton": {"directory": "providers/proton"}},
+        "routes": [],
+        "routing": {"mode": "vpn-list", "vpn_domains": ["a.example"]},
+    }))
+    router._providers = {"proton": {}}
+    router._routing = {"mode": "vpn-list", "vpn_domains": []}
+
+    assert router.routing_cli_add("vpn-list", "b.example") == 0
+
+    saved = json.loads(router.CONFIG_FILE.read_text())
+    assert saved["routing"]["vpn_domains"] == ["a.example", "b.example"]
+
+
+def test_routes_add_reloads_config_to_preserve_concurrent_update(tmp_path):
+    router = load_router(tmp_path)
+    router.CONFIG_FILE.write_text(json.dumps({
+        "port": 2080,
+        "providers": {"proton": {"directory": "providers/proton"}},
+        "routes": [
+            {"id": "existing", "domains": ["existing.example"], "provider": "proton"}
+        ],
+        "routing": {"mode": "default"},
+    }))
+    router._providers = {"proton": {}}
+    router._routes = []
+    args = SimpleNamespace(domain="new.example", ip=None, id="new", provider="proton")
+
+    with mock.patch.object(router, "engine_reload", return_value=0), \
+         mock.patch.object(router, "routes_list", return_value=0):
+        assert router.routes_add(args) == 0
+
+    saved = json.loads(router.CONFIG_FILE.read_text())
+    ids = [route["id"] for route in saved["routes"]]
+    assert "existing" in ids and "new" in ids
+
+
 def test_vpn_list_filters_provider_routes_to_vpn_domains(tmp_path):
     router = load_router(tmp_path)
     profile = tmp_path / "proton.conf"
@@ -1698,6 +1738,49 @@ def test_restore_last_good_permission_error_on_sighup_only(tmp_path, monkeypatch
     assert router.restore_last_good() == 1
     assert start_calls == []
     assert router.PID_FILE.read_text() == "4242"
+
+
+def test_engine_reload_rejected_candidate_reports_failed_change_not_restore_success(tmp_path, monkeypatch):
+    """Audit F04: a candidate that fails validation must never read as a
+    successful reload just because the last-good rollback recovered service.
+    The restore returning 0 is 'service restored on the OLD config' — the
+    requested change was NOT applied, so engine_reload reports nonzero."""
+    router = load_router(tmp_path)
+    router.resolve_sing_box = lambda: Path("/bin/true")
+    router.sing_box_at_least = lambda v: True
+    router.build_singbox_config = lambda overrides=None: ({"inbounds": []}, {"proton": Path("p")})
+    router.write_sing_box = lambda c: None
+    router.validate_config = lambda: False
+    router.LAST_GOOD_FILE.write_text("{}")
+    start_calls = []
+    monkeypatch.setattr(router, "engine_start", lambda **k: start_calls.append(k) or 0)
+    monkeypatch.setattr(router.os, "kill", lambda pid, sig: None)
+
+    assert router.engine_reload() == 1
+
+
+def test_engine_reload_rejected_candidate_message_names_the_old_config(tmp_path, monkeypatch, capsys):
+    """The honest-outcome wrapper tells the operator the change did not apply."""
+    router = load_router(tmp_path)
+    router.resolve_sing_box = lambda: Path("/bin/true")
+    router.sing_box_at_least = lambda v: True
+    router.build_singbox_config = lambda overrides=None: ({"inbounds": []}, {"proton": Path("p")})
+    router.write_sing_box = lambda c: None
+    validations = {"count": 0}
+
+    def candidate_fails_restored_last_good_passes() -> bool:
+        validations["count"] += 1
+        return validations["count"] > 1
+
+    router.validate_config = candidate_fails_restored_last_good_passes
+    router.LAST_GOOD_FILE.write_text("{}")
+    monkeypatch.setattr(router, "engine_start", lambda **k: 0)
+    monkeypatch.setattr(router.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(router, "wait_engine", lambda *a, **k: True)
+
+    assert router.engine_reload() == 1
+    captured = capsys.readouterr()
+    assert "the requested change was NOT applied" in captured.err
 
 
 def test_tray_full_tunnel_toggle_checked_when_tun(tmp_path):

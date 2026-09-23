@@ -26,7 +26,7 @@ foreach ($Name in @('examples', 'guides', 'rulesets')) {
   New-Item -ItemType Directory -Force -Path (Join-Path $Dest $Name) | Out-Null
 }
 
-foreach ($Name in @('router.py', 'setup_tui.py', 'monitor.py', 'route_watcher.py', 'proxy_tray.py')) {
+foreach ($Name in @('router.py', 'setup_tui.py', 'monitor.py', 'route_watcher.py', 'proxy_tray.py', 'domain_autodetect.py', 'egress.py', 'state.py', 'config_schema.py', 'worker_lock.py', 'providers_check.py', 'net_safety.py')) {
   Copy-Item (Join-Path $ScriptDir $Name) -Destination $Dest -Force
 }
 Copy-Item (Join-Path $ScriptDir 'router.example.json') -Destination $Dest -Force
