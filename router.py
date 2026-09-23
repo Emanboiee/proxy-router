@@ -3558,11 +3558,13 @@ def _pid_matches(pid: int) -> bool:
     return len(parts) == 2 and parts[0].isdigit() and _command_is_our_engine(parts[1])
 
 
-def engine_alive() -> bool:
+def engine_alive(*, skip_helper: bool = False) -> bool:
     """True when a sing-box started by us is still running (tun mode has no
     TCP listener to probe, so process liveness is the health check). Also
-    refuses foreign/recycled PIDs so a stale pid file can't claim liveness."""
-    if sys.platform == "darwin" and _effective_uid() != 0:
+    refuses foreign/recycled PIDs so a stale pid file can't claim liveness.
+
+    skip_helper retains local PID and process-identity checks for fast status polls."""
+    if not skip_helper and sys.platform == "darwin" and _effective_uid() != 0:
         helper = _helper_status()
         if helper and helper.get("installed") and helper.get("running"):
             return True
@@ -3597,12 +3599,14 @@ def engine_alive() -> bool:
         return False
 
 
-def engine_mode_consistent() -> bool:
+def engine_mode_consistent(*, skip_helper: bool = False) -> bool:
     """True when the running engine's config actually matches current_mode.
 
     Prevents the H2 false-positive: a proxy-mode engine running while
-    state/mode says 'tun' (or vice versa) is NOT the state we claim."""
-    if sys.platform == "darwin" and _effective_uid() != 0:
+    state/mode says 'tun' (or vice versa) is NOT the state we claim.
+
+    skip_helper checks the generated config without a privileged probe."""
+    if not skip_helper and sys.platform == "darwin" and _effective_uid() != 0:
         helper = _helper_status()
         if helper and helper.get("installed") and helper.get("running"):
             return helper.get("mode") == current_mode()
@@ -4248,6 +4252,7 @@ def _find_our_engine_pids() -> list[int]:
         raise EngineIdentityError(f"cannot scan engine processes: {exc}") from exc
     if result.returncode != 0:
         raise EngineIdentityError("cannot scan engine processes")
+    raw_engine_binary = resolve_sing_box() or ""
     pids: list[int] = []
     for line in (result.stdout or "").splitlines():
         parts = line.strip().split(None, 2)
@@ -4258,9 +4263,11 @@ def _find_our_engine_pids() -> list[int]:
             int(parts[1])  # Parse UID as part of the authenticated row.
         except ValueError:
             continue
-        # Cheap prefilter: only a command line carrying the exact engine
-        # binary can match, so the ~1500 unrelated rows skip shlex entirely.
-        if engine_binary not in parts[2]:
+        # Cheap prefilter: only a row carrying the normalized or raw binary
+        # can match, so unrelated rows skip shlex entirely.
+        if engine_binary not in parts[2] and not (
+            raw_engine_binary and raw_engine_binary in parts[2]
+        ):
             continue
         if pid > 1 and _command_is_our_engine(parts[2]):
             pids.append(pid)
@@ -5474,7 +5481,7 @@ def _degraded_lanes() -> list[str]:
     return lanes
 
 
-def _status_report() -> tuple[int, str]:
+def _status_report(*, fast: bool = False) -> tuple[int, str]:
     """Single liveness check shared by `status` and `vpn status` (M13): both
     commands must report the same up/down state and exit code so automation
     cannot disagree with a human reading one or the other.
@@ -5482,16 +5489,24 @@ def _status_report() -> tuple[int, str]:
     Returns (rc, line) with rc == 0 only when the engine is running AND its
     generated config matches the persisted mode (tun engine for tun mode,
     proxy listener for proxy mode); anything else is a degraded/down state
-    with rc == 1.
+    with rc == 1. Fast status reports skip the privileged helper while keeping
+    local PID, process-identity and generated-config checks.
     """
     mode = current_mode()
+
+    def _engine_alive() -> bool:
+        return engine_alive(skip_helper=True) if fast else engine_alive()
+
+    def _engine_mode_consistent() -> bool:
+        return engine_mode_consistent(skip_helper=True) if fast else engine_mode_consistent()
+
     if mode == "tun":
-        if engine_alive() and engine_mode_consistent():
+        if _engine_alive() and _engine_mode_consistent():
             return 0, "up (tun)"
-        if engine_alive():
+        if _engine_alive():
             return 1, "down (running engine does not match tun mode; run 'vpn on')"
         return 1, "down (mode set to tun; run 'vpn on')"
-    if listener_up() and engine_alive():
+    if listener_up() and _engine_alive():
         proxy_status, _effective = _system_proxy_status_readonly()
         suffix = "" if proxy_status in {"ok", "skipped"} else f"; {proxy_status}"
         degraded = _degraded_lanes()
@@ -5956,7 +5971,7 @@ def status_json(*, fast: bool = False) -> dict:
 
 
 def _status_json(*, fast: bool = False) -> dict:
-    rc, line = _status_report()
+    rc, line = _status_report(fast=fast)
     data = {"up": rc == 0, "state": line, "mode": current_mode(), "port": _port,
             "sing_box": resolve_sing_box(), "schema_version": SCHEMA_VERSION}
     # Local settings inspection is read-only and does not perform a network

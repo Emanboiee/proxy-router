@@ -203,6 +203,21 @@ class EngineRunsAsRootTests(unittest.TestCase):
             self.assertFalse(router._engine_runs_as_root())
 
 
+class EngineDiscoveryTests(unittest.TestCase):
+    def test_prefilter_keeps_escaped_resolved_binary_path(self):
+        raw_binary = r"/tmp/sing\box"
+        expected_argv = [
+            "/tmp/singbox", "run", "-c", str(router.SING_BOX_CONFIG),
+        ]
+        row = f"4242 501 {raw_binary} run -c {router.SING_BOX_CONFIG}"
+        process_table = subprocess.CompletedProcess([], 0, row, "")
+
+        with mock.patch.object(router, "resolve_sing_box", return_value=raw_binary), \
+             mock.patch.object(router, "_expected_engine_argv", return_value=expected_argv), \
+             mock.patch.object(router.subprocess, "run", return_value=process_table):
+            self.assertEqual(router._find_our_engine_pids(), [4242])
+
+
 class NeedsElevationTests(unittest.TestCase):
     """Proxy-mode engine commands elevate only while the engine runs as root."""
 
@@ -486,16 +501,32 @@ class HelperPermissionUxTests(unittest.TestCase):
         probe = mock.patch.object(router, "_probe_helper_status")
         root_engine = mock.patch.object(router, "_engine_runs_as_root")
         launchd = mock.patch.object(router, "_launchd_agent_state")
-        report = mock.patch.object(router, "_status_report", return_value=(0, "up"))
-        for patcher in (platform, euid, probe, root_engine, launchd, report):
+        pid_matches = mock.patch.object(router, "_pid_matches", return_value=True)
+        process_exists = mock.patch.object(router.os, "kill")
+        system_proxy = mock.patch.object(
+            router, "_system_proxy_status_readonly", return_value=("skipped", {}))
+        legacy_agents = mock.patch.object(router, "_legacy_launch_agents", return_value=[])
+        for patcher in (
+            platform, euid, probe, root_engine, launchd, pid_matches,
+            process_exists, system_proxy, legacy_agents,
+        ):
             patcher.start()
             self.addCleanup(patcher.stop)
+
+        router.MODE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        router.MODE_FILE.write_text("tun")
+        router.PID_FILE.write_text("4242")
+        router.SING_BOX_CONFIG.write_text(json.dumps({"inbounds": [{"type": "tun"}]}))
+
         data = router.status_json(fast=True)
         self.assertEqual(data["elevation"], {"platform": "darwin", "skipped": "fast"})
-        self.assertEqual(data["up"], True)
+        self.assertTrue(data["up"])
+        self.assertEqual(data["state"], "up (tun)")
         router._probe_helper_status.assert_not_called()
         router._engine_runs_as_root.assert_not_called()
         router._launchd_agent_state.assert_not_called()
+        router._pid_matches.assert_called_once_with(4242)
+        router.os.kill.assert_called_once_with(4242, 0)
 
 
 if __name__ == "__main__":
