@@ -416,18 +416,18 @@ class KeepaliveEgressCheckTests(unittest.TestCase):
             # must never trigger an EMERGENCY provider rotation.
             rotates = [line for line in lines if line.startswith("rotate proton")]
             self.assertEqual(rotates, [])
-            # cadence: periodic checks every PROBE_EVERY(2) ensures after boot.
-            # `rotate --if-due` entries are tick noise, so measure gaps on the
-            # filtered list. restore_fallbacks() probes once right after the
-            # sweep, so drop the `egress check` that directly follows a sweep
-            # line too (the sweep cadence is measured separately).
+            # Cadence: periodic checks every PROBE_EVERY(2) ensures after boot.
+            # With no parked fallback marker, the full-pool sweep must not add
+            # a duplicate restore probe; keep only the boot and periodic checks.
             checks = [line for line in lines if line == "egress check"]
-            self.assertGreaterEqual(len(checks), 4, f"too few checks: {lines}")
             restore_probes = {
                 i + 1 for i, line in enumerate(lines)
                 if line == "egress sweep --json" and i + 1 < len(lines)
                 and lines[i + 1] == "egress check"
             }
+            self.assertEqual(restore_probes, set(),
+                             f"restore probe ran without a fallback marker: {lines}")
+            self.assertGreaterEqual(len(checks), 3, f"too few checks: {lines}")
             ticks = [line for i, line in enumerate(lines)
                      if i not in restore_probes
                      and line not in {"network-status", "network-status --json",
