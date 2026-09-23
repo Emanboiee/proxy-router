@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import plistlib
 import re
 import shlex
 import shutil
@@ -76,11 +77,17 @@ _REAL_DARWIN_PYSTRAY = bool(
 
 POLL_SECONDS = 5.0  # live-enough menu state without spawning 24 CLI procs/min
 COMMAND_TIMEOUT = 20
+# Rotation legitimately runs long: SIGHUP reload (tun readiness budget 12s)
+# plus the post-switch egress probe (8s) plus a 60s probe settle window plus
+# possible rollback. A 20s kill murders a healthy rotation after it has
+# already mutated engine/markers, reporting a failed action with real work
+# half-applied (audit F13).
+ROTATION_TIMEOUT = 100
 DASHBOARD_WIDTH = 1120
 DASHBOARD_HEIGHT = 720
 # Quit waits at most this long for an in-flight mutation to finish before
 # stopping the engine anyway — a hung mutation must not make Quit unkillable.
-MUTATION_DRAIN_TIMEOUT = COMMAND_TIMEOUT + 5.0
+MUTATION_DRAIN_TIMEOUT = ROTATION_TIMEOUT + COMMAND_TIMEOUT + 5.0
 
 # Friendly, non-jargon labels for tray menu entries. The router CLI words
 # (safe-list / vpn-list / rotate / exit) stay in the terminal; the tray
@@ -408,6 +415,17 @@ _DASHBOARD_MODES = (
 _DASHBOARD_MODE_LABELS = dict(_DASHBOARD_MODES)
 
 
+def _dashboard_indicator(status: RouterStatus) -> tuple[str, tuple[int, int, int]]:
+    """Return a truthful symbol and color for the native dashboard state."""
+    if status.error:
+        return "!", (242, 157, 76)
+    if status.up and status.degraded_lanes:
+        return "▲", (242, 157, 76)
+    if status.up:
+        return "●", (77, 205, 139)
+    return "○", (134, 147, 166)
+
+
 @dataclass(frozen=True)
 class DashboardViewModel:
     """Small, UI-safe projection of router status for the native window."""
@@ -433,6 +451,9 @@ class DashboardViewModel:
         if status.error:
             title = "Router unavailable"
             explanation = "The dashboard could not read proxy-router status. Try Connect again or open Setup."
+        elif status.up and status.degraded_lanes:
+            title = "Degraded"
+            explanation = f"Some routed connections need attention: {', '.join(status.degraded_lanes)}."
         elif not providers:
             title = "No VPN profile yet"
             explanation = "Add a provider profile from Setup, then Connect to start routing traffic."
@@ -474,6 +495,8 @@ class DashboardViewModel:
             provider_summary = "No provider"
         if status.error:
             route_health = "Unavailable"
+        elif status.up and status.degraded_lanes:
+            route_health = "Needs attention"
         elif not providers:
             route_health = "Not configured"
         else:
@@ -688,8 +711,8 @@ def _launch_terminal(root, script_args: list[str]) -> bool:
     return False
 
 
-def _dashboard_bundle(root: Path) -> Path | None:
-    """Find the built Tauri dashboard without assuming a developer path."""
+def _dashboard_bundle_candidates(root: Path) -> list[Path]:
+    """Find dashboard bundle locations without assuming a developer path."""
     override = os.environ.get("PROXY_ROUTER_DASHBOARD")
     candidates: list[Path] = []
     if override:
@@ -710,9 +733,38 @@ def _dashboard_bundle(root: Path) -> Path | None:
             candidates.append(
                 base / "target" / profile / "bundle" / "macos" / "Proxy Router.app"
             )
+    return candidates
 
-    for app in candidates:
-        if app.is_dir() and (app / "Contents" / "MacOS").is_dir():
+
+def _is_complete_dashboard_bundle(app: Path) -> bool:
+    """Require the bundle metadata and executable before suppressing the tray."""
+    app = Path(app)
+    if not app.is_dir():
+        return False
+    contents = app / "Contents"
+    try:
+        with (contents / "Info.plist").open("rb") as handle:
+            metadata = plistlib.load(handle)
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return False
+    if not isinstance(metadata, dict):
+        return False
+    executable = metadata.get("CFBundleExecutable")
+    if not isinstance(executable, str) or not executable:
+        return False
+    if Path(executable).name != executable:
+        return False
+    binary = contents / "MacOS" / executable
+    try:
+        return binary.is_file() and bool(binary.stat().st_mode & 0o111)
+    except OSError:
+        return False
+
+
+def _dashboard_bundle(root: Path) -> Path | None:
+    """Find a complete built Tauri dashboard bundle."""
+    for app in _dashboard_bundle_candidates(root):
+        if _is_complete_dashboard_bundle(app):
             return app
     return None
 
@@ -821,13 +873,13 @@ class RouterClient:
         self.router = os.path.join(root, "router.py")
         self._active_provider: str | None = None
 
-    def _run(self, *args: str) -> tuple[int, str]:
+    def _run(self, *args: str, timeout: float = COMMAND_TIMEOUT) -> tuple[int, str]:
         cmd = [self.python, self.router, *args]
         env = dict(os.environ)
         try:
             p = subprocess.run(
                 cmd, capture_output=True, text=True,
-                timeout=COMMAND_TIMEOUT, env=env, cwd=self.root,
+                timeout=timeout, env=env, cwd=self.root,
             )
             out = (p.stdout or "") + ("\n" + p.stderr if p.stderr else "")
             return p.returncode, out.strip()
@@ -923,7 +975,7 @@ class RouterClient:
     def rotate(self) -> tuple[int, str]:
         if not self._active_provider:
             return 1, "no active provider"
-        return self._run("rotate", self._active_provider)
+        return self._run("rotate", self._active_provider, timeout=ROTATION_TIMEOUT)
 
     def rotate_to(self, provider: str, profile: str, force: bool = False) -> tuple[int, str]:
         cmd = ["rotate", provider, "--to", profile]
@@ -931,7 +983,7 @@ class RouterClient:
             # Explicit pick of an offline/SSL exit: try it anyway, ignoring
             # the cooldown its failed probe left behind.
             cmd.append("--force")
-        return self._run(*cmd)
+        return self._run(*cmd, timeout=ROTATION_TIMEOUT)
 
     def set_mode(self, mode: str, default_provider: str | None = None) -> tuple[int, str]:
         cmd = ["routing", "set", "--mode", mode]
@@ -987,9 +1039,10 @@ class RouterClient:
 def _status_icon_color(st: RouterStatus, action_result: str | None = None) -> str:
     """Choose green/red/orange from current state plus the latest action."""
     action_failed = bool(action_result and ": failed" in action_result.lower())
-    if action_failed or st.error or (st.up and st.mode == "proxy" and (
-            st.system_proxy_status not in {"ok", "skipped"}
-            or st.network_status not in {"ok", "unknown", "skipped"})):
+    if action_failed or st.error or (st.up and (
+            st.degraded_lanes or (st.mode == "proxy" and (
+                st.system_proxy_status not in {"ok", "skipped"}
+                or st.network_status not in {"ok", "unknown", "skipped"})))):
         return "#ff9800"
     return "#4caf50" if st.up else "#e53935"
 
@@ -1078,14 +1131,11 @@ if _REAL_DARWIN_PYSTRAY:
             panel = _dashboard_color(25, 30, 40)
             border = _dashboard_color(46, 54, 68)
 
-            background.set()
-            AppKit.NSRectFill_(self.bounds())
-            rail.set()
-            AppKit.NSRectFill_(AppKit.NSMakeRect(0, 0, 196, height))
+            self._fill_rect(self.bounds(), background)
+            self._fill_rect(AppKit.NSMakeRect(0, 0, 196, height), rail)
 
             separator = AppKit.NSMakeRect(195, 0, 1, height)
-            border.set()
-            AppKit.NSRectFill_(separator)
+            self._fill_rect(separator, border)
 
             content_x = 228
             content_width = max(420, width - content_x - 32)
@@ -1104,6 +1154,13 @@ if _REAL_DARWIN_PYSTRAY:
             self._round_fill(
                 AppKit.NSMakeRect(content_x, health_y, content_width, health_height),
                 16, panel, border)
+
+        @staticmethod
+        def _fill_rect(rect, color):
+            # NSRectFill_ is absent from current PyObjC builds; raising inside
+            # drawRect: escapes the draw callback and AppKit aborts the process.
+            color.set()
+            AppKit.NSBezierPath.bezierPathWithRect_(rect).fill()
 
         @staticmethod
         def _round_fill(rect, radius, fill, stroke=None):
@@ -1351,16 +1408,9 @@ if _REAL_DARWIN_PYSTRAY:
             )
             self.mode_popup.selectItemAtIndex_(mode_index)
             self.mode_popup.setEnabled_(bool(status.providers))
-            if status.error:
-                color = _dashboard_color(242, 157, 76)
-                self.hero_dot.setStringValue_("!")
-            elif status.up:
-                color = _dashboard_color(77, 205, 139)
-                self.hero_dot.setStringValue_("●")
-            else:
-                color = _dashboard_color(134, 147, 166)
-                self.hero_dot.setStringValue_("○")
-            self.hero_dot.setTextColor_(color)
+            indicator, rgb = _dashboard_indicator(status)
+            self.hero_dot.setStringValue_(indicator)
+            self.hero_dot.setTextColor_(_dashboard_color(*rgb))
             self.health_summary.setStringValue_(self._model.route_health)
             self.route_label.setStringValue_(
                 f"{self._model.provider_summary} · {self._model.port_label} · "
@@ -1676,6 +1726,7 @@ class TrayApp:
             "preset": st.preset,
             "system_proxy": st.system_proxy_status,
             "network": st.network_status,
+            "degraded_lanes": list(st.degraded_lanes or []),
             "active": st.active_providers,
             "profiles": {n: list((i or {}).get("profiles") or [])
                          for n, i in (st.providers or {}).items()},
@@ -2556,7 +2607,7 @@ def main() -> int:
     if args.selftest:
         return selftest(args.root)
 
-    if args.headless or tray_ownership(args.root) == "headless":
+    if tray_ownership(args.root, explicit_headless=args.headless) == "headless":
         if not args.headless:
             print("tray: dashboard app owns the menu bar; running headless "
                   "(set PROXY_ROUTER_TRAY_HEADLESS=0 to force the legacy icon)",

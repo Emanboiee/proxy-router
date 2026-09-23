@@ -133,6 +133,49 @@ def test_build_config_keeps_source_roots_in_vpn_list_mode(tmp_path, monkeypatch)
          router._vpn, router._routing, router._autodetect, router._port) = old
 
 
+def test_vpn_list_intersects_broader_route_with_narrower_list(tmp_path, monkeypatch):
+    old = (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
+           router._vpn, router._routing, router._autodetect, router._port)
+    try:
+        router.ROOT = Path(tmp_path)
+        router.CONFIG_FILE = router.ROOT / "router.json"
+        router._providers = {
+            "cloudflare": {"socks5": {"host": "127.0.0.1", "port": 2181}}
+        }
+        router._routes = [{
+            "id": "school", "domains": ["example.com"], "provider": "cloudflare"
+        }]
+        router._vpn = {}
+        router._routing = {"mode": "vpn-list", "vpn_domains": ["api.example.com"]}
+        router._autodetect = {"enabled": False, "sources": {}}
+        router._port = 2080
+        monkeypatch.setattr(router, "current_mode", lambda: "proxy")
+
+        config, _ = router.build_singbox_config()
+
+        rule = next(
+            rule for rule in config["route"]["rules"]
+            if rule.get("outbound") == "cloudflare"
+        )
+        assert rule["domain_suffix"] == ["api.example.com"]
+    finally:
+        (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
+         router._vpn, router._routing, router._autodetect, router._port) = old
+
+
+def test_vpn_list_intersection_narrowest_wins():
+    assert router._vpn_list_intersection(
+        ["example.com"], ["api.example.com"]
+    ) == ["api.example.com"]
+    assert router._vpn_list_intersection(
+        ["api.example.com"], ["example.com"]
+    ) == ["api.example.com"]
+    assert router._vpn_list_intersection(
+        ["example.com"], ["example.com"]
+    ) == ["example.com"]
+    assert router._vpn_list_intersection(["a.com"], ["b.com"]) == []
+
+
 def test_build_config_keeps_learned_hosts_when_provider_changes(tmp_path, monkeypatch):
     old = (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
            router._vpn, router._routing, router._autodetect, router._port)

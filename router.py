@@ -45,7 +45,9 @@ from typing import Any
 
 import domain_autodetect
 import egress
+import net_safety
 import state
+from providers_check import provider_config_errors as _provider_config_errors
 from config_schema import (
     DEFAULT_DIRECT_PROBE_URL,
     DEFAULT_EGRESS_SETTINGS,
@@ -621,6 +623,7 @@ def load_config() -> int:
     if not all(isinstance(name, str) and _PROVIDER_NAME.fullmatch(name) and isinstance(entry, dict)
                for name, entry in providers.items()):
         return fail(f"bad {CONFIG_FILE.name}: provider names/entries are invalid")
+    normalized_fallbacks: dict[str, list[str]] = {}
     for name, entry in providers.items():
         if "fail_open_direct" in entry and not isinstance(entry["fail_open_direct"], bool):
             return fail(f"bad {CONFIG_FILE.name}: fail_open_direct must be a boolean")
@@ -679,17 +682,13 @@ def load_config() -> int:
             return fail(
                 f"bad {CONFIG_FILE.name}: provider '{name}' {field} must name another configured provider"
             )
+        normalized_fallbacks[name] = fallbacks
         try:
             (ROOT / directory).resolve().relative_to(ROOT)
         except ValueError:
             return fail(f"bad {CONFIG_FILE.name}: provider '{name}' directory escapes the router root")
     def fallback_targets(provider: str) -> list[str]:
-        entry = providers[provider]
-        targets = entry.get("fallback_providers")
-        if isinstance(targets, list):
-            return targets
-        target = entry.get("fallback_provider")
-        return [target] if isinstance(target, str) else []
+        return list(normalized_fallbacks.get(provider, ()))
 
     def check_fallback_path(provider: str, path: tuple[str, ...] = ()) -> str | None:
         if provider in path:
@@ -726,6 +725,11 @@ def load_config() -> int:
         for key in ("domains", "ip_cidr"):
             if key in route and (not isinstance(route[key], list) or not all(isinstance(v, str) for v in route[key])):
                 return fail(f"bad {CONFIG_FILE.name}: route '{route.get('id', '<unnamed>')}' {key} must be a string list")
+        if not route.get("domains") and not route.get("ip_cidr"):
+            return fail(
+                f"bad {CONFIG_FILE.name}: route '{route.get('id', '<unnamed>')}' "
+                "needs domains or ip_cidr"
+            )
     for name, entry in providers.items():
         probe_route_id = entry.get("probe_route_id")
         if probe_route_id is None:
@@ -1039,21 +1043,14 @@ def _iso_ts(epoch: int) -> str:
 # must not aim probes at loopback/LAN/link-local/metadata endpoints. These
 # checks mirror monitor.py so both files share one trust model; the explicit
 # opt-out environment variable is honored identically.
-PRIVATE_TARGET_BYPASS_ENV = "PROXY_ROUTER_ALLOW_PRIVATE_TARGETS"
-_METADATA_HOSTNAMES = {"metadata", "metadata.google.internal"}
-_METADATA_ADDRESSES = {"169.254.169.254", "fd00:ec2::254"}
+PRIVATE_TARGET_BYPASS_ENV = net_safety.PRIVATE_TARGET_BYPASS_ENV
+_METADATA_HOSTNAMES = net_safety.METADATA_HOSTNAMES
+_METADATA_ADDRESSES = net_safety.METADATA_ADDRESSES
 
 
 def _probe_addr_is_private(addr: str) -> bool:
     """True for loopback / private / link-local / reserved / multicast IPs."""
-    try:
-        parsed_ip = ipaddress.ip_address(str(addr))
-    except ValueError:
-        return True  # cannot prove it public -> treat as private (fail closed)
-    return (
-        parsed_ip.is_private or parsed_ip.is_loopback or parsed_ip.is_link_local
-        or parsed_ip.is_reserved or parsed_ip.is_multicast or parsed_ip.is_unspecified
-    )
+    return net_safety.addr_is_private(addr)
 
 
 def unsafe_probe_target(url, *, resolved_addresses=None) -> str | None:
@@ -1110,25 +1107,8 @@ def unsafe_probe_target(url, *, resolved_addresses=None) -> str | None:
 
 
 def resolve_target_addresses(url: str) -> list[str]:
-    """Best-effort resolution of ``url``'s hostname (empty list on any error).
-
-    Connection-time companion to :func:`unsafe_probe_target`: validating what
-    the name resolves to right before dialing closes the DNS-rebinding window
-    a config-time-only check leaves open.
-    """
-    try:
-        host = urllib.parse.urlsplit(str(url)).hostname
-        if not host:
-            return []
-        infos = socket.getaddrinfo(host, None)
-        addresses: list[str] = []
-        for info in infos:
-            addr = str(info[4][0]).strip("[]")
-            if addr not in addresses:
-                addresses.append(addr)
-        return addresses[:8]
-    except Exception:  # noqa: BLE001 - best-effort: no addresses on any failure
-        return []
+    """Best-effort resolution for connection-time target validation."""
+    return net_safety.resolve_target_addresses(url)
 
 
 def _transport_reason(error_text) -> str:
@@ -1714,7 +1694,10 @@ def autodetect_source(source: str = "twitch", *, reload: bool = True,
         return 0 if quiet else fail("autodetection is disabled")
     settings = (_autodetect.get("sources") or {}).get(source)
     if not isinstance(settings, dict):
-        return 0 if quiet else fail(f"autodetection source '{source}' is not configured")
+        configured = ", ".join(sorted(_autodetect.get("sources") or {})) or "none"
+        return 0 if quiet else fail(
+            f"autodetection source '{source}' is not configured (have: {configured})"
+        )
     proxy = f"http://127.0.0.1:{_port}"
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({"http": proxy, "https": proxy})
@@ -2272,32 +2255,15 @@ def check_egress_live(name: str, profile: Path, *, port: int | None = None,
 
 
 def _egress_rank(record: dict, now: int | None = None) -> tuple[int, float]:
-    """Rotation preference: lower is better. Recently-OK profiles rank by
-    latency (fastest first); known-slow-but-OK and unknown profiles rank
-    second; profiles with RECENT repeated failures rank last.
-
-    Failure streaks expire with the ok window: a record whose last probe is
-    older than that window carries no signal (it was typically written by
-    an era of dishonest probes or long-gone network conditions), so it
-    ranks as unknown instead of poisoning the exit forever."""
-    if not record:
-        return (1, float("inf"))
-    now = int(now if now is not None else time.time())
-    ok = record.get("ok")
-    last_ok = record.get("last_ok_at") or record.get("checked_at")
-    checked_at = record.get("checked_at")
-    fails = int(record.get("fails") or 0)
+    """Rotation preference for one exit: lower is better (see egress.egress_rank)."""
     settings = egress_settings()
-    window = int(settings["ok_window"])
-    fresh = checked_at is not None and now - int(checked_at) < window
-    if ok and last_ok and now - int(last_ok) < window:
-        latency = float(record.get("latency_ms") or float("inf"))
-        if latency < float(settings["slow_latency_ms"]):
-            return (0, latency)
-        return (2, latency)
-    if fails >= int(settings["fail_threshold"]) and fresh:
-        return (3, float("inf"))
-    return (1, float("inf"))
+    return egress.egress_rank(
+        record,
+        now=int(now if now is not None else time.time()),
+        ok_window=int(settings["ok_window"]),
+        slow_latency_ms=float(settings["slow_latency_ms"]),
+        fail_threshold=int(settings["fail_threshold"]),
+    )
 
 
 def record_rotation(name: str, profile: Path) -> None:
@@ -2324,12 +2290,8 @@ def rotation_policy() -> str:
 
 
 def _lru_key(record: dict) -> int:
-    """Autoroute key: epoch of the exit's last verified OK probe (older =
-    preferred; 0 = never used = preferred first)."""
-    try:
-        return int(record.get("last_ok_at") or record.get("checked_at") or 0)
-    except (TypeError, ValueError):
-        return 0
+    """Autoroute key (see egress.lru_key): older last-OK = preferred."""
+    return egress.lru_key(record)
 
 
 def last_rotation_at(name: str) -> int | None:
@@ -2846,6 +2808,26 @@ def _effective_vpn_domains(routing: dict | None = None) -> frozenset[str]:
     return frozenset(domains)
 
 
+def _vpn_list_intersection(domains, vpn_domains) -> list[str]:
+    """Route domains narrowed to the vpn-list intersection, narrowest wins.
+
+    A route domain already inside the list keeps itself; a list entry that is
+    a subdomain of the route domain is emitted instead. Disjoint pairs drop.
+    """
+    out: list[str] = []
+    for domain in domains:
+        for vpn in vpn_domains:
+            if domain == vpn or domain.endswith("." + vpn):
+                candidate = domain
+            elif vpn.endswith("." + domain):
+                candidate = vpn
+            else:
+                continue
+            if candidate not in out:
+                out.append(candidate)
+    return out
+
+
 def _routes_with_autodetected_domains(routes: list[dict]) -> list[dict]:
     if not _autodetect.get("enabled"):
         return routes
@@ -3156,10 +3138,7 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
             continue
         domains = route["domains"]
         if routing_mode == "vpn-list":
-            domains = [
-                domain for domain in domains
-                if any(domain == vpn or domain.endswith("." + vpn) for vpn in vpn_domains)
-            ]
+            domains = _vpn_list_intersection(domains, vpn_domains)
         if domains:
             if route_provider == "direct" or route_provider in proxy_live:
                 # Direct and SOCKS5-hopped traffic share the local resolver:
@@ -3185,10 +3164,7 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
         if route.get("domains"):
             domains = route["domains"]
             if routing_mode == "vpn-list":
-                domains = [
-                    domain for domain in domains
-                    if any(domain == vpn or domain.endswith("." + vpn) for vpn in vpn_domains)
-                ]
+                domains = _vpn_list_intersection(domains, vpn_domains)
             if domains:
                 rule["domain_suffix"] = domains
             elif not route.get("ip_cidr"):
@@ -3456,6 +3432,24 @@ def restore_last_good() -> int:
     return engine_start(use_existing_config=True)
 
 
+def _rejected_change_after_restore(restored_rc: int) -> int:
+    """Translate a last-good recovery into a failed-change result.
+
+    ``restore_last_good()`` returning 0 means service is back on the PREVIOUS
+    config, not that the requested change was applied. Callers must never
+    read recovery as success (audit F04): a candidate that failed validation
+    or failed to come up reports nonzero here even when the rollback worked.
+    """
+    if restored_rc == 0:
+        print(
+            "router: service restored on the previous config; "
+            "the requested change was NOT applied",
+            file=sys.stderr,
+        )
+        return 1
+    return restored_rc
+
+
 def listener_up() -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.settimeout(0.5)
@@ -3703,6 +3697,18 @@ def ensure_tray_started() -> None:
         return subprocess.run(
             ["launchctl", *args], capture_output=True, text=True, timeout=10,
         )
+
+    # Single-tray policy (issue #144): when the dashboard app owns the menu bar
+    # the pystray agent is retired and there is no tray service to start. Keep
+    # the dashboard job alive instead, and stay quiet so a normal `start` does
+    # not report a missing service as a failure.
+    dashboard_plist = Path.home() / "Library" / "LaunchAgents" / "com.proxy-router.dashboard.plist"
+    if not plist.is_file() and dashboard_plist.is_file():
+        try:
+            run_launchctl("kickstart", f"{domain}/com.proxy-router.dashboard")
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return
 
     try:
         result = run_launchctl("kickstart", "-k", label)
@@ -4486,6 +4492,148 @@ def apply_network_preset(*, reload_engine: bool = True, root: Path | None = None
     return {"applied": True, **result, "preset": preset, "checked_at": now}
 
 
+_BUILTIN_NETWORK_PRESETS = ("default", "opencode", "roblox", "school-warp")
+_PRESET_SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+
+
+def _valid_preset_name(name: str) -> str | None:
+    """Return why ``name`` cannot be applied as a preset, else None.
+
+    Mirrors setup_tui's built-ins (the tray keeps the same mirrored list) and
+    accepts any custom preset that exists as ``presets/<name>.json``.
+    """
+    if not isinstance(name, str) or not _PRESET_SLUG_RE.fullmatch(name):
+        return "preset name must be 1-64 characters of [A-Za-z0-9._-]"
+    if name in _BUILTIN_NETWORK_PRESETS:
+        return None
+    if (ROOT / "presets" / f"{name}.json").is_file():
+        return None
+    return (f"unknown preset '{name}' (built-ins: "
+            f"{', '.join(_BUILTIN_NETWORK_PRESETS)}; custom presets live in presets/)")
+
+
+def _vpn_network_mutate(presets: dict[str, str] | None = None,
+                        auto: bool | None = None) -> int:
+    """Persist vpn.network_presets / vpn.network_auto atomically (router.json).
+
+    Same convention as _routing_mutate: temp file + replace, mode 0600, refresh
+    the in-memory vpn state, and never reload or restart the engine.
+    """
+    try:
+        data = json.loads(CONFIG_FILE.read_text())
+        if not isinstance(data, dict):
+            return fail(f"bad {CONFIG_FILE.name}: top level must be an object")
+        vpn = data.get("vpn")
+        if not isinstance(vpn, dict):
+            vpn = {}
+            data["vpn"] = vpn
+        if presets is not None:
+            vpn["network_presets"] = {str(k): str(v) for k, v in sorted(presets.items())}
+        if auto is not None:
+            vpn["network_auto"] = bool(auto)
+        _atomic_write(CONFIG_FILE, json.dumps(data, indent=2) + "\n", 0o600)
+    except (json.JSONDecodeError, OSError, TypeError) as exc:
+        return fail(f"could not save network presets in {CONFIG_FILE.name}: {exc}")
+    if isinstance(_vpn, dict):
+        if presets is not None:
+            _vpn["network_presets"] = {str(k): str(v) for k, v in presets.items()}
+        if auto is not None:
+            _vpn["network_auto"] = bool(auto)
+    return 0
+
+
+def network_presets_state() -> dict:
+    """Effective SSID -> preset view for the CLI and the dashboard."""
+    marker: dict = {}
+    try:
+        loaded = json.loads(network_preset_marker().read_text())
+        if isinstance(loaded, dict):
+            marker = loaded
+    except (OSError, json.JSONDecodeError):
+        marker = {}
+    ssid = current_ssid()
+    mapping = network_preset_map()
+    return {
+        "ssid": ssid,
+        "connected": bool(ssid),
+        "auto": network_auto_enabled(),
+        "mapped_preset": mapping.get(ssid) if ssid else None,
+        "presets": dict(sorted(mapping.items())),
+        "last_applied": marker,
+    }
+
+
+def _print_network_presets(state: dict) -> None:
+    print(json.dumps(state, indent=2, sort_keys=True))
+    ssid = state.get("ssid") or "(no Wi-Fi)"
+    mapped = state.get("mapped_preset") or "(no preset)"
+    auto = "on" if state.get("auto") else "off"
+    print(f"network: {ssid} -> {mapped}; auto={auto}", file=sys.stderr)
+
+
+def cmd_network_preset_show(as_json: bool = False) -> int:
+    _print_network_presets(network_presets_state())
+    return 0
+
+
+def cmd_network_preset_set(ssid: str, preset: str) -> int:
+    """Map one Wi-Fi network to a preset (idempotent)."""
+    ssid = (ssid or "").strip()
+    if not ssid:
+        return fail("--ssid must name the Wi-Fi network")
+    if any(ch in ssid for ch in "\n\r\t"):
+        return fail("--ssid must not contain control characters")
+    if len(ssid) > 255:
+        return fail("--ssid must be 255 characters or fewer")
+    error = _valid_preset_name(preset or "")
+    if error is not None:
+        return fail(error)
+    mapping = network_preset_map()
+    if mapping.get(ssid) == preset:
+        print(f"network-preset: '{ssid}' already maps to '{preset}' (no change)",
+              file=sys.stderr)
+        _print_network_presets(network_presets_state())
+        return 0
+    mapping[ssid] = preset
+    if _vpn_network_mutate(presets=mapping) != 0:
+        return 1
+    _print_network_presets(network_presets_state())
+    return 0
+
+
+def cmd_network_preset_remove(ssid: str) -> int:
+    """Drop one Wi-Fi network's mapping (idempotent)."""
+    ssid = (ssid or "").strip()
+    if not ssid:
+        return fail("--ssid must name the Wi-Fi network")
+    mapping = network_preset_map()
+    if ssid not in mapping:
+        print(f"network-preset: no mapping for '{ssid}' (no change)", file=sys.stderr)
+        _print_network_presets(network_presets_state())
+        return 0
+    del mapping[ssid]
+    if _vpn_network_mutate(presets=mapping) != 0:
+        return 1
+    _print_network_presets(network_presets_state())
+    return 0
+
+
+def cmd_network_preset_auto(state: str) -> int:
+    """Enable or disable automatic preset switching on network change."""
+    normalized = (state or "").strip().lower()
+    if normalized not in ("on", "off"):
+        return fail("--state must be 'on' or 'off'")
+    desired = normalized == "on"
+    if network_auto_enabled() == desired:
+        print(f"network-preset: auto is already {normalized} (no change)", file=sys.stderr)
+        _print_network_presets(network_presets_state())
+        return 0
+    if _vpn_network_mutate(auto=desired) != 0:
+        return 1
+    _print_network_presets(network_presets_state())
+    return 0
+
+
 def cmd_network_check() -> int:
     """Auto-switch the routing preset for the current network (SSID)."""
     def apply() -> dict | int:
@@ -4537,7 +4685,7 @@ def engine_reload(active_overrides: dict[str, Path] | None = None) -> int:
         # so a crash/restart can never boot it (F2: bad generated config must
         # not leave the proxy dead while a known-good config exists).
         print("router: new sing-box config failed validation; restoring last-good", file=sys.stderr)
-        return restore_last_good()
+        return _rejected_change_after_restore(restore_last_good())
     if sys.platform == "darwin" and _effective_uid() != 0:
         helper = _helper_status()
         if helper and helper.get("installed") and helper.get("running"):
@@ -4550,7 +4698,7 @@ def engine_reload(active_overrides: dict[str, Path] | None = None) -> int:
     if not PID_FILE.is_file():
         if engine_start(recover=False) != 0:
             print("router: engine failed to start with new config; restoring last-good", file=sys.stderr)
-            return restore_last_good()
+            return _rejected_change_after_restore(restore_last_good())
         write_last_good()
         return 0
     try:
@@ -4559,14 +4707,14 @@ def engine_reload(active_overrides: dict[str, Path] | None = None) -> int:
         PID_FILE.unlink(missing_ok=True)
         if engine_start(recover=False) != 0:
             print("router: engine failed to start with new config; restoring last-good", file=sys.stderr)
-            return restore_last_good()
+            return _rejected_change_after_restore(restore_last_good())
         write_last_good()
         return 0
     if not _pid_matches(pid):
         PID_FILE.unlink(missing_ok=True)
         if engine_start(recover=False) != 0:
             print("router: engine failed to start with new config; restoring last-good", file=sys.stderr)
-            return restore_last_good()
+            return _rejected_change_after_restore(restore_last_good())
         write_last_good()
         return 0
     if os.name == "nt":
@@ -4575,7 +4723,7 @@ def engine_reload(active_overrides: dict[str, Path] | None = None) -> int:
             return fail("engine stop failed during reload")
         if engine_start(recover=False) != 0:
             print("router: engine failed to start with new config; restoring last-good", file=sys.stderr)
-            return restore_last_good()
+            return _rejected_change_after_restore(restore_last_good())
         write_last_good()
         return 0
     reload_log_from = log_offset()
@@ -4595,7 +4743,7 @@ def engine_reload(active_overrides: dict[str, Path] | None = None) -> int:
     except ProcessLookupError:
         if engine_start(recover=False) != 0:
             print("router: engine failed to start with new config; restoring last-good", file=sys.stderr)
-            return restore_last_good()
+            return _rejected_change_after_restore(restore_last_good())
         write_last_good()
         return 0
     # In tun mode a fresh WireGuard handshake routinely needs >2s before an
@@ -4613,7 +4761,7 @@ def engine_reload(active_overrides: dict[str, Path] | None = None) -> int:
     print("router: engine did not come up after SIGHUP; trying a full start", file=sys.stderr)
     if engine_start(recover=False) != 0:
         print("router: engine failed to start with new config; restoring last-good", file=sys.stderr)
-        return restore_last_good()
+        return _rejected_change_after_restore(restore_last_good())
     # The restart path applies the new config just like a clean SIGHUP
     # would; snapshot it so the next failure restores THIS config, not an
     # older one (parity with the SIGHUP success path).
@@ -4850,6 +4998,8 @@ def _routes_add_entry(target: str, key: str, id_: str | None, provider: str) -> 
 
 
 def routes_add(args) -> int:
+    if load_config() != 0:
+        return 1
     # Honor BOTH --domain and --ip when provided (F4).
     targets: list[tuple[str, str]] = []
     if args.domain:
@@ -4878,6 +5028,8 @@ def _routes_remove_entry(id_: str) -> bool:
 
 
 def routes_remove(id_: str) -> int:
+    if load_config() != 0:
+        return 1
     if not _routes_remove_entry(id_):
         return fail(f"no route with id '{id_}'")
     if save_config() != 0:
@@ -4983,6 +5135,8 @@ def routing_cli_show() -> int:
 
 
 def routing_cli_set(mode: str, default_provider: str | None) -> int:
+    if load_config() != 0:
+        return 1
     routing = dict(_routing if isinstance(_routing, dict) else {})
     routing["mode"] = mode
     if default_provider is not None:
@@ -4997,6 +5151,8 @@ def routing_cli_set(mode: str, default_provider: str | None) -> int:
 
 
 def routing_cli_add(mode: str, domain: str) -> int:
+    if load_config() != 0:
+        return 1
     key = "direct_domains" if mode == "safe-list" else "vpn_domains"
     routing = dict(_routing if isinstance(_routing, dict) else {})
     entries = list(routing.get(key, []) or [])
@@ -5016,6 +5172,8 @@ def routing_cli_add(mode: str, domain: str) -> int:
 
 
 def routing_cli_remove(mode: str, domain: str) -> int:
+    if load_config() != 0:
+        return 1
     key = "direct_domains" if mode == "safe-list" else "vpn_domains"
     routing = dict(_routing if isinstance(_routing, dict) else {})
     entries = list(routing.get(key, []) or [])
@@ -6185,29 +6343,6 @@ def egress_show(name: str | None = None) -> int:
 # ---------------------------------------------------------------------------
 # provider validity preflight (`providers check`, issue #51)
 # ---------------------------------------------------------------------------
-
-def _provider_config_errors(name: str, entry: dict) -> list[str]:
-    """Static config errors for one provider entry (offline, no probing).
-
-    ``load_config`` already enforces the schema-wide rules (types, fallback
-    references, directory containment); this re-checks only what a single
-    provider entry controls, so the report can name the offending provider
-    instead of failing the whole load.
-    """
-    errors: list[str] = []
-    cooldown = entry.get("cooldown_seconds")
-    if cooldown is not None and not isinstance(cooldown, int):
-        # Non-integer cooldowns are coerced elsewhere with int(); flag the
-        # ones that would raise at rotation time.
-        try:
-            int(cooldown)
-        except (TypeError, ValueError):
-            errors.append(f"cooldown_seconds must be an integer (got {cooldown!r})")
-    probe_url = entry.get("probe_url")
-    if probe_url is not None and not (isinstance(probe_url, str) and probe_url.startswith("https://")):
-        errors.append("probe_url must be an https:// URL when set")
-    return errors
-
 
 def _check_provider_validity(name: str) -> dict:
     """One provider's validity verdict: config, profile pool, parseability,
@@ -7632,6 +7767,17 @@ def main() -> int:
     network_status_parser.add_argument("--json", action="store_true", help="machine-readable JSON")
     sub.add_parser("network-disconnect", help="stop proxy-router until Wi-Fi returns")
     sub.add_parser("network-reconnect", help="reconnect after Wi-Fi returns")
+    network_preset_parser = sub.add_parser(
+        "network-preset",
+        help="show or map a Wi-Fi network (SSID) to a routing preset")
+    network_preset_parser.add_argument(
+        "action", nargs="?", default="show", choices=["show", "set", "remove", "auto"],
+        help="show mappings (default), map a network, drop a mapping, or toggle auto")
+    network_preset_parser.add_argument("--ssid", default=None, help="Wi-Fi network name")
+    network_preset_parser.add_argument("--preset", default=None, help="preset to apply on that network")
+    network_preset_parser.add_argument(
+        "--state", default=None, choices=["on", "off"],
+        help="for action 'auto': enable/disable automatic preset switching")
 
     args, passthrough = parser.parse_known_args()
     if args.cmd == "elevate":
@@ -7644,6 +7790,19 @@ def main() -> int:
         return cmd_network_disconnect()
     if args.cmd == "network-reconnect":
         return cmd_network_reconnect()
+    if args.cmd == "network-preset":
+        # Reads/writes vpn.network_presets, so the config must be loaded first -
+        # dispatching before load_config() left _vpn empty and reported an empty
+        # map (and made every mutation a silent no-op).
+        if load_config() != 0:
+            return 1
+        if args.action == "set":
+            return cmd_network_preset_set(args.ssid or "", args.preset or "")
+        if args.action == "remove":
+            return cmd_network_preset_remove(args.ssid or "")
+        if args.action == "auto":
+            return cmd_network_preset_auto(args.state or "")
+        return cmd_network_preset_show(as_json=bool(getattr(args, "json", False)))
     if _needs_elevation(args):
         return _elevate()
     def _delegated_setup_argv() -> list[str]:
@@ -7935,11 +8094,11 @@ def main() -> int:
         if args.routing_action == "show":
             return routing_cli_show()
         if args.routing_action == "set":
-            return routing_cli_set(args.mode, args.default_provider)
+            return _with_lock(lambda: routing_cli_set(args.mode, args.default_provider))
         if args.routing_action == "add":
-            return routing_cli_add(args.mode, args.domain)
+            return _with_lock(lambda: routing_cli_add(args.mode, args.domain))
         if args.routing_action == "remove":
-            return routing_cli_remove(args.mode, args.domain)
+            return _with_lock(lambda: routing_cli_remove(args.mode, args.domain))
         parser.error("routing needs an action: show | set | add | remove")
     if args.cmd == "vpn":
         if args.action == "capture":
