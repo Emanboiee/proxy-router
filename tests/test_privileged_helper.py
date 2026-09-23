@@ -498,6 +498,12 @@ class ReleaseArtifactTests(unittest.TestCase):
             )
 
 
+class TcpProbeTests(unittest.TestCase):
+    def test_socket_creation_failure_is_a_readiness_failure(self):
+        with mock.patch.object(helper.socket, "socket", side_effect=OSError("fd limit")):
+            self.assertFalse(helper._probe_tcp_connect(2080))
+
+
 class HelperLifecycleTests(unittest.TestCase):
     def runtime(self, root: Path):
         bundle = root / "bundle"
@@ -800,12 +806,92 @@ class HelperLifecycleTests(unittest.TestCase):
                 runner=runner,
                 killer=killer,
                 waiter=waiter,
+                readiness=lambda _pid, _runtime: True,
             )
 
             self.assertEqual(result, {"reloaded": True, "pid": 4242})
             killer.assert_called_once_with(4242, signal.SIGHUP)
             waiter.assert_called_once_with(4242, runtime)
             self.assertEqual(json.loads(runtime.config.read_text()), _generated_config("tun"))
+
+    def test_reload_engine_reports_failure_when_listener_never_becomes_ready(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = self.runtime(root)
+            runtime.pid_file.write_text("4242\n", encoding="ascii")
+            runtime.pid_file.chmod(0o600)
+            user_root = root / "user"
+            user_root.mkdir(mode=0o700)
+            user_config = user_root / "sing-box.json"
+            user_config.write_text(json.dumps(_generated_config("proxy")), encoding="utf-8")
+            user_config.chmod(0o600)
+            identity = user_root.stat()
+            install = helper.InstallMetadata(
+                uid=os.getuid(), gid=os.getgid(), user_root=user_root,
+                user_root_device=identity.st_dev, user_root_inode=identity.st_ino,
+            )
+            exact = f"{runtime.root_uid} {runtime.binary} run -c {runtime.config}\n"
+            runner = mock.Mock(return_value=SimpleNamespace(returncode=0, stdout=exact))
+            checker = mock.Mock(return_value=SimpleNamespace(returncode=0, stdout="", stderr=""))
+            killer = mock.Mock()
+            waiter = mock.Mock(return_value=True)
+
+            with self.assertRaisesRegex(helper.SecurityError, "ready state"):
+                helper.reload_engine(
+                    install,
+                    runtime,
+                    checker=checker,
+                    runner=runner,
+                    killer=killer,
+                    waiter=waiter,
+                    readiness=lambda _pid, _runtime: False,
+                )
+
+            killer.assert_called_once_with(4242, signal.SIGHUP)
+
+    def test_wait_ready_requires_proxy_listener_and_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = self.runtime(root)
+            runtime.config.write_text(
+                json.dumps(_generated_config("proxy")), encoding="utf-8"
+            )
+            runtime.config.chmod(0o600)
+            exact = f"{runtime.root_uid} {runtime.binary} run -c {runtime.config}\n"
+            runner = mock.Mock(return_value=SimpleNamespace(returncode=0, stdout=exact))
+            probes = iter([False, True])
+
+            self.assertTrue(
+                helper._wait_ready(
+                    4242, runtime, runner=runner,
+                    probe=lambda _port: next(probes), deadline_seconds=1.0,
+                ),
+                "second probe should prove listener readiness",
+            )
+            self.assertEqual(runner.call_count, 2, "identity must be re-checked each poll")
+
+            dead = mock.Mock(return_value=SimpleNamespace(returncode=0, stdout="something else\n"))
+            self.assertFalse(
+                helper._wait_ready(
+                    4242, runtime, runner=dead, deadline_seconds=0.2,
+                ),
+                "identity mismatch must fail readiness immediately",
+            )
+
+            tun_config = _generated_config("tun")
+            runtime.config.write_text(json.dumps(tun_config), encoding="utf-8")
+            runtime.config.chmod(0o600)
+            self.assertEqual(helper._read_runtime_config(runtime), tun_config)
+            tun_port = helper._inbound_listen_port(runtime)
+            self.assertEqual(tun_port, 2080)
+            tun_probe = mock.Mock(side_effect=[False, True])
+            self.assertTrue(
+                helper._wait_ready(
+                    4242, runtime, runner=runner, probe=tun_probe, deadline_seconds=1.0,
+                ),
+                "second probe should confirm the listener in the valid generated TUN config",
+            )
+            self.assertEqual(tun_probe.call_args_list, [mock.call(2080), mock.call(2080)])
 
     def test_failed_config_check_preserves_previous_root_config(self):
         with tempfile.TemporaryDirectory() as temporary:

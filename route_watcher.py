@@ -26,6 +26,8 @@ import time
 from pathlib import Path
 from typing import Callable, Iterable
 
+import worker_lock
+
 ROOT = Path(os.environ.get("PROXY_ROUTER_ROOT") or Path(__file__).resolve().parent).resolve()
 LOG_FILE_NAME = "logs/sing-box.log"
 STATE_DIR_NAME = "state/route-watcher"
@@ -813,6 +815,14 @@ def status(root: Path | None = None) -> dict:
 
 def start(root: Path | None = None, *, interval: float = DEFAULT_INTERVAL) -> dict:
     root = Path(root) if root is not None else ROOT
+    try:
+        with worker_lock.exclusive(state_dir(root) / "start.lock"):
+            return _start_locked(root, interval)
+    except TimeoutError as exc:
+        return {"started": False, "error": str(exc)}
+
+
+def _start_locked(root: Path, interval: float) -> dict:
     current = status(root)
     if current["running"]:
         return {"started": False, "already_running": True, "pid": current["pid"]}

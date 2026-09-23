@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import plistlib
 import re
 import shlex
 import shutil
@@ -68,11 +69,17 @@ _REAL_DARWIN_PYSTRAY = bool(
 
 POLL_SECONDS = 5.0  # live-enough menu state without spawning 24 CLI procs/min
 COMMAND_TIMEOUT = 20
+# Rotation legitimately runs long: SIGHUP reload (tun readiness budget 12s)
+# plus the post-switch egress probe (8s) plus a 60s probe settle window plus
+# possible rollback. A 20s kill murders a healthy rotation after it has
+# already mutated engine/markers, reporting a failed action with real work
+# half-applied (audit F13).
+ROTATION_TIMEOUT = 100
 DASHBOARD_WIDTH = 1120
 DASHBOARD_HEIGHT = 720
 # Quit waits at most this long for an in-flight mutation to finish before
 # stopping the engine anyway — a hung mutation must not make Quit unkillable.
-MUTATION_DRAIN_TIMEOUT = COMMAND_TIMEOUT + 5.0
+MUTATION_DRAIN_TIMEOUT = ROTATION_TIMEOUT + COMMAND_TIMEOUT + 5.0
 
 # Friendly, non-jargon labels for tray menu entries. The router CLI words
 # (safe-list / vpn-list / rotate / exit) stay in the terminal; the tray
@@ -225,6 +232,7 @@ class RouterStatus:
     preset: str | None = None
     system_proxy_status: str = "ok"
     network_status: str = "unknown"
+    degraded_lanes: list = field(default_factory=list)
     error: str | None = None
 
     @classmethod
@@ -298,6 +306,8 @@ class RouterStatus:
             system_proxy_status=str(system_proxy.get("status") or (
                 "unknown" if d.get("up") and d.get("mode") == "proxy" else "skipped")),
             network_status=str(network.get("status") or "unknown"),
+            degraded_lanes=[str(lane) for lane in (d.get("degraded_lanes") or [])
+                            if isinstance(lane, str) and lane],
         )
 
     def provider_label(self, name: str) -> str:
@@ -375,13 +385,15 @@ class RouterStatus:
             return f"proxy-router: error ({self.error})"
         degraded = self.up and self.mode == "proxy" and (
             self.system_proxy_status not in {"ok", "skipped"}
-            or self.network_status not in {"ok", "unknown", "skipped"})
+            or self.network_status not in {"ok", "unknown", "skipped"}
+            or bool(self.degraded_lanes))
         state = "degraded" if degraded else ("connected" if self.up else "disconnected")
         detail = self.engine_label().removeprefix("router: ") if self.up else self.mode
         if degraded:
-            reason = (self.system_proxy_status
-                      if self.system_proxy_status not in {"ok", "skipped"}
-                      else self.network_status)
+            reason = (", ".join(self.degraded_lanes) if self.degraded_lanes
+                      else (self.system_proxy_status
+                            if self.system_proxy_status not in {"ok", "skipped"}
+                            else self.network_status))
             detail += f" · {reason}"
         watcher = "watcher on" if self.watcher else "watcher off"
         return f"proxy {state} · {detail} · {watcher}"
@@ -393,6 +405,17 @@ _DASHBOARD_MODES = (
     ("default", "Default"),
 )
 _DASHBOARD_MODE_LABELS = dict(_DASHBOARD_MODES)
+
+
+def _dashboard_indicator(status: RouterStatus) -> tuple[str, tuple[int, int, int]]:
+    """Return a truthful symbol and color for the native dashboard state."""
+    if status.error:
+        return "!", (242, 157, 76)
+    if status.up and status.degraded_lanes:
+        return "▲", (242, 157, 76)
+    if status.up:
+        return "●", (77, 205, 139)
+    return "○", (134, 147, 166)
 
 
 @dataclass(frozen=True)
@@ -420,6 +443,9 @@ class DashboardViewModel:
         if status.error:
             title = "Router unavailable"
             explanation = "The dashboard could not read proxy-router status. Try Connect again or open Setup."
+        elif status.up and status.degraded_lanes:
+            title = "Degraded"
+            explanation = f"Some routed connections need attention: {', '.join(status.degraded_lanes)}."
         elif not providers:
             title = "No VPN profile yet"
             explanation = "Add a provider profile from Setup, then Connect to start routing traffic."
@@ -461,6 +487,8 @@ class DashboardViewModel:
             provider_summary = "No provider"
         if status.error:
             route_health = "Unavailable"
+        elif status.up and status.degraded_lanes:
+            route_health = "Needs attention"
         elif not providers:
             route_health = "Not configured"
         else:
@@ -675,15 +703,106 @@ def _launch_terminal(root, script_args: list[str]) -> bool:
     return False
 
 
-def open_dashboard(root) -> bool:
-    """Open the full dashboard TUI in a terminal window (tray one-click).
+def _dashboard_bundle_candidates(root: Path) -> list[Path]:
+    """Find dashboard bundle locations without assuming a developer path."""
+    override = os.environ.get("PROXY_ROUTER_DASHBOARD")
+    candidates: list[Path] = []
+    if override:
+        candidates.append(Path(override).expanduser())
 
-    The tray menu is compact by design; the dashboard is where profiles,
-    exits, fallbacks, routing, and presets get managed. macOS: Terminal runs
-    setup_tui.py in the router root. Elsewhere: the first common terminal
-    emulator that exists wins. Never raises — the tray must survive a
-    broken terminal setup."""
+    layouts = (
+        root / "dashboard" / "src-tauri",
+        root.parent / "proxy-router-ui" / "dashboard" / "src-tauri",
+        Path(__file__).resolve().parent / "dashboard" / "src-tauri",
+        Path.home() / "Applications",
+        Path("/Applications"),
+    )
+    for base in layouts:
+        if base.name == "Applications":
+            candidates.append(base / "Proxy Router.app")
+            continue
+        for profile in ("release", "debug"):
+            candidates.append(
+                base / "target" / profile / "bundle" / "macos" / "Proxy Router.app"
+            )
+    return candidates
+
+
+def _is_complete_dashboard_bundle(app: Path) -> bool:
+    """Require the bundle metadata and executable before suppressing the tray."""
+    app = Path(app)
+    if not app.is_dir():
+        return False
+    contents = app / "Contents"
+    try:
+        with (contents / "Info.plist").open("rb") as handle:
+            metadata = plistlib.load(handle)
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return False
+    if not isinstance(metadata, dict):
+        return False
+    executable = metadata.get("CFBundleExecutable")
+    if not isinstance(executable, str) or not executable:
+        return False
+    if Path(executable).name != executable:
+        return False
+    binary = contents / "MacOS" / executable
+    try:
+        return binary.is_file() and bool(binary.stat().st_mode & 0o111)
+    except OSError:
+        return False
+
+
+def _dashboard_bundle(root: Path) -> Path | None:
+    """Find a complete built Tauri dashboard bundle."""
+    for app in _dashboard_bundle_candidates(root):
+        if _is_complete_dashboard_bundle(app):
+            return app
+    return None
+
+
+def _launch_dashboard_app(app: Path) -> bool:
+    """Open the Tauri dashboard asynchronously and never block the tray."""
+    try:
+        if sys.platform == "darwin":
+            subprocess.Popen(
+                ["open", "-a", str(app)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        else:
+            subprocess.Popen(
+                [str(app)],
+                cwd=str(app.parent),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        return True
+    except OSError as exc:
+        print(f"dashboard: could not open {app}: {exc}", file=sys.stderr)
+        return False
+
+
+def tray_ownership(root) -> str:
+    """Which side owns the single menu-bar item: ``"headless"`` or ``"icon"``.
+
+    The dashboard app registers its own status item (issue #144), so this agent
+    must never paint a second one while that app is installed. An explicit
+    ``PROXY_ROUTER_TRAY_HEADLESS=0`` opts back into the legacy icon for local
+    debugging.
+    """
+    if os.environ.get("PROXY_ROUTER_TRAY_HEADLESS", "").strip() == "0":
+        return "icon"
+    return "headless" if _dashboard_bundle(Path(root)) is not None else "icon"
+
+
+def open_dashboard(root) -> bool:
+    """Open the Tauri dashboard from the tray, with a TUI fallback."""
     root = Path(root)
+    app = _dashboard_bundle(root)
+    if app is not None:
+        return _launch_dashboard_app(app)
+
     if not (root / "setup_tui.py").is_file():
         print(f"dashboard: missing {root / 'setup_tui.py'}", file=sys.stderr)
         return False
@@ -699,13 +818,13 @@ class RouterClient:
         self.router = os.path.join(root, "router.py")
         self._active_provider: str | None = None
 
-    def _run(self, *args: str) -> tuple[int, str]:
+    def _run(self, *args: str, timeout: float = COMMAND_TIMEOUT) -> tuple[int, str]:
         cmd = [self.python, self.router, *args]
         env = dict(os.environ)
         try:
             p = subprocess.run(
                 cmd, capture_output=True, text=True,
-                timeout=COMMAND_TIMEOUT, env=env, cwd=self.root,
+                timeout=timeout, env=env, cwd=self.root,
             )
             out = (p.stdout or "") + ("\n" + p.stderr if p.stderr else "")
             return p.returncode, out.strip()
@@ -801,7 +920,7 @@ class RouterClient:
     def rotate(self) -> tuple[int, str]:
         if not self._active_provider:
             return 1, "no active provider"
-        return self._run("rotate", self._active_provider)
+        return self._run("rotate", self._active_provider, timeout=ROTATION_TIMEOUT)
 
     def rotate_to(self, provider: str, profile: str, force: bool = False) -> tuple[int, str]:
         cmd = ["rotate", provider, "--to", profile]
@@ -809,7 +928,7 @@ class RouterClient:
             # Explicit pick of an offline/SSL exit: try it anyway, ignoring
             # the cooldown its failed probe left behind.
             cmd.append("--force")
-        return self._run(*cmd)
+        return self._run(*cmd, timeout=ROTATION_TIMEOUT)
 
     def set_mode(self, mode: str, default_provider: str | None = None) -> tuple[int, str]:
         cmd = ["routing", "set", "--mode", mode]
@@ -865,9 +984,10 @@ class RouterClient:
 def _status_icon_color(st: RouterStatus, action_result: str | None = None) -> str:
     """Choose green/red/orange from current state plus the latest action."""
     action_failed = bool(action_result and ": failed" in action_result.lower())
-    if action_failed or st.error or (st.up and st.mode == "proxy" and (
-            st.system_proxy_status not in {"ok", "skipped"}
-            or st.network_status not in {"ok", "unknown", "skipped"})):
+    if action_failed or st.error or (st.up and (
+            st.degraded_lanes or (st.mode == "proxy" and (
+                st.system_proxy_status not in {"ok", "skipped"}
+                or st.network_status not in {"ok", "unknown", "skipped"})))):
         return "#ff9800"
     return "#4caf50" if st.up else "#e53935"
 
@@ -956,14 +1076,11 @@ if _REAL_DARWIN_PYSTRAY:
             panel = _dashboard_color(25, 30, 40)
             border = _dashboard_color(46, 54, 68)
 
-            background.set()
-            AppKit.NSRectFill_(self.bounds())
-            rail.set()
-            AppKit.NSRectFill_(AppKit.NSMakeRect(0, 0, 196, height))
+            self._fill_rect(self.bounds(), background)
+            self._fill_rect(AppKit.NSMakeRect(0, 0, 196, height), rail)
 
             separator = AppKit.NSMakeRect(195, 0, 1, height)
-            border.set()
-            AppKit.NSRectFill_(separator)
+            self._fill_rect(separator, border)
 
             content_x = 228
             content_width = max(420, width - content_x - 32)
@@ -982,6 +1099,13 @@ if _REAL_DARWIN_PYSTRAY:
             self._round_fill(
                 AppKit.NSMakeRect(content_x, health_y, content_width, health_height),
                 16, panel, border)
+
+        @staticmethod
+        def _fill_rect(rect, color):
+            # NSRectFill_ is absent from current PyObjC builds; raising inside
+            # drawRect: escapes the draw callback and AppKit aborts the process.
+            color.set()
+            AppKit.NSBezierPath.bezierPathWithRect_(rect).fill()
 
         @staticmethod
         def _round_fill(rect, radius, fill, stroke=None):
@@ -1229,16 +1353,9 @@ if _REAL_DARWIN_PYSTRAY:
             )
             self.mode_popup.selectItemAtIndex_(mode_index)
             self.mode_popup.setEnabled_(bool(status.providers))
-            if status.error:
-                color = _dashboard_color(242, 157, 76)
-                self.hero_dot.setStringValue_("!")
-            elif status.up:
-                color = _dashboard_color(77, 205, 139)
-                self.hero_dot.setStringValue_("●")
-            else:
-                color = _dashboard_color(134, 147, 166)
-                self.hero_dot.setStringValue_("○")
-            self.hero_dot.setTextColor_(color)
+            indicator, rgb = _dashboard_indicator(status)
+            self.hero_dot.setStringValue_(indicator)
+            self.hero_dot.setTextColor_(_dashboard_color(*rgb))
             self.health_summary.setStringValue_(self._model.route_health)
             self.route_label.setStringValue_(
                 f"{self._model.provider_summary} · {self._model.port_label} · "
@@ -1554,6 +1671,7 @@ class TrayApp:
             "preset": st.preset,
             "system_proxy": st.system_proxy_status,
             "network": st.network_status,
+            "degraded_lanes": list(st.degraded_lanes or []),
             "active": st.active_providers,
             "profiles": {n: list((i or {}).get("profiles") or [])
                          for n, i in (st.providers or {}).items()},
@@ -1762,6 +1880,22 @@ class TrayApp:
             self.last_action_result = result
         self._dashboard_update_action(result)
         self._refresh_menu()
+
+    def _open_primary_dashboard(self):
+        """Left-click: launch the Tauri dashboard, else the native window.
+
+        Right-click keeps the classic tray menu, so this is only the icon's
+        primary click action.
+        """
+        app = _dashboard_bundle(Path(self.client.root))
+        if app is not None and _launch_dashboard_app(app):
+            result = "dashboard opened"
+            with self.lock:
+                self.last_action_result = result
+            self._dashboard_update_action(result)
+            self._refresh_menu()
+            return True
+        return self._show_native_dashboard()
 
     def _show_native_dashboard(self):
         """Open or focus the custom macOS dashboard without engine changes."""
@@ -2011,12 +2145,14 @@ class TrayApp:
             state = "● No VPN set up yet"
         elif st.up and (st.mode != "proxy" or (
                 st.system_proxy_status in {"ok", "skipped"}
-                and st.network_status in {"ok", "unknown", "skipped"})):
+                and st.network_status in {"ok", "unknown", "skipped"}
+                and not st.degraded_lanes)):
             state = "● Connected"
         elif st.up:
-            reason = (st.system_proxy_status
-                      if st.system_proxy_status not in {"ok", "skipped"}
-                      else st.network_status)
+            reason = (", ".join(st.degraded_lanes) if st.degraded_lanes
+                      else (st.system_proxy_status
+                            if st.system_proxy_status not in {"ok", "skipped"}
+                            else st.network_status))
             state = f"▲ Degraded ({reason})"
         elif st.error:
             state = "! Error"
@@ -2283,7 +2419,7 @@ class TrayApp:
             try:
                 return _DarwinDashboardIcon(
                     "proxy-router", self.icon_image, "proxy-router", menu=menu,
-                    dashboard_callback=self._show_native_dashboard,
+                    dashboard_callback=self._open_primary_dashboard,
                 )
             except Exception as exc:
                 print(f"tray: native dashboard unavailable: {exc}", file=sys.stderr)
@@ -2409,6 +2545,12 @@ def main() -> int:
 
     if args.selftest:
         return selftest(args.root)
+
+    if tray_ownership(args.root) == "headless":
+        print("tray: dashboard app owns the menu bar; not starting a second "
+              "status item (set PROXY_ROUTER_TRAY_HEADLESS=0 to force)",
+              file=sys.stderr)
+        return 0
 
     if pystray is None or Image is None:
         print("pystray + pillow required (pip install pystray pillow)",

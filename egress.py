@@ -55,3 +55,46 @@ def dns_error_markers(text: str) -> bool:
     """Return whether an error describes failed DNS resolution."""
     return bool(text) and bool(_DNS_ERROR_RE.search(text))
 
+
+def _int_or_none(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def egress_rank(record: dict, *, now: int, ok_window: int, slow_latency_ms: float,
+                fail_threshold: int) -> tuple[int, float]:
+    """Rotation preference: lower is better. Recently-OK profiles rank by
+    latency (fastest first); known-slow-but-OK and unknown profiles rank
+    second; profiles with RECENT repeated failures rank last.
+
+    Failure streaks expire with the ok window: a record whose last probe is
+    older than that window carries no signal (it was typically written by
+    an era of dishonest probes or long-gone network conditions), so it
+    ranks as unknown instead of poisoning the exit forever."""
+    if not record:
+        return (1, float("inf"))
+    ok = record.get("ok")
+    last_ok = _int_or_none(record.get("last_ok_at") or record.get("checked_at"))
+    checked_at = _int_or_none(record.get("checked_at"))
+    fails = _int_or_none(record.get("fails") or 0) or 0
+    window = int(ok_window)
+    fresh = checked_at is not None and now - checked_at < window
+    if ok and last_ok is not None and now - last_ok < window:
+        latency = float(record.get("latency_ms") or float("inf"))
+        if latency < float(slow_latency_ms):
+            return (0, latency)
+        return (2, latency)
+    if fails >= int(fail_threshold) and fresh:
+        return (3, float("inf"))
+    return (1, float("inf"))
+
+
+def lru_key(record: dict) -> int:
+    """Autoroute key: epoch of the exit's last verified OK probe (older =
+    preferred; 0 = never used = preferred first)."""
+    try:
+        return int(record.get("last_ok_at") or record.get("checked_at") or 0)
+    except (TypeError, ValueError):
+        return 0

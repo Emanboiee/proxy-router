@@ -7,6 +7,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import urllib.request
 from pathlib import Path
@@ -211,6 +212,83 @@ class StateTests(unittest.TestCase):
         kill.assert_not_called()
         self.assertFalse(path.exists())
 
+    def test_stop_waits_for_start_to_publish_pid(self):
+        spawn_entered = threading.Event()
+        finish_spawn = threading.Event()
+        stop_lock_contended = threading.Event()
+        stop_done = threading.Event()
+        start_results = []
+        stop_results = []
+        original_spin = monitor.worker_lock._spin
+
+        def spawn(*_args, **_kwargs):
+            spawn_entered.set()
+            if not finish_spawn.wait(3):
+                raise AssertionError("test did not release fake spawn")
+            return mock.Mock(pid=4321)
+
+        def observe_spin(attempt, timeout, path):
+            if threading.current_thread().name != "monitor-stopper":
+                return original_spin(attempt, timeout, path)
+
+            def observe_attempt():
+                acquired = attempt()
+                if not acquired:
+                    stop_lock_contended.set()
+                return acquired
+
+            return original_spin(observe_attempt, timeout, path)
+
+        with (
+            mock.patch.object(monitor.subprocess, "Popen", side_effect=spawn),
+            mock.patch.object(monitor, "_pid_running", return_value=False),
+            mock.patch.object(monitor.worker_lock, "_spin", side_effect=observe_spin),
+        ):
+            starter = threading.Thread(
+                target=lambda: start_results.append(
+                    monitor.start(self.root, interval=77)
+                )
+            )
+            stopper = threading.Thread(
+                target=lambda: (
+                    stop_results.append(monitor.stop(self.root)),
+                    stop_done.set(),
+                ),
+                name="monitor-stopper",
+            )
+            starter.start()
+            self.assertTrue(spawn_entered.wait(2))
+            stopper.start()
+            self.assertTrue(
+                stop_lock_contended.wait(2),
+                "stop did not contend on the start lock",
+            )
+            self.assertFalse(
+                stop_done.is_set(),
+                "stop raced past the active start transaction",
+            )
+            finish_spawn.set()
+            starter.join(3)
+            stopper.join(3)
+
+        self.assertFalse(starter.is_alive())
+        self.assertFalse(stopper.is_alive())
+        self.assertTrue(start_results[0]["started"])
+        self.assertEqual(stop_results[0]["pid"], 4321)
+        self.assertFalse(monitor.pid_file(self.root).exists())
+        self.assertFalse(monitor.enabled_file(self.root).exists())
+
+    def test_stop_reports_lock_timeout_without_clearing_start_state(self):
+        monitor.enabled_file(self.root).parent.mkdir(parents=True, exist_ok=True)
+        monitor.enabled_file(self.root).touch()
+        with mock.patch.object(
+            monitor.worker_lock, "exclusive", side_effect=TimeoutError("worker lock busy")
+        ):
+            result = monitor.stop(self.root)
+        self.assertFalse(result["stopped"])
+        self.assertIn("worker lock busy", result["error"])
+        self.assertTrue(monitor.enabled_file(self.root).exists())
+
     def test_logs_tail_is_bounded(self):
         path = self.root / "state" / "monitor" / "samples.jsonl"
         path.parent.mkdir(parents=True)
@@ -275,6 +353,60 @@ class ValidatedTargetTests(unittest.TestCase):
             )
         self.assertIn("resolved to private/loopback", result["error"])
         self.assertIn("unsafe monitor target", result["error"])
+
+    def test_default_transport_rechecks_dns_for_all_probe_types(self):
+        with mock.patch.object(
+            monitor, "resolve_target_addresses", return_value=["10.0.0.8"]
+        ) as resolve:
+            results = [
+                monitor.measure_http_latency("https://probe.example/"),
+                monitor.measure_download("https://probe.example/file", max_bytes=8),
+                monitor.measure_upload("https://probe.example/upload", max_bytes=8),
+            ]
+
+        self.assertEqual(resolve.call_count, 3)
+        for result in results:
+            self.assertIn("resolved to private/loopback", result["error"])
+            self.assertIn("unsafe monitor target", result["error"])
+
+    def test_default_transport_pins_dns_answer_used_for_connection(self):
+        with mock.patch.object(
+            monitor,
+            "resolve_target_addresses",
+            side_effect=[["93.184.216.34"], ["10.0.0.8"]],
+        ) as resolve, mock.patch.object(
+            monitor.socket,
+            "create_connection",
+            side_effect=OSError("blocked test socket"),
+        ) as connect:
+            result = monitor.measure_http_latency("https://probe.example/")
+
+        self.assertEqual(resolve.call_count, 1)
+        self.assertEqual(connect.call_count, 1, result)
+        self.assertEqual(connect.call_args.args[0], ("93.184.216.34", 443))
+        self.assertIn("blocked test socket", result["error"])
+
+        connection = monitor._PinnedHTTPSConnection(
+            "probe.example", pinned_addresses=("93.184.216.34",), timeout=1
+        )
+        self.assertEqual(connection.host, "probe.example")
+
+    def test_default_safe_transport_preserves_default_headers(self):
+        response = FakeResponse(b"ok")
+        with mock.patch.object(
+            monitor, "resolve_target_addresses", return_value=["93.184.216.34"]
+        ), mock.patch.object(
+            monitor._SAFE_OPENER, "open", return_value=response
+        ) as open_request:
+            result = monitor.measure_http_latency(
+                "https://probe.example/", clock=iter([1.0, 1.05]).__next__
+            )
+
+        self.assertEqual(result["status"], 200)
+        request = open_request.call_args.args[0]
+        self.assertIsInstance(request, urllib.request.Request)
+        self.assertEqual(request.get_header("User-agent"), monitor.DEFAULT_HEADERS["User-Agent"])
+        self.assertEqual(request.get_header("Accept"), monitor.DEFAULT_HEADERS["Accept"])
 
     def test_explicit_opt_in_allows_private_targets(self):
         with mock.patch.dict(os.environ, {monitor.PRIVATE_TARGET_BYPASS_ENV: "1"}):
