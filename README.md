@@ -607,6 +607,27 @@ RouterClient and CLI ownership are unchanged. If Cocoa is unavailable, the
 core CLI and `--selftest` remain usable and the native dashboard path fails
 closed.
 
+### Native dashboard app (macOS)
+
+The macOS app is published as
+`proxy-router-dashboard-<version>-darwin-arm64.zip` with the CLI release.
+Extract it into `~/Applications` and launch the app directly. Its own
+menu-bar icon provides the dashboard controls. Install the Python router with
+the CLI installer first.
+
+To build and test from a clean checkout on macOS:
+
+```sh
+cd dashboard
+npm ci
+npm test
+npm run tauri -- build --bundles app
+```
+
+The source archive includes the dashboard source, locked npm and Rust
+dependencies, and required assets. CI runs the frontend build, Playwright and
+Rust tests, then verifies the packaged app executable.
+
 macOS login autostart (launchd agent):
 
 ```sh

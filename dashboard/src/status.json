@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "source": "fixture",
+  "connection": "connected",
+  "profile": "School access",
+  "route_mode": "selective",
+  "router": "ready",
+  "network": "online",
+  "health": "Selected routes are responding. Other traffic uses your normal connection.",
+  "observed_at": 0,
+  "stale": false,
+  "action": "idle"
+}
