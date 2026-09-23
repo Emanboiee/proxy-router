@@ -1730,43 +1730,86 @@ class DashboardTrayIntegrationTests(unittest.TestCase):
 
 
 class TrayOwnershipTests(unittest.TestCase):
-    """Issue #144: exactly one proxy-router menu-bar item — the dashboard app.
+    """Issue #144: the tray follows the dashboard's live ownership lease."""
 
-    The tray agent must refuse to paint a second status item while the
-    dashboard bundle is installed; PROXY_ROUTER_TRAY_HEADLESS=0 keeps the
-    legacy icon for local debugging.
-    """
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name).resolve()
+        self.owner_file = self.root / tray.DASHBOARD_OWNER_FILE
+        self.owner_file.parent.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(self.tmp.cleanup)
 
-    def test_installed_dashboard_forces_headless(self):
-        bundle = Path("/tmp/Proxy Router.app")
-        with mock.patch.object(tray, "_dashboard_bundle", return_value=bundle):
-            self.assertEqual(tray.tray_ownership("/tmp/root"), "headless")
+    def _write_owner(self, at, owner_root=None):
+        self.owner_file.write_text(json.dumps({
+            "pid": 4242,
+            "at": at,
+            "root": str(Path(owner_root or self.root).resolve()),
+            "owner_id": "tauri-test-owner",
+        }), encoding="utf-8")
 
-    def test_no_dashboard_bundle_keeps_the_legacy_icon(self):
-        with mock.patch.object(tray, "_dashboard_bundle", return_value=None), \
-                mock.patch.dict(tray.os.environ, {"PROXY_ROUTER_TRAY_HEADLESS": ""}):
-            self.assertEqual(tray.tray_ownership("/tmp/root"), "icon")
+    def _app(self):
+        client = SimpleNamespace(root=str(self.root))
+        app = tray.TrayApp(client, None)
+        app.tray = SimpleNamespace(visible=True)
+        return app
+
+    def test_dashboard_first_hides_python_icon_from_fresh_lease(self):
+        self._write_owner(at=1000.0)
+        with mock.patch.dict(tray.os.environ, {"PROXY_ROUTER_TRAY_HEADLESS": ""}):
+            app = self._app()
+            self.assertFalse(app._sync_tray_ownership(now=1000.0))
+        self.assertFalse(app.tray.visible)
+
+    def test_python_first_hides_when_dashboard_claims_after_startup(self):
+        with mock.patch.dict(tray.os.environ, {"PROXY_ROUTER_TRAY_HEADLESS": ""}):
+            app = self._app()
+            self.assertTrue(app._sync_tray_ownership(now=1000.0))
+            self.assertTrue(app.tray.visible)
+
+            self._write_owner(at=1000.0)
+            self.assertFalse(app._sync_tray_ownership(now=1001.0))
+        self.assertFalse(app.tray.visible)
+
+    def test_clean_dashboard_quit_returns_icon_to_python(self):
+        self._write_owner(at=1000.0)
+        with mock.patch.dict(tray.os.environ, {"PROXY_ROUTER_TRAY_HEADLESS": ""}):
+            app = self._app()
+            self.assertFalse(app._sync_tray_ownership(now=1000.0))
+            self.owner_file.unlink()
+            self.assertTrue(app._sync_tray_ownership(now=1001.0))
+        self.assertTrue(app.tray.visible)
+
+    def test_crashed_dashboard_lease_expires_and_python_takes_over(self):
+        self._write_owner(at=1000.0 - tray.DASHBOARD_OWNER_TTL - 1)
+        with mock.patch.dict(tray.os.environ, {"PROXY_ROUTER_TRAY_HEADLESS": ""}):
+            app = self._app()
+            self.assertTrue(app._sync_tray_ownership(now=1000.0))
+        self.assertTrue(app.tray.visible)
+
+    def test_malformed_and_other_root_leases_do_not_hide_icon(self):
+        with mock.patch.dict(tray.os.environ, {"PROXY_ROUTER_TRAY_HEADLESS": ""}):
+            self._write_owner(at=1000.0, owner_root=self.root.parent)
+            self.assertEqual(tray.tray_ownership(self.root, now=1000.0), "icon")
+            self.owner_file.write_text("not json", encoding="utf-8")
+            self.assertEqual(tray.tray_ownership(self.root, now=1000.0), "icon")
 
     def test_explicit_opt_out_keeps_the_legacy_icon(self):
-        with mock.patch.object(tray, "_dashboard_bundle",
-                               return_value=Path("/tmp/Proxy Router.app")), \
-                mock.patch.dict(tray.os.environ, {"PROXY_ROUTER_TRAY_HEADLESS": "0"}):
-            self.assertEqual(tray.tray_ownership("/tmp/root"), "icon")
+        self._write_owner(at=1000.0)
+        with mock.patch.dict(tray.os.environ, {"PROXY_ROUTER_TRAY_HEADLESS": "0"}):
+            self.assertEqual(tray.tray_ownership(self.root, now=1000.0), "icon")
 
-    def test_main_refuses_the_icon_when_the_dashboard_owns_the_menubar(self):
-        stderr = io.StringIO()
-        with mock.patch.object(tray, "_dashboard_bundle",
-                               return_value=Path("/tmp/Proxy Router.app")), \
-                mock.patch.object(tray, "RouterClient") as client, \
+    def test_main_keeps_resident_worker_when_dashboard_owns_tray(self):
+        with mock.patch.object(tray, "RouterClient") as client, \
                 mock.patch.object(tray, "TrayApp") as tray_app, \
-                mock.patch.object(sys, "stderr", stderr), \
-                mock.patch.object(sys, "argv",
-                                  ["proxy_tray.py", "--root", "/tmp/root"]):
-            rc = tray.main()
-        self.assertEqual(rc, 0)
-        client.assert_not_called()
-        tray_app.assert_not_called()
-        self.assertIn("not starting a second status item", stderr.getvalue())
+                mock.patch.object(tray, "make_icon", return_value=object()), \
+                mock.patch.object(tray, "pystray", object()), \
+                mock.patch.object(tray, "Image", object()), \
+                mock.patch.object(tray, "tray_ownership", return_value="headless"), \
+                mock.patch.object(sys, "argv", ["proxy_tray.py", "--root", "/tmp/root"]):
+            self.assertEqual(tray.main(), 0)
+        client.assert_called_once_with("/tmp/root")
+        tray_app.assert_called_once()
+        tray_app.return_value.run.assert_called_once_with()
 
 
 if __name__ == "__main__":

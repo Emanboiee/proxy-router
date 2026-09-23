@@ -589,6 +589,11 @@ Notes on claims vs reality:
 every click shells out to `router.py`, so rotation ownership, cooldowns, and
 keepalive semantics stay exactly where they are.
 
+The Tauri dashboard publishes an atomic tray-owner lease under
+`state/dashboard-owns-tray.json` and refreshes it every 15 seconds. The Python
+tray stays resident but hides its icon while that lease is fresh; it shows the
+icon again after a clean dashboard quit or when the lease expires after a crash.
+
 The tray needs two GUI dependencies beyond the stdlib-only core:
 
 ```sh
