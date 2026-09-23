@@ -97,11 +97,20 @@ fn run_controller_raw(
     args: &[&str],
     timeout: Duration,
 ) -> Result<std::process::Output, String> {
+    run_controller_with_python(root, args, timeout, &router_python())
+}
+
+fn run_controller_with_python(
+    root: &Path,
+    args: &[&str],
+    timeout: Duration,
+    python: &str,
+) -> Result<std::process::Output, String> {
     let script = controller_path(root);
     if !script.is_file() {
         return Err(format!("controller not found: {}", script.display()));
     }
-    let mut child = Command::new(router_python())
+    let mut child = Command::new(python)
         .arg(&script)
         .args(args)
         .current_dir(root)
@@ -109,18 +118,28 @@ fn run_controller_raw(
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|error| format!("could not run controller: {error}"))?;
+    let stdout_reader = child.stdout.take().map(read_pipe);
+    let stderr_reader = child.stderr.take().map(read_pipe);
     let deadline = std::time::Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                return output_with_status(child, status);
+                return output_with_status(status, stdout_reader, stderr_reader);
             }
             Ok(None) => {}
-            Err(error) => return Err(format!("could not run controller: {error}")),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = finish_pipe_reader(stdout_reader);
+                let _ = finish_pipe_reader(stderr_reader);
+                return Err(format!("could not run controller: {error}"));
+            }
         }
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = finish_pipe_reader(stdout_reader);
+            let _ = finish_pipe_reader(stderr_reader);
             return Err(format!(
                 "controller timed out after {}s: {}",
                 timeout.as_secs(),
@@ -131,19 +150,35 @@ fn run_controller_raw(
     }
 }
 
+fn read_pipe<R: std::io::Read + Send + 'static>(
+    mut stream: R,
+) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>> {
+    std::thread::spawn(move || {
+        let mut output = Vec::new();
+        stream.read_to_end(&mut output)?;
+        Ok(output)
+    })
+}
+
+fn finish_pipe_reader(
+    reader: Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>,
+) -> Result<Vec<u8>, String> {
+    let Some(reader) = reader else {
+        return Ok(Vec::new());
+    };
+    reader
+        .join()
+        .map_err(|_| "controller output reader panicked".to_string())?
+        .map_err(|error| format!("could not read controller output: {error}"))
+}
+
 fn output_with_status(
-    mut child: std::process::Child,
     status: std::process::ExitStatus,
+    stdout_reader: Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>,
+    stderr_reader: Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>,
 ) -> Result<std::process::Output, String> {
-    use std::io::Read;
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    if let Some(mut stream) = child.stdout.take() {
-        let _ = stream.read_to_end(&mut stdout);
-    }
-    if let Some(mut stream) = child.stderr.take() {
-        let _ = stream.read_to_end(&mut stderr);
-    }
+    let stdout = finish_pipe_reader(stdout_reader)?;
+    let stderr = finish_pipe_reader(stderr_reader)?;
     Ok(std::process::Output {
         status,
         stdout,
@@ -154,7 +189,8 @@ fn output_with_status(
 /// Parse a read-only JSON subcommand's stdout.
 pub fn json_command(root: &Path, args: &[&str]) -> Result<Value, String> {
     let out = run_controller_allow_nonzero(root, args)?;
-    serde_json::from_str::<Value>(&out).map_err(|error| format!("invalid JSON from {args:?}: {error}"))
+    serde_json::from_str::<Value>(&out)
+        .map_err(|error| format!("invalid JSON from {args:?}: {error}"))
 }
 
 /// A transport flag that is not explicitly healthy counts as degraded, but an
@@ -204,6 +240,37 @@ pub fn state_for_result(result: &Result<Value, String>) -> &'static str {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestControllerRoot(PathBuf);
+
+    impl TestControllerRoot {
+        fn new(script: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock before unix epoch")
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "proxy-router-controller-{}-{unique}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&root).expect("create temporary controller root");
+            fs::write(root.join("router.py"), script).expect("write temporary controller");
+            Self(root)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestControllerRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn healthy_status_is_connected() {
@@ -256,6 +323,52 @@ mod tests {
         let root = std::path::Path::new("/nonexistent-proxy-router-root");
         assert!(run_controller(root, &["status", "--json"]).is_err());
         assert!(live_status(root).is_err());
+    }
+
+    #[test]
+    fn controller_drains_large_stdout_and_stderr_concurrently() {
+        let root = TestControllerRoot::new(
+            "import sys\nsys.stdout.write('out' * 131072)\nsys.stdout.flush()\nsys.stderr.write('err' * 131072)\nsys.stderr.flush()\n",
+        );
+        let output =
+            run_controller_with_python(root.path(), &[], Duration::from_secs(10), "python3")
+                .expect("controller completes after writing beyond both pipe capacities");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"out".repeat(131072));
+        assert_eq!(output.stderr, b"err".repeat(131072));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timed_out_controller_is_killed_and_reaped() {
+        let root = TestControllerRoot::new(
+            "import pathlib, sys, time\npathlib.Path(sys.argv[1]).write_text(str(__import__('os').getpid()))\ntime.sleep(60)\n",
+        );
+        let pid_file = root.path().join("child.pid");
+        let pid_argument = pid_file.to_str().expect("temporary path is valid UTF-8");
+        let result = run_controller_with_python(
+            root.path(),
+            &[pid_argument],
+            Duration::from_secs(2),
+            "python3",
+        );
+
+        let error = result.expect_err("hung controller should time out");
+        assert!(error.contains("controller timed out"), "{error}");
+        let pid = fs::read_to_string(pid_file)
+            .expect("child started before timeout")
+            .parse::<u32>()
+            .expect("child wrote a process id");
+        let still_running = Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .expect("check child process");
+        assert!(
+            !still_running.success(),
+            "timed out child {pid} is still running"
+        );
     }
 
     #[test]
