@@ -45,7 +45,14 @@ case "$cmd" in
         printf '%s\n' '{"connected": false, "ssid": null}'
         exit 1
       fi
-      ssid_json=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$ssid")
+      case "$ssid" in
+        *[!a-zA-Z0-9._-]*)
+          ssid_json=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$ssid")
+          ;;
+        *)
+          ssid_json="\"$ssid\""
+          ;;
+      esac
       printf '{"connected": true, "ssid": %s}\n' "$ssid_json"
       exit 0
     fi
