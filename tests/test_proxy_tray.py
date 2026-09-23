@@ -1470,6 +1470,29 @@ class DashboardViewModelTests(unittest.TestCase):
         self.assertEqual(model.watcher_label, "Route watcher active")
         self.assertEqual(model.route_health, "Healthy")
 
+
+    def test_degraded_connected_model_warns_instead_of_showing_healthy(self):
+        status = tray.RouterStatus(
+            up=True,
+            mode="proxy",
+            providers={
+                "proton": {
+                    "active": "01-NL",
+                    "profiles": ["01-NL"],
+                    "egress": {"01-NL": {"ok": True, "latency_ms": 18}},
+                }
+            },
+            degraded_lanes=["proton"],
+        )
+
+        model = tray.DashboardViewModel.from_status(status)
+
+        self.assertEqual(model.title, "Degraded")
+        self.assertEqual(model.route_health, "Needs attention")
+        self.assertEqual(model.primary_action, "disconnect")
+        self.assertEqual(
+            tray._dashboard_indicator(status), ("▲", (242, 157, 76)))
+
     def test_error_model_renders_actionable_error_without_crashing(self):
         model = tray.DashboardViewModel.from_status(
             tray.RouterStatus(error="status exit 7"))

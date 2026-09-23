@@ -406,6 +406,17 @@ _DASHBOARD_MODES = (
 _DASHBOARD_MODE_LABELS = dict(_DASHBOARD_MODES)
 
 
+def _dashboard_indicator(status: RouterStatus) -> tuple[str, tuple[int, int, int]]:
+    """Return a truthful symbol and color for the native dashboard state."""
+    if status.error:
+        return "!", (242, 157, 76)
+    if status.up and status.degraded_lanes:
+        return "▲", (242, 157, 76)
+    if status.up:
+        return "●", (77, 205, 139)
+    return "○", (134, 147, 166)
+
+
 @dataclass(frozen=True)
 class DashboardViewModel:
     """Small, UI-safe projection of router status for the native window."""
@@ -431,6 +442,9 @@ class DashboardViewModel:
         if status.error:
             title = "Router unavailable"
             explanation = "The dashboard could not read proxy-router status. Try Connect again or open Setup."
+        elif status.up and status.degraded_lanes:
+            title = "Degraded"
+            explanation = "Some routed connections need attention. Check the status details below."
         elif not providers:
             title = "No VPN profile yet"
             explanation = "Add a provider profile from Setup, then Connect to start routing traffic."
@@ -472,6 +486,8 @@ class DashboardViewModel:
             provider_summary = "No provider"
         if status.error:
             route_health = "Unavailable"
+        elif status.up and status.degraded_lanes:
+            route_health = "Needs attention"
         elif not providers:
             route_health = "Not configured"
         else:
@@ -1307,16 +1323,9 @@ if _REAL_DARWIN_PYSTRAY:
             )
             self.mode_popup.selectItemAtIndex_(mode_index)
             self.mode_popup.setEnabled_(bool(status.providers))
-            if status.error:
-                color = _dashboard_color(242, 157, 76)
-                self.hero_dot.setStringValue_("!")
-            elif status.up:
-                color = _dashboard_color(77, 205, 139)
-                self.hero_dot.setStringValue_("●")
-            else:
-                color = _dashboard_color(134, 147, 166)
-                self.hero_dot.setStringValue_("○")
-            self.hero_dot.setTextColor_(color)
+            indicator, rgb = _dashboard_indicator(status)
+            self.hero_dot.setStringValue_(indicator)
+            self.hero_dot.setTextColor_(_dashboard_color(*rgb))
             self.health_summary.setStringValue_(self._model.route_health)
             self.route_label.setStringValue_(
                 f"{self._model.provider_summary} · {self._model.port_label} · "
