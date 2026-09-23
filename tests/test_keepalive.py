@@ -626,7 +626,7 @@ class KeepaliveFallbackRestoreTests(unittest.TestCase):
                 deadline = time.time() + 10
                 lines = h.lines()
                 while time.time() < deadline and not any(
-                        line.startswith("failover proton off") for line in lines):
+                        line.startswith("egress check --provider proton") for line in lines):
                     time.sleep(0.05)
                     lines = h.lines()
                 self.assertTrue(
