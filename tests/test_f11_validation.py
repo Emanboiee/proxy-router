@@ -117,13 +117,27 @@ class NonObjectConfigTests(unittest.TestCase):
             any("must be an object" in issue for issue in result["issues"]), result
         )
 
-    def test_watcher_router_port_falls_back(self):
+    def test_watcher_rejects_non_object_config_for_router_port(self):
         watcher = _load("route_watcher")
-        self.assertEqual(watcher.router_port(self.root), 2080)
+        with self.assertRaisesRegex(
+            watcher.RouterConfigError, "top level must be an object"
+        ):
+            watcher.router_port(self.root)
 
-    def test_watcher_critical_domains_does_not_crash(self):
+    def test_watcher_rejects_non_object_config_for_critical_domains(self):
         watcher = _load("route_watcher")
-        self.assertIsInstance(watcher.critical_domains(self.root), tuple)
+        with self.assertRaisesRegex(
+            watcher.RouterConfigError, "top level must be an object"
+        ):
+            watcher.critical_domains(self.root)
+
+    def test_watcher_defaults_when_router_config_is_missing(self):
+        (self.root / "router.json").unlink()
+        watcher = _load("route_watcher")
+        self.assertEqual(watcher.router_port(self.root), watcher.DEFAULT_ROUTER_PORT)
+        self.assertEqual(
+            watcher.critical_domains(self.root), watcher.DEFAULT_CRITICAL_DOMAINS
+        )
 
 
 if __name__ == "__main__":

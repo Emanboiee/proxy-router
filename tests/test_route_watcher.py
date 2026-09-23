@@ -264,6 +264,31 @@ class RouteWatcherTests(unittest.TestCase):
         self.assertFalse(w.enabled_file(root).exists(), "worker must clean up its markers")
         self.assertFalse(w.pid_file(root).exists())
 
+    def test_worker_rejects_invalid_config_before_starting(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        (root / "router.json").write_text("{")
+
+        with self.assertRaisesRegex(w.RouterConfigError, "invalid router.json"):
+            w.worker(root, interval=0.05, sleep=lambda _: None)
+
+        self.assertFalse(w.enabled_file(root).exists())
+        self.assertFalse(w.pid_file(root).exists())
+
+    def test_worker_rejects_invalid_port_before_starting(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        (root / "router.json").write_text(json.dumps({
+            "routes": [{"domains": ["example.com"]}],
+            "port": "2081",
+        }))
+
+        with self.assertRaisesRegex(w.RouterConfigError, "port must be an integer"):
+            w.worker(root, interval=0.05, sleep=lambda _: None)
+
+        self.assertFalse(w.enabled_file(root).exists())
+        self.assertFalse(w.pid_file(root).exists())
+
     def test_worker_keeps_running_while_engine_alive(self):
         root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, root, ignore_errors=True)
@@ -407,10 +432,30 @@ class RouteWatcherTests(unittest.TestCase):
         self.assertFalse(w.pid_file(root).exists(), "stale markers are removed")
         self.assertFalse(w.enabled_file(root).exists())
 
-    def test_router_port_falls_back_to_2080(self):
+    def test_missing_router_config_uses_explicit_first_run_port(self):
         root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, root, ignore_errors=True)
         self.assertEqual(w.router_port(root), 2080)
+
+    def test_router_port_rejects_wrong_field_type(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        (root / "router.json").write_text(json.dumps({"port": "2081"}))
+        with self.assertRaisesRegex(w.RouterConfigError, "port must be an integer"):
+            w.router_port(root)
+
+    def test_start_rejects_invalid_router_port_before_marking_or_spawning(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        (root / "router.json").write_text(json.dumps({"port": "2081"}))
+
+        with mock.patch.object(w.subprocess, "Popen") as popen:
+            with self.assertRaisesRegex(w.RouterConfigError, "port must be an integer"):
+                w.start(root)
+
+        popen.assert_not_called()
+        self.assertFalse(w.enabled_file(root).exists())
+        self.assertFalse(w.pid_file(root).exists())
 
     def test_router_port_reads_custom_port(self):
         root = Path(tempfile.mkdtemp())
@@ -516,6 +561,21 @@ class ProviderForHostTests(unittest.TestCase):
             data["routing"] = routing
         (root / "router.json").write_text(json.dumps(data))
         return root
+
+    def test_missing_router_config_uses_explicit_first_run_domain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(w.critical_domains(Path(tmp)), ("opencode.ai",))
+
+    def test_malformed_router_json_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "router.json").write_text("{")
+            with self.assertRaisesRegex(w.RouterConfigError, "invalid router.json"):
+                w.critical_domains(root)
+
+    def test_existing_empty_routes_do_not_guess_a_critical_domain(self):
+        root = self._root_with_routes([])
+        self.assertEqual(w.critical_domains(root), ())
 
     def test_maps_host_to_its_route_provider(self):
         root = self._root_with_routes([
