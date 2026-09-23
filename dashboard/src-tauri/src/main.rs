@@ -246,11 +246,127 @@ fn apply_preset(app: AppHandle, name: String) -> Result<String, String> {
     Ok(applied)
 }
 
-/// Config keys the dashboard may read. Explicit allowlist: router.json is
-/// handed to the webview, so no key is exposed implicitly.
-const CONFIG_KEYS: [&str; 8] = [
-    "port", "preset", "providers", "routes", "routing", "vpn", "keepalive", "rotation",
-];
+/// Preserve the dashboard's truthiness checks without forwarding provider data.
+fn configured(value: Option<&Value>) -> bool {
+    match value {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(value)) => *value,
+        Some(Value::Number(value)) => value.as_f64().map(|number| number != 0.0).unwrap_or(false),
+        Some(Value::String(value)) => !value.is_empty(),
+        Some(Value::Array(_)) | Some(Value::Object(_)) => true,
+    }
+}
+
+fn copy_string_fields(source: &Value, keys: &[&str], output: &mut serde_json::Map<String, Value>) {
+    for key in keys {
+        if let Some(value) = source.get(key).and_then(Value::as_str) {
+            output.insert((*key).to_string(), Value::String(value.to_string()));
+        }
+    }
+}
+
+fn copy_number_fields(source: &Value, keys: &[&str], output: &mut serde_json::Map<String, Value>) {
+    for key in keys {
+        if let Some(value) = source.get(key).and_then(Value::as_u64) {
+            output.insert((*key).to_string(), Value::from(value));
+        }
+    }
+}
+
+fn copy_bool_fields(source: &Value, keys: &[&str], output: &mut serde_json::Map<String, Value>) {
+    for key in keys {
+        if let Some(value) = source.get(key).and_then(Value::as_bool) {
+            output.insert((*key).to_string(), Value::Bool(value));
+        }
+    }
+}
+
+fn copy_string_array(source: &Value, key: &str, output: &mut serde_json::Map<String, Value>) {
+    if let Some(values) = source.get(key).and_then(Value::as_array) {
+        output.insert(
+            key.to_string(),
+            Value::Array(
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|value| Value::String(value.to_string()))
+                    .collect(),
+            ),
+        );
+    }
+}
+
+/// Project only typed values used by the dashboard; never forward config objects.
+fn redacted_config(parsed: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    copy_number_fields(parsed, &["port"], &mut out);
+    copy_string_fields(parsed, &["preset"], &mut out);
+
+    if let Some(providers) = parsed.get("providers").and_then(Value::as_object) {
+        let mut provider_views = serde_json::Map::new();
+        for (name, provider) in providers {
+            if !provider.is_object() {
+                continue;
+            }
+            let mut view = serde_json::Map::new();
+            // The UI only needs to know which kind is configured, not a path or
+            // SOCKS endpoint that may contain local or credential data.
+            view.insert(
+                "directory".to_string(),
+                Value::Bool(configured(provider.get("directory"))),
+            );
+            view.insert(
+                "socks5".to_string(),
+                Value::Bool(configured(provider.get("socks5"))),
+            );
+            copy_string_array(provider, "fallback_providers", &mut view);
+            provider_views.insert(name.clone(), Value::Object(view));
+        }
+        out.insert("providers".to_string(), Value::Object(provider_views));
+    }
+
+    if let Some(routes) = parsed.get("routes").and_then(Value::as_array) {
+        let route_views = routes
+            .iter()
+            .filter_map(Value::as_object)
+            .map(|route| {
+                let source = Value::Object(route.clone());
+                let mut view = serde_json::Map::new();
+                copy_string_fields(&source, &["id", "provider"], &mut view);
+                copy_string_array(&source, "domains", &mut view);
+                Value::Object(view)
+            })
+            .collect();
+        out.insert("routes".to_string(), Value::Array(route_views));
+    }
+
+    for (key, string_fields, number_fields, bool_fields) in [
+        ("routing", &["mode"][..], &[][..], &[][..]),
+        (
+            "vpn",
+            &["default_mode", "capture", "dns_transport"][..],
+            &["mtu"][..],
+            &[][..],
+        ),
+        ("keepalive", &[][..], &["interval"][..], &["enabled"][..]),
+        (
+            "rotation",
+            &[][..],
+            &["interval_seconds", "jitter_seconds"][..],
+            &[][..],
+        ),
+    ] {
+        if let Some(section) = parsed.get(key).filter(|value| value.is_object()) {
+            let mut view = serde_json::Map::new();
+            copy_string_fields(section, string_fields, &mut view);
+            copy_number_fields(section, number_fields, &mut view);
+            copy_bool_fields(section, bool_fields, &mut view);
+            out.insert(key.to_string(), Value::Object(view));
+        }
+    }
+
+    Value::Object(out)
+}
 
 /// Preset/SSID slug rules, mirrored from the engine's validation.
 fn valid_slug(value: &str, max: usize) -> bool {
@@ -271,15 +387,9 @@ fn get_config() -> Result<Value, String> {
     let path = root.join("router.json");
     let raw = std::fs::read_to_string(&path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-    let parsed: Value = serde_json::from_str(&raw)
-        .map_err(|error| format!("invalid router.json: {error}"))?;
-    let mut out = serde_json::Map::new();
-    for key in CONFIG_KEYS {
-        if let Some(value) = parsed.get(key) {
-            out.insert(key.to_string(), value.clone());
-        }
-    }
-    Ok(Value::Object(out))
+    let parsed: Value =
+        serde_json::from_str(&raw).map_err(|error| format!("invalid router.json: {error}"))?;
+    Ok(redacted_config(&parsed))
 }
 
 /// Live network detection: current Wi-Fi + the SSID -> preset mapping.
@@ -580,5 +690,88 @@ mod tests {
         // (main-thread command), not a tray-menu verb.
         assert!(action_args("stop", None).is_err());
         assert!(action_args("rotate", Some(&serde_json::json!({}))).is_err());
+    }
+
+    #[test]
+    fn config_view_preserves_dashboard_fields_and_drops_nested_secrets() {
+        let parsed = serde_json::json!({
+            "port": 2080,
+            "preset": "school-warp",
+            "providers": {
+                "primary-vpn": {
+                    "directory": "/private/path/providers/primary-vpn",
+                    "fallback_providers": ["fallback-vpn"],
+                    "socks5": {"host": "proxy.local", "username": "user", "password": "socks-secret-marker"},
+                    "credentials": {"api_token": "provider-secret-marker"},
+                    "private_key": "wireguard-secret-marker"
+                }
+            },
+            "routes": [{
+                "id": "opencode-zen",
+                "provider": "primary-vpn",
+                "domains": ["opencode.ai"],
+                "private_key": "route-secret-marker"
+            }],
+            "routing": {"mode": "vpn-list", "token": "routing-secret-marker"},
+            "vpn": {
+                "default_mode": "tun",
+                "capture": "routes",
+                "mtu": 1500,
+                "dns_transport": "udp",
+                "private_key": "vpn-secret-marker",
+                "network_presets": {"HomeWiFi": "default"}
+            },
+            "keepalive": {"enabled": true, "interval": 15, "api_key": "keepalive-secret-marker"},
+            "rotation": {"interval_seconds": 7200, "jitter_seconds": 300, "token": "rotation-secret-marker"},
+            "unlisted": {"password": "top-level-secret-marker"}
+        });
+
+        let view = redacted_config(&parsed);
+
+        assert_eq!(
+            view,
+            serde_json::json!({
+                "port": 2080,
+                "preset": "school-warp",
+                "providers": {
+                    "primary-vpn": {
+                        "directory": true,
+                        "socks5": true,
+                        "fallback_providers": ["fallback-vpn"]
+                    }
+                },
+                "routes": [{
+                    "id": "opencode-zen",
+                    "provider": "primary-vpn",
+                    "domains": ["opencode.ai"]
+                }],
+                "routing": {"mode": "vpn-list"},
+                "vpn": {
+                    "default_mode": "tun",
+                    "capture": "routes",
+                    "mtu": 1500,
+                    "dns_transport": "udp"
+                },
+                "keepalive": {"enabled": true, "interval": 15},
+                "rotation": {"interval_seconds": 7200, "jitter_seconds": 300}
+            })
+        );
+        let serialized = view.to_string();
+        for marker in [
+            "socks-secret-marker",
+            "provider-secret-marker",
+            "wireguard-secret-marker",
+            "route-secret-marker",
+            "routing-secret-marker",
+            "vpn-secret-marker",
+            "keepalive-secret-marker",
+            "rotation-secret-marker",
+            "top-level-secret-marker",
+            "/private/path",
+            "proxy.local",
+            "HomeWiFi",
+        ] {
+            assert!(!serialized.contains(marker), "leaked {marker}");
+        }
     }
 }
