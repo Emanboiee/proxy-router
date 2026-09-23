@@ -167,6 +167,19 @@ class ConfigBuildTests(unittest.TestCase):
         self.assertIn({"outbound": "proton", "domain_suffix": ["example.com"]}, rules)
         self.assertNotIn({"outbound": "cloudflare", "domain_suffix": ["roblox.com"]}, rules)
 
+    def test_unavailable_block_route_rejects_traffic_and_dns(self):
+        router._routes = [{
+            "id": "roblox", "domains": ["roblox.com"], "provider": "cloudflare",
+            "on_unavailable": "block",
+        }]
+
+        config, active = router.build_singbox_config()
+
+        self.assertEqual(set(active), {"proton"})
+        self.assertIn({"action": "reject", "domain_suffix": ["roblox.com"]}, config["route"]["rules"])
+        self.assertIn({"domain_suffix": ["roblox.com"], "action": "reject"}, config["dns"]["rules"])
+        self.assertEqual(config["route"]["final"], "direct")
+
     def test_build_retains_persisted_profile_when_every_profile_is_cooled(self):
         profile = self.root / "providers" / "cloudflare" / "warp.conf"
         _write_conf(profile)
@@ -237,6 +250,17 @@ class ConfigValidationTests(unittest.TestCase):
     def test_load_config_rejects_provider_path_escape(self):
         router.CONFIG_FILE.write_text(json.dumps({
             "port": 2080, "providers": {"proton": {"directory": "../outside"}}, "routes": []
+        }))
+        self.assertEqual(router.load_config(), 1)
+
+    def test_load_config_rejects_invalid_route_unavailable_policy(self):
+        router.CONFIG_FILE.write_text(json.dumps({
+            "port": 2080,
+            "providers": {"proton": {}},
+            "routes": [{
+                "id": "example-com", "domains": ["example.com"], "provider": "proton",
+                "on_unavailable": "fallback",
+            }],
         }))
         self.assertEqual(router.load_config(), 1)
 
@@ -356,6 +380,20 @@ class VpnModeTests(unittest.TestCase):
         router.set_mode("tun")
         config, _ = router.build_singbox_config()
         self.assertEqual(config["route"]["rules"][0], {"protocol": "dns", "action": "hijack-dns"})
+
+    def test_tun_captures_unavailable_block_route(self):
+        router._routes = [{
+            "id": "missing", "domains": ["blocked.example"], "provider": "cloudflare",
+            "on_unavailable": "block",
+        }]
+        router._vpn["capture"] = "routes"
+        router.set_mode("tun")
+        with mock.patch.object(router, "_bounded_getaddrinfo", return_value=["203.0.113.7"]):
+            config, _ = router.build_singbox_config()
+
+        captured = config["route"]["rule_set"][0]["rules"][0]["ip_cidr"]
+        self.assertIn("203.0.113.7/32", captured)
+        self.assertIn({"action": "reject", "domain_suffix": ["blocked.example"]}, config["route"]["rules"])
 
     def test_proxy_mode_has_no_hijack_rule(self):
         router.set_mode("proxy")

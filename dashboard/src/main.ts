@@ -1,6 +1,7 @@
 import './tokens.css';
 import './style.css';
-import { LocalController, applyEngineAction, applyProfileToEngine, getCachedLiveStatus, getLiveStatus, getPreviewStatus, reportPreviewFrame, setTrayStatus, states, type Accent, type Connection, type Density, type FallbackMode, type LayoutPreset, type MotionSpeed, type PreviewState, type Profile, type ProviderKind, type RouteMode, type Scheme, type Snapshot, type Status, type TailscaleMode } from './controller';
+import { LocalController, applyEngineAction, applyDashboardProfile, deleteDashboardProfile, deleteDashboardProvider, getCachedLiveStatus, getDashboardState, getLiveStatus, getPreviewStatus, reportPreviewFrame, saveDashboardProfile, saveDashboardProvider, setTrayStatus, states, type Accent, type Connection, type DashboardState, type Density, type FallbackMode, type LayoutPreset, type MotionSpeed, type PreviewState, type Profile, type Provider, type ProviderKind, type RouteMode, type Scheme, type Snapshot, type Status, type TailscaleMode } from './controller';
+import { open as openNativeFile } from '@tauri-apps/plugin-dialog';
 import { isTauri } from '@tauri-apps/api/core';
 import { addRoute, applyPreset, getConfig, getNetwork, getRouting, presetChoices, removeNetworkPreset, removeRoute, runNetworkAction, setNetworkAuto, setNetworkPreset, setRoutingMode, type EngineConfig, type NetworkPresetState, type RoutingState } from './controller';
 
@@ -8,20 +9,26 @@ const pages = ['Home', 'Profiles', 'Providers', 'Connectivity', 'Settings', 'App
 type Page = typeof pages[number];
 const controller = new LocalController();
 let snapshot = controller.snapshot();
+if (isTauri()) snapshot = { ...snapshot, profiles: [], providers: [], activeProfileId: null };
 let status: Status | null = null;
 let previewState: PreviewState = snapshot.connection;
 let page: Page = 'Home';
 let editingProfileId: string | undefined;
+let editingProviderId: string | undefined;
 let addingProvider = false;
 let addingProviderFromProfile = false;
 let pendingProviderId: string | undefined;
 let profileDraft: Omit<Profile, 'id' | 'updatedAt'> | undefined;
+let selectedProviderPath: string | undefined;
+let profileReturnFocus: { action: 'new-profile' } | { action: 'edit-profile'; id: string } | undefined;
 let providerReturnFocusContext: 'providers' | 'profile' | undefined;
 let requestGeneration = 0;
 let busy = false;
 let actionQueue: Promise<void> = Promise.resolve();
 let lastTrayState: PreviewState | undefined;
 let engineConfig: EngineConfig | null = null;
+let dashboardStateReady = !isTauri();
+let dashboardStateError: string | null = null;
 let networkState: NetworkPresetState | null = null;
 let livePayload: Record<string, unknown> | null = null;
 let routingState: RoutingState | null = null;
@@ -42,7 +49,7 @@ const accents: { id: Accent; name: string; colour: string }[] = [
   { id: 'moss', name: 'Moss', colour: '#a8ddb0' }, { id: 'iris', name: 'Iris', colour: '#c9b7ff' },
 ];
 
-app.innerHTML = `<aside class="rail"><header><img class="rail-logo" src="/gremlin-cat-goblin-cat.gif" alt="" width="32" height="32" decoding="async"><strong>proxy router</strong><button id="menu" aria-expanded="false" aria-controls="nav">Menu</button></header><nav id="nav" aria-label="Primary">${pages.map(item => `<a href="#${item.toLowerCase()}">${item}</a>`).join('')}</nav><div class="rail-status"><span class="status-dot" aria-hidden="true"></span><span id="rail-status">Local controller</span></div></aside><div class="workspace"><div class="topbar" role="banner"><span id="page-label">Home</span><span class="topbar-actions"><span class="badge">Local prototype</span><span id="toast" role="status" aria-live="polite"></span></span></div><main id="main" tabindex="-1"></main><footer><span>Local data · router changes stay behind the controller</span><button id="preview" type="button">Preview states</button></footer></div><dialog id="preview-dialog" aria-labelledby="dialog-title"><form method="dialog"><h2 id="dialog-title">Preview a connection state</h2><p>These examples review the interface. They do not change your network or VPN.</p><label for="scenario">Connection state</label><select id="scenario">${states.map(item => `<option value="${item}">${copy[item][0]}</option>`).join('')}</select><div class="dialog-actions"><button value="cancel" autofocus>Cancel</button><button value="apply" class="primary">Show preview</button></div></form></dialog><dialog id="import-dialog" aria-labelledby="import-title"><form id="import-form" method="dialog"><h2 id="import-title">Import a profile</h2><p>Paste a proxy-router profile export. It is saved locally on this computer.</p><label for="profile-json">Profile JSON</label><textarea id="profile-json" rows="8" required placeholder="{ &quot;proxyRouterProfile&quot;: 1, &quot;profile&quot;: ... }"></textarea><div class="dialog-actions"><button value="cancel">Cancel</button><button value="import" class="primary">Import profile</button></div></form></dialog><dialog id="profile-dialog" aria-labelledby="profile-dialog-title"></dialog><dialog id="provider-dialog" aria-labelledby="provider-dialog-title"></dialog>`;
+app.innerHTML = `<aside class="rail"><header><img class="rail-logo" src="/gremlin-cat-goblin-cat.gif" alt="" width="32" height="32" decoding="async"><strong>proxy router</strong><button id="menu" aria-expanded="false" aria-controls="nav">Menu</button></header><nav id="nav" aria-label="Primary">${pages.map(item => `<a href="#${item.toLowerCase()}">${item}</a>`).join('')}</nav><div class="rail-status"><span class="status-dot" aria-hidden="true"></span><span id="rail-status">Local controller</span></div></aside><div class="workspace"><div class="topbar" role="banner"><span id="page-label">Home</span><span class="topbar-actions"><span class="badge" id="prototype-badge">Local prototype</span><span id="toast" role="status" aria-live="polite"></span></span></div><main id="main" tabindex="-1"></main><footer><span>Local data · router changes stay behind the controller</span><button id="preview" type="button">Preview states</button></footer></div><dialog id="preview-dialog" aria-labelledby="dialog-title"><form method="dialog"><h2 id="dialog-title">Preview a connection state</h2><p>These examples review the interface. They do not change your network or VPN.</p><label for="scenario">Connection state</label><select id="scenario">${states.map(item => `<option value="${item}">${copy[item][0]}</option>`).join('')}</select><div class="dialog-actions"><button value="cancel" autofocus>Cancel</button><button value="apply" class="primary">Show preview</button></div></form></dialog><dialog id="import-dialog" aria-labelledby="import-title"><form id="import-form" method="dialog"><h2 id="import-title">Import a profile</h2><p>Paste a proxy-router profile export. It is saved locally on this computer.</p><label for="profile-json">Profile JSON</label><textarea id="profile-json" rows="8" required placeholder="Profile export JSON"></textarea><div class="dialog-actions"><button value="cancel">Cancel</button><button value="import" class="primary">Import profile</button></div></form></dialog><dialog id="profile-dialog" aria-labelledby="profile-dialog-title"></dialog><dialog id="provider-dialog" aria-labelledby="provider-dialog-title"></dialog>`;
 const main = document.querySelector<HTMLElement>('#main')!;
 const previewDialog = document.querySelector<HTMLDialogElement>('#preview-dialog')!;
 const importDialog = document.querySelector<HTMLDialogElement>('#import-dialog')!;
@@ -52,8 +59,19 @@ const scenario = document.querySelector<HTMLSelectElement>('#scenario')!;
 const menu = document.querySelector<HTMLButtonElement>('#menu')!;
 
 function esc(value: string): string { return value.replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character] ?? character)); }
-function activeProfile(): Profile { return controller.activeProfile(); }
-function activeProvider() { return snapshot.providers.find(item => item.id === activeProfile().providerId) ?? snapshot.providers[0]; }
+function activeProfile(): Profile { return snapshot.profiles.find(item => item.id === snapshot.activeProfileId) ?? snapshot.profiles[0] ?? controller.activeProfile(); }
+function activeProvider(): Provider { return snapshot.providers.find(item => item.id === activeProfile().providerId) ?? snapshot.providers[0] ?? controller.snapshot().providers[0]; }
+function installDashboardState(next: DashboardState): void {
+  dashboardStateReady = true;
+  dashboardStateError = null;
+  snapshot = { ...snapshot, profiles: next.profiles, providers: next.providers, activeProfileId: next.activeProfileId };
+  render();
+}
+async function refreshDashboardState(): Promise<DashboardState> {
+  const next = await getDashboardState();
+  installDashboardState(next);
+  return next;
+}
 function announce(message: string): void { const toast = document.querySelector('#toast')!; toast.textContent = message; window.setTimeout(() => { if (toast.textContent === message) toast.textContent = ''; }, 2600); const region = document.querySelector('#announcement')!; region.textContent = message; }
 function applyTheme(): void {
   const root = document.documentElement;
@@ -62,9 +80,26 @@ function applyTheme(): void {
 }
 function sync(next: Snapshot, message = next.lastAction): void { snapshot = next; if (!isTauri() && previewState !== 'loading') previewState = snapshot.connection; applyTheme(); render(); if (message) announce(message); }
 function perform(action: () => Promise<Snapshot>): Promise<void> { actionQueue = actionQueue.then(async () => { busy = true; try { sync(await action()); } catch (error) { announce(error instanceof Error ? error.message : 'Action failed'); } finally { busy = false; render(); } }); return actionQueue; }
+async function performDashboard(action: () => Promise<DashboardState>, message: string): Promise<void> {
+  busy = true;
+  render();
+  try {
+    installDashboardState(await action());
+    announce(message);
+  } catch (error) {
+    announce(error instanceof Error ? error.message : 'Could not save dashboard data');
+  } finally {
+    busy = false;
+    render();
+  }
+}
 function button(label: string, action: string, className = '', extra = ''): string { return `<button type="button" class="${className}" data-action="${action}" ${extra} ${busy ? 'disabled' : ''}>${label}</button>`; }
 function statusTitle(): [string, string] { return copy[previewState]; }
-function providerOptions(selected: string): string { return snapshot.providers.map(provider => `<option value="${provider.id}" ${provider.id === selected ? 'selected' : ''}>${esc(provider.name)}</option>`).join(''); }
+function providerOptions(selected: string): string { return snapshot.providers.map(provider => `<option value="${esc(provider.id)}" ${provider.id === selected ? 'selected' : ''}>${esc(provider.name)}</option>`).join('') || '<option value="">No connections yet</option>'; }
+function fallbackProviderOptions(selected: string, primary: string): string {
+  const choices = snapshot.providers.filter(provider => provider.id !== primary);
+  return choices.map(provider => `<option value="${esc(provider.id)}" ${provider.id === selected ? 'selected' : ''}>${esc(provider.name)}</option>`).join('') || '<option value="" disabled selected>Add another connection first</option>';
+}
 function profileOptions(selected: string | null): string { return snapshot.profiles.map(profile => `<option value="${profile.id}" ${profile.id === selected ? 'selected' : ''}>${esc(profile.name)}</option>`).join(''); }
 function routeLabel(mode: RouteMode): string { return mode === 'full' ? 'Full tunnel' : mode === 'direct' ? 'Direct connection' : 'Selective routing'; }
 function fallbackLabel(mode: FallbackMode): string { return mode === 'direct' ? 'Direct fallback' : mode === 'retry' ? 'Retry another provider' : 'Block until healthy'; }
@@ -104,10 +139,12 @@ function moveProfileOption(trigger: HTMLElement, direction: number): void {
 }
 
 function homePage(): string {
-  const [title, description] = statusTitle(); const profile = activeProfile(); const provider = activeProvider();
+  if (isTauri() && !dashboardStateReady) return `<section class="page-section home-page"><div class="connection-hero"><div class="connection-emblem" aria-hidden="true"><img src="/gremlin-cat-goblin-cat.gif" alt="" width="88" height="88" decoding="async"></div><h1 tabindex="-1">Loading profiles</h1><p class="lead">Reading saved routing choices.</p></div></section>`;
+  if (isTauri() && !snapshot.profiles.length) return `<section class="page-section home-page"><div class="connection-hero"><div class="connection-emblem" aria-hidden="true"><img src="/gremlin-cat-goblin-cat.gif" alt="" width="88" height="88" decoding="async"></div><h1 tabindex="-1">${previewState === 'connected' ? 'Connected' : 'Disconnected'}</h1><p class="lead">Create a profile to choose how traffic is routed.</p><div class="hero-actions"><a class="button primary" href="#profiles">Create a profile</a></div>${dashboardStateError ? `<p class="field-note" role="alert">${esc(dashboardStateError)}</p>` : ''}</div></section>`;
+  const [title, description] = statusTitle(); const profile = activeProfile(); const provider = profile.routeMode === 'direct' ? null : activeProvider();
   const action = previewState === 'connected' ? button('Disconnect', 'disconnect', 'danger') : previewState === 'disconnected' ? button('Connect', 'connect', 'primary') : previewState === 'failed' || previewState === 'stale' ? button('Refresh preview', 'refresh', 'primary') : button('Reconnect', 'reconnect', 'primary');
   const routeInfo = profile.routeMode === 'selective' ? `${profile.domains.length} ${profile.domains.length === 1 ? 'site' : 'sites'}` : routeLabel(profile.routeMode);
-  const compactStatus = `${provider.name} · ${provider.latency ?? '—'} ms · ${routeInfo} · ${fallbackLabel(profile.fallback)}`;
+  const compactStatus = `${provider ? `${provider.name} · ${provider.latency ?? '—'} ms` : 'Direct'} · ${routeInfo} · ${fallbackLabel(profile.fallback)}`;
   return `<section class="page-section home-page" data-state="${previewState}">
     <div class="connection-hero">
       <div class="connection-emblem" aria-hidden="true"><img src="/gremlin-cat-goblin-cat.gif" alt="" width="88" height="88" decoding="async"></div>
@@ -121,29 +158,53 @@ function homePage(): string {
 }
 
 function profileForm(profile?: Profile): string {
-  const value = profileDraft ?? profile ?? { name: '', description: '', providerId: activeProvider().id, routeMode: 'selective' as RouteMode, domains: [] as string[], autoSubdomains: false, fallback: 'direct' as FallbackMode };
+  const value = profileDraft ?? profile ?? { name: '', description: '', providerId: snapshot.providers[0]?.id ?? '', fallbackProviderId: '', routeMode: 'selective' as RouteMode, domains: [] as string[], autoSubdomains: false, fallback: 'direct' as FallbackMode };
   const selectedProviderId = pendingProviderId ?? value.providerId;
-  return `<form class="panel editor profile-editor" id="profile-form"><div class="panel-heading"><div><span class="label">${profile ? 'Edit profile' : 'New profile'}</span><h2 id="profile-dialog-title">${profile ? esc(profile.name) : 'Create a profile'}</h2></div><button type="button" class="quiet" data-action="cancel-profile">← Back</button></div><div class="form-grid"><label>Name<input id="profile-name" name="name" required maxlength="48" value="${esc(value.name)}" placeholder="e.g. School access"></label><div class="field-with-action"><label>Connection<select name="providerId">${providerOptions(selectedProviderId)}</select></label><button type="button" class="quiet" data-action="new-provider-from-profile">Add connection</button></div><label class="wide">Description<input name="description" maxlength="120" value="${esc(value.description)}" placeholder="What is this profile for?"></label><div class="wide form-subsection"><span class="label">Traffic routing</span><p class="muted">Choose where this profile sends traffic and what happens when its route fails.</p></div><label>Routing mode<select name="routeMode"><option value="selective" ${value.routeMode === 'selective' ? 'selected' : ''}>Selective routing</option><option value="direct" ${value.routeMode === 'direct' ? 'selected' : ''}>Direct connection</option><option value="full" ${value.routeMode === 'full' ? 'selected' : ''}>Full tunnel</option></select></label><label>Fallback<select name="fallback"><option value="direct" ${value.fallback === 'direct' ? 'selected' : ''}>Fall back to direct</option><option value="retry" ${value.fallback === 'retry' ? 'selected' : ''}>Retry another provider</option><option value="block" ${value.fallback === 'block' ? 'selected' : ''}>Block until healthy</option></select></label><label class="wide">Domains <span class="muted">one per line</span><textarea id="profile-domains" name="domains" rows="4" placeholder="example.com&#10;api.example.com">${esc(value.domains.join('\n'))}</textarea><span class="field-note">Enter the domains this profile should route. Turn on subdomain detection to include everything under each domain.</span></label><label class="setting-row wide"><span><strong>Auto-detect subdomains</strong><small>Route subdomains under each domain in this profile automatically.</small></span><input type="checkbox" name="autoSubdomains" ${value.autoSubdomains ? 'checked' : ''}></label></div><div class="form-actions"><button type="submit" class="primary">${profile ? 'Save changes' : 'Create profile'}</button></div></form>`;
+  const fallbackProvider = snapshot.providers.find(provider => provider.id === value.fallbackProviderId)?.id ?? '';
+  return `<form class="panel editor profile-editor" id="profile-form"><div class="panel-heading"><div><span class="label">${profile ? 'Edit profile' : 'New profile'}</span><h2 id="profile-dialog-title">${profile ? esc(profile.name) : 'Create a profile'}</h2></div><button type="button" class="quiet" data-action="cancel-profile">← Back</button></div><div class="form-grid"><label>Name<input id="profile-name" name="name" required maxlength="48" value="${esc(value.name)}" placeholder="e.g. School access"></label><div class="field-with-action"><label>Connection<select name="providerId" ${value.routeMode === 'direct' ? '' : 'required'}>${providerOptions(selectedProviderId)}</select></label><button type="button" class="quiet" data-action="new-provider-from-profile">Add connection</button></div><label class="wide">Description<input name="description" maxlength="120" value="${esc(value.description)}" placeholder="What is this profile for?"></label><div class="wide form-subsection"><span class="label">Traffic routing</span><p class="muted">Choose where this profile sends traffic and what happens when its route fails.</p></div><label>Routing mode<select name="routeMode"><option value="selective" ${value.routeMode === 'selective' ? 'selected' : ''}>Selective routing</option><option value="direct" ${value.routeMode === 'direct' ? 'selected' : ''}>Direct connection</option><option value="full" ${value.routeMode === 'full' ? 'selected' : ''}>Full tunnel</option></select></label><label>Fallback<select name="fallback"><option value="direct" ${value.fallback === 'direct' ? 'selected' : ''}>Fall back to direct</option><option value="retry" ${value.fallback === 'retry' ? 'selected' : ''}>Retry another provider</option><option value="block" ${value.fallback === 'block' ? 'selected' : ''}>Block until healthy</option></select></label><label class="${value.fallback === 'retry' ? '' : 'wide'} fallback-provider-field" ${value.fallback === 'retry' ? '' : 'hidden'}>Fallback connection<select name="fallbackProviderId" ${value.fallback === 'retry' ? 'required' : ''}>${fallbackProviderOptions(fallbackProvider, selectedProviderId)}</select></label><label class="wide">Domains <span class="muted">one per line</span><textarea id="profile-domains" name="domains" rows="4" placeholder="example.com&#10;api.example.com">${esc(value.domains.join('\n'))}</textarea><span class="field-note">Enter the domains this profile should route. Turn on subdomain detection to include everything under each domain.</span></label><label class="setting-row wide"><span><strong>Auto-detect subdomains</strong><small>Route subdomains under each domain in this profile automatically.</small></span><input type="checkbox" name="autoSubdomains" ${value.autoSubdomains ? 'checked' : ''}></label></div><div class="form-actions"><button type="submit" class="primary">${profile ? 'Save changes' : 'Create profile'}</button></div></form>`;
 }
 
 function profilesPage(): string {
-  if (isTauri() && engineConfig) return liveProfilesPage();
-  const cards = snapshot.profiles.map(profile => `<article class="profile-card ${profile.id === snapshot.activeProfileId ? 'selected' : ''}"><div class="panel-heading"><div><span class="label">${profile.id === snapshot.activeProfileId ? 'Active profile' : 'Profile'}</span><h2>${esc(profile.name)}</h2></div></div><p class="muted">${esc(profile.description || 'No description yet.')}</p><div class="profile-meta"><span>${profile.routeMode === 'full' ? 'Full tunnel' : profile.routeMode === 'direct' ? 'Direct' : `${profile.domains.length} routed sites`}</span><span>${profile.autoSubdomains ? 'Subdomains on' : 'Exact domains'}</span><span>${fallbackLabel(profile.fallback)}</span><span>${esc(snapshot.providers.find(provider => provider.id === profile.providerId)?.name ?? 'Provider')}</span></div><div class="card-actions">${profile.id === snapshot.activeProfileId ? '' : button('Use profile', 'select-profile', 'primary', `data-profile="${profile.id}"`)}${button('Edit', 'edit-profile', 'quiet', `data-profile="${profile.id}"`)}${button('Duplicate', 'duplicate-profile', 'quiet', `data-profile="${profile.id}"`)}${button('Export', 'export-profile', 'quiet', `data-profile="${profile.id}"`)}${button('Delete', 'delete-profile', 'quiet danger-text', `data-profile="${profile.id}"`)}</div></article>`).join('');
-  return `<section class="page-section"><div class="section-heading"><div><h1 tabindex="-1">Profiles</h1><p class="lead">Create a profile, add its connection, and keep routing and fallback choices together.</p></div><div class="section-actions">${button('Create profile', 'new-profile', 'primary')}${button('Import', 'import-profile', 'quiet')}</div></div><div class="cards profile-cards">${cards}</div><article class="panel tip"><strong>Profiles are independent.</strong><span>Switching one changes the next connection action; it never edits another profile.</span></article></section>`;
+  const cards = snapshot.profiles.map(profile => `<article class="profile-card ${profile.id === snapshot.activeProfileId ? 'selected' : ''}"><div class="panel-heading"><div><span class="label">${profile.id === snapshot.activeProfileId ? 'Active profile' : 'Profile'}</span><h2>${esc(profile.name)}</h2></div></div><p class="muted">${esc(profile.description || 'No description yet.')}</p><div class="profile-meta"><span>${profile.routeMode === 'full' ? 'Full tunnel' : profile.routeMode === 'direct' ? 'Direct' : `${profile.domains.length} routed sites`}</span><span>${profile.autoSubdomains ? 'Subdomains on' : 'Exact domains'}</span><span>${fallbackLabel(profile.fallback)}${profile.fallback === 'retry' && profile.fallbackProviderId ? ` · ${esc(snapshot.providers.find(provider => provider.id === profile.fallbackProviderId)?.name ?? 'Backup')}` : ''}</span><span>${profile.routeMode === 'direct' ? 'Direct connection' : esc(snapshot.providers.find(provider => provider.id === profile.providerId)?.name ?? 'Connection unavailable')}</span></div><div class="card-actions">${profile.id === snapshot.activeProfileId ? '' : button('Use profile', 'select-profile', 'primary', `data-profile="${esc(profile.id)}"`)}${button('Edit', 'edit-profile', 'quiet', `data-profile="${esc(profile.id)}"`)}${button('Duplicate', 'duplicate-profile', 'quiet', `data-profile="${esc(profile.id)}"`)}${button('Export', 'export-profile', 'quiet', `data-profile="${esc(profile.id)}"`)}${button('Delete', 'delete-profile', 'quiet danger-text', `data-profile="${esc(profile.id)}"`)}</div></article>`).join('');
+  const error = dashboardStateError ? `<p class="field-note" role="alert">Saved profile data could not be loaded: ${esc(dashboardStateError)}</p>` : '';
+  const noProfiles = isTauri() && !snapshot.profiles.length ? `<p class="muted empty-state">${dashboardStateReady ? 'No profiles yet. Create one to save routing and fallback choices.' : 'Loading saved profiles…'}</p>` : '';
+  const desktopNote = isTauri() ? '<p class="setting-note">Using a profile saves routing for your next explicit Connect. It never starts or reconnects the VPN by itself.</p>' : '';
+  return `<section class="page-section"><div class="section-heading"><div><h1 tabindex="-1">Profiles</h1><p class="lead">Create a profile, add its connection, and keep routing and fallback choices together.</p></div><div class="section-actions">${button('Create profile', 'new-profile', 'primary')}${button('Import', 'import-profile', 'quiet')}</div></div>${error}${desktopNote}<div class="cards profile-cards">${cards || noProfiles}</div><article class="panel tip"><strong>Routing lives with the profile.</strong><span>Choose domains, subdomain detection, connection, and fallbacks here.</span></article></section>`;
 }
 
 function providerKindLabel(kind: ProviderKind): string { return kind === 'warp' ? 'Cloudflare WARP' : kind === 'proton' ? 'Proton VPN' : kind === 'wireguard' ? 'WireGuard' : kind === 'socks5' ? 'SOCKS5 proxy' : kind === 'tailscale' ? 'Tailscale exit node' : 'Custom VPN'; }
 function tailscaleModeLabel(mode: TailscaleMode): string { return mode === 'pause-tailscale' ? 'Pause Tailscale while a VPN is active' : mode === 'prefer-tailscale' ? 'Prefer Tailscale when it is active' : 'Keep Tailscale running'; }
 function providerForm(context: 'providers' | 'profile' = 'providers'): string {
   const fromProfile = context === 'profile';
-  return `<form class="panel editor provider-editor" id="provider-form" data-provider-context="${context}"><div class="panel-heading"><div><span class="label">${fromProfile ? 'New profile connection' : 'New provider'}</span><h2 id="provider-dialog-title">${fromProfile ? 'Add a connection to this profile' : 'Add a connection path'}</h2></div><button type="button" class="quiet" data-action="${fromProfile ? 'cancel-provider-profile' : 'cancel-provider'}">← Back</button></div><div class="form-grid"><label>Name<input id="provider-name" name="name" required maxlength="48" placeholder="e.g. Home WireGuard"></label><label>Type<select name="kind" data-provider-kind><option value="custom">Custom VPN</option><option value="warp">Cloudflare WARP</option><option value="proton">Proton VPN</option><option value="wireguard">WireGuard</option><option value="tailscale">Tailscale exit node</option><option value="socks5">SOCKS5 proxy</option></select></label><label class="wide endpoint-field" data-provider-endpoint>Server or endpoint<input name="server" maxlength="120" placeholder="e.g. us-ny-001.example.net"></label><div class="wide provider-fields" data-provider-fields="config"><label>VPN configuration (.conf)<input name="wireguardConfig" type="file" accept=".conf,text/plain"></label><p class="field-note">Choose a WireGuard-compatible file from your computer. This preview validates its endpoint and never stores the private key in browser storage.</p></div><div class="wide provider-fields" data-provider-fields="tailscale" hidden><label>Tailscale exit node<input name="tailscaleExitNode" maxlength="255" placeholder="e.g. my-linux-box or 100.x.y.z"></label><p class="field-note">Use the machine name or Tailscale IP of the Linux box advertising the exit node. Tailscale must be running on both devices.</p></div><div class="wide provider-fields" data-provider-fields="socks5" hidden><div class="form-grid"><label>SOCKS5 host<input name="socksHost" maxlength="255" placeholder="127.0.0.1"></label><label>Port<input name="socksPort" type="number" min="1" max="65535" placeholder="10473"></label></div><p class="field-note">For Windscribe, enter the IP and port shown under Proxy Gateway while Windscribe is connected.</p></div></div><div class="form-actions"><button type="submit" class="primary">${fromProfile ? 'Add connection' : 'Add provider'}</button></div></form>`;
+  const provider = editingProviderId ? snapshot.providers.find(item => item.id === editingProviderId) : undefined;
+  const desktop = isTauri();
+  const kind = provider?.kind === 'custom' ? 'custom' : 'wireguard';
+  const fileName = provider?.connection?.kind === 'wireguard' ? provider.connection.fileName : '';
+  const providerKinds = desktop
+    ? `<option value="custom" ${kind === 'custom' ? 'selected' : ''}>Custom VPN (WireGuard config)</option><option value="wireguard" ${kind === 'wireguard' ? 'selected' : ''}>WireGuard</option>`
+    : '<option value="custom">Custom VPN</option><option value="warp">Cloudflare WARP</option><option value="proton">Proton VPN</option><option value="wireguard">WireGuard</option><option value="tailscale">Tailscale exit node</option><option value="socks5">SOCKS5 proxy</option>';
+  const configControl = desktop
+    ? `<button type="button" class="quiet" data-action="pick-wireguard-config">${selectedProviderPath ? 'Change selected config' : provider ? 'Replace VPN config (optional)' : 'Choose WireGuard config'}</button><span id="wireguard-file-label" class="field-note">${esc(selectedProviderPath?.split(/[\\/]/).pop() ?? fileName ?? 'Private config stays out of dashboard storage.')}</span>`
+    : '<input name="wireguardConfig" type="file" accept=".conf,text/plain">';
+  return `<form class="panel editor provider-editor" id="provider-form" data-provider-context="${context}"><div class="panel-heading"><div><span class="label">${provider ? 'Edit connection' : fromProfile ? 'New profile connection' : 'New provider'}</span><h2 id="provider-dialog-title">${provider ? `Edit ${esc(provider.name)}` : fromProfile ? 'Add a connection to this profile' : 'Add a connection path'}</h2></div><button type="button" class="quiet" data-action="${fromProfile ? 'cancel-provider-profile' : 'cancel-provider'}">← Back</button></div><div class="form-grid"><label>Name<input id="provider-name" name="name" required maxlength="48" placeholder="e.g. Home WireGuard" value="${esc(provider?.name ?? '')}"></label><label>Type<select name="kind" data-provider-kind>${providerKinds}</select></label>${desktop ? '' : '<label class="wide endpoint-field" data-provider-endpoint>Server or endpoint<input name="server" maxlength="120" placeholder="e.g. us-ny-001.example.net"></label>'}<div class="wide provider-fields" data-provider-fields="config"><label>${desktop ? 'VPN configuration' : 'VPN configuration (.conf)'}</label>${configControl}<p class="field-note">Choose a WireGuard-compatible .conf file. Proxy Router stores it in a private local folder; the dashboard never reads or displays its private key.</p></div>${desktop ? '' : '<div class="wide provider-fields" data-provider-fields="tailscale" hidden><label>Tailscale exit node<input name="tailscaleExitNode" maxlength="255" placeholder="e.g. my-linux-box or 100.x.y.z"></label><p class="field-note">Use the machine name or Tailscale IP of the Linux box advertising the exit node. Tailscale must be running on both devices.</p></div><div class="wide provider-fields" data-provider-fields="socks5" hidden><div class="form-grid"><label>SOCKS5 host<input name="socksHost" maxlength="255" placeholder="127.0.0.1"></label><label>Port<input name="socksPort" type="number" min="1" max="65535" placeholder="10473"></label></div><p class="field-note">For Windscribe, enter the IP and port shown under Proxy Gateway while Windscribe is connected.</p></div>'}</div><div class="form-actions"><button type="submit" class="primary">${provider ? 'Save connection' : fromProfile ? 'Add connection' : 'Add provider'}</button></div></form>`;
 }
 function syncProfileDialog(): void {
   const shouldOpen = page === 'Profiles' && editingProfileId !== undefined && !addingProviderFromProfile;
   if (!shouldOpen) {
+    const wasOpen = profileDialog.open;
     if (profileDialog.open) profileDialog.close('sync');
     profileDialog.replaceChildren();
     profileDialog.dataset.context = '';
+    if (wasOpen && profileReturnFocus) {
+      const target = profileReturnFocus;
+      profileReturnFocus = undefined;
+      requestAnimationFrame(() => {
+        const button = [...app.querySelectorAll<HTMLButtonElement>('[data-action]')].find(item =>
+          target.action === 'new-profile' ? item.dataset.action === 'new-profile' : item.dataset.action === 'edit-profile' && item.dataset.profile === target.id,
+        );
+        button?.focus({ preventScroll: true });
+      });
+    }
     return;
   }
   const profile = editingProfileId === 'new' ? undefined : snapshot.profiles.find(item => item.id === editingProfileId);
@@ -158,7 +219,7 @@ function syncProfileDialog(): void {
   }
 }
 function syncProviderDialog(): void {
-  const shouldOpen = addingProvider || addingProviderFromProfile;
+  const shouldOpen = addingProvider || addingProviderFromProfile || editingProviderId !== undefined;
   if (!shouldOpen) {
     const returnFocusContext = providerReturnFocusContext;
     providerReturnFocusContext = undefined;
@@ -180,9 +241,18 @@ function syncProviderDialog(): void {
   }
 }
 function providersPage(): string {
+  if (isTauri()) return dashboardProvidersPage();
   const tailscale = snapshot.settings.tailscale;
   const cards = snapshot.providers.map(provider => `<article class="provider-card provider-managed"><div class="panel-heading"><div><span class="label">${providerKindLabel(provider.kind)}</span><h2>${esc(provider.name)}</h2></div><span class="health-pill ${provider.status}">${provider.status[0].toUpperCase() + provider.status.slice(1)}</span></div><div class="provider-meta"><span>Connection<strong>${esc(provider.server)}</strong></span><span>Latency<strong>${provider.latency ?? '—'} ms</strong></span></div><div class="provider-controls"><label class="sr-only" for="managed-${provider.id}">${esc(provider.name)} server</label><select id="managed-${provider.id}" data-server-provider="${provider.id}">${provider.servers.map(server => `<option ${server === provider.server ? 'selected' : ''}>${esc(server)}</option>`).join('')}</select>${provider.id === activeProfile().providerId ? '<span class="selected-note">Used by active profile</span>' : button('Use in active profile', 'choose-provider', 'quiet', `data-provider="${provider.id}"`)}</div><div class="card-actions">${provider.status === 'offline' ? button('Mark recovered', 'recover-provider', 'quiet', `data-provider="${provider.id}"`) : button('Simulate outage', 'outage-provider', 'quiet danger-text', `data-provider="${provider.id}"`)}</div></article>`).join('');
   return `<section class="page-section"><div class="section-heading"><div><h1 tabindex="-1">Providers</h1><p class="lead">Add WireGuard files, Tailscale exit nodes, or local SOCKS5 gateways here, then choose the connection from Profiles.</p></div><div class="section-actions">${button('Add provider', 'new-provider', 'primary')}</div></div><div class="cards provider-cards provider-management-cards">${cards}</div><article class="panel tailscale-panel"><div class="panel-heading"><div><span class="label">Network coordination</span><h2>Tailscale</h2></div><span class="badge">Profile option</span></div><p class="muted">Add a Tailscale exit node as a provider, then select it in any profile. The live Tailscale client remains responsible for advertising and accepting exit-node routes.</p><label for="tailscale-mode">When a VPN connects<select id="tailscale-mode" data-tailscale-mode><option value="pause-tailscale" ${tailscale.mode === 'pause-tailscale' ? 'selected' : ''}>Pause Tailscale while a VPN is active</option><option value="keep-running" ${tailscale.mode === 'keep-running' ? 'selected' : ''}>Keep Tailscale running</option><option value="prefer-tailscale" ${tailscale.mode === 'prefer-tailscale' ? 'selected' : ''}>Prefer Tailscale when it is active</option></select></label><p class="setting-note"><strong>Current policy:</strong> ${tailscaleModeLabel(tailscale.mode)}</p></article></section>`;
+}
+
+function dashboardProvidersPage(): string {
+  const profile = snapshot.profiles.find(item => item.id === snapshot.activeProfileId);
+  const cards = snapshot.providers.map(provider => `<article class="provider-card provider-managed dashboard-provider"><div class="panel-heading"><div><span class="label">${providerKindLabel(provider.kind)}</span><h2>${esc(provider.name)}</h2></div><span class="health-pill offline">Saved</span></div><div class="provider-meta"><span>Endpoint<strong>${esc(provider.server || 'WireGuard config')}</strong></span><span>Credential<strong>Stored locally</strong></span></div><div class="card-actions">${button('Edit', 'edit-provider', 'quiet', `data-provider="${esc(provider.id)}"`)}${button('Delete', 'delete-provider', 'quiet danger-text', `data-provider="${esc(provider.id)}"`)}${profile && provider.id === profile.providerId ? '<span class="selected-note">Used by active profile</span>' : profile ? button('Use in active profile', 'choose-provider', 'quiet', `data-provider="${esc(provider.id)}"`) : ''}</div></article>`).join('');
+  const error = dashboardStateError ? `<p class="field-note" role="alert">Saved connections could not be loaded: ${esc(dashboardStateError)}</p>` : '';
+  const empty = !snapshot.providers.length ? `<p class="muted empty-state">${dashboardStateReady ? 'No connections yet. Add a WireGuard configuration file to use it in a profile.' : 'Loading saved connections…'}</p>` : '';
+  return `<section class="page-section"><div class="section-heading"><div><h1 tabindex="-1">Providers</h1><p class="lead">Add or manage WireGuard connections, then assign them to profiles.</p></div><div class="section-actions">${button('Add provider', 'new-provider', 'primary')}</div></div>${error}<p class="setting-note">Configuration files are copied into Proxy Router’s private provider folder. Adding or editing a connection never starts the VPN.</p><div class="cards provider-cards provider-management-cards">${cards || empty}</div></section>`;
 }
 
 function connectivityPage(): string {
@@ -387,17 +457,91 @@ async function refreshEngineData(): Promise<void> {
 function navigate(focus: boolean): void { const name = location.hash.slice(1).toLowerCase(); if (name === 'routing') { history.replaceState(null, '', '#profiles'); page = 'Profiles'; } else page = pages.find(item => item.toLowerCase() === name) ?? 'Home'; menu.setAttribute('aria-expanded', 'false'); render(); resetMainScroll(); if (focus) main.querySelector<HTMLElement>('h1')?.focus({ preventScroll: true }); }
 function formInput(form: HTMLFormElement, name: string): string { return (new FormData(form).get(name) as string | null ?? '').trim(); }
 function readProfileDraft(form: HTMLFormElement): Omit<Profile, 'id' | 'updatedAt'> {
-  return { name: formInput(form, 'name'), description: formInput(form, 'description'), providerId: formInput(form, 'providerId'), routeMode: formInput(form, 'routeMode') as RouteMode, domains: (formInput(form, 'domains') || '').split('\n'), autoSubdomains: form.querySelector<HTMLInputElement>('[name="autoSubdomains"]')?.checked ?? false, fallback: formInput(form, 'fallback') as FallbackMode };
+  return { name: formInput(form, 'name'), description: formInput(form, 'description'), providerId: formInput(form, 'providerId'), fallbackProviderId: formInput(form, 'fallbackProviderId'), routeMode: formInput(form, 'routeMode') as RouteMode, domains: (formInput(form, 'domains') || '').split('\n'), autoSubdomains: form.querySelector<HTMLInputElement>('[name="autoSubdomains"]')?.checked ?? false, fallback: formInput(form, 'fallback') as FallbackMode };
 }
 function download(filename: string, content: string, type = 'application/json'): void { const link = document.createElement('a'); link.href = URL.createObjectURL(new Blob([content], { type })); link.download = filename; document.body.append(link); link.click(); link.remove(); URL.revokeObjectURL(link.href); }
+
+function saveProfileToDashboard(profile: Omit<Profile, 'id' | 'updatedAt'> | Profile, profileId?: string): Promise<void> {
+  const { name, description, providerId, fallbackProviderId, routeMode, domains, autoSubdomains, fallback } = profile;
+  return performDashboard(async () => {
+    const previousIds = new Set(snapshot.profiles.map(item => item.id));
+    const wasActive = profileId !== undefined && snapshot.activeProfileId === profileId;
+    let next = await saveDashboardProfile({ name, description, providerId, fallbackProviderId, routeMode, domains, autoSubdomains, fallback }, profileId);
+    const createdId = profileId === undefined ? next.profiles.find(item => !previousIds.has(item.id))?.id : undefined;
+    const profileToApply = profileId === undefined ? createdId : wasActive ? profileId : undefined;
+    if (profileToApply) {
+      try { next = await applyDashboardProfile(profileToApply); }
+      catch (error) {
+        editingProfileId = undefined;
+        pendingProviderId = undefined;
+        profileDraft = undefined;
+        installDashboardState(next);
+        throw error;
+      }
+    }
+    editingProfileId = undefined;
+    pendingProviderId = undefined;
+    profileDraft = undefined;
+    return next;
+  }, 'Profile saved for the next explicit Connect');
+}
+
+async function importDashboardProfile(raw: string): Promise<void> {
+  try {
+    const value = JSON.parse(raw) as { proxyRouterProfile?: unknown; profile?: Partial<Profile> };
+    const profile = value.profile;
+    if (value.proxyRouterProfile !== 1 || !profile || typeof profile.name !== 'string') throw new Error('This is not a proxy-router profile export');
+    await saveProfileToDashboard({
+      name: profile.name,
+      description: profile.description ?? '',
+      providerId: profile.providerId ?? '',
+      fallbackProviderId: profile.fallbackProviderId ?? '',
+      routeMode: profile.routeMode ?? 'selective',
+      domains: profile.domains ?? [],
+      autoSubdomains: profile.autoSubdomains === true,
+      fallback: profile.fallback ?? 'direct',
+    });
+  } catch (error) {
+    announce(error instanceof Error ? error.message : 'Could not import profile');
+  }
+}
+
+async function pickWireGuardConfig(): Promise<void> {
+  if (!isTauri()) {
+    app.querySelector<HTMLInputElement>('[name="wireguardConfig"]')?.click();
+    return;
+  }
+  try {
+    const selected = await openNativeFile({ multiple: false, directory: false, filters: [{ name: 'WireGuard configuration', extensions: ['conf'] }] });
+    if (typeof selected !== 'string') return;
+    selectedProviderPath = selected;
+    const label = providerDialog.querySelector<HTMLElement>('#wireguard-file-label');
+    if (label) label.textContent = selected.split(/[\\/]/).pop() ?? 'Configuration selected';
+  } catch (error) {
+    announce(error instanceof Error ? error.message : 'Could not open the selected file');
+  }
+}
+
+async function chooseDashboardProvider(providerId: string): Promise<void> {
+  const profile = snapshot.profiles.find(item => item.id === snapshot.activeProfileId);
+  if (!profile) { announce('Create a profile before assigning a connection'); return; }
+  const { name, description, routeMode, domains, autoSubdomains, fallback, fallbackProviderId } = profile;
+  await performDashboard(async () => {
+    const saved = await saveDashboardProfile({ name, description, providerId, fallbackProviderId, routeMode, domains, autoSubdomains, fallback }, profile.id);
+    try { return await applyDashboardProfile(profile.id); }
+    catch (error) { installDashboardState(saved); throw error; }
+  }, 'Connection saved for the next explicit Connect');
+}
 
 menu.addEventListener('click', () => menu.setAttribute('aria-expanded', String(menu.getAttribute('aria-expanded') !== 'true')));
 document.querySelector('#preview')!.addEventListener('click', () => { scenario.value = previewState; previewDialog.showModal(); });
 providerDialog.addEventListener('cancel', event => {
-  if (!addingProvider && !addingProviderFromProfile) return;
+  if (!addingProvider && !addingProviderFromProfile && editingProviderId === undefined) return;
   event.preventDefault();
   addingProvider = false;
   addingProviderFromProfile = false;
+  editingProviderId = undefined;
+  selectedProviderPath = undefined;
   render();
 });
 providerDialog.addEventListener('close', () => {
@@ -416,7 +560,14 @@ profileDialog.addEventListener('close', () => {
   profileDialog.returnValue = '';
 });
 previewDialog.addEventListener('close', () => { if (previewDialog.returnValue === 'apply') { ++requestGeneration; previewState = scenario.value as PreviewState; page = 'Home'; history.replaceState(null, '', '#home'); render(); resetMainScroll(); announce(copy[previewState][0]); if (previewState === 'loading') window.setTimeout(() => { if (previewState === 'loading') { previewState = 'failed'; render(); announce(copy.failed[0]); } }, 3000); } previewDialog.returnValue = ''; document.querySelector<HTMLButtonElement>('#preview')?.focus({ preventScroll: true }); });
-importDialog.addEventListener('close', () => { if (importDialog.returnValue === 'import') { const raw = document.querySelector<HTMLTextAreaElement>('#profile-json')!.value; void perform(() => controller.importProfile(raw)); } importDialog.returnValue = ''; });
+importDialog.addEventListener('close', () => {
+  if (importDialog.returnValue === 'import') {
+    const raw = document.querySelector<HTMLTextAreaElement>('#profile-json')!.value;
+    if (isTauri()) void importDashboardProfile(raw);
+    else void perform(() => controller.importProfile(raw));
+  }
+  importDialog.returnValue = '';
+});
 document.querySelector('#import-form')!.addEventListener('submit', event => { if ((event as SubmitEvent).submitter && ((event as SubmitEvent).submitter as HTMLButtonElement).value !== 'import') return; event.preventDefault(); importDialog.close('import'); });
 
 app.addEventListener('click', event => {
@@ -447,19 +598,43 @@ app.addEventListener('click', event => {
     })();
   }
   else if (action === 'refresh') void refreshStatus();
-  else if (action === 'new-profile') { editingProfileId = 'new'; pendingProviderId = undefined; profileDraft = undefined; addingProviderFromProfile = false; render(); }
+  else if (action === 'new-profile') { profileReturnFocus = { action: 'new-profile' }; editingProfileId = 'new'; pendingProviderId = undefined; profileDraft = undefined; addingProviderFromProfile = false; render(); }
   else if (action === 'cancel-profile') { editingProfileId = undefined; pendingProviderId = undefined; profileDraft = undefined; addingProviderFromProfile = false; render(); }
-  else if (action === 'new-provider') { providerReturnFocusContext = 'providers'; addingProvider = true; render(); }
-  else if (action === 'cancel-provider') { addingProvider = false; render(); }
-  else if (action === 'new-provider-from-profile') { providerReturnFocusContext = 'profile'; const form = app.querySelector<HTMLFormElement>('#profile-form'); if (form) profileDraft = readProfileDraft(form); addingProviderFromProfile = true; render(); }
-  else if (action === 'cancel-provider-profile') { addingProviderFromProfile = false; render(); }
-  else if (action === 'edit-profile' && profileId) { editingProfileId = profileId; render(); }
+  else if (action === 'new-provider') { providerReturnFocusContext = 'providers'; editingProviderId = undefined; selectedProviderPath = undefined; addingProvider = true; render(); }
+  else if (action === 'cancel-provider') { addingProvider = false; editingProviderId = undefined; selectedProviderPath = undefined; render(); }
+  else if (action === 'new-provider-from-profile') { providerReturnFocusContext = 'profile'; editingProviderId = undefined; selectedProviderPath = undefined; const form = app.querySelector<HTMLFormElement>('#profile-form'); if (form) profileDraft = readProfileDraft(form); addingProviderFromProfile = true; render(); }
+  else if (action === 'cancel-provider-profile') { addingProviderFromProfile = false; editingProviderId = undefined; selectedProviderPath = undefined; render(); }
+  else if (action === 'edit-profile' && profileId) { profileReturnFocus = { action: 'edit-profile', id: profileId }; editingProfileId = profileId; render(); }
   else if (action === 'select-profile' && profileId) void selectProfile(profileId);
-  else if (action === 'duplicate-profile' && profileId) void perform(() => controller.duplicateProfile(profileId));
-  else if (action === 'delete-profile' && profileId) void perform(() => controller.deleteProfile(profileId));
-  else if (action === 'export-profile' && profileId) { download(`${profileId}.proxy-router.json`, controller.exportProfile(profileId)); announce('Profile export ready'); }
+  else if (action === 'duplicate-profile' && profileId) {
+    if (isTauri()) { const source = snapshot.profiles.find(item => item.id === profileId); if (source) void saveProfileToDashboard({ ...source, name: `${source.name} copy` }, undefined); }
+    else void perform(() => controller.duplicateProfile(profileId));
+  }
+  else if (action === 'delete-profile' && profileId) {
+    const profile = snapshot.profiles.find(item => item.id === profileId);
+    if (profile && window.confirm(`Delete “${profile.name}”?`)) {
+      if (isTauri()) void performDashboard(() => deleteDashboardProfile(profileId), 'Profile deleted');
+      else void perform(() => controller.deleteProfile(profileId));
+    }
+  }
+  else if (action === 'export-profile' && profileId) {
+    const profile = snapshot.profiles.find(item => item.id === profileId);
+    if (profile) { download(`${profileId}.proxy-router.json`, JSON.stringify({ proxyRouterProfile: 1, profile }, null, 2)); announce('Profile export ready'); }
+  }
   else if (action === 'import-profile') { document.querySelector<HTMLTextAreaElement>('#profile-json')!.value = ''; importDialog.showModal(); }
-  else if (action === 'choose-provider' && target.dataset.provider) void perform(() => controller.setProvider(target.dataset.provider!));
+  else if (action === 'edit-provider' && target.dataset.provider) { providerReturnFocusContext = 'providers'; editingProviderId = target.dataset.provider; selectedProviderPath = undefined; render(); }
+  else if (action === 'delete-provider' && target.dataset.provider) {
+    const provider = snapshot.providers.find(item => item.id === target.dataset.provider);
+    if (provider && window.confirm(`Delete connection “${provider.name}”?`)) {
+      if (isTauri()) void performDashboard(() => deleteDashboardProvider(provider.id), 'Connection deleted');
+      else announce('Deleting providers is available in the desktop app');
+    }
+  }
+  else if (action === 'pick-wireguard-config') void pickWireGuardConfig();
+  else if (action === 'choose-provider' && target.dataset.provider) {
+    if (isTauri()) void chooseDashboardProvider(target.dataset.provider);
+    else void perform(() => controller.setProvider(target.dataset.provider!));
+  }
   else if (action === 'refresh-health') void perform(() => controller.refreshHealth());
   else if (action === 'network-check' || action === 'network-reconnect' || action === 'network-disconnect') void networkAction(action);
   else if (action === 'network-auto') void networkAuto(target.dataset.networkState === 'on');
@@ -503,6 +678,27 @@ document.addEventListener('click', event => {
 app.addEventListener('change', event => {
   const target = event.target as HTMLInputElement | HTMLSelectElement; if (target.dataset.bind === 'active-profile') void perform(() => controller.selectProfile(target.value));
   else if (target.dataset.bind === 'fallback') void perform(() => controller.setFallback(target.value as FallbackMode));
+  else if (target.name === 'routeMode') {
+    const connection = profileDialog.querySelector<HTMLSelectElement>('[name="providerId"]');
+    if (connection) connection.required = target.value !== 'direct';
+  }
+  else if (target.name === 'fallback') {
+    const field = profileDialog.querySelector<HTMLElement>('.fallback-provider-field');
+    if (field) field.hidden = target.value !== 'retry';
+    const backup = profileDialog.querySelector<HTMLSelectElement>('[name="fallbackProviderId"]');
+    if (backup) backup.required = target.value === 'retry';
+  }
+  else if (target.name === 'providerId') {
+    const form = target.closest<HTMLFormElement>('#profile-form');
+    const backup = form?.querySelector<HTMLSelectElement>('[name="fallbackProviderId"]');
+    if (backup) {
+      const current = backup.value;
+      const available = snapshot.providers.filter(provider => provider.id !== target.value);
+      const selected = available.some(provider => provider.id === current) ? current : available[0]?.id ?? '';
+      backup.innerHTML = fallbackProviderOptions(selected, target.value);
+      backup.required = form?.querySelector<HTMLSelectElement>('[name="fallback"]')?.value === 'retry';
+    }
+  }
   else if (target.hasAttribute('data-provider-kind')) {
     const kind = target.value;
     const endpoint = app.querySelector<HTMLElement>('[data-provider-endpoint]');
@@ -541,6 +737,26 @@ app.addEventListener('submit', event => {
   if (form.id === 'provider-form') {
     event.preventDefault();
     const name = formInput(form, 'name'); const kind = formInput(form, 'kind') as ProviderKind; const context = form.dataset.providerContext === 'profile' ? 'profile' : 'providers';
+    if (isTauri()) {
+      const providerId = editingProviderId;
+      if (!providerId && !selectedProviderPath) { announce('Choose a WireGuard .conf file'); return; }
+      if (kind !== 'wireguard' && kind !== 'custom') { announce('Choose WireGuard or Custom VPN'); return; }
+      void performDashboard(async () => {
+        const next = await saveDashboardProvider({ name, kind }, providerId, selectedProviderPath);
+        const saved = providerId ? next.providers.find(item => item.id === providerId) : next.providers.find(item => item.name === name);
+        if (context === 'profile' && saved) {
+          pendingProviderId = saved.id;
+          if (profileDraft) profileDraft = { ...profileDraft, providerId: saved.id };
+          addingProviderFromProfile = false;
+        } else if (context === 'providers') {
+          addingProvider = false;
+        }
+        editingProviderId = undefined;
+        selectedProviderPath = undefined;
+        return next;
+      }, context === 'profile' ? 'Connection added to profile' : providerId ? 'Connection saved' : 'Connection added');
+      return;
+    }
     void perform(async () => {
       let next: Snapshot;
       const file = new FormData(form).get('wireguardConfig');
@@ -559,11 +775,18 @@ app.addEventListener('submit', event => {
       return next;
     });
   }
-  if (form.id === 'profile-form') { event.preventDefault(); const data = readProfileDraft(form); const current = editingProfileId; void perform(async () => { const next = await controller.saveProfile(data, current === 'new' ? undefined : current); editingProfileId = undefined; pendingProviderId = undefined; profileDraft = undefined; return next; }); }
+  if (form.id === 'profile-form') {
+    event.preventDefault();
+    const data = readProfileDraft(form);
+    const current = editingProfileId;
+    if (isTauri()) void saveProfileToDashboard(data, current === 'new' ? undefined : current);
+    else void perform(async () => { const next = await controller.saveProfile(data, current === 'new' ? undefined : current); editingProfileId = undefined; pendingProviderId = undefined; profileDraft = undefined; return next; });
+  }
 });
 async function selectProfile(profileId: string): Promise<void> {
   if (isTauri()) {
-    try { await applyProfileToEngine(profileId); } catch (error) { announce(error instanceof Error ? error.message : 'Profile switch failed'); }
+    await performDashboard(() => applyDashboardProfile(profileId), 'Profile saved for the next explicit Connect');
+    return;
   }
   await perform(() => controller.selectProfile(profileId));
   if (isTauri()) { await refreshStatus({ silent: true }); render(); }
@@ -675,6 +898,8 @@ if (isTauri()) {
   // Paint the poller's last reading before anything waits on the CLI, then
   // reconcile in the background: the window never blocks on first paint.
   void (async () => {
+    try { await refreshDashboardState(); }
+    catch (error) { dashboardStateReady = true; dashboardStateError = error instanceof Error ? error.message : 'Saved profile data could not be loaded'; render(); }
     try {
       const cached = await getCachedLiveStatus();
       if (cached.status) { applyLive(cached); render(); }

@@ -378,6 +378,66 @@ fn remove_route(id: String) -> Result<Value, String> {
     Ok(serde_json::json!({ "removed": id }))
 }
 
+/// Dashboard CRUD is served by a small allowlisted router.py surface. These
+/// commands only write saved configuration; they never start or reload the
+/// engine, so choosing or editing a profile cannot connect the machine.
+fn dashboard_json(args: &[&str]) -> Result<Value, String> {
+    let root = controller::router_root();
+    let output = controller::run_controller(&root, args)?;
+    serde_json::from_str(&output).map_err(|error| format!("invalid dashboard response: {error}"))
+}
+
+#[tauri::command]
+fn get_dashboard_state() -> Result<Value, String> {
+    dashboard_json(&["dashboard", "state"])
+}
+
+#[tauri::command]
+fn save_dashboard_profile(profile: Value, profile_id: Option<String>) -> Result<Value, String> {
+    let data = serde_json::to_string(&profile).map_err(|error| error.to_string())?;
+    let root = controller::router_root();
+    let mut args = vec!["dashboard", "profile-save", "--json", data.as_str()];
+    if let Some(id) = profile_id.as_deref() {
+        args.extend(["--id", id]);
+    }
+    let output = controller::run_controller(&root, &args)?;
+    serde_json::from_str(&output).map_err(|error| format!("invalid dashboard response: {error}"))
+}
+
+#[tauri::command]
+fn delete_dashboard_profile(profile_id: String) -> Result<Value, String> {
+    dashboard_json(&["dashboard", "profile-delete", "--id", &profile_id])
+}
+
+#[tauri::command]
+fn apply_dashboard_profile(profile_id: String) -> Result<Value, String> {
+    dashboard_json(&["dashboard", "profile-apply", "--id", &profile_id])
+}
+
+#[tauri::command]
+fn save_dashboard_provider(
+    provider: Value,
+    provider_id: Option<String>,
+    source_path: Option<String>,
+) -> Result<Value, String> {
+    let data = serde_json::to_string(&provider).map_err(|error| error.to_string())?;
+    let root = controller::router_root();
+    let mut args = vec!["dashboard", "provider-save", "--json", data.as_str()];
+    if let Some(id) = provider_id.as_deref() {
+        args.extend(["--id", id]);
+    }
+    if let Some(path) = source_path.as_deref() {
+        args.extend(["--path", path]);
+    }
+    let output = controller::run_controller(&root, &args)?;
+    serde_json::from_str(&output).map_err(|error| format!("invalid dashboard response: {error}"))
+}
+
+#[tauri::command]
+fn delete_dashboard_provider(provider_id: String) -> Result<Value, String> {
+    dashboard_json(&["dashboard", "provider-delete", "--id", &provider_id])
+}
+
 #[tauri::command]
 fn set_tray_status<R: Runtime>(app: AppHandle<R>, state: String) -> Result<(), String> {
     apply_tray_state(&app, &state)
@@ -390,6 +450,7 @@ fn main() {
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             show_dashboard(app);
         }))
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.handle()
@@ -515,6 +576,12 @@ fn main() {
             set_routing_mode,
             add_route,
             remove_route,
+            get_dashboard_state,
+            save_dashboard_profile,
+            delete_dashboard_profile,
+            apply_dashboard_profile,
+            save_dashboard_provider,
+            delete_dashboard_provider,
             set_tray_status,
             preview_rendered
         ])

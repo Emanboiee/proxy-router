@@ -438,6 +438,9 @@ def load_config() -> int:
                 f"bad {CONFIG_FILE.name}: route '{route.get('id', '<unnamed>')}' "
                 f"references unknown provider '{route['provider']}'"
             )
+        unavailable_policy = route.get("on_unavailable", "direct")
+        if unavailable_policy not in ("direct", "block"):
+            return fail(f"bad {CONFIG_FILE.name}: route on_unavailable must be 'direct' or 'block'")
         for key in ("domains", "ip_cidr"):
             if key in route and (not isinstance(route[key], list) or not all(isinstance(v, str) for v in route[key])):
                 return fail(f"bad {CONFIG_FILE.name}: route '{route.get('id', '<unnamed>')}' {key} must be a string list")
@@ -2236,7 +2239,7 @@ def _route_capture_cidrs(routes: list[dict], routing: dict,
 
     for route in routes:
         route_provider = _effective_route_provider(route.get("provider", ""))
-        if route_provider not in active:
+        if route_provider not in active and route.get("on_unavailable") != "block":
             continue
         for value in (route.get("domains") or []):
             domain = _capture_domain_name(value)
@@ -2399,7 +2402,7 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
     vpn_domains = frozenset(routing["vpn_domains"])
     for route in build_routes:
         route_provider = _effective_route_provider(route["provider"])
-        if route_provider not in active or not route.get("domains"):
+        if not route.get("domains"):
             continue
         domains = route["domains"]
         if routing_mode == "vpn-list":
@@ -2407,9 +2410,13 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
                 domain for domain in domains
                 if any(domain == vpn or domain.endswith("." + vpn) for vpn in vpn_domains)
             ]
-        if domains:
+        if not domains:
+            continue
+        if route_provider in active:
             dns_rules.append({"domain_suffix": domains,
                               "server": dns_alias.get(route_provider, f"dns-{route_provider}")})
+        elif route.get("on_unavailable") == "block":
+            dns_rules.append({"domain_suffix": domains, "action": "reject"})
 
     # Route rules: safe-list direct-domain pins first (a trusted domain is
     # never tunneled even if a provider route also mentions it), then the
@@ -2419,9 +2426,13 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
     provider_rules = []
     for route in build_routes:
         route_provider = _effective_route_provider(route["provider"])
-        if route_provider not in active:
+        provider_active = route_provider in active
+        if not provider_active and (
+            route.get("on_unavailable") != "block"
+            or (not route.get("domains") and not route.get("ip_cidr"))
+        ):
             continue
-        rule = {"outbound": route_provider}
+        rule = {"outbound": route_provider} if provider_active else {"action": "reject"}
         if route.get("domains"):
             domains = route["domains"]
             if routing_mode == "vpn-list":
@@ -5831,12 +5842,54 @@ def main() -> int:
     profile_copy_parser.add_argument("--provider", required=True,
                                     help="configured destination provider (e.g. proton)")
 
+    dashboard = sub.add_parser("dashboard", help=argparse.SUPPRESS)
+    dashboard_sub = dashboard.add_subparsers(dest="dashboard_action", required=True)
+    dashboard_sub.add_parser("state", help=argparse.SUPPRESS)
+    for action in ("profile-save", "provider-save"):
+        command = dashboard_sub.add_parser(action, help=argparse.SUPPRESS)
+        command.add_argument("--json", required=True, help=argparse.SUPPRESS)
+        command.add_argument("--id", default=None, help=argparse.SUPPRESS)
+        if action == "provider-save":
+            command.add_argument("--path", default=None, help=argparse.SUPPRESS)
+    for action in ("profile-delete", "profile-apply", "provider-delete"):
+        command = dashboard_sub.add_parser(action, help=argparse.SUPPRESS)
+        command.add_argument("--id", required=True, help=argparse.SUPPRESS)
+
     elevate = sub.add_parser("elevate", help="one-time passwordless-sudo grant (install|uninstall|status)")
     elevate.add_argument("action", choices=["install", "uninstall", "status"])
 
     sub.add_parser("network-check", help="auto-switch routing preset for the current Wi-Fi network")
 
     args, passthrough = parser.parse_known_args()
+    if args.cmd == "dashboard":
+        import dashboard_profile_manager as dashboard_profiles
+
+        def run_dashboard_action() -> int:
+            try:
+                if args.dashboard_action == "state":
+                    value = dashboard_profiles.state(ROOT)
+                elif args.dashboard_action == "profile-save":
+                    value = dashboard_profiles.save_profile(
+                        ROOT, json.loads(args.json), args.id,
+                    )
+                elif args.dashboard_action == "profile-delete":
+                    value = dashboard_profiles.delete_profile(ROOT, args.id)
+                elif args.dashboard_action == "profile-apply":
+                    value = dashboard_profiles.apply_profile(ROOT, args.id)
+                elif args.dashboard_action == "provider-save":
+                    value = dashboard_profiles.save_provider(
+                        ROOT, json.loads(args.json), args.id, args.path,
+                    )
+                elif args.dashboard_action == "provider-delete":
+                    value = dashboard_profiles.delete_provider(ROOT, args.id)
+                else:
+                    return fail("unsupported dashboard operation")
+            except (dashboard_profiles.DashboardError, json.JSONDecodeError) as exc:
+                return fail(str(exc))
+            print(json.dumps(value, separators=(",", ":")))
+            return 0
+
+        return _with_lock(run_dashboard_action, timeout=5.0)
     if args.cmd == "elevate":
         return cmd_elevate(args.action)
     if args.cmd == "network-check":
