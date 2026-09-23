@@ -323,7 +323,7 @@ class ValidatedTargetTests(unittest.TestCase):
     def test_default_transport_rechecks_dns_for_all_probe_types(self):
         with mock.patch.object(
             monitor, "resolve_target_addresses", return_value=["10.0.0.8"]
-        ) as resolve, mock.patch.object(monitor._SAFE_OPENER, "open") as open_request:
+        ) as resolve:
             results = [
                 monitor.measure_http_latency("https://probe.example/"),
                 monitor.measure_download("https://probe.example/file", max_bytes=8),
@@ -331,10 +331,31 @@ class ValidatedTargetTests(unittest.TestCase):
             ]
 
         self.assertEqual(resolve.call_count, 3)
-        open_request.assert_not_called()
         for result in results:
             self.assertIn("resolved to private/loopback", result["error"])
             self.assertIn("unsafe monitor target", result["error"])
+
+    def test_default_transport_pins_dns_answer_used_for_connection(self):
+        with mock.patch.object(
+            monitor,
+            "resolve_target_addresses",
+            side_effect=[["93.184.216.34"], ["10.0.0.8"]],
+        ) as resolve, mock.patch.object(
+            monitor.socket,
+            "create_connection",
+            side_effect=OSError("blocked test socket"),
+        ) as connect:
+            result = monitor.measure_http_latency("https://probe.example/")
+
+        self.assertEqual(resolve.call_count, 1)
+        self.assertEqual(connect.call_count, 1, result)
+        self.assertEqual(connect.call_args.args[0], ("93.184.216.34", 443))
+        self.assertIn("blocked test socket", result["error"])
+
+        connection = monitor._PinnedHTTPSConnection(
+            "probe.example", pinned_addresses=("93.184.216.34",), timeout=1
+        )
+        self.assertEqual(connection.host, "probe.example")
 
     def test_default_safe_transport_preserves_default_headers(self):
         response = FakeResponse(b"ok")

@@ -9,20 +9,24 @@ from __future__ import annotations
 
 import argparse
 import collections
+import functools
+import http.client
+import ipaddress
 import json
 import os
 import platform
 import re
-import signal
 import shlex
+import signal
+import socket
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
-import ipaddress
 
 import net_safety
 import worker_lock
@@ -126,7 +130,7 @@ def _reject_unsafe_url(url: str) -> str | None:
 
 
 class _ValidatedRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Follow a redirect only when the hop itself passes the SSRF check."""
+    """Reject redirect hops that fail the monitor target policy."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         violation = target_violation(
@@ -137,11 +141,89 @@ class _ValidatedRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-_SAFE_OPENER = urllib.request.build_opener(_ValidatedRedirectHandler)
+def _validated_connection_addresses(url: str) -> tuple[str, ...]:
+    """Resolve and validate once; the returned IPs are the only dial targets."""
+    violation = target_violation(url)
+    if violation is not None:
+        raise urllib.error.URLError(f"unsafe monitor target: {violation}")
+
+    addresses = tuple(resolve_target_addresses(url))
+    if not addresses:
+        raise urllib.error.URLError("monitor target did not resolve to an address")
+    violation = target_violation(url, resolved_addresses=addresses)
+    if violation is not None:
+        raise urllib.error.URLError(f"unsafe monitor target: {violation}")
+    return addresses
+
+
+class _PinnedConnectMixin:
+    """Dial only validated numeric IPs while retaining the URL hostname."""
+
+    def __init__(self, host, *args, pinned_addresses, **kwargs):
+        self._pinned_addresses = tuple(pinned_addresses)
+        super().__init__(host, *args, **kwargs)
+        # HTTPConnection stores socket.create_connection on the instance, so
+        # replace that attribute after its initializer returns.
+        self._create_connection = self._create_pinned_connection
+
+    def _create_pinned_connection(self, address, timeout=None, source_address=None):
+        host, port = address
+        if host != self.host:
+            raise OSError("monitor connection host changed after validation")
+
+        last_error = None
+        for pinned_address in self._pinned_addresses:
+            try:
+                return socket.create_connection(
+                    (pinned_address, port), timeout, source_address
+                )
+            except OSError as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        raise OSError("monitor connection has no validated addresses")
+
+
+class _PinnedHTTPConnection(_PinnedConnectMixin, http.client.HTTPConnection):
+    pass
+
+
+class _PinnedHTTPSConnection(_PinnedConnectMixin, http.client.HTTPSConnection):
+    pass
+
+
+def _pinned_connection_factory(url: str, connection_type):
+    addresses = _validated_connection_addresses(url)
+    return functools.partial(connection_type, pinned_addresses=addresses)
+
+
+class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        connection = _pinned_connection_factory(req.full_url, _PinnedHTTPConnection)
+        return self.do_open(connection, req)
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        connection = _pinned_connection_factory(req.full_url, _PinnedHTTPSConnection)
+        return self.do_open(
+            connection,
+            req,
+            context=getattr(self, "_context", None),
+        )
+
+
+# A proxy would resolve the destination outside this process, bypassing pinning.
+_SAFE_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}),
+    _ValidatedRedirectHandler,
+    _PinnedHTTPHandler,
+    _PinnedHTTPSHandler,
+)
 
 
 def _safe_urlopen(url, timeout=None):
-    """Default monitor transport: redirect-aware with per-hop validation."""
+    """Default monitor transport: validate and pin every request and redirect."""
     return _SAFE_OPENER.open(url, timeout=timeout)
 
 
@@ -174,11 +256,17 @@ def validate_ping_host(host: str) -> str | None:
     return None
 
 
+def _open_request(opener, request, timeout: float):
+    """Route urllib transports through DNS-pinned connections."""
+    transport = _safe_urlopen if _uses_urllib_transport(opener) else opener
+    return transport(request, timeout=timeout)
+
+
 def _open(opener, url: str, timeout: float):
     """Use browser-like headers for urllib transports; keep injected openers simple."""
     if _uses_urllib_transport(opener):
         request = urllib.request.Request(url, headers=DEFAULT_HEADERS)
-        return opener(request, timeout=timeout)
+        return _open_request(opener, request, timeout)
     return opener(url, timeout=timeout)
 
 
@@ -259,12 +347,6 @@ def measure_http_latency(url: str = DEFAULT_HTTP_URL, *, opener=_safe_urlopen,
     started = clock()
     response = None
     violation = target_violation(url)
-    if violation is None and _uses_urllib_transport(opener):
-        # Connection-time revalidation of what the name resolves to right now
-        # closes the DNS-rebinding window left by config-time checks alone.
-        violation = target_violation(
-            url, resolved_addresses=resolve_target_addresses(url)
-        )
     if violation is not None:
         return _network_error(ValueError(f"unsafe monitor target: {violation}"),
                               url, target=_safe_target(url))
@@ -298,10 +380,6 @@ def measure_download(url: str = DEFAULT_DOWNLOAD_URL, *, max_bytes: int = DEFAUL
     response = None
     total = 0
     violation = target_violation(url)
-    if violation is None and _uses_urllib_transport(opener):
-        violation = target_violation(
-            url, resolved_addresses=resolve_target_addresses(url)
-        )
     if violation is not None:
         return _network_error(ValueError(f"unsafe monitor target: {violation}"), url, bytes=0)
     try:
@@ -328,15 +406,11 @@ def measure_upload(url: str = DEFAULT_UPLOAD_URL, *, max_bytes: int = DEFAULT_MA
     started = clock()
     response = None
     violation = target_violation(url)
-    if violation is None and _uses_urllib_transport(opener):
-        violation = target_violation(
-            url, resolved_addresses=resolve_target_addresses(url)
-        )
     if violation is not None:
         return _network_error(ValueError(f"unsafe monitor target: {violation}"), url, bytes=max_bytes)
     try:
         request = urllib.request.Request(url, data=payload, headers=DEFAULT_HEADERS, method="POST")
-        response = opener(request, timeout=timeout)
+        response = _open_request(opener, request, timeout)
         response.read(1)
         elapsed = clock() - started
         return {"bytes": max_bytes, "mbps": _throughput(max_bytes, elapsed),
