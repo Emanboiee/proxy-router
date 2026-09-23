@@ -242,6 +242,80 @@ class ValidatedTargetTests(unittest.TestCase):
         self.assertIn("resolved to private/loopback", result["error"])
         self.assertIn("unsafe monitor target", result["error"])
 
+    def test_private_dns_targets_are_rejected_before_default_probes(self):
+        probes = (
+            (monitor.measure_http_latency, "https://public.example/"),
+            (lambda url: monitor.measure_download(url, max_bytes=8), "https://public.example/down"),
+            (lambda url: monitor.measure_upload(url, max_bytes=8), "https://public.example/up"),
+        )
+        for address in ("127.0.0.1", "169.254.169.254"):
+            for probe, url in probes:
+                with self.subTest(address=address, url=url):
+                    with mock.patch.object(
+                        monitor, "resolve_target_addresses", return_value=[address]
+                    ), mock.patch.object(
+                        monitor._SAFE_OPENER, "open", side_effect=AssertionError("request opened")
+                    ) as opened:
+                        result = probe(url)
+                    opened.assert_not_called()
+                    self.assertIn("unsafe monitor target", result["error"])
+
+    def test_rebinding_after_probe_validation_is_blocked_before_dial(self):
+        with mock.patch.object(
+            monitor,
+            "resolve_target_addresses",
+            side_effect=[["104.16.132.229"], ["169.254.169.254"]],
+        ) as resolve, mock.patch.object(monitor.socket, "create_connection") as connect:
+            result = monitor.measure_http_latency("https://public.example/")
+
+        self.assertEqual(resolve.call_count, 2)
+        connect.assert_not_called()
+        self.assertIn("resolved to a metadata endpoint", result["error"])
+
+    def test_redirect_to_private_dns_target_is_rejected(self):
+        handler = monitor._ValidatedRedirectHandler()
+        request = urllib.request.Request("https://public.example/start")
+        destination = "https://redirect.example/private"
+        for address in ("127.0.0.1", "169.254.169.254"):
+            with self.subTest(address=address):
+                with mock.patch.object(
+                    monitor, "resolve_target_addresses", return_value=[address]
+                ) as resolve:
+                    redirected = handler.redirect_request(
+                        request, FakeResponse(), 302, "Found", {}, destination
+                    )
+                self.assertIsNone(redirected)
+                resolve.assert_called_once_with(destination)
+
+    def test_connections_dial_validated_ip_and_keep_https_sni(self):
+        address = "104.16.132.229"
+        raw_socket = mock.Mock()
+        http = monitor._PinnedHTTPConnection(
+            "public.example", addresses=[address], timeout=3
+        )
+        with mock.patch.object(
+            monitor.socket, "create_connection", return_value=raw_socket
+        ) as create_connection:
+            http.connect()
+        create_connection.assert_called_once_with((address, 80), 3, None)
+        self.assertIs(http.sock, raw_socket)
+
+        tls_socket = mock.Mock()
+        context = mock.Mock()
+        context.wrap_socket.return_value = tls_socket
+        https = monitor._PinnedHTTPSConnection(
+            "public.example", addresses=[address], timeout=3, context=context
+        )
+        with mock.patch.object(
+            monitor.socket, "create_connection", return_value=raw_socket
+        ) as create_connection:
+            https.connect()
+        create_connection.assert_called_once_with((address, 443), 3, None)
+        context.wrap_socket.assert_called_once_with(
+            raw_socket, server_hostname="public.example"
+        )
+        self.assertIs(https.sock, tls_socket)
+
     def test_explicit_opt_in_allows_private_targets(self):
         with mock.patch.dict(os.environ, {monitor.PRIVATE_TARGET_BYPASS_ENV: "1"}):
             violation = monitor.target_violation("http://127.0.0.1:9090/metrics")
