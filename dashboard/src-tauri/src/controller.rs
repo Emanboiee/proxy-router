@@ -154,13 +154,18 @@ fn output_with_status(
 /// Parse a read-only JSON subcommand's stdout.
 pub fn json_command(root: &Path, args: &[&str]) -> Result<Value, String> {
     let out = run_controller_allow_nonzero(root, args)?;
-    serde_json::from_str::<Value>(&out).map_err(|error| format!("invalid JSON from {args:?}: {error}"))
+    serde_json::from_str::<Value>(&out)
+        .map_err(|error| format!("invalid JSON from {args:?}: {error}"))
 }
 
-/// A transport flag that is not explicitly healthy counts as degraded, but an
-/// absent/unknown field must not (the CLI omits them in some paths).
+/// A nested transport flag that is not explicitly healthy counts as degraded,
+/// but an absent/unknown field must not (the CLI omits some paths).
 fn flag_needs_attention(status: &Value, key: &str) -> bool {
-    match status.get(key).and_then(Value::as_str) {
+    match status
+        .get(key)
+        .and_then(|section| section.get("status"))
+        .and_then(Value::as_str)
+    {
         Some(value) => !matches!(value, "ok" | "skipped" | "unknown"),
         None => false,
     }
@@ -185,7 +190,10 @@ pub fn connection_state(status: &Value) -> &'static str {
         .and_then(Value::as_array)
         .map(|lanes| !lanes.is_empty())
         .unwrap_or(false);
-    if degraded_lanes || flag_needs_attention(status, "system_proxy_status") {
+    if degraded_lanes
+        || flag_needs_attention(status, "system_proxy")
+        || flag_needs_attention(status, "network")
+    {
         return "degraded";
     }
     "connected"
@@ -205,30 +213,54 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn captured_status() -> Value {
+        serde_json::from_str(include_str!("../tests/fixtures/router-status-proxy.json"))
+            .expect("captured router status fixture")
+    }
+
     #[test]
-    fn healthy_status_is_connected() {
-        let status = json!({"up": true, "mode": "proxy", "degraded_lanes": [],
-                            "system_proxy_status": "ok", "network_status": "ok", "error": null});
+    fn captured_real_status_schema_is_connected() {
+        let status = captured_status();
+        assert_eq!(status["system_proxy"]["status"], "ok");
+        assert_eq!(status["network"]["status"], "ok");
         assert_eq!(connection_state(&status), "connected");
+    }
+
+    #[test]
+    fn nested_system_proxy_mismatch_is_degraded() {
+        let mut status = captured_status();
+        status["system_proxy"]["status"] = json!("mismatch");
+        assert_eq!(connection_state(&status), "degraded");
+    }
+
+    #[test]
+    fn nested_network_failure_is_degraded() {
+        let mut status = captured_status();
+        status["network"]["status"] = json!("unavailable");
+        assert_eq!(connection_state(&status), "degraded");
     }
 
     #[test]
     fn parked_lane_is_degraded() {
-        let status = json!({"up": true, "degraded_lanes": [{"lane": "school"}], "error": null});
+        let mut status = captured_status();
+        status["degraded_lanes"] = json!([{"lane": "school"}]);
         assert_eq!(connection_state(&status), "degraded");
     }
 
     #[test]
-    fn unhealthy_system_proxy_is_degraded() {
-        let status =
-            json!({"up": true, "degraded_lanes": [], "system_proxy_status": "unavailable"});
-        assert_eq!(connection_state(&status), "degraded");
-    }
-
-    #[test]
-    fn unknown_flags_do_not_fake_degradation() {
-        let status = json!({"up": true, "mode": "proxy"});
+    fn unknown_or_missing_flags_do_not_fake_degradation() {
+        let status = json!({
+            "up": true,
+            "mode": "proxy",
+            "degraded_lanes": [],
+            "system_proxy": {"status": "unknown"},
+            "network": {"status": "unknown"}
+        });
         assert_eq!(connection_state(&status), "connected");
+        assert_eq!(
+            connection_state(&json!({"up": true, "mode": "proxy"})),
+            "connected"
+        );
     }
 
     #[test]
@@ -247,7 +279,7 @@ mod tests {
     fn unreachable_controller_is_failed_not_stale() {
         let result: Result<Value, String> = Err("controller not found".to_string());
         assert_eq!(state_for_result(&result), "failed");
-        let ok: Result<Value, String> = Ok(json!({"up": true}));
+        let ok: Result<Value, String> = Ok(captured_status());
         assert_eq!(state_for_result(&ok), "connected");
     }
 

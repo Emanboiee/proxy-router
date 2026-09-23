@@ -1,0 +1,12 @@
+{
+  "up": true,
+  "mode": "proxy",
+  "degraded_lanes": [],
+  "system_proxy": {
+    "status": "ok"
+  },
+  "network": {
+    "status": "ok"
+  },
+  "error": null
+}
