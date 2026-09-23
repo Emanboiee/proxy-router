@@ -123,22 +123,54 @@ class ProbeTests(unittest.TestCase):
         self.assertIn("77", command)
         self.assertIn("/tmp/router", command)
 
-    def test_malformed_monitor_settings_fall_back_to_safe_defaults(self):
+    def test_missing_router_config_uses_explicit_first_run_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = monitor._monitor_settings(root)
+        self.assertEqual(settings["http_url"], monitor.DEFAULT_HTTP_URL)
+        self.assertEqual(settings["interval_seconds"], monitor.DEFAULT_INTERVAL)
+        self.assertEqual(settings["ping_hosts"], list(monitor.DEFAULT_PING_HOSTS))
+
+    def test_malformed_router_json_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "router.json").write_text("{\"monitor\":")
+            with self.assertRaisesRegex(monitor.MonitorConfigError, "invalid router.json"):
+                monitor._monitor_settings(root)
+
+    def test_wrong_monitor_field_type_is_reported_before_probing(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "router.json").write_text(json.dumps({
-                "monitor": {
-                    "http_url": "file:///etc/passwd",
-                    "download_url": 123,
-                    "interval_seconds": "bad",
-                    "ping_hosts": "1.1.1.1",
-                }
+                "monitor": {"ping_hosts": "1.1.1.1"}
             }))
-            settings = monitor._monitor_settings(root)
-        self.assertEqual(settings["http_url"], monitor.DEFAULT_HTTP_URL)
-        self.assertEqual(settings["download_url"], monitor.DEFAULT_DOWNLOAD_URL)
-        self.assertEqual(settings["interval_seconds"], monitor.DEFAULT_INTERVAL)
-        self.assertEqual(settings["ping_hosts"], list(monitor.DEFAULT_PING_HOSTS))
+            with mock.patch.object(monitor, "measure_http_latency") as http_probe, \
+                 mock.patch.object(monitor, "measure_ping") as ping_probe:
+                with self.assertRaisesRegex(monitor.MonitorConfigError, "ping_hosts"):
+                    monitor.collect_sample(root)
+            http_probe.assert_not_called()
+            ping_probe.assert_not_called()
+
+    def test_worker_records_invalid_config_without_probing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            enabled = monitor.enabled_file(root)
+            enabled.parent.mkdir(parents=True)
+            enabled.touch()
+            (root / "router.json").write_text("{")
+
+            def stop_after_sample(_seconds):
+                enabled.unlink(missing_ok=True)
+
+            with mock.patch.object(monitor, "measure_http_latency") as http_probe, \
+                 mock.patch.object(monitor, "measure_ping") as ping_probe, \
+                 mock.patch.object(monitor.time, "sleep", side_effect=stop_after_sample):
+                self.assertEqual(monitor.worker(root, interval=5), 0)
+
+            samples = [json.loads(line) for line in monitor.tail_logs(root).splitlines()]
+        self.assertIn("MonitorConfigError: invalid router.json", samples[-1]["error"])
+        http_probe.assert_not_called()
+        ping_probe.assert_not_called()
 
 
 class StateTests(unittest.TestCase):

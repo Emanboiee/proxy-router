@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import collections
 import json
+import math
 import os
 import platform
 import re
@@ -41,6 +42,11 @@ DEFAULT_HEADERS = {
     "User-Agent": "proxy-router-monitor/1.0",
     "Accept": "*/*",
 }
+
+
+class MonitorConfigError(ValueError):
+    """An existing router.json cannot safely guide monitor probes."""
+
 
 # --- Issue #64: validated monitor targets -----------------------------------
 # Trust model: router.json's monitor URLs point at public internet endpoints
@@ -380,14 +386,42 @@ def _monitor_settings(root: Path) -> dict:
     }
     config = root / "router.json"
     try:
-        data = json.loads(config.read_text())
-        custom = data.get("monitor", {}) if isinstance(data, dict) else {}
-        if isinstance(custom, dict):
-            for key in settings:
-                if key in custom:
-                    settings[key] = custom[key]
-    except (OSError, json.JSONDecodeError):
-        pass
+        raw = config.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raw = None
+    except (OSError, UnicodeError) as exc:
+        raise MonitorConfigError(f"cannot read router.json: {exc}") from exc
+    if raw is not None:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise MonitorConfigError(
+                f"invalid router.json: {exc.msg} (line {exc.lineno}, column {exc.colno})"
+            ) from exc
+        if not isinstance(data, dict):
+            raise MonitorConfigError("invalid router.json: top level must be an object")
+        custom = data.get("monitor", {})
+        if not isinstance(custom, dict):
+            raise MonitorConfigError("invalid router.json: monitor must be an object")
+        for key in settings:
+            if key in custom:
+                settings[key] = custom[key]
+
+    for key in ("http_url", "download_url", "upload_url"):
+        if not isinstance(settings[key], str):
+            raise MonitorConfigError(f"invalid router.json: monitor.{key} must be a string")
+    for key in ("interval_seconds", "max_bytes", "timeout_seconds"):
+        value = settings[key]
+        try:
+            finite = math.isfinite(value)
+        except (OverflowError, TypeError):
+            finite = False
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not finite:
+            raise MonitorConfigError(f"invalid router.json: monitor.{key} must be a finite number")
+    hosts = settings["ping_hosts"]
+    if not isinstance(hosts, list) or any(not isinstance(host, str) for host in hosts):
+        raise MonitorConfigError("invalid router.json: monitor.ping_hosts must be an array of strings")
+
     for key in ("http_url", "download_url", "upload_url"):
         value = settings[key]
         try:
@@ -412,26 +446,14 @@ def _monitor_settings(root: Path) -> dict:
                     "download_url": DEFAULT_DOWNLOAD_URL,
                     "upload_url": DEFAULT_UPLOAD_URL,
                 }[key]
-    try:
-        settings["interval_seconds"] = max(5, int(settings["interval_seconds"]))
-    except (TypeError, ValueError):
-        settings["interval_seconds"] = DEFAULT_INTERVAL
-    try:
-        settings["max_bytes"] = min(max(1, int(settings["max_bytes"])), 10_000_000)
-    except (TypeError, ValueError):
-        settings["max_bytes"] = DEFAULT_MAX_BYTES
-    try:
-        settings["timeout_seconds"] = min(max(1, float(settings["timeout_seconds"])), 60)
-    except (TypeError, ValueError):
-        settings["timeout_seconds"] = DEFAULT_TIMEOUT
-    hosts = settings["ping_hosts"]
-    if not isinstance(hosts, (list, tuple)):
-        hosts = DEFAULT_PING_HOSTS
+    settings["interval_seconds"] = max(5, int(settings["interval_seconds"]))
+    settings["max_bytes"] = min(max(1, int(settings["max_bytes"])), 10_000_000)
+    settings["timeout_seconds"] = min(max(1, float(settings["timeout_seconds"])), 60)
     # Issue #64: keep only conservative DNS/IP values; anything option-like or
     # metacharacter-bearing is dropped rather than passed to the ping argv.
     settings["ping_hosts"] = [
-        str(x) for x in hosts
-        if str(x) and validate_ping_host(str(x)) is None
+        host for host in hosts
+        if host and validate_ping_host(host) is None
     ][:8]
     return settings
 
