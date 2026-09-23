@@ -55,6 +55,7 @@ class ProxyRunner:
         self.https = ({"enabled": True, "server": "10.0.0.2", "port": 8080}
                       if foreign_https else {"enabled": False, "server": None, "port": None})
         self.converge = converge
+        self.bypass_domains = []
 
     def __call__(self, command, **kwargs):
         self.commands.append(command)
@@ -75,8 +76,10 @@ class ProxyRunner:
             enabled = "Yes" if state["enabled"] else "No"
             return SimpleNamespace(returncode=0, stdout=(
                 f"Enabled: {enabled}\nServer: {state['server'] or ''}\nPort: {state['port'] or ''}\n"))
+        if command[0] == "networksetup" and command[1] == "-getproxybypassdomains":
+            return SimpleNamespace(returncode=0, stdout="\n".join(self.bypass_domains))
         if command[0] == "networksetup" and command[1] in {
-                "-getautoproxyurl", "-getproxyautodiscovery", "-getproxybypassdomains"}:
+                "-getautoproxyurl", "-getproxyautodiscovery"}:
             return SimpleNamespace(returncode=0, stdout="Enabled: No\n")
         if command[0] == "networksetup" and command[1] == "-setwebproxy":
             self.http = {"enabled": True, "server": command[3], "port": int(command[4])}
@@ -86,6 +89,8 @@ class ProxyRunner:
             self.http["enabled"] = False
         elif command[0] == "networksetup" and command[1] == "-setsecurewebproxystate" and command[3] == "off":
             self.https["enabled"] = False
+        elif command[0] == "networksetup" and command[1] == "-setproxybypassdomains":
+            self.bypass_domains = command[3:]
         return SimpleNamespace(returncode=0, stdout="")
 
 
@@ -150,6 +155,38 @@ def test_connect_records_ownership_and_disconnect_uses_recorded_port(tmp_path, m
     assert router.system_proxy_off(runner=runner) == 0
     assert runner.http["enabled"] is False and runner.https["enabled"] is False
     assert not (tmp_path / "system-proxy.json").exists()
+
+
+def test_disconnect_restores_bypass_domains_after_config_reload(tmp_path, monkeypatch):
+    runner = ProxyRunner()
+    state_file = tmp_path / "system-proxy.json"
+    monkeypatch.setattr(router, "SYSTEM_PROXY_STATE_FILE", state_file)
+    monkeypatch.setattr(router, "_proxy_bypass_domains", ["before.example"])
+
+    assert router.system_proxy_on(runner=runner) == 0
+    record = json.loads(state_file.read_text())
+    applied_domains = router._bypass_domains()
+    assert record["proxy_bypass_domains"] == applied_domains
+    assert runner.bypass_domains == applied_domains
+
+    monkeypatch.setattr(router, "_proxy_bypass_domains", ["after.example"])
+    assert router.system_proxy_off(runner=runner) == 0
+    assert runner.bypass_domains == []
+
+
+def test_disconnect_legacy_record_falls_back_to_current_bypass_domains(tmp_path, monkeypatch):
+    runner = ProxyRunner()
+    state_file = tmp_path / "system-proxy.json"
+    monkeypatch.setattr(router, "SYSTEM_PROXY_STATE_FILE", state_file)
+    monkeypatch.setattr(router, "_proxy_bypass_domains", ["legacy.example"])
+
+    assert router.system_proxy_on(runner=runner) == 0
+    record = json.loads(state_file.read_text())
+    record.pop("proxy_bypass_domains")
+    state_file.write_text(json.dumps(record))
+
+    assert router.system_proxy_off(runner=runner) == 0
+    assert runner.bypass_domains == []
 
 
 def test_connected_extension_is_reconciled_after_physical_service(monkeypatch, tmp_path):

@@ -6838,7 +6838,11 @@ def system_proxy_on(runner=None) -> int:
     if conflicts:
         return fail("foreign system proxy conflict: " + "; ".join(conflicts))
 
+    # Freeze the exact list that Connect will apply so Disconnect can restore
+    # the captured pre-Connect list even after a config reload.
+    bypass_domains = _bypass_domains()
     state = {"version": 1, "endpoint": {"server": "127.0.0.1", "port": _port},
+             "proxy_bypass_domains": bypass_domains,
              "services": snapshots, "changed_at": int(time.time())}
     try:
         # Persist the ownership intent before the first mutation.  A crash or
@@ -6857,7 +6861,7 @@ def system_proxy_on(runner=None) -> int:
                 # 127.0.0.1:2080 for GUI apps.
                 ["networksetup", "-setautoproxystate", service, "off"],
                 ["networksetup", "-setproxyautodiscovery", service, "off"],
-                ["networksetup", "-setproxybypassdomains", service, *_bypass_domains()],
+                ["networksetup", "-setproxybypassdomains", service, *bypass_domains],
             ]
             for index, command in enumerate(commands):
                 _run_result(run, command, check=True, capture_output=True, timeout=10)
@@ -7079,7 +7083,12 @@ def system_proxy_off(runner=None) -> int:
             if before_domains is not None:
                 try:
                     current_domains = _capture_proxy_aux(service, run).get("bypass", {}).get("domains")
-                    ours_domains = _bypass_domains()
+                    if "proxy_bypass_domains" in state:
+                        ours_domains = state["proxy_bypass_domains"]
+                    else:
+                        # Compatibility with ownership records written before
+                        # Connect persisted the applied bypass list.
+                        ours_domains = _bypass_domains()
                     if current_domains == ours_domains and current_domains != before_domains:
                         _run_result(run, ["networksetup", "-setproxybypassdomains", service, *before_domains],
                                     check=True, capture_output=True, timeout=10)
