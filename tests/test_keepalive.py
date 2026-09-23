@@ -33,7 +33,22 @@ case "$cmd" in
     if [ -n "${FAKE_ROUTER_NETWORK_FILE:-}" ] && [ -f "$FAKE_ROUTER_NETWORK_FILE" ]; then
       state=$(cat "$FAKE_ROUTER_NETWORK_FILE")
     fi
-    if [ "$2" = "--json" ]; then
+      if [ "$2" = "--json" ]; then
+      gate="${FAKE_ROUTER_JSON_CAPTURE_GATE_FILE:-}"
+      if [ -n "$gate" ] && [ -f "$gate" ]; then
+        rm -f "$gate"
+        : > "${gate}.waiting"
+        attempts=0
+        while [ ! -f "${gate}.release" ] && [ "$attempts" -lt 500 ]; do
+          /bin/sleep 0.01
+          attempts=$((attempts + 1))
+        done
+        if [ ! -f "${gate}.release" ]; then
+          echo "fake router: JSON capture gate timed out" >&2
+          exit 75
+        fi
+        rm -f "${gate}.release"
+      fi
       ssid="${FAKE_ROUTER_SSID:-proto}"
       if [ -n "${FAKE_ROUTER_SSID_FILE:-}" ] && [ -f "$FAKE_ROUTER_SSID_FILE" ]; then
         ssid=$(cat "$FAKE_ROUTER_SSID_FILE")
@@ -148,25 +163,23 @@ printf '%s\n' "$1" >> "${SLEEP_LOG:-/dev/null}"
 """
 
 FAKE_DATE = r"""#!/usr/bin/env bash
-if [ "${1:-}" = "+%s" ] && [ -n "${FAKE_DATE_FILE:-}" ] && [ -f "$FAKE_DATE_FILE" ]; then
-  now=$(cat "$FAKE_DATE_FILE")
-  if [ -n "${FAKE_DATE_SAMPLE_ARM_FILE:-}" ] \
-     && [ -n "${FAKE_DATE_SAMPLE_FILE:-}" ] \
-     && [ -n "${FAKE_DATE_RELEASE_FILE:-}" ] \
-     && [ -f "$FAKE_DATE_SAMPLE_ARM_FILE" ]; then
-    : > "$FAKE_DATE_SAMPLE_FILE"
-    attempts=0
-    while [ ! -f "$FAKE_DATE_RELEASE_FILE" ] && [ "$attempts" -lt 1500 ]; do
-      /bin/sleep 0.01
-      attempts=$((attempts + 1))
-    done
-    if [ -f "$FAKE_DATE_RELEASE_FILE" ]; then
-      rm -f "$FAKE_DATE_SAMPLE_ARM_FILE"
-    else
-      exit 1
-    fi
+if [ "${1:-}" = "+%s" ] && [ -n "${FAKE_DATE_SAMPLE_GATE_FILE:-}" ] \
+   && [ -f "$FAKE_DATE_SAMPLE_GATE_FILE" ]; then
+  rm -f "$FAKE_DATE_SAMPLE_GATE_FILE"
+  : > "${FAKE_DATE_SAMPLE_GATE_FILE}.waiting"
+  attempts=0
+  while [ ! -f "${FAKE_DATE_SAMPLE_GATE_FILE}.release" ] && [ "$attempts" -lt 500 ]; do
+    /bin/sleep 0.01
+    attempts=$((attempts + 1))
+  done
+  if [ ! -f "${FAKE_DATE_SAMPLE_GATE_FILE}.release" ]; then
+    echo "fake date: time sample gate timed out" >&2
+    exit 75
   fi
-  printf '%s\n' "$now"
+  rm -f "${FAKE_DATE_SAMPLE_GATE_FILE}.release"
+fi
+if [ "${1:-}" = "+%s" ] && [ -n "${FAKE_DATE_FILE:-}" ] && [ -f "$FAKE_DATE_FILE" ]; then
+  cat "$FAKE_DATE_FILE"
   exit 0
 fi
 exec /bin/date "$@"
@@ -211,15 +224,9 @@ class KeepaliveHarness:
         sleep_bin.write_text(FAKE_SLEEP)
         sleep_bin.chmod(0o755)
         self.clock_file = None
-        self.clock_sample_arm_file = None
-        self.clock_sample_file = None
-        self.clock_release_file = None
         if clock is not None:
             self.clock_file = self.root / "clock"
             self.clock_file.write_text(str(clock))
-            self.clock_sample_arm_file = self.root / "clock-sample.armed"
-            self.clock_sample_file = self.root / "clock-sample"
-            self.clock_release_file = self.root / "clock-sample.release"
             date_bin = self.root / "bin" / "date"
             date_bin.write_text(FAKE_DATE)
             date_bin.chmod(0o755)
@@ -246,8 +253,10 @@ class KeepaliveHarness:
         self.network_file.write_text(network)
         self.ssid_file = self.root / "ssid.state"
         self.ssid_file.write_text(ssid)
+        self.json_capture_gate = self.root / "network-status-json.gate"
+        self.date_sample_gate = self.root / "date-sample.gate"
         self.ssid_flip_file = self.root / "ssid-flip.state"
-        self.ssid_flip_at = self.root / "ssid-flip.count" 
+        self.ssid_flip_at = self.root / "ssid-flip.count"
         self.network_off_file = self.root / "state" / "network-off"
         env = dict(os.environ)
         env["PATH"] = f"{self.root / 'bin'}:" + env["PATH"]
@@ -267,13 +276,12 @@ class KeepaliveHarness:
         env["FAKE_ROUTER_NETWORK_OFF_FILE"] = str(self.network_off_file)
         env["FAKE_ROUTER_SSID_FILE"] = str(self.ssid_file)
         env["FAKE_ROUTER_HOLD_FILE"] = str(self.root / "ssid-hold.state")
+        env["FAKE_ROUTER_JSON_CAPTURE_GATE_FILE"] = str(self.json_capture_gate)
+        env["FAKE_DATE_SAMPLE_GATE_FILE"] = str(self.date_sample_gate)
         if wake_gap:
             env["PROXY_KEEPALIVE_WAKE_GAP"] = wake_gap
         if self.clock_file is not None:
             env["FAKE_DATE_FILE"] = str(self.clock_file)
-            env["FAKE_DATE_SAMPLE_ARM_FILE"] = str(self.clock_sample_arm_file)
-            env["FAKE_DATE_SAMPLE_FILE"] = str(self.clock_sample_file)
-            env["FAKE_DATE_RELEASE_FILE"] = str(self.clock_release_file)
         if pinned_python:
             pinned_bin = self.root / "bin" / "pinned-python"
             env["PROXY_ROUTER_PYTHON"] = str(pinned_bin)
@@ -296,6 +304,46 @@ class KeepaliveHarness:
     def set_network(self, state: str) -> None:
         self.network_file.write_text(state)
 
+    def arm_json_capture_gate(self) -> None:
+        self.json_capture_gate.with_name(self.json_capture_gate.name + ".waiting").unlink(
+            missing_ok=True)
+        self.json_capture_gate.with_name(self.json_capture_gate.name + ".release").unlink(
+            missing_ok=True)
+        self.json_capture_gate.touch()
+
+    def wait_for_json_capture(self, timeout: float = 5.0) -> None:
+        waiting = self.json_capture_gate.with_name(self.json_capture_gate.name + ".waiting")
+        deadline = time.monotonic() + timeout
+        while not waiting.is_file() and time.monotonic() < deadline:
+            if self.proc.poll() is not None:
+                raise AssertionError(f"keepalive exited before capture gate: {self.err!r}")
+            time.sleep(0.01)
+        if not waiting.is_file():
+            raise AssertionError("fake router never reached the gated JSON capture")
+
+    def release_json_capture(self) -> None:
+        self.json_capture_gate.with_name(self.json_capture_gate.name + ".release").touch()
+
+    def arm_time_sample_gate(self) -> None:
+        self.date_sample_gate.with_name(self.date_sample_gate.name + ".waiting").unlink(
+            missing_ok=True)
+        self.date_sample_gate.with_name(self.date_sample_gate.name + ".release").unlink(
+            missing_ok=True)
+        self.date_sample_gate.touch()
+
+    def wait_for_time_sample(self, timeout: float = 5.0) -> None:
+        waiting = self.date_sample_gate.with_name(self.date_sample_gate.name + ".waiting")
+        deadline = time.monotonic() + timeout
+        while not waiting.is_file() and time.monotonic() < deadline:
+            if self.proc.poll() is not None:
+                raise AssertionError(f"keepalive exited before time sample gate: {self.err!r}")
+            time.sleep(0.01)
+        if not waiting.is_file():
+            raise AssertionError("keepalive never reached the gated clock sample")
+
+    def release_time_sample(self) -> None:
+        self.date_sample_gate.with_name(self.date_sample_gate.name + ".release").touch()
+
     def advance_clock(self, seconds: int) -> None:
         if self.clock_file is None:
             raise AssertionError("clock simulation is not enabled")
@@ -306,27 +354,6 @@ class KeepaliveHarness:
             tmp.write(str(current + seconds))
             replacement = Path(tmp.name)
         replacement.replace(self.clock_file)
-
-    def arm_clock_sample(self) -> None:
-        if self.clock_sample_arm_file is None:
-            raise AssertionError("clock simulation is not enabled")
-        self.clock_sample_file.unlink(missing_ok=True)
-        self.clock_release_file.unlink(missing_ok=True)
-        self.clock_sample_arm_file.touch()
-
-    def wait_for_clock_sample(self, timeout: float = 10.0) -> bool:
-        if self.clock_sample_file is None:
-            raise AssertionError("clock simulation is not enabled")
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if self.clock_sample_file.is_file():
-                return True
-            time.sleep(0.01)
-        return self.clock_sample_file.is_file()
-
-    def release_clock_sample(self) -> None:
-        if self.clock_release_file is not None:
-            self.clock_release_file.touch()
 
     def wait_lines(self, count: int, timeout: float = 20.0) -> list[str]:
         deadline = time.time() + timeout
@@ -695,6 +722,14 @@ def _wait_two_ticks(h, timeout: float = 30.0) -> int:
     return len(h.lines())
 
 
+def _trigger_wake(h, seconds: int = 10) -> None:
+    """Advance the fake clock between loop samples, not during a tick."""
+    h.arm_time_sample_gate()
+    h.wait_for_time_sample()
+    h.advance_clock(seconds)
+    h.release_time_sample()
+
+
 class KeepaliveNetworkGuardTests(unittest.TestCase):
     def test_wifi_loss_disconnects_and_return_reconnects(self):
         h = KeepaliveHarness(interval="1", network="disconnected")
@@ -724,19 +759,18 @@ class KeepaliveNetworkGuardTests(unittest.TestCase):
     def test_wake_gap_forces_immediate_network_recovery(self):
         h = KeepaliveHarness(interval="1", probe_every="99", wake_gap="5", clock=1000)
         try:
-            # The two observed ticks put the clock jump between top-of-loop
-            # samples. Hold the old SSID until the fake clock confirms the
-            # post-jump sample is blocked, then let that wake tick read the roam.
-            wake_line = _wait_two_ticks(h)
-            hold_file = h.root / "ssid-hold.state"
-            hold_file.write_text("1")
+            _wait_two_ticks(h)
+            (h.root / "ssid-hold.state").write_text("1")
             h.ssid_file.write_text("new-wifi")
-            h.arm_clock_sample()
+            wake_line = len(h.lines())
+            h.arm_time_sample_gate()
+            h.wait_for_time_sample()
+            h.arm_json_capture_gate()
             h.advance_clock(10)
-            self.assertTrue(h.wait_for_clock_sample(),
-                            "keepalive did not reach the post-jump clock sample")
-            hold_file.unlink(missing_ok=True)
-            h.release_clock_sample()
+            h.release_time_sample()
+            h.wait_for_json_capture()
+            (h.root / "ssid-hold.state").unlink(missing_ok=True)
+            h.release_json_capture()
 
             deadline = time.time() + 20
             lines = h.lines()
@@ -746,27 +780,26 @@ class KeepaliveNetworkGuardTests(unittest.TestCase):
                     break
                 time.sleep(0.05)
             tail = lines[wake_line:]
-            self.assertIn("network-disconnect", tail)
-            self.assertIn("network-reconnect", tail)
-            self.assertIn("ensure", tail)
+            # Give the boot self-test one extra tick to log egress check.
             deadline = time.time() + 10
             while time.time() < deadline and "egress check" not in tail:
                 time.sleep(0.05)
                 tail = h.lines()[wake_line:]
+            self.assertIn("network-disconnect", tail)
+            self.assertIn("network-reconnect", tail)
+            self.assertIn("ensure", tail)
             self.assertIn("egress check", tail)
             h.close()
             self.assertIn("wake gap detected (10s)", h.err)
         finally:
-            if not getattr(h, "_closed", False):
-                h.release_clock_sample()
-                h.close()
+            h.close()
 
     def test_wake_gap_on_unchanged_network_skips_teardown(self):
         ssid = 'office "guest" \\ café (5GHz)'
         h = KeepaliveHarness(interval="1", probe_every="99", wake_gap="5", clock=1000, ssid=ssid)
         try:
             baseline = _wait_two_ticks(h)
-            h.advance_clock(10)
+            _trigger_wake(h)
             deadline = time.time() + 30
             lines = h.lines()
             while time.time() < deadline:
@@ -790,19 +823,21 @@ class KeepaliveNetworkGuardTests(unittest.TestCase):
     def test_wake_gap_after_ssid_change_still_tears_down(self):
         h = KeepaliveHarness(interval="1", probe_every="99", wake_gap="5", clock=1000)
         try:
-            # Pin the per-tick baseline to proto while the roam is staged.
-            hold_file = h.root / "ssid-hold.state"
-            hold_file.write_text("1")
-            wake_line = _wait_two_ticks(h)
+            # The held baseline stays proto. Pause the next wake capture,
+            # release the hold after the fake router acknowledges that exact
+            # call, and then let it read school-wifi.
+            (h.root / "ssid-hold.state").write_text("1")
+            baseline = _wait_two_ticks(h)
             h.ssid_file.write_text("school-wifi")
-            h.arm_clock_sample()
+            wake_line = len(h.lines())
+            h.arm_time_sample_gate()
+            h.wait_for_time_sample()
+            h.arm_json_capture_gate()
             h.advance_clock(10)
-            self.assertTrue(h.wait_for_clock_sample(),
-                            "keepalive did not reach the post-jump clock sample")
-            # The fake clock is blocked after the wake sample and before the
-            # status read, so this tick observes school-wifi against proto.
-            hold_file.unlink(missing_ok=True)
-            h.release_clock_sample()
+            h.release_time_sample()
+            h.wait_for_json_capture()
+            (h.root / "ssid-hold.state").unlink(missing_ok=True)
+            h.release_json_capture()
 
             deadline = time.time() + 20
             lines = h.lines()
@@ -811,20 +846,19 @@ class KeepaliveNetworkGuardTests(unittest.TestCase):
                 if "network-disconnect" in lines[wake_line:]:
                     break
                 time.sleep(0.05)
-            tail = lines[wake_line:]
+            self.assertIn("network-disconnect", lines[wake_line:])
+            tail = lines[baseline:]
             self.assertIn("network-disconnect", tail,
                           f"SSID change did not tear down: {tail}")
             deadline = time.time() + 10
             while time.time() < deadline and "network-reconnect" not in tail:
                 time.sleep(0.05)
-                tail = h.lines()[wake_line:]
+                tail = h.lines()[baseline:]
             self.assertIn("network-reconnect", tail)
             h.close()
             self.assertIn("wake gap detected (10s)", h.err)
         finally:
-            if not getattr(h, "_closed", False):
-                h.release_clock_sample()
-                h.close()
+            h.close()
 
 
 class KeepalivePinnedInterpreterTests(unittest.TestCase):

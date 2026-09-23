@@ -748,7 +748,7 @@ while true; do
     autodetect_now=$(date +%s)
     if [ "$AUTODETECT_ENABLED" != "0" ] && ! is_tun_mode \
        && { [ "$last_autodetect" -eq 0 ] || [ $((autodetect_now - last_autodetect)) -ge "$AUTODETECT_INTERVAL" ]; }; then
-      sources=$(autodetect_sources 2>/dev/null || printf '%s\n' twitch)
+      sources=$(autodetect_sources 2>/dev/null || true)
       while IFS= read -r source; do
         [ -n "$source" ] || continue
         if controller autodetect "$source" --quiet; then

@@ -148,7 +148,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cp router.py setup_tui.py monitor.py route_watcher.py proxy_tray.py README.md LICENSE .gitignore router.example.json dist/proxy-router/
+          cp router.py setup_tui.py monitor.py route_watcher.py proxy_tray.py domain_autodetect.py egress.py state.py config_schema.py worker_lock.py providers_check.py net_safety.py README.md LICENSE .gitignore router.example.json dist/proxy-router/
           cp -R guides rulesets dist/proxy-router/
           cp privileged_helper.py privileged_installer.py sing-box-release.json dist/proxy-router/
           if [ "${{ matrix.archive }}" = "tar.gz" ]; then
@@ -164,23 +164,6 @@ jobs:
           mkdir -p dist/proxy-router/examples
           cp -R examples/. dist/proxy-router/examples/
 
-      - name: Clean-install smoke test (unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Issue #63: artifacts shipped untested. Install the extracted
-          # artifact into a throwaway prefix and exercise the CLI end-to-end
-          # before the artifact is allowed to publish.
-          tar -xzf "proxy-router-${GITHUB_REF_NAME}-${{ matrix.suffix }}.tar.gz" -C /tmp 2>/dev/null || true
-          [ ! -d /tmp/proxy-router ] && exit 0 || true
-          export PROXY_ROUTER_DIR="$(mktemp -d)/prefix"
-          /tmp/proxy-router/install.sh PROXY_ROUTER_SKIP_SMOKE=1 >/dev/null
-          export PATH="$PROXY_ROUTER_DIR:$PATH"
-          "$PROXY_ROUTER_DIR/current/router.py" status --json | python3 -c "import json,sys; json.load(sys.stdin)"
-          "$PROXY_ROUTER_DIR/current/router.py" --help >/dev/null
-          echo "clean-install CLI smoke passed"
-
       - name: Archive
         shell: bash
         run: |
@@ -193,6 +176,23 @@ jobs:
             powershell -NoProfile -Command "Compress-Archive -Force -Path proxy-router -DestinationPath \"..\\proxy-router-${GITHUB_REF_NAME}-${{ matrix.suffix }}.zip\""
             cd ..
           fi
+
+      - name: Clean-install smoke test (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Install the EXACT published archive into a throwaway prefix. A
+          # missing archive or an install that cannot run is a hard failure.
+          rm -rf /tmp/proxy-router
+          tar -xzf "proxy-router-${GITHUB_REF_NAME}-${{ matrix.suffix }}.tar.gz" -C /tmp
+          [ -d /tmp/proxy-router ] || { echo "error: archive did not contain proxy-router/" >&2; exit 1; }
+          export PROXY_ROUTER_DIR="$(mktemp -d)/prefix"
+          /tmp/proxy-router/install.sh >/dev/null
+          status_json=$("$PROXY_ROUTER_DIR/current/router.py" status --json || true)
+          printf '%s' "$status_json" | python3 -c "import json,sys; json.load(sys.stdin)"
+          "$PROXY_ROUTER_DIR/current/router.py" --help >/dev/null
+          echo "clean-install CLI smoke passed"
 
       - name: Generate project checksums
         id: checksums
@@ -223,7 +223,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist/proxy-router
-          cp router.py setup_tui.py monitor.py route_watcher.py proxy_tray.py README.md LICENSE .gitignore router.example.json dist/proxy-router/
+          cp router.py setup_tui.py monitor.py route_watcher.py proxy_tray.py domain_autodetect.py egress.py state.py config_schema.py worker_lock.py providers_check.py net_safety.py README.md LICENSE .gitignore router.example.json pyproject.toml requirements-dev.txt dist/proxy-router/
           cp -R tests examples guides rulesets install.sh install.ps1 .github dist/proxy-router/
           cp privileged_helper.py privileged_installer.py sing-box-release.json VERSION dist/proxy-router/
           tar -czf "proxy-router-${GITHUB_REF_NAME}-source.tar.gz" -C dist proxy-router

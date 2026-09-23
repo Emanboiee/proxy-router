@@ -159,3 +159,22 @@ curl --max-time 10 -x socks5h://127.0.0.1:2181 \
   above) — move UDP-dependent apps back to a WireGuard/TUN route.
 - **Suspected loop:** verify the outbound port ≠ the router listener port
   and that no route covers `127.0.0.0/8`.
+
+## Empirical note: local vs remote DNS (September 2026)
+
+The contract above calls for remote DNS (`socks5h`). Measured against a
+filtered school network with the official client in proxy mode:
+
+- Sending a locally resolved IP and resolving remotely with `socks5h`
+  both returned HTTP 200 for the same targets.
+- The failures proxy-router observed on this lane (`socks5: request
+  rejected, code=4/5`, and `use of closed network connection`) clustered
+  with the WARP listener cycling, not with DNS — the proxy closed the
+  connection mid-flight.
+- One destination (`www.reddit.com`) was reset by the WARP egress IP
+  while the same name worked through a WireGuard provider, so it was
+  moved off this lane.
+
+Conclusion: keep remote DNS as the documented default, but do not treat
+this lane's intermittent failures as a DNS bug without first checking
+whether the WARP listener stayed up for the whole request.

@@ -173,11 +173,18 @@ class ApplyPresetsTests(unittest.TestCase):
 
     def test_adds_opencode_route(self):
         result = setup_tui.apply_presets(self.config)
-        self.assertEqual(result["added"], ["opencode-zen", "roblox"])
+        self.assertEqual(result["added"], ["opencode-zen", "roblox", "reddit"])
         data = json.loads(self.config.read_text())
         route = next(r for r in data["routes"] if r["id"] == "opencode-zen")
         self.assertEqual(route["domains"], ["opencode.ai"])
         self.assertEqual(route["provider"], "proton")
+
+    def test_adds_reddit_route_via_cloudflare(self):
+        setup_tui.apply_presets(self.config)
+        data = json.loads(self.config.read_text())
+        route = next(r for r in data["routes"] if r["id"] == "reddit")
+        self.assertEqual(route["provider"], "cloudflare")
+        self.assertIn("reddit.com", route["domains"])
 
     def test_adds_roblox_route(self):
         setup_tui.apply_presets(self.config)
