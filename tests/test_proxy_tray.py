@@ -1592,6 +1592,77 @@ class DashboardLifecycleTests(unittest.TestCase):
         self.assertIsNone(controller.window)
 
 
+def _is_window_server_unavailable_error(exc):
+    message = str(exc)
+    name = str(getattr(exc, "name", "") or "")
+    reason = str(getattr(exc, "reason", "") or "")
+    if not name:
+        name, _, parsed_reason = message.partition(" - ")
+        reason = reason or parsed_reason
+    if name in {
+        "NSWindowServerCommunicationException",
+        "NSWindowServerException",
+    }:
+        return True
+    reason = reason.lower().replace("windowserver", "window server")
+    return (
+        name == "NSInternalInconsistencyException"
+        and "window server" in reason
+        and any(
+            phrase in reason
+            for phrase in (
+                "not available",
+                "unavailable",
+                "unable to connect",
+                "cannot connect",
+            )
+        )
+    )
+
+
+def _make_dashboard_window_or_skip(test_case, factory, *args):
+    try:
+        return factory(*args)
+    except tray.objc.error as exc:
+        if _is_window_server_unavailable_error(exc):
+            test_case.skipTest(f"no window server: {exc}")
+        raise
+
+
+class DashboardRenderWindowConstructionTests(unittest.TestCase):
+    def test_only_known_window_server_errors_skip(self):
+        class FakeObjCError(Exception):
+            def __init__(self, name, reason):
+                self.name = name
+                self.reason = reason
+                super().__init__(f"{name} - {reason}")
+
+        def raising(exc):
+            def factory(*_args):
+                raise exc
+            return factory
+
+        with mock.patch.object(tray, "objc", SimpleNamespace(error=FakeObjCError)):
+            for name, reason in (
+                ("NSWindowServerCommunicationException", "server unavailable"),
+                ("NSInternalInconsistencyException", "WindowServer is not available"),
+            ):
+                with self.subTest(name=name), self.assertRaises(unittest.SkipTest):
+                    _make_dashboard_window_or_skip(
+                        self, raising(FakeObjCError(name, reason)))
+
+            cocoa_bug = FakeObjCError(
+                "NSInvalidArgumentException", "setTitle_ received an invalid value")
+            with self.assertRaises(FakeObjCError) as caught:
+                _make_dashboard_window_or_skip(self, raising(cocoa_bug))
+            self.assertIs(caught.exception, cocoa_bug)
+
+            python_bug = RuntimeError("_apply_status failed")
+            with self.assertRaises(RuntimeError) as caught:
+                _make_dashboard_window_or_skip(self, raising(python_bug))
+            self.assertIs(caught.exception, python_bug)
+
+
 class DashboardRenderTests(unittest.TestCase):
     """The dashboard must survive a real AppKit repaint.
 
@@ -1619,12 +1690,9 @@ class DashboardRenderTests(unittest.TestCase):
     def test_window_draw_survives_repaint(self):
         client = tray.RouterClient("/tmp")
         app = tray.TrayApp(client, None)
-        try:
-            window = app.dashboard.window_factory(
-                client, app._dispatch_dashboard_action,
-                tray.RouterStatus(up=True, port=2080))
-        except Exception as exc:
-            self.skipTest(f"no window server: {exc}")
+        window = _make_dashboard_window_or_skip(
+            self, app.dashboard.window_factory, client,
+            app._dispatch_dashboard_action, tray.RouterStatus(up=True, port=2080))
 
         self.render(window.root)
         self.render(window.root)
