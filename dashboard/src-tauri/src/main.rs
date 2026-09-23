@@ -8,8 +8,10 @@
 //! (Emanboiee/proxy-router#144).
 
 mod controller;
+mod tray_owner;
+use crate::tray_owner::TrayOwnerLease;
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -38,7 +40,12 @@ impl LiveStatus {
         let state = self.state.lock().map(|s| s.clone()).unwrap_or_default();
         let payload = self.payload.lock().ok().and_then(|p| p.clone());
         let detail = self.detail.lock().ok().and_then(|d| d.clone());
-        let age = self.at.lock().ok().and_then(|a| *a).map(|t| t.elapsed().as_millis());
+        let age = self
+            .at
+            .lock()
+            .ok()
+            .and_then(|a| *a)
+            .map(|t| t.elapsed().as_millis());
         (state, payload, detail, age)
     }
 }
@@ -249,7 +256,14 @@ fn apply_preset(app: AppHandle, name: String) -> Result<String, String> {
 /// Config keys the dashboard may read. Explicit allowlist: router.json is
 /// handed to the webview, so no key is exposed implicitly.
 const CONFIG_KEYS: [&str; 8] = [
-    "port", "preset", "providers", "routes", "routing", "vpn", "keepalive", "rotation",
+    "port",
+    "preset",
+    "providers",
+    "routes",
+    "routing",
+    "vpn",
+    "keepalive",
+    "rotation",
 ];
 
 /// Preset/SSID slug rules, mirrored from the engine's validation.
@@ -259,9 +273,7 @@ fn valid_slug(value: &str, max: usize) -> bool {
     // networks contain spaces and non-ASCII; the old alnum-only rule made
     // them unmappable from the UI.
     let trimmed = value.trim();
-    !trimmed.is_empty()
-        && trimmed.len() <= max
-        && !trimmed.contains(|c: char| c.is_control())
+    !trimmed.is_empty() && trimmed.len() <= max && !trimmed.contains(|c: char| c.is_control())
 }
 
 /// Redacted router.json view for Profiles / Providers / Routing / Settings.
@@ -271,8 +283,8 @@ fn get_config() -> Result<Value, String> {
     let path = root.join("router.json");
     let raw = std::fs::read_to_string(&path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-    let parsed: Value = serde_json::from_str(&raw)
-        .map_err(|error| format!("invalid router.json: {error}"))?;
+    let parsed: Value =
+        serde_json::from_str(&raw).map_err(|error| format!("invalid router.json: {error}"))?;
     let mut out = serde_json::Map::new();
     for key in CONFIG_KEYS {
         if let Some(value) = parsed.get(key) {
@@ -298,10 +310,23 @@ fn set_network_preset(ssid: String, preset: String) -> Result<Value, String> {
         return Err("network name must be 1-255 characters without control characters".into());
     }
     if !valid_slug(&preset, 64) {
-        return Err("preset name must be 1-64 characters of letters, digits, dot, dash or underscore".into());
+        return Err(
+            "preset name must be 1-64 characters of letters, digits, dot, dash or underscore"
+                .into(),
+        );
     }
     let root = controller::router_root();
-    controller::run_controller(&root, &["network-preset", "set", "--ssid", &ssid, "--preset", &preset])?;
+    controller::run_controller(
+        &root,
+        &[
+            "network-preset",
+            "set",
+            "--ssid",
+            &ssid,
+            "--preset",
+            &preset,
+        ],
+    )?;
     controller::json_command(&root, &["network-preset", "show"])
 }
 
@@ -352,13 +377,28 @@ fn add_route(domain: String, provider: String, id: Option<String>) -> Result<Val
         return Err("domain must be a hostname of 1-253 characters".into());
     }
     if !valid_slug(&provider, 64) {
-        return Err("provider must be 1-64 characters of letters, digits, dot, dash or underscore".into());
+        return Err(
+            "provider must be 1-64 characters of letters, digits, dot, dash or underscore".into(),
+        );
     }
     let root = controller::router_root();
-    let mut args = vec!["add", "--domain", domain.as_str(), "--provider", provider.as_str()];
-    if let Some(id) = id.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+    let mut args = vec![
+        "add",
+        "--domain",
+        domain.as_str(),
+        "--provider",
+        provider.as_str(),
+    ];
+    if let Some(id) = id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         if !valid_slug(id, 64) {
-            return Err("route id must be 1-64 characters of letters, digits, dot, dash or underscore".into());
+            return Err(
+                "route id must be 1-64 characters of letters, digits, dot, dash or underscore"
+                    .into(),
+            );
         }
         args.push("--id");
         args.push(id);
@@ -371,7 +411,9 @@ fn add_route(domain: String, provider: String, id: Option<String>) -> Result<Val
 #[tauri::command]
 fn remove_route(id: String) -> Result<Value, String> {
     if !valid_slug(&id, 64) {
-        return Err("route id must be 1-64 characters of letters, digits, dot, dash or underscore".into());
+        return Err(
+            "route id must be 1-64 characters of letters, digits, dot, dash or underscore".into(),
+        );
     }
     let root = controller::router_root();
     controller::run_controller(&root, &["remove", &id])?;
@@ -382,18 +424,48 @@ fn remove_route(id: String) -> Result<Value, String> {
 fn set_tray_status<R: Runtime>(app: AppHandle<R>, state: String) -> Result<(), String> {
     apply_tray_state(&app, &state)
 }
+type OwnerSlot = Arc<Mutex<Option<TrayOwnerLease>>>;
+
+fn claim_tray_ownership(root: &std::path::Path, slot: &OwnerSlot) -> std::io::Result<()> {
+    let lease = TrayOwnerLease::claim(root)?;
+    let mut stored = slot
+        .lock()
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "tray owner lock poisoned"))?;
+    *stored = Some(lease.clone());
+    drop(stored);
+    let _ = lease.start_heartbeat()?;
+    Ok(())
+}
+
+fn release_tray_ownership(slot: &OwnerSlot) {
+    let lease = slot.lock().ok().and_then(|mut stored| stored.take());
+    if let Some(lease) = lease {
+        if let Err(error) = lease.release() {
+            eprintln!("tray owner cleanup failed: {error}");
+        }
+    }
+}
 
 fn main() {
-    tauri::Builder::default()
+    let owner_slot = Arc::new(Mutex::new(None::<TrayOwnerLease>));
+    let owner_cleanup = Arc::clone(&owner_slot);
+    let setup_owner = Arc::clone(&owner_slot);
+    let owner_root = controller::router_root();
+
+    let run_result = tauri::Builder::default()
         .manage(LaunchTime(Instant::now()))
         .manage(LiveStatus::default())
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             show_dashboard(app);
         }))
-        .setup(|app| {
+        .setup(move |app| {
             #[cfg(target_os = "macos")]
             app.handle()
                 .set_activation_policy(tauri::ActivationPolicy::Accessory)?;
+
+            // Claim before building our status item, so the Python tray can
+            // hide itself as soon as this app can serve the menu bar.
+            claim_tray_ownership(&owner_root, &setup_owner)?;
 
             let open = MenuItem::with_id(app, "open", "Open Dashboard", true, None::<&str>)?;
             let connect = MenuItem::with_id(app, "connect", "Connect", true, None::<&str>)?;
@@ -407,27 +479,49 @@ fn main() {
             let mut preset_items = Vec::new();
             for name in ALLOWED_PRESETS {
                 preset_items.push(MenuItem::with_id(
-                    app, format!("preset:{name}"), name, true, None::<&str>)?);
+                    app,
+                    format!("preset:{name}"),
+                    name,
+                    true,
+                    None::<&str>,
+                )?);
             }
-            let preset_refs: Vec<&dyn tauri::menu::IsMenuItem<_>> =
-                preset_items.iter().map(|item| item as &dyn tauri::menu::IsMenuItem<_>).collect();
+            let preset_refs: Vec<&dyn tauri::menu::IsMenuItem<_>> = preset_items
+                .iter()
+                .map(|item| item as &dyn tauri::menu::IsMenuItem<_>)
+                .collect();
             let presets_menu = Submenu::with_items(app, "Presets", true, &preset_refs)?;
 
             let mut mode_items = Vec::new();
             for mode in ["safe-list", "vpn-list", "default"] {
                 mode_items.push(MenuItem::with_id(
-                    app, format!("routing:{mode}"), mode, true, None::<&str>)?);
+                    app,
+                    format!("routing:{mode}"),
+                    mode,
+                    true,
+                    None::<&str>,
+                )?);
             }
-            let mode_refs: Vec<&dyn tauri::menu::IsMenuItem<_>> =
-                mode_items.iter().map(|item| item as &dyn tauri::menu::IsMenuItem<_>).collect();
+            let mode_refs: Vec<&dyn tauri::menu::IsMenuItem<_>> = mode_items
+                .iter()
+                .map(|item| item as &dyn tauri::menu::IsMenuItem<_>)
+                .collect();
             let routing_menu = Submenu::with_items(app, "Routing mode", true, &mode_refs)?;
             let separator = PredefinedMenuItem::separator(app)?;
             let quit = MenuItem::with_id(app, "quit", "Quit Proxy Router", true, None::<&str>)?;
             let menu = Menu::with_items(
                 app,
                 &[
-                    &open, &connect, &disconnect, &rotate, &sweep, &refresh,
-                    &presets_menu, &routing_menu, &separator, &quit,
+                    &open,
+                    &connect,
+                    &disconnect,
+                    &rotate,
+                    &sweep,
+                    &refresh,
+                    &presets_menu,
+                    &routing_menu,
+                    &separator,
+                    &quit,
                 ],
             )?;
 
@@ -525,8 +619,12 @@ fn main() {
                 }
             }
         })
-        .run(tauri::generate_context!())
-        .expect("Unable to open dashboard preview");
+        .run(tauri::generate_context!());
+
+    // run() returns on the app's Quit action; hand the status item back to
+    // the Python tray before the process exits.
+    release_tray_ownership(&owner_cleanup);
+    run_result.expect("Unable to open dashboard preview");
 }
 
 #[cfg(test)]
