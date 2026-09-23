@@ -129,7 +129,10 @@ class _ValidatedRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Follow a redirect only when the hop itself passes the SSRF check."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if target_violation(newurl) is not None:
+        violation = target_violation(
+            newurl, resolved_addresses=resolve_target_addresses(newurl)
+        )
+        if violation is not None:
             return None
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
@@ -140,6 +143,11 @@ _SAFE_OPENER = urllib.request.build_opener(_ValidatedRedirectHandler)
 def _safe_urlopen(url, timeout=None):
     """Default monitor transport: redirect-aware with per-hop validation."""
     return _SAFE_OPENER.open(url, timeout=timeout)
+
+
+def _uses_urllib_transport(opener) -> bool:
+    """True for built-in transports that accept urllib Request objects."""
+    return opener is _safe_urlopen or opener is urllib.request.urlopen
 
 
 def validate_ping_host(host: str) -> str | None:
@@ -167,9 +175,10 @@ def validate_ping_host(host: str) -> str | None:
 
 
 def _open(opener, url: str, timeout: float):
-    """Use browser-like headers for real urllib; leave injected test openers simple."""
-    if opener is urllib.request.urlopen:
-        return opener(urllib.request.Request(url, headers=DEFAULT_HEADERS), timeout=timeout)
+    """Use browser-like headers for urllib transports; keep injected openers simple."""
+    if _uses_urllib_transport(opener):
+        request = urllib.request.Request(url, headers=DEFAULT_HEADERS)
+        return opener(request, timeout=timeout)
     return opener(url, timeout=timeout)
 
 
@@ -250,7 +259,7 @@ def measure_http_latency(url: str = DEFAULT_HTTP_URL, *, opener=_safe_urlopen,
     started = clock()
     response = None
     violation = target_violation(url)
-    if violation is None and opener is urllib.request.urlopen:
+    if violation is None and _uses_urllib_transport(opener):
         # Connection-time revalidation of what the name resolves to right now
         # closes the DNS-rebinding window left by config-time checks alone.
         violation = target_violation(
@@ -289,7 +298,7 @@ def measure_download(url: str = DEFAULT_DOWNLOAD_URL, *, max_bytes: int = DEFAUL
     response = None
     total = 0
     violation = target_violation(url)
-    if violation is None and opener is urllib.request.urlopen:
+    if violation is None and _uses_urllib_transport(opener):
         violation = target_violation(
             url, resolved_addresses=resolve_target_addresses(url)
         )
@@ -319,7 +328,7 @@ def measure_upload(url: str = DEFAULT_UPLOAD_URL, *, max_bytes: int = DEFAULT_MA
     started = clock()
     response = None
     violation = target_violation(url)
-    if violation is None and opener is urllib.request.urlopen:
+    if violation is None and _uses_urllib_transport(opener):
         violation = target_violation(
             url, resolved_addresses=resolve_target_addresses(url)
         )

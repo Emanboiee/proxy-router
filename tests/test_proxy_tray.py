@@ -3,6 +3,7 @@ module's pystray/PIL imports are guarded)."""
 import importlib.util
 import io
 import json
+import plistlib
 import signal
 import subprocess
 import sys
@@ -74,12 +75,15 @@ class MainInitializationTests(unittest.TestCase):
             def run(self):
                 return None
 
-        with mock.patch.object(tray, "RouterClient", return_value=client), \
-             mock.patch.object(tray, "TrayApp", FakeApp), \
-             mock.patch.object(tray, "make_icon", return_value=object()) as make_icon, \
-             mock.patch.object(tray, "pystray", object()), \
-             mock.patch.object(tray, "Image", object()), \
-             mock.patch.object(tray.sys, "argv", ["proxy_tray.py", "--root", "/tmp"]):
+        with (
+            mock.patch.object(tray, "RouterClient", return_value=client),
+            mock.patch.object(tray, "TrayApp", FakeApp),
+            mock.patch.object(tray, "make_icon", return_value=object()) as make_icon,
+            mock.patch.object(tray, "pystray", object()),
+            mock.patch.object(tray, "Image", object()),
+            mock.patch.object(tray, "_dashboard_bundle", return_value=None),
+            mock.patch.object(tray.sys, "argv", ["proxy_tray.py", "--root", "/tmp"]),
+        ):
             self.assertEqual(tray.main(), 0)
 
         self.assertIs(created["client"], client)
@@ -1265,17 +1269,29 @@ class DashboardOpenerTests(unittest.TestCase):
 
     def test_prefers_tauri_dashboard_bundle(self):
         app = self.root / "Proxy Router.app"
-        (app / "Contents" / "MacOS").mkdir(parents=True)
+        macos = app / "Contents" / "MacOS"
+        macos.mkdir(parents=True)
+        executable = "proxy-router-dashboard"
+        with (app / "Contents" / "Info.plist").open("wb") as handle:
+            plistlib.dump({"CFBundleExecutable": executable}, handle)
+        binary = macos / executable
+        binary.write_text("#!/bin/sh\\n")
+        binary.chmod(0o755)
         calls = []
 
         def fake_popen(argv, **kwargs):
             calls.append(argv)
             return mock.Mock()
 
-        with mock.patch.dict(
-            tray.os.environ, {"PROXY_ROUTER_DASHBOARD": str(app)}, clear=False
-        ), mock.patch.object(tray.sys, "platform", "darwin"), mock.patch.object(
-            tray.subprocess, "Popen", side_effect=fake_popen
+        with (
+            mock.patch.dict(
+                tray.os.environ, {"PROXY_ROUTER_DASHBOARD": str(app)}, clear=False
+            ),
+            mock.patch.object(tray.sys, "platform", "darwin"),
+            mock.patch.object(
+                tray, "_dashboard_bundle_candidates", return_value=[app]
+            ),
+            mock.patch.object(tray.subprocess, "Popen", side_effect=fake_popen),
         ):
             self.assertTrue(tray.open_dashboard(self.root))
 
@@ -1284,15 +1300,21 @@ class DashboardOpenerTests(unittest.TestCase):
 
     def test_missing_tui_fails_quietly(self):
         (self.root / "setup_tui.py").unlink()
-        self.assertFalse(tray.open_dashboard(self.root))
+        with mock.patch.object(tray, "_dashboard_bundle", return_value=None):
+            self.assertFalse(tray.open_dashboard(self.root))
 
     @unittest.skipUnless(sys.platform == "darwin", "macOS Terminal path")
     def test_macos_opens_terminal_with_tui(self):
         calls = []
+
         def fake_popen(argv, **kwargs):
             calls.append(argv)
             return mock.Mock()
-        with mock.patch.object(tray.subprocess, "Popen", side_effect=fake_popen):
+
+        with (
+            mock.patch.object(tray, "_dashboard_bundle", return_value=None),
+            mock.patch.object(tray.subprocess, "Popen", side_effect=fake_popen),
+        ):
             self.assertTrue(tray.open_dashboard(self.root))
         self.assertEqual(calls[0][0], "osascript")
         self.assertIn("setup_tui.py", " ".join(calls[0]))
@@ -1492,6 +1514,7 @@ class DashboardViewModelTests(unittest.TestCase):
         self.assertEqual(model.primary_action, "disconnect")
         self.assertEqual(
             tray._dashboard_indicator(status), ("▲", (242, 157, 76)))
+        self.assertIn("proton", model.explanation)
 
     def test_error_model_renders_actionable_error_without_crashing(self):
         model = tray.DashboardViewModel.from_status(
@@ -1769,12 +1792,45 @@ class DashboardTrayIntegrationTests(unittest.TestCase):
 
 
 class TrayOwnershipTests(unittest.TestCase):
-    """Issue #144: exactly one proxy-router menu-bar item — the dashboard app.
+    """Issue #144: exactly one proxy-router menu-bar item — the dashboard app."""
 
-    The tray agent must refuse to paint a second status item while the
-    dashboard bundle is installed; PROXY_ROUTER_TRAY_HEADLESS=0 keeps the
-    legacy icon for local debugging.
-    """
+    def _bundle(self, root: Path, name: str, *, executable=None, include_binary=True):
+        app = root / name
+        macos = app / "Contents" / "MacOS"
+        macos.mkdir(parents=True)
+        if executable is not None:
+            with (app / "Contents" / "Info.plist").open("wb") as handle:
+                plistlib.dump({"CFBundleExecutable": executable}, handle)
+            if include_binary:
+                binary = macos / executable
+                binary.write_text("#!/bin/sh\n")
+                binary.chmod(0o755)
+        return app
+
+    def test_empty_bundle_does_not_count_as_installed_dashboard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self._bundle(Path(directory), "Empty.app")
+            self.assertFalse(tray._is_complete_dashboard_bundle(app))
+
+    def test_bundle_requires_declared_executable_to_exist(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self._bundle(
+                Path(directory), "Incomplete.app",
+                executable="proxy-router-dashboard", include_binary=False,
+            )
+            self.assertFalse(tray._is_complete_dashboard_bundle(app))
+
+    def test_complete_bundle_owns_the_tray(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self._bundle(
+                Path(directory), "Proxy Router.app",
+                executable="proxy-router-dashboard",
+            )
+            self.assertTrue(tray._is_complete_dashboard_bundle(app))
+            with mock.patch.object(
+                tray, "_dashboard_bundle_candidates", return_value=[app]
+            ):
+                self.assertEqual(tray._dashboard_bundle(Path(directory)), app)
 
     def test_installed_dashboard_forces_headless(self):
         bundle = Path("/tmp/Proxy Router.app")
@@ -1782,25 +1838,34 @@ class TrayOwnershipTests(unittest.TestCase):
             self.assertEqual(tray.tray_ownership("/tmp/root"), "headless")
 
     def test_no_dashboard_bundle_keeps_the_legacy_icon(self):
-        with mock.patch.object(tray, "_dashboard_bundle", return_value=None), \
-                mock.patch.dict(tray.os.environ, {"PROXY_ROUTER_TRAY_HEADLESS": ""}):
+        with (
+            mock.patch.object(tray, "_dashboard_bundle", return_value=None),
+            mock.patch.dict(tray.os.environ, {"PROXY_ROUTER_TRAY_HEADLESS": ""}),
+        ):
             self.assertEqual(tray.tray_ownership("/tmp/root"), "icon")
 
     def test_explicit_opt_out_keeps_the_legacy_icon(self):
-        with mock.patch.object(tray, "_dashboard_bundle",
-                               return_value=Path("/tmp/Proxy Router.app")), \
-                mock.patch.dict(tray.os.environ, {"PROXY_ROUTER_TRAY_HEADLESS": "0"}):
+        with (
+            mock.patch.object(
+                tray, "_dashboard_bundle", return_value=Path("/tmp/Proxy Router.app")
+            ),
+            mock.patch.dict(tray.os.environ, {"PROXY_ROUTER_TRAY_HEADLESS": "0"}),
+        ):
             self.assertEqual(tray.tray_ownership("/tmp/root"), "icon")
 
     def test_main_refuses_the_icon_when_the_dashboard_owns_the_menubar(self):
         stderr = io.StringIO()
-        with mock.patch.object(tray, "_dashboard_bundle",
-                               return_value=Path("/tmp/Proxy Router.app")), \
-                mock.patch.object(tray, "RouterClient") as client, \
-                mock.patch.object(tray, "TrayApp") as tray_app, \
-                mock.patch.object(sys, "stderr", stderr), \
-                mock.patch.object(sys, "argv",
-                                  ["proxy_tray.py", "--root", "/tmp/root"]):
+        with (
+            mock.patch.object(
+                tray, "_dashboard_bundle", return_value=Path("/tmp/Proxy Router.app")
+            ),
+            mock.patch.object(tray, "RouterClient") as client,
+            mock.patch.object(tray, "TrayApp") as tray_app,
+            mock.patch.object(sys, "stderr", stderr),
+            mock.patch.object(
+                sys, "argv", ["proxy_tray.py", "--root", "/tmp/root"]
+            ),
+        ):
             rc = tray.main()
         self.assertEqual(rc, 0)
         client.assert_not_called()

@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import plistlib
 import re
 import shlex
 import shutil
@@ -444,7 +445,7 @@ class DashboardViewModel:
             explanation = "The dashboard could not read proxy-router status. Try Connect again or open Setup."
         elif status.up and status.degraded_lanes:
             title = "Degraded"
-            explanation = "Some routed connections need attention. Check the status details below."
+            explanation = f"Some routed connections need attention: {', '.join(status.degraded_lanes)}."
         elif not providers:
             title = "No VPN profile yet"
             explanation = "Add a provider profile from Setup, then Connect to start routing traffic."
@@ -702,8 +703,8 @@ def _launch_terminal(root, script_args: list[str]) -> bool:
     return False
 
 
-def _dashboard_bundle(root: Path) -> Path | None:
-    """Find the built Tauri dashboard without assuming a developer path."""
+def _dashboard_bundle_candidates(root: Path) -> list[Path]:
+    """Find dashboard bundle locations without assuming a developer path."""
     override = os.environ.get("PROXY_ROUTER_DASHBOARD")
     candidates: list[Path] = []
     if override:
@@ -724,9 +725,38 @@ def _dashboard_bundle(root: Path) -> Path | None:
             candidates.append(
                 base / "target" / profile / "bundle" / "macos" / "Proxy Router.app"
             )
+    return candidates
 
-    for app in candidates:
-        if app.is_dir() and (app / "Contents" / "MacOS").is_dir():
+
+def _is_complete_dashboard_bundle(app: Path) -> bool:
+    """Require the bundle metadata and executable before suppressing the tray."""
+    app = Path(app)
+    if not app.is_dir():
+        return False
+    contents = app / "Contents"
+    try:
+        with (contents / "Info.plist").open("rb") as handle:
+            metadata = plistlib.load(handle)
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return False
+    if not isinstance(metadata, dict):
+        return False
+    executable = metadata.get("CFBundleExecutable")
+    if not isinstance(executable, str) or not executable:
+        return False
+    if Path(executable).name != executable:
+        return False
+    binary = contents / "MacOS" / executable
+    try:
+        return binary.is_file() and bool(binary.stat().st_mode & 0o111)
+    except OSError:
+        return False
+
+
+def _dashboard_bundle(root: Path) -> Path | None:
+    """Find a complete built Tauri dashboard bundle."""
+    for app in _dashboard_bundle_candidates(root):
+        if _is_complete_dashboard_bundle(app):
             return app
     return None
 
