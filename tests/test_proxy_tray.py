@@ -76,6 +76,7 @@ class MainInitializationTests(unittest.TestCase):
 
         with mock.patch.object(tray, "RouterClient", return_value=client), \
              mock.patch.object(tray, "TrayApp", FakeApp), \
+             mock.patch.object(tray, "_dashboard_bundle", return_value=None), \
              mock.patch.object(tray, "make_icon", return_value=object()) as make_icon, \
              mock.patch.object(tray, "pystray", object()), \
              mock.patch.object(tray, "Image", object()), \
@@ -1284,7 +1285,8 @@ class DashboardOpenerTests(unittest.TestCase):
 
     def test_missing_tui_fails_quietly(self):
         (self.root / "setup_tui.py").unlink()
-        self.assertFalse(tray.open_dashboard(self.root))
+        with mock.patch.object(tray, "_dashboard_bundle", return_value=None):
+            self.assertFalse(tray.open_dashboard(self.root))
 
     @unittest.skipUnless(sys.platform == "darwin", "macOS Terminal path")
     def test_macos_opens_terminal_with_tui(self):
@@ -1292,13 +1294,15 @@ class DashboardOpenerTests(unittest.TestCase):
         def fake_popen(argv, **kwargs):
             calls.append(argv)
             return mock.Mock()
-        with mock.patch.object(tray.subprocess, "Popen", side_effect=fake_popen):
+        with mock.patch.object(tray, "_dashboard_bundle", return_value=None), \
+             mock.patch.object(tray.subprocess, "Popen", side_effect=fake_popen):
             self.assertTrue(tray.open_dashboard(self.root))
         self.assertEqual(calls[0][0], "osascript")
         self.assertIn("setup_tui.py", " ".join(calls[0]))
 
     def test_macos_terminal_failure_fails_quietly(self):
-        with mock.patch.object(tray.sys, "platform", "darwin"), \
+        with mock.patch.object(tray, "_dashboard_bundle", return_value=None), \
+             mock.patch.object(tray.sys, "platform", "darwin"), \
              mock.patch.object(tray.subprocess, "Popen",
                                side_effect=OSError("no Terminal")):
             self.assertFalse(tray.open_dashboard(self.root))
