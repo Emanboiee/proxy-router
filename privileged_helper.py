@@ -1263,9 +1263,14 @@ def _validate_dns(value: object) -> None:
     if not isinstance(rules, list) or len(rules) > 512:
         raise ValidationError("dns rules must be a bounded list")
     for rule in rules:
-        rule = _exact_object(rule, {"domain_suffix", "server"}, set(), "dns rule")
+        if isinstance(rule, dict) and rule.get("action") == "reject":
+            rule = _exact_object(rule, {"domain_suffix", "action"}, set(), "dns rule")
+            if rule["action"] != "reject":
+                raise ValidationError("dns rule action is unsupported")
+        else:
+            rule = _exact_object(rule, {"domain_suffix", "server"}, set(), "dns rule")
+            _string(rule["server"], "dns rule server", maximum=80)
         _strings(rule["domain_suffix"], "dns rule domain_suffix")
-        _string(rule["server"], "dns rule server", maximum=80)
 
 
 def _validate_route_rule(rule: object) -> None:
@@ -1275,6 +1280,19 @@ def _validate_route_rule(rule: object) -> None:
     if keys == {"action"} and rule["action"] == "sniff":
         return
     if keys == {"action", "protocol"} and rule == {"action": "hijack-dns", "protocol": "dns"}:
+        return
+    if rule.get("action") == "reject":
+        data_keys = keys - {"action"}
+        if not data_keys or not data_keys <= {"domain_suffix", "ip_cidr"}:
+            raise ValidationError("reject route rule keys must match the generated schema")
+        for key in data_keys:
+            values = _strings(rule[key], f"route rule {key}")
+            if key == "ip_cidr":
+                try:
+                    for value in values:
+                        ipaddress.ip_network(value, strict=False)
+                except ValueError as exc:
+                    raise ValidationError("route rule ip_cidr is invalid") from exc
         return
     data_keys = keys - {"outbound"}
     if "outbound" not in rule or not data_keys or not data_keys <= {"domain", "domain_suffix", "ip_cidr", "rule_set"}:

@@ -122,6 +122,9 @@ def _profile_data(value: Any, providers: dict[str, Any], old: dict[str, Any] | N
         raise DashboardError("Choose a routing mode")
     if not isinstance(fallback, str) or fallback not in _FALLBACKS:
         raise DashboardError("Choose a fallback behavior")
+    # A direct profile has no provider route that needs retry or block fallback.
+    if route_mode == "direct":
+        fallback = "direct"
     if provider_id and not _PROVIDER_ID.fullmatch(provider_id):
         raise DashboardError("Choose a valid connection")
     if route_mode != "direct" and provider_id not in providers:

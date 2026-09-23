@@ -114,6 +114,31 @@ def test_apply_full_and_direct_modes_map_to_engine_config(tmp_path):
     assert config["routing"]["mode"] == "default"
 
 
+
+def test_direct_profile_normalizes_retry_fallback_before_apply(tmp_path):
+    root = tmp_path / "router"
+    config_at(root)
+    add_provider(root, "primary")
+    fallback_source = tmp_path / "fallback.conf"
+    fallback_source.write_text(WIREGUARD.replace("vpn.example.test", "backup.example.test"))
+    fallback_id = manager.save_provider(
+        root, {"name": "Backup tunnel", "kind": "wireguard"}, source_path=str(fallback_source)
+    )["providers"][0]["id"]
+
+    saved = manager.save_profile(root, {
+        "name": "Direct with imported retry", "providerId": "", "routeMode": "direct",
+        "fallback": "retry", "fallbackProviderId": fallback_id,
+        "domains": [], "autoSubdomains": False,
+    })
+    profile = saved["profiles"][0]
+    manager.apply_profile(root, profile["id"])
+
+    config = json.loads((root / "router.json").read_text())
+    assert profile["fallback"] == "direct"
+    assert profile["fallbackProviderId"] == ""
+    assert "" not in config["providers"]
+    assert config["routing"] == {"mode": "default"}
+
 def test_invalid_profile_or_provider_save_preserves_saved_files(tmp_path):
     root = tmp_path / "router"
     config_at(root)
