@@ -96,18 +96,48 @@ class RouteWatcherTests(unittest.TestCase):
         self.assertEqual(event["host"], "opencode.ai")
         self.assertTrue(event["failure"])
 
-    def test_guard_requires_two_failures_and_cooldown(self):
+    def test_guard_requires_three_failures_and_cooldown(self):
         guard = w.RotationGuard()
         self.assertFalse(guard.record_transport_failure(100.0))
-        self.assertTrue(guard.record_transport_failure(101.0))
-        self.assertFalse(guard.record_transport_failure(102.0))
+        self.assertFalse(guard.record_transport_failure(101.0))
+        self.assertTrue(guard.record_transport_failure(102.0))
         self.assertFalse(guard.record_transport_failure(222.0))
-        self.assertTrue(guard.record_transport_failure(223.0))
+        self.assertFalse(guard.record_transport_failure(223.0))
+        self.assertTrue(guard.record_transport_failure(224.0))
 
     def test_guard_discards_old_failures(self):
         guard = w.RotationGuard()
         self.assertFalse(guard.record_transport_failure(100.0))
         self.assertFalse(guard.record_transport_failure(161.0))
+
+
+    def test_underlay_status_rejects_stale_or_unsupported_results(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        state = {"connected": False, "supported": True, "checked_at": 100}
+        captured = {}
+
+        def fake_runner(args, **kwargs):
+            captured["args"] = args
+            return SimpleNamespace(returncode=1, stdout=json.dumps(state), stderr="")
+
+        with mock.patch.object(w.sys, "platform", "darwin"):
+            self.assertFalse(w.underlay_network_status(root, runner=fake_runner, now=100))
+            state["checked_at"] = 39
+            self.assertIsNone(w.underlay_network_status(root, runner=fake_runner, now=100))
+            state.update({"connected": True, "supported": False, "checked_at": 100})
+            self.assertIsNone(w.underlay_network_status(root, runner=fake_runner, now=100))
+        self.assertEqual(captured["args"][-2:], ["network-status", "--json"])
+
+    def test_underlay_unknown_defers_and_explicit_no_route_is_classified(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        with mock.patch.object(w.sys, "platform", "darwin"), \
+             mock.patch.object(w, "underlay_network_status", return_value=None):
+            self.assertEqual(w.recovery_defer_reason(root), "network-status-unknown")
+        self.assertTrue(w.underlay_failure({
+            "line": "ERROR wireguard: dial udp: network is unreachable",
+        }))
 
     def test_probe_http_failure_is_not_transport_failure(self):
         def fake_runner(*args, **kwargs):
@@ -280,19 +310,18 @@ class RouteWatcherTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertGreaterEqual(ticks, 3)
 
-    def test_worker_rotates_after_context_canceled_probe_confirmation(self):
+    def test_worker_recovers_proton2_after_three_context_cancellations(self):
         root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, root, ignore_errors=True)
         w.state_dir(root).mkdir(parents=True)
         (root / "router.json").write_text(json.dumps({
-            "routes": [{"id": "opencode", "domains": ["opencode.ai"], "provider": "proton"}],
+            "port": 2281,
+            "routes": [{"id": "discord", "domains": ["discord.com"], "provider": "proton2"}],
         }))
         lines = [
-            "ERROR connection: open connection to opencode.ai:443 using "
-            "outbound/wireguard[proton]: context canceled\n",
-            "ERROR connection: open connection to opencode.ai:443 using "
-            "outbound/wireguard[proton]: context canceled\n",
-        ]
+            "ERROR connection: open connection to discord.com:443 using "
+            "outbound/wireguard[proton2]: context canceled\n",
+        ] * 3
         reads = [0]
         calls = []
 
@@ -310,26 +339,28 @@ class RouteWatcherTests(unittest.TestCase):
              mock.patch.object(w, "client_snapshot", return_value=[]), \
              mock.patch.object(w, "_network_check_hop"), \
              mock.patch.object(w, "probe_target", return_value={
-                 "host": "opencode.ai", "transport_failure": True,
+                 "host": "discord.com", "transport_failure": True,
                  "error": "SSL_ERROR_SYSCALL",
              }), \
+             mock.patch.object(w, "recovery_defer_reason", return_value=None), \
              mock.patch.object(w, "rotate_provider", side_effect=lambda *args, **kwargs: calls.append(args) or {"rotated": True}):
             rc = w.worker(root, interval=0.05, sleep=stop_after_tick)
         self.assertEqual(rc, 0)
-        self.assertEqual(calls, [(root.resolve(), "proton")])
+        self.assertEqual(calls, [(root.resolve(), "proton2")])
 
-    def test_worker_rotates_provider_from_outbound_tag(self):
+    def test_worker_recovers_provider_from_outbound_tag_after_three_failures(self):
         root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, root, ignore_errors=True)
         w.state_dir(root).mkdir(parents=True)
         (root / "router.json").write_text(json.dumps({
+            "port": 2281,
             "routes": [{"id": "discord", "domains": ["discord.com"], "provider": "cloudflare"}],
             "routing": {"mode": "vpn-list", "vpn_domains": ["discord.com"]},
         }))
         lines = [
-            "ERROR using outbound/wireguard[cloudflare]: open connection to discord.com:443: connection reset\n",
-            "ERROR using outbound/wireguard[cloudflare]: open connection to discord.com:443: connection reset\n",
-        ]
+            "ERROR using outbound/wireguard[cloudflare]: open connection to "
+            "discord.com:443: connection reset\n",
+        ] * 3
         reads = [0]
         calls = []
 
@@ -347,10 +378,50 @@ class RouteWatcherTests(unittest.TestCase):
              mock.patch.object(w, "client_snapshot", return_value=[]), \
              mock.patch.object(w, "_network_check_hop"), \
              mock.patch.object(w, "probe_target", return_value={"transport_failure": False}), \
+             mock.patch.object(w, "recovery_defer_reason", return_value=None), \
              mock.patch.object(w, "rotate_provider", side_effect=lambda *args, **kwargs: calls.append(args) or {"rotated": False}):
             rc = w.worker(root, interval=0.05, sleep=stop_after_tick)
         self.assertEqual(rc, 0)
         self.assertEqual(calls, [(root.resolve(), "cloudflare")])
+
+    def test_worker_defers_proton2_recovery_while_wifi_is_disconnected(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        w.state_dir(root).mkdir(parents=True)
+        (root / "router.json").write_text(json.dumps({
+            "port": 2281,
+            "routes": [{"id": "discord", "domains": ["discord.com"], "provider": "proton2"}],
+        }))
+        lines = [
+            "ERROR using outbound/wireguard[proton2]: open connection to "
+            "discord.com:443: TLS handshake timeout\n",
+        ] * 3
+        reads = [0]
+
+        def fake_read(_path, offset):
+            if reads[0] == 0:
+                reads[0] += 1
+                return offset, lines
+            return offset, []
+
+        def stop_after_tick(_seconds):
+            w.enabled_file(root).unlink(missing_ok=True)
+
+        with mock.patch.object(w, "engine_pid_alive", return_value=True), \
+             mock.patch.object(w, "_read_new_lines", side_effect=fake_read), \
+             mock.patch.object(w, "client_snapshot", return_value=[]), \
+             mock.patch.object(w, "_network_check_hop"), \
+             mock.patch.object(w, "probe_target", return_value={"transport_failure": False}), \
+             mock.patch.object(w, "recovery_defer_reason", return_value="wifi-disconnected"), \
+             mock.patch.object(w, "rotate_provider") as rotate:
+            rc = w.worker(root, interval=0.05, sleep=stop_after_tick)
+        self.assertEqual(rc, 0)
+        rotate.assert_not_called()
+        events = [json.loads(line) for line in w.events_file(root).read_text().splitlines()]
+        deferred = [event for event in events if event["kind"] == "recovery-deferred"]
+        self.assertEqual(len(deferred), 1)
+        self.assertEqual(deferred[0]["provider"], "proton2")
+        self.assertEqual(deferred[0]["reason"], "wifi-disconnected")
 
     def test_worker_sigterm_self_cleans_markers_after_exit(self):
         """AC4: a SIGTERM'd worker exits through its finally and removes its
@@ -434,21 +505,26 @@ class RouteWatcherTests(unittest.TestCase):
             w.client_snapshot(root, runner=fake_runner)
         self.assertIn("-iTCP:2081", captured["args"], f"args: {captured['args']}")
 
-    def test_probe_target_uses_configured_port(self):
-        """AC6: probe_target must route through the configured port."""
+    def test_probe_target_uses_proton2_fixture_port(self):
+        """The isolated proton2 fixture must never hit the live 2080 listener."""
         root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, root, ignore_errors=True)
-        (root / "router.json").write_text(json.dumps({"port": 2081}))
+        (root / "router.json").write_text(json.dumps({
+            "port": 2281,
+            "routes": [{"id": "discord", "domains": ["discord.com"], "provider": "proton2"}],
+        }))
         captured: dict = {}
 
         def fake_runner(args, **kwargs):
             captured["args"] = args
             return SimpleNamespace(returncode=0, stdout="200", stderr="")
 
-        result = w.probe_target(root, "opencode.ai", runner=fake_runner)
+        self.assertEqual(w.provider_for_host(root, "discord.com"), "proton2")
+        result = w.probe_target(root, "discord.com", runner=fake_runner)
         self.assertTrue(result["ok"])
         self.assertIn("--proxy", captured["args"])
-        self.assertIn("http://127.0.0.1:2081", captured["args"])
+        self.assertIn("http://127.0.0.1:2281", captured["args"])
+        self.assertNotIn("http://127.0.0.1:2080", captured["args"])
 
     def test_append_event_hands_ownership_back_to_sudo_user(self):
         """AC5: a root-owned worker hands fresh event files back to the user

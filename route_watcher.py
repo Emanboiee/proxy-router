@@ -42,10 +42,11 @@ TARGET_IDLE_SECONDS = 60.0
 PROBE_EVERY_SECONDS = 10.0
 CLIENT_SNAPSHOT_EVERY_SECONDS = 5.0
 FAILURE_WINDOW_SECONDS = 60.0
-MIN_TRANSPORT_FAILURES = 2
+MIN_TRANSPORT_FAILURES = 3
 ROTATE_COOLDOWN_SECONDS = 120.0
 RESTORE_COOLDOWN_SECONDS = 300.0
 NETWORK_CHECK_EVERY_SECONDS = 30.0
+NETWORK_STATUS_MAX_AGE_SECONDS = 60.0
 EVENT_MAX_LINES = 5000
 EVENT_MAX_BYTES = 2_000_000
 TARGET_RE = re.compile(
@@ -61,6 +62,11 @@ FAILURE_RE = re.compile(
     re.IGNORECASE,
 )
 _CONTEXT_CANCEL_RE = re.compile(r"\bcontext\s+cancel(?:ed|led)\b", re.IGNORECASE)
+UNDERLAY_FAILURE_RE = re.compile(
+    r"\b(?:network is unreachable|no route to (?:host|internet)|network is down|"
+    r"missing default interface|wireguard is not ready yet)\b",
+    re.IGNORECASE,
+)
 
 
 def state_dir(root: Path | None = None) -> Path:
@@ -478,6 +484,91 @@ def rotate_provider(root: Path, provider: str = "proton", *, host: str | None = 
             "output": (result.stderr or result.stdout or "")[-300:]}
 
 
+
+def underlay_network_status(root: Path, *, runner: Callable = subprocess.run,
+                            now: float | None = None) -> bool | None:
+    """Return fresh macOS Wi-Fi association state; None means unavailable/unknown.
+
+    The CLI is a read-only physical-network check, independent of the configured
+    VPN egress. Unsupported platforms return unknown so their existing route
+    recovery path remains available.
+    """
+    if sys.platform != "darwin":
+        return None
+    try:
+        result = runner(
+            [sys.executable, str(Path(root) / "router.py"), "network-status", "--json"],
+            capture_output=True, text=True, timeout=12,
+        )
+        status = json.loads(result.stdout or "")
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        return None
+    if not isinstance(status, dict) or status.get("supported") is not True:
+        return None
+    checked_at = status.get("checked_at")
+    if not isinstance(checked_at, (int, float)) or isinstance(checked_at, bool):
+        return None
+    current_time = time.time() if now is None else now
+    if abs(current_time - checked_at) > NETWORK_STATUS_MAX_AGE_SECONDS:
+        return None
+    connected = status.get("connected")
+    return connected if isinstance(connected, bool) else None
+
+
+def recovery_defer_reason(root: Path) -> str | None:
+    """Pause macOS recovery when fresh physical Wi-Fi state is down or unknown."""
+    if sys.platform != "darwin":
+        return None
+    status = underlay_network_status(root)
+    if status is False:
+        return "wifi-disconnected"
+    if status is None:
+        return "network-status-unknown"
+    return None
+
+
+def defer_provider_recovery(root: Path, guard: RotationGuard, provider: str,
+                            host: str, reason: str) -> None:
+    guard.failure_times.pop(normalize_host(host), None)
+    append_event(root, {
+        "kind": "recovery-deferred",
+        "observed_at": time.time(),
+        "provider": provider,
+        "host": normalize_host(host),
+        "reason": reason,
+    })
+
+
+def underlay_failure(event: dict) -> bool:
+    """Recognize errors caused by a missing base route or an unready tunnel."""
+    message = " ".join(str(event.get(key) or "") for key in ("line", "error"))
+    return bool(UNDERLAY_FAILURE_RE.search(message))
+
+
+def recover_provider(root: Path, guard: RotationGuard, provider: str, host: str) -> dict | None:
+    """Recover only when the physical network is freshly reported as available."""
+    reason = recovery_defer_reason(root)
+    if reason:
+        defer_provider_recovery(root, guard, provider, host, reason)
+        return None
+    result = rotate_provider(root, provider, host=host)
+    append_event(root, {"kind": "rotation", "observed_at": time.time(), **result})
+    return result
+
+
+def handle_transport_failure(root: Path, guard: RotationGuard, provider: str,
+                             host: str, event: dict, now: float) -> dict | None:
+    """Recover only after repeated destination failure and a healthy underlay."""
+    if underlay_failure(event):
+        defer_provider_recovery(root, guard, provider, host, "underlay-transport-error")
+        return None
+    if not guard.record_transport_failure(now, host):
+        return None
+    if not confirm_context_cancellation(root, event):
+        return None
+    return recover_provider(root, guard, provider, host)
+
+
 def restore_provider(root: Path, provider: str, host: str,
                      runner: Callable = subprocess.run) -> dict:
     """Ask the controller to test and, when stable, restore the primary VPN."""
@@ -607,14 +698,9 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
                         provider = event.get("provider") or provider_for_host(root, host)
                         if provider:
                             last_provider[host] = provider
-                        if (
-                            event.get("failure")
-                            and guard.record_transport_failure(now, host)
-                            and confirm_context_cancellation(root, event)
-                        ):
-                            target = last_provider.get(host) or "proton"
-                            result = rotate_provider(root, provider_for_host(root, host) or target, host=host)
-                            append_event(root, {"kind": "rotation", "observed_at": time.time(), **result})
+                        if event.get("failure"):
+                            recovery_provider = provider_for_host(root, host) or "proton"
+                            handle_transport_failure(root, guard, recovery_provider, host, event, now)
                 elif event["kind"] == "client":
                     # Client lines are retained only as a bounded observation;
                     # exact app attribution is captured on target events.
@@ -641,10 +727,8 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
                             append_event(root, {"kind": "restore", "observed_at": time.time(),
                                                 "provider": provider, "host": host, **restore})
                 append_event(root, {"kind": "probe", "observed_at": time.time(), **result})
-                if result.get("transport_failure") and guard.record_transport_failure(now, host):
-                    target = provider or "proton"
-                    rotation = rotate_provider(root, provider or target, host=host)
-                    append_event(root, {"kind": "rotation", "observed_at": time.time(), **rotation})
+                if result.get("transport_failure"):
+                    handle_transport_failure(root, guard, provider or "proton", host, result, now)
             sleep(max(0.5, float(interval)))
     finally:
         _cleanup_worker_state(root, os.getpid())
