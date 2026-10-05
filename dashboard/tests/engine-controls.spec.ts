@@ -12,13 +12,15 @@ test('background polls preserve navigation focus and open profile pickers', asyn
   const picker = page.locator('#home-profile');
   await picker.focus();
   await picker.press('ArrowDown');
-  const option = page.locator('#home-profile-options [role="option"]').first();
+  await picker.press('End');
+  const option = page.locator('#home-profile-options [role="option"]').last();
   await expect(picker).toHaveAttribute('aria-expanded', 'true');
-  await page.clock.runFor(5500);
+  await page.clock.runFor(16500);
   await expect(picker).toHaveAttribute('aria-expanded', 'true');
   await expect(option).toBeFocused();
-  await option.press('Escape');
-  await expect(picker).toBeFocused();
+  await option.press('Enter');
+  await expect(picker).toContainText('OpenCode only');
+  await expect(picker).toHaveAttribute('aria-expanded', 'false');
 });
 
 /** Desktop app: the window's engine controls must reach the real controller. */
@@ -300,6 +302,7 @@ test('desktop Connect and Disconnect are explicit engine actions', async ({ page
 });
 
 test('desktop profile GUI creates, edits, duplicates and deletes saved profiles', async ({ page }) => {
+  await page.clock.install();
   await page.addInitScript(desktopMock);
   await page.goto('/#profiles');
 
@@ -328,6 +331,9 @@ test('desktop profile GUI creates, edits, duplicates and deletes saved profiles'
   const card = page.locator('.profile-card').filter({ hasText: 'Home setup' });
   await card.getByRole('button', { name: 'Edit', exact: true }).click();
   await dialog.locator('[name="description"]').fill('A profile edited in the GUI');
+  await page.clock.runFor(16500);
+  await expect(dialog.locator('[name="description"]')).toHaveValue('A profile edited in the GUI');
+  await expect(dialog.locator('[name="name"]')).toHaveValue('Home setup');
   await dialog.locator('[name="fallback"]').selectOption('retry');
   await dialog.locator('[name="fallbackProviderId"]').selectOption('proton');
   await dialog.locator('[name="providerId"]').selectOption('proton');
@@ -357,6 +363,7 @@ test('desktop profile GUI creates, edits, duplicates and deletes saved profiles'
 });
 
 test('desktop profile apply failure leaves the previous selection intact', async ({ page }) => {
+  await page.clock.install();
   await page.addInitScript(desktopMock);
   await page.goto('/#profiles');
   await page.evaluate(() => { (window as unknown as { __failApply: boolean }).__failApply = true; });
@@ -369,6 +376,8 @@ test('desktop profile apply failure leaves the previous selection intact', async
   await dialog.getByRole('button', { name: 'Create profile', exact: true }).click();
 
   await expect(page.locator('#toast')).toHaveText('Profile apply rejected');
+  await page.clock.runFor(16500);
+  await expect(page.locator('#announcement')).toHaveText('Profile apply rejected');
   const previous = page.locator('.profile-card').filter({ hasText: 'School access' });
   const pending = page.locator('.profile-card').filter({ hasText: 'Needs review' });
   await expect(previous.locator('.label')).toHaveText('Active profile');
