@@ -37,6 +37,8 @@ EVENTS_NAME = "events.jsonl"
 WORKER_LOG_NAME = "worker.log"
 ENGINE_PID_NAME = "sing-box.pid"
 DEFAULT_INTERVAL = 2.0
+DEFAULT_ROUTER_PORT = 2080
+DEFAULT_CRITICAL_DOMAINS = ("opencode.ai",)
 ENGINE_DOWN_GRACE_TICKS = 3
 TARGET_IDLE_SECONDS = 60.0
 PROBE_EVERY_SECONDS = 10.0
@@ -61,6 +63,10 @@ FAILURE_RE = re.compile(
     re.IGNORECASE,
 )
 _CONTEXT_CANCEL_RE = re.compile(r"\bcontext\s+cancel(?:ed|led)\b", re.IGNORECASE)
+
+
+class RouterConfigError(ValueError):
+    """The existing router.json cannot safely guide watcher decisions."""
 
 
 def state_dir(root: Path | None = None) -> Path:
@@ -157,6 +163,26 @@ def parse_line(line: str) -> dict | None:
     return None
 
 
+def _read_router_config(root: Path) -> dict | None:
+    """Read router.json, keeping missing first-run config distinct from bad data."""
+    path = Path(root) / "router.json"
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError) as exc:
+        raise RouterConfigError(f"cannot read router.json: {exc}") from exc
+    try:
+        config = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RouterConfigError(
+            f"invalid router.json: {exc.msg} (line {exc.lineno}, column {exc.colno})"
+        ) from exc
+    if not isinstance(config, dict):
+        raise RouterConfigError("invalid router.json: top level must be an object")
+    return config
+
+
 def critical_domains(root: Path) -> tuple[str, ...]:
     """Read configured *tunneled* domains for transparent-mode observation.
 
@@ -164,33 +190,50 @@ def critical_domains(root: Path) -> tuple[str, ...]:
     allow-list. Observing those direct domains could trigger an unrelated
     provider rotation, so only domains covered by ``vpn_domains`` are watched.
     """
-    domains: list[str] = []
+    config = _read_router_config(root)
+    if config is None:
+        return DEFAULT_CRITICAL_DOMAINS
+
     mode: str | None = None
-    try:
-        config = json.loads((Path(root) / "router.json").read_text())
-        if not isinstance(config, dict):
-            config = {}
-        routing = config.get("routing") or {}
-        mode = routing.get("mode") if isinstance(routing, dict) else None
-        vpn_domains = routing.get("vpn_domains") or [] if isinstance(routing, dict) else []
-        vpn_domains = [normalize_host(str(domain)) for domain in vpn_domains if str(domain).strip()]
+    vpn_domains: list[str] = []
+    if "routing" in config:
+        routing = config["routing"]
+        if not isinstance(routing, dict):
+            raise RouterConfigError("invalid router.json: routing must be an object")
+        if "mode" in routing:
+            mode = routing["mode"]
+            if not isinstance(mode, str):
+                raise RouterConfigError("invalid router.json: routing.mode must be a string")
+        vpn_domains_value = routing.get("vpn_domains", [])
+        if not isinstance(vpn_domains_value, list) or any(
+            not isinstance(domain, str) for domain in vpn_domains_value
+        ):
+            raise RouterConfigError("invalid router.json: routing.vpn_domains must be an array of strings")
+        vpn_domains = [normalize_host(domain) for domain in vpn_domains_value if domain.strip()]
 
-        def allowed(domain: str) -> bool:
-            if mode != "vpn-list":
-                return True
-            return any(domain_matches(domain, vpn) or domain_matches(vpn, domain)
-                       for vpn in vpn_domains)
+    def allowed(domain: str) -> bool:
+        if mode != "vpn-list":
+            return True
+        return any(domain_matches(domain, vpn) or domain_matches(vpn, domain)
+                   for vpn in vpn_domains)
 
-        for route in config.get("routes", []):
-            for domain in route.get("domains", []):
-                domain = normalize_host(str(domain))
-                if domain and allowed(domain):
-                    domains.append(domain)
-    except (OSError, ValueError, TypeError):
-        pass
-    if domains:
-        return tuple(dict.fromkeys(domains))
-    return () if mode == "vpn-list" else ("opencode.ai",)
+    routes = config.get("routes", [])
+    if not isinstance(routes, list):
+        raise RouterConfigError("invalid router.json: routes must be an array")
+    domains: list[str] = []
+    for route in routes:
+        if not isinstance(route, dict):
+            raise RouterConfigError("invalid router.json: each route must be an object")
+        route_domains = route.get("domains", [])
+        if not isinstance(route_domains, list) or any(
+            not isinstance(domain, str) for domain in route_domains
+        ):
+            raise RouterConfigError("invalid router.json: route domains must be an array of strings")
+        for domain in route_domains:
+            domain = normalize_host(domain)
+            if domain and allowed(domain):
+                domains.append(domain)
+    return tuple(dict.fromkeys(domains))
 
 
 def _owned_pid(root: Path) -> int | None:
@@ -201,15 +244,15 @@ def _owned_pid(root: Path) -> int | None:
 
 
 def router_port(root: Path | None = None) -> int:
-    """Listener port from router.json; 2080 fallback keeps old roots working."""
+    """Read the listener port, using 2080 only when config or port is absent."""
     root = Path(root) if root is not None else ROOT
-    try:
-        port = int(json.loads((root / "router.json").read_text(encoding="utf-8")).get("port", 2080))
-        if 1 <= port <= 65535:
-            return port
-    except (OSError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
-        pass
-    return 2080
+    config = _read_router_config(root)
+    if config is None:
+        return DEFAULT_ROUTER_PORT
+    port = config.get("port", DEFAULT_ROUTER_PORT)
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise RouterConfigError("invalid router.json: port must be an integer from 1 to 65535")
+    return port
 
 
 def _hand_back_ownership(*paths: Path) -> None:
@@ -531,6 +574,8 @@ def _network_check_hop(root: Path) -> None:
 
 def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = time.sleep) -> int:
     root = Path(root).resolve()
+    domains = critical_domains(root)
+    router_port(root)
     state_dir(root).mkdir(parents=True, exist_ok=True)
 
     def _on_sigterm(signum: int, frame: object) -> None:
@@ -549,7 +594,6 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
     _hand_back_ownership(pid_file(root), enabled_file(root))
     log_path = root / LOG_FILE_NAME
     offset = log_path.stat().st_size if log_path.exists() else 0
-    domains = critical_domains(root)
     last_target: dict[str, float] = {}
     last_probe: dict[str, float] = {}
     clients: list[dict] = []
@@ -573,6 +617,7 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
             # target set each tick so transparent capture starts observing a
             # newly configured domain without requiring a router restart.
             domains = critical_domains(root)
+            router_port(root)
             # Probe one representative per configured lane even before a slow
             # connection timeout produces its first log line.
             representatives: set[str] = set()
@@ -781,6 +826,7 @@ def _start_locked(root: Path, interval: float) -> dict:
     current = status(root)
     if current["running"]:
         return {"started": False, "already_running": True, "pid": current["pid"]}
+    router_port(root)
     state_dir(root).mkdir(parents=True, exist_ok=True)
     # Publish the start intent before spawning so the child cannot observe a
     # missing enable marker and exit during the tiny parent/child race.

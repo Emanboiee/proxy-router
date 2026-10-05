@@ -235,6 +235,9 @@ _PROVIDER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 # loopback and public answers over time). The upstream port must never equal
 # the router's own listener port (proxy loop).
 _PROXY_PROFILE_STEM = "socks"
+_LOCAL_PROXY_BYPASS = ["*.local", "localhost", "127.0.0.1", "::1"]
+_TAILSCALE_DOMAINS = ["tailscale.com", "tailscale.io", "ts.net"]
+_TAILSCALE_CIDRS = ["100.64.0.0/10", "fd7a:115c:a1e0::/48"]
 
 
 def is_proxy_provider(name: str) -> bool:
@@ -620,6 +623,10 @@ def load_config() -> int:
     default_mode = vpn.get("default_mode")
     if default_mode is not None and default_mode not in ("proxy", "tun"):
         return fail(f"bad {CONFIG_FILE.name}: vpn.default_mode must be 'proxy' or 'tun'")
+    if "tailscale_bypass" in vpn and not isinstance(vpn["tailscale_bypass"], bool):
+        return fail(f"bad {CONFIG_FILE.name}: vpn.tailscale_bypass must be a boolean")
+    if error := _public_dns_error(vpn.get("public_dns")):
+        return fail(f"bad {CONFIG_FILE.name}: {error}")
     if not all(isinstance(name, str) and _PROVIDER_NAME.fullmatch(name) and isinstance(entry, dict)
                for name, entry in providers.items()):
         return fail(f"bad {CONFIG_FILE.name}: provider names/entries are invalid")
@@ -1436,13 +1443,13 @@ def recover_route(name: str, host: str) -> int:
     """Confirm a stalled route, then try configured alternatives and opt-in direct."""
     if MANUAL_OFF_FILE.exists() or not _automatic_proxy_mode():
         return 3
-    if name not in _providers or response_provider_for_host(host) != name:
-        return fail("recovery target does not belong to the configured provider")
-    if not _diagnostic_host_is_routed(host):
-        return 3
     routing = routing_state()
     if routing["mode"] == "vpn-list" and not any(
             _response_host_matches(host, domain) for domain in _effective_vpn_domains(routing)):
+        return 3
+    if name not in _providers or response_provider_for_host(host) != name:
+        return fail("recovery target does not belong to the configured provider")
+    if not _diagnostic_host_is_routed(host):
         return 3
     url = f"https://{host}/"
     if urllib.parse.urlsplit(url).hostname != host or unsafe_probe_target(url):
@@ -1602,15 +1609,9 @@ def _response_host_matches(host: str, domain: str) -> bool:
 
 
 def response_provider_for_host(host: str) -> str | None:
-    """Return the configured route provider responsible for ``host``."""
-    for route in _routes_with_autodetected_domains(_routes):
-        provider = route.get("provider")
-        if not isinstance(provider, str):
-            continue
-        for domain in route.get("domains", []):
-            if _response_host_matches(host, domain):
-                return provider
-    return None
+    """Attribute responses with the same bypass and availability rules as routing."""
+    from model_relay import route_provider
+    return route_provider(globals(), host)
 
 
 def _response_event_marker(provider: str) -> Path:
@@ -2323,6 +2324,26 @@ def next_rotation_at(name: str) -> int | None:
     return at + interval + offset
 
 
+def _rotation_candidates() -> list[str]:
+    """Providers scheduled rotation can actually switch.
+
+    SOCKS5 proxy providers are a single non-rotating egress (no *.conf pool),
+    and a provider with no profiles has nothing to switch to; both keep a
+    possibly ancient ``state/<name>.rotation`` record that would otherwise
+    pin the scheduled-rotation clock permanently in the past.
+    """
+    candidates = []
+    for name in _providers:
+        if is_proxy_provider(name):
+            continue
+        try:
+            if provider_files(name):
+                candidates.append(name)
+        except ValueError:
+            continue
+    return candidates
+
+
 def rotate_due(provider: str | None = None) -> int:
     """Scheduled rotation pass: rotate every provider whose interval elapsed.
 
@@ -2348,10 +2369,11 @@ def rotate_due(provider: str | None = None) -> int:
         names = [provider]
     else:
         suffix = ".active"
+        candidates = set(_rotation_candidates())
         names = sorted(
             p.name[: -len(suffix)]
             for p in (ROOT / "state").glob(f"*{suffix}")
-            if p.name.endswith(suffix) and p.name[: -len(suffix)] in _providers
+            if p.name.endswith(suffix) and p.name[: -len(suffix)] in candidates
         )
     if not names:
         return 3
@@ -2731,6 +2753,60 @@ def dns_transport() -> str:
     return transport
 
 
+_DNS_RESOLVERS = ("provider", "local")
+
+
+def _public_dns_error(value) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        return "vpn.public_dns must be an object"
+    if not isinstance(value.get("server"), str):
+        return "vpn.public_dns.server must be an IP address (no bootstrap DNS)"
+    try:
+        address = ipaddress.ip_address(value.get("server", ""))
+    except ValueError:
+        return "vpn.public_dns.server must be an IP address (no bootstrap DNS)"
+    if address.is_unspecified or address.is_multicast:
+        return "vpn.public_dns.server must be a unicast address"
+    if value.get("transport", "https") not in ("https", "udp", "tcp", "tls"):
+        return "vpn.public_dns.transport must be 'https', 'udp', 'tcp', or 'tls'"
+    domains = value.get("private_domains", ["local", "ts.net"])
+    if (not isinstance(domains, list)
+            or any(not isinstance(domain, str)
+                   or not re.fullmatch(r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*", domain)
+                   for domain in domains)):
+        return "vpn.public_dns.private_domains must be a list of domain suffixes"
+    return None
+
+
+def system_proxy_bypass_domains() -> list[str]:
+    domains = list(_LOCAL_PROXY_BYPASS)
+    if _vpn.get("tailscale_bypass"):
+        for domain in _TAILSCALE_DOMAINS:
+            domains.extend([domain, f"*.{domain}"])
+        domains.extend(_TAILSCALE_CIDRS)
+    return domains
+
+
+def dns_resolver() -> str:
+    """Resolver set used for a provider's routed domains.
+
+    ``provider`` (default) pins each WireGuard-backed provider's tunneled
+    domains to that provider's own ``dns-<provider>`` resolver (profile
+    ``[Interface] DNS``, fallback 1.1.1.1) over ``dns_transport``. Some
+    filtered networks block public UDP 53 *and* intermittently reset DoH to
+    the public endpoint, so neither transport is dependable there; ``local``
+    resolves those domains through the same OS resolver every other lane
+    already uses (``dns-local``). Destination traffic still exits through the
+    provider's endpoint either way - only the query path changes.
+    """
+    resolver = _vpn.get("dns_resolver", "provider")
+    if resolver not in _DNS_RESOLVERS:
+        return "provider"
+    return resolver
+
+
 def _autodetect_state_path(source: str) -> Path:
     if not isinstance(source, str) or not _PROVIDER_NAME.fullmatch(source):
         raise ValueError("invalid autodetect source")
@@ -2816,7 +2892,7 @@ def _vpn_list_intersection(domains, vpn_domains) -> list[str]:
     """
     out: list[str] = []
     for domain in domains:
-        for vpn in vpn_domains:
+        for vpn in sorted(vpn_domains):
             if domain == vpn or domain.endswith("." + vpn):
                 candidate = domain
             elif vpn.endswith("." + domain):
@@ -3013,6 +3089,13 @@ def _route_capture_cidrs(routes: list[dict], routing: dict,
 
 
 def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tuple[dict, dict[str, Path]]:
+    public_dns = _vpn.get("public_dns")
+    if error := _public_dns_error(public_dns):
+        raise ValueError(error)
+    default_dns = "dns-public" if public_dns else "dns-local"
+    private_domains = list(public_dns.get("private_domains", ["local", "ts.net"])) if public_dns else []
+    if _vpn.get("tailscale_bypass") and "ts.net" not in private_domains:
+        private_domains.append("ts.net")
     active: dict[str, dict] = {}
     selected: dict[str, Path] = {}
     dns_map: dict[str, str] = {}
@@ -3110,6 +3193,12 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
     # implicit fallback. Route DNS rules still pin tunneled domains to the
     # provider's own server.
     dns_servers.append({"type": "local", "tag": "dns-local"})
+    if public_dns:
+        transport = public_dns.get("transport", "https")
+        entry = {"type": transport, "tag": "dns-public", "server": public_dns["server"]}
+        if transport in ("https", "tls"):
+            entry["server_port"] = 443 if transport == "https" else 853
+        dns_servers.append(entry)
     routing = routing_state()
     routing_mode = routing["mode"]
     # health_order: emit provider rules in egress-health order instead of
@@ -3122,13 +3211,17 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
     else:
         build_routes = routed_domains
     dns_rules = []
+    if private_domains:
+        dns_rules.append({"domain_suffix": private_domains, "server": "dns-local"})
+    if public_dns:
+        dns_rules.append({"domain_regex": [r"^[^.]+$"], "server": "dns-local"})
     if routing_mode == "safe-list" and routing["direct_domains"]:
         # Safe-list: trusted domains go DIRECT, so their DNS must resolve via
         # the local resolver, never a provider's DNS server - pinning them to
         # a provider resolver would leak direct traffic's DNS through the
         # tunnel. The rule comes first so a domain listed both here and in a
         # provider route always wins the direct resolver.
-        dns_rules.append({"domain_suffix": list(routing["direct_domains"]), "server": "dns-local"})
+        dns_rules.append({"domain_suffix": list(routing["direct_domains"]), "server": default_dns})
     vpn_domains = _effective_vpn_domains(routing)
     for route in build_routes:
         route_provider = _effective_route_provider(route["provider"])
@@ -3140,11 +3233,13 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
         if routing_mode == "vpn-list":
             domains = _vpn_list_intersection(domains, vpn_domains)
         if domains:
-            if route_provider == "direct" or route_provider in proxy_live:
+            if (route_provider == "direct" or route_provider in proxy_live
+                    or dns_resolver() == "local"):
                 # Direct and SOCKS5-hopped traffic share the local resolver:
                 # there is no tunnel DNS to pin to, and pinning to a
                 # provider resolver would leak direct-path queries.
-                dns_rules.append({"domain_suffix": domains, "server": "dns-local"})
+                # vpn.dns_resolver=local opts WireGuard lanes into it too.
+                dns_rules.append({"domain_suffix": domains, "server": default_dns})
             else:
                 dns_rules.append({"domain_suffix": domains,
                                   "server": dns_alias.get(route_provider, f"dns-{route_provider}")})
@@ -3173,6 +3268,9 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
             if routing_mode == "vpn-list":
                 continue
             rule["ip_cidr"] = route["ip_cidr"]
+        if public_dns and route_provider in proxy_live and rule.get("domain_suffix"):
+            provider_rules.append({"domain_suffix": list(rule["domain_suffix"]),
+                                   "action": "resolve", "server": default_dns})
         provider_rules.append(rule)
     direct_pins: list[dict] = []
     if routing_mode == "safe-list" and routing["direct_domains"]:
@@ -3183,6 +3281,21 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
     ]
 
     mode = current_mode()
+    private_outbounds = []
+    bypass_rules = []
+    if private_domains or public_dns:
+        private_outbounds.append({"type": "direct", "tag": "direct-private",
+                                  "domain_resolver": "dns-local"})
+    if private_domains:
+        bypass_rules.append({"domain_suffix": private_domains, "outbound": "direct-private"})
+    if public_dns:
+        bypass_rules.append({"domain_regex": [r"^[^.]+$"], "outbound": "direct-private"})
+    if _vpn.get("tailscale_bypass"):
+        bypass_rules.extend([
+            {"domain_suffix": _TAILSCALE_DOMAINS[:2], "outbound": "direct"},
+            {"ip_cidr": list(_TAILSCALE_CIDRS),
+             "outbound": "direct-private" if private_domains else "direct"},
+        ])
     if mode == "tun":
         blockers = _tun_proxy_blockers(build_routes, routing, proxy_live)
         if blockers:
@@ -3310,6 +3423,8 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
                 "cannot emit a dangling route.final (drop *.conf into providers/<name>/ first)"
             )
         route_final = default_provider
+    if public_dns and route_final in proxy_live:
+        rules.append({"action": "resolve", "server": default_dns})
 
     config = {
         # warn in steady state: info logs a line per connection, which costs
@@ -3318,14 +3433,17 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
         "log": {"level": "warn"},
         "inbounds": inbounds,
         "endpoints": list(active.values()),
-        "outbounds": [{"type": "direct", "tag": "direct"}, *proxy_outbounds],
-        # Without dns.final, unmatched queries hit the FIRST server (tunnel-riding
-        # provider DNS); pin them to the always-present local resolver instead.
-        "dns": {"servers": dns_servers, "rules": dns_rules, "strategy": dns_strategy(), "final": "dns-local"},
+        "outbounds": [{"type": "direct", "tag": "direct"}, *private_outbounds, *proxy_outbounds],
+        # Private names keep OS resolution; unmatched names use the explicit
+        # public resolver when configured, otherwise the historical OS default.
+        "dns": {"servers": dns_servers, "rules": dns_rules, "strategy": dns_strategy(), "final": default_dns},
         "route": {
-            "auto_detect_interface": True,
-            "default_domain_resolver": "dns-local",
-            "rules": rules,
+            # Proxy mode needs OS routing for tailnet destinations; binding
+            # every direct socket to the physical NIC defeats that routing.
+            # TUN mode keeps the loop-prevention binding.
+            "auto_detect_interface": mode == "tun" or not _vpn.get("tailscale_bypass"),
+            "default_domain_resolver": default_dns,
+            "rules": bypass_rules + rules,
             "rule_set": rule_sets,
             "final": route_final,
         },
@@ -5915,7 +6033,8 @@ def status_json() -> dict:
         "policy": rotation_policy(),
     }
     if rotation["interval_seconds"] > 0:
-        next_times = [n for n in (next_rotation_at(name) for name in _providers) if n is not None]
+        next_times = [n for n in (next_rotation_at(name) for name in _rotation_candidates())
+                      if n is not None]
         if next_times:
             rotation["next_at"] = min(next_times)
     data["rotation"] = rotation
@@ -6798,6 +6917,9 @@ def system_proxy_on(runner=None) -> int:
     if not services:
         return fail("could not determine any macOS network services")
     strict = injected or sys.platform == "darwin"
+    previous = _proxy_state_read() or {}
+    previous_records = {record["service"]: record for record in previous.get("services", [])
+                        if isinstance(record, dict) and "service" in record}
     snapshots = []
     conflicts = []
     for service in services:
@@ -6809,9 +6931,19 @@ def system_proxy_on(runner=None) -> int:
                     conflicts.append(f"{service} {protocol} proxy state unavailable")
                 elif state.get("enabled") and not _proxy_endpoint_matches(state, _port):
                     conflicts.append(f"{service} {protocol} proxy {state.get('server')}:{state.get('port')}")
+        aux = _capture_proxy_aux(service, run)
+        current_bypass = aux.get("bypass", {}).get("domains") or []
+        applied_bypass = list(dict.fromkeys(system_proxy_bypass_domains() + current_bypass))
+        prior = previous_records.get(service, {})
+        if current_bypass == prior.get("applied_bypass", _LOCAL_PROXY_BYPASS):
+            # Reconnects must retain the original bypass list, rather than
+            # treating our last applied list as the user's pre-existing one.
+            original = prior.get("aux", {}).get("bypass")
+            if original is not None:
+                aux["bypass"] = original
         snapshots.append({"service": service, "service_id": service, "port": _port,
-                          "before": before,
-                          "aux": _capture_proxy_aux(service, run),
+                          "before": before, "aux": aux,
+                          "applied_bypass": applied_bypass,
                           "owned": {"http": False, "https": False}})
     if conflicts:
         return fail("foreign system proxy conflict: " + "; ".join(conflicts))
@@ -6835,7 +6967,7 @@ def system_proxy_on(runner=None) -> int:
                 # 127.0.0.1:2080 for GUI apps.
                 ["networksetup", "-setautoproxystate", service, "off"],
                 ["networksetup", "-setproxyautodiscovery", service, "off"],
-                ["networksetup", "-setproxybypassdomains", service, "*.local", "localhost", "127.0.0.1", "::1"],
+                ["networksetup", "-setproxybypassdomains", service, *record["applied_bypass"]],
             ]
             for index, command in enumerate(commands):
                 _run_result(run, command, check=True, capture_output=True, timeout=10)
@@ -6908,7 +7040,7 @@ def system_proxy_on(runner=None) -> int:
             if "bypass" in aux and aux["bypass"].get("domains") is not None:
                 try:
                     _run_result(run, ["networksetup", "-setproxybypassdomains", service,
-                                      *aux["bypass"].get("domains", [])], check=True,
+                                      *(aux["bypass"].get("domains") or ["Empty"])], check=True,
                                 capture_output=True, timeout=10)
                 except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError, TypeError) as rollback_exc:
                     rollback_errors.append(f"{service} bypass: {rollback_exc}")
@@ -7057,9 +7189,9 @@ def system_proxy_off(runner=None) -> int:
             if before_domains is not None:
                 try:
                     current_domains = _capture_proxy_aux(service, run).get("bypass", {}).get("domains")
-                    ours_domains = ["*.local", "localhost", "127.0.0.1", "::1"]
+                    ours_domains = record.get("applied_bypass", _LOCAL_PROXY_BYPASS)
                     if current_domains == ours_domains and current_domains != before_domains:
-                        _run_result(run, ["networksetup", "-setproxybypassdomains", service, *before_domains],
+                        _run_result(run, ["networksetup", "-setproxybypassdomains", service, *(before_domains or ["Empty"])],
                                     check=True, capture_output=True, timeout=10)
                 except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError, TypeError) as exc:
                     failures.append(f"{service} bypass: {exc}")
@@ -7577,6 +7709,13 @@ def main() -> int:
                                help="run bounded direct/routed connectivity and DNS checks")
     status.add_argument("--json", action="store_true", help="machine-readable status (JSON)")
     sub.add_parser("reload")
+    relay = sub.add_parser("model-relay", help="retry free-model 429s through rotating exits before client fallback")
+    relay.add_argument("--port", type=int, default=2082, help="loopback API port (default 2082)")
+    relay.add_argument("--upstream", default="https://opencode.ai/zen/v1", help="HTTPS API base URL")
+    relay.add_argument("--max-retries", type=int, default=32)
+    relay.add_argument("--timeout", type=int, default=180, help="upstream socket timeout in seconds")
+    relay.add_argument("--retry-window", type=int, default=180, help="bounded recovery window in seconds")
+    relay.add_argument("--free-model", action="append", default=[], help="additional free model ID (repeatable)")
     autodetect = sub.add_parser("autodetect", help="discover routed web-app dependency hostnames")
     autodetect.add_argument("source", nargs="?", default="twitch",
                             help="configured discovery source (default: twitch)")
@@ -8030,6 +8169,16 @@ def main() -> int:
         if rc == 0:
             route_watcher_start()
         return rc
+    if args.cmd == "model-relay":
+        if not 1 <= args.port <= 65535 or args.port == _port:
+            return fail("model-relay port must be valid and differ from the proxy listener")
+        if not 0 <= args.max_retries <= 64 or args.timeout < 1 or args.retry_window < 1:
+            return fail("invalid model-relay retry or timeout limit")
+        from model_relay import serve
+        try:
+            return serve(sys.modules[__name__], args)
+        except (ValueError, OSError) as exc:
+            return fail(f"model-relay: {exc}")
     if args.cmd == "autodetect":
         return _with_lock(lambda: autodetect_source(
             args.source, reload=not args.no_reload, quiet=args.quiet
