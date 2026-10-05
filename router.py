@@ -2323,6 +2323,26 @@ def next_rotation_at(name: str) -> int | None:
     return at + interval + offset
 
 
+def _rotation_candidates() -> list[str]:
+    """Providers scheduled rotation can actually switch.
+
+    SOCKS5 proxy providers are a single non-rotating egress (no *.conf pool),
+    and a provider with no profiles has nothing to switch to; both keep a
+    possibly ancient ``state/<name>.rotation`` record that would otherwise
+    pin the scheduled-rotation clock permanently in the past.
+    """
+    candidates = []
+    for name in _providers:
+        if is_proxy_provider(name):
+            continue
+        try:
+            if provider_files(name):
+                candidates.append(name)
+        except ValueError:
+            continue
+    return candidates
+
+
 def rotate_due(provider: str | None = None) -> int:
     """Scheduled rotation pass: rotate every provider whose interval elapsed.
 
@@ -2348,10 +2368,11 @@ def rotate_due(provider: str | None = None) -> int:
         names = [provider]
     else:
         suffix = ".active"
+        candidates = set(_rotation_candidates())
         names = sorted(
             p.name[: -len(suffix)]
             for p in (ROOT / "state").glob(f"*{suffix}")
-            if p.name.endswith(suffix) and p.name[: -len(suffix)] in _providers
+            if p.name.endswith(suffix) and p.name[: -len(suffix)] in candidates
         )
     if not names:
         return 3
@@ -2729,6 +2750,27 @@ def dns_transport() -> str:
     if transport not in ("udp", "https"):
         return "udp"
     return transport
+
+
+_DNS_RESOLVERS = ("provider", "local")
+
+
+def dns_resolver() -> str:
+    """Resolver set used for a provider's routed domains.
+
+    ``provider`` (default) pins each WireGuard-backed provider's tunneled
+    domains to that provider's own ``dns-<provider>`` resolver (profile
+    ``[Interface] DNS``, fallback 1.1.1.1) over ``dns_transport``. Some
+    filtered networks block public UDP 53 *and* intermittently reset DoH to
+    the public endpoint, so neither transport is dependable there; ``local``
+    resolves those domains through the same OS resolver every other lane
+    already uses (``dns-local``). Destination traffic still exits through the
+    provider's endpoint either way - only the query path changes.
+    """
+    resolver = _vpn.get("dns_resolver", "provider")
+    if resolver not in _DNS_RESOLVERS:
+        return "provider"
+    return resolver
 
 
 def _autodetect_state_path(source: str) -> Path:
@@ -3140,10 +3182,12 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
         if routing_mode == "vpn-list":
             domains = _vpn_list_intersection(domains, vpn_domains)
         if domains:
-            if route_provider == "direct" or route_provider in proxy_live:
+            if (route_provider == "direct" or route_provider in proxy_live
+                    or dns_resolver() == "local"):
                 # Direct and SOCKS5-hopped traffic share the local resolver:
                 # there is no tunnel DNS to pin to, and pinning to a
                 # provider resolver would leak direct-path queries.
+                # vpn.dns_resolver=local opts WireGuard lanes into it too.
                 dns_rules.append({"domain_suffix": domains, "server": "dns-local"})
             else:
                 dns_rules.append({"domain_suffix": domains,
@@ -5915,7 +5959,8 @@ def status_json() -> dict:
         "policy": rotation_policy(),
     }
     if rotation["interval_seconds"] > 0:
-        next_times = [n for n in (next_rotation_at(name) for name in _providers) if n is not None]
+        next_times = [n for n in (next_rotation_at(name) for name in _rotation_candidates())
+                      if n is not None]
         if next_times:
             rotation["next_at"] = min(next_times)
     data["rotation"] = rotation

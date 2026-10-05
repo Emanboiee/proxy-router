@@ -627,6 +627,48 @@ class DnsStrategyTests(unittest.TestCase):
         self.assertEqual(config["dns"]["strategy"], "ipv4_prefer")
 
 
+class DnsResolverTests(unittest.TestCase):
+    """vpn.dns_resolver picks the resolver set for a WireGuard provider's
+    routed domains: its own dns-<provider> server, or the OS resolver."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(router, self.root)
+        (self.root / "providers" / "proton").mkdir(parents=True)
+        _write_conf(self.root / "providers" / "proton" / "a.conf")
+        router._providers = {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}}
+        router._routes = [{"id": "example-com", "domains": ["example.com"], "provider": "proton"}]
+        router._port = 2080
+        router._vpn = {}
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _proton_dns_rule(self) -> dict:
+        config, _ = router.build_singbox_config()
+        return next(r for r in config["dns"]["rules"]
+                    if "example.com" in r.get("domain_suffix", []))
+
+    def test_defaults_to_provider(self):
+        self.assertEqual(router.dns_resolver(), "provider")
+
+    def test_configured_local_used(self):
+        router._vpn = {"dns_resolver": "local"}
+        self.assertEqual(router.dns_resolver(), "local")
+
+    def test_invalid_falls_back_to_provider(self):
+        router._vpn = {"dns_resolver": "bogus"}
+        self.assertEqual(router.dns_resolver(), "provider")
+
+    def test_default_pins_provider_resolver(self):
+        self.assertEqual(self._proton_dns_rule()["server"], "dns-proton")
+
+    def test_local_uses_the_os_resolver(self):
+        router._vpn = {"dns_resolver": "local"}
+        self.assertEqual(self._proton_dns_rule()["server"], "dns-local")
+
+
 class ParseEndpointEdgeTests(unittest.TestCase):
     def test_bracketed_v6_requires_port(self):
         with self.assertRaises(SystemExit):
@@ -3516,6 +3558,31 @@ class ScheduledRotationTests(unittest.TestCase):
             data = router.status_json()
         self.assertEqual(data["rotation"]["interval_seconds"], 3600)
         self.assertIn("next_at", data["rotation"])
+
+    def _seed_proxy_provider(self, stale_at: int) -> None:
+        """A SOCKS5 lane that never rotates keeps an ancient rotation record."""
+        router._providers["cloudflare"] = {
+            "socks5": {"host": "127.0.0.1", "port": 2181}, "cooldown_seconds": 60}
+        (self.root / "state" / "cloudflare.active").write_text("warp", encoding="utf-8")
+        (self.root / "state" / "cloudflare.rotation").write_text(
+            json.dumps({"profile": "warp", "at": stale_at}), encoding="utf-8")
+
+    def test_rotate_due_skips_proxy_provider(self):
+        router.set_active("proton", self.root / "providers" / "proton" / "a.conf")
+        (self.root / "state" / "proton.rotation").write_text(
+            json.dumps({"profile": "a", "at": int(time.time())}), encoding="utf-8")
+        self._seed_proxy_provider(int(time.time()) - 30 * 86400)
+        with mock.patch.object(router, "rotate", side_effect=AssertionError(
+                "a SOCKS5 lane has nothing to rotate")):
+            self.assertEqual(router.rotate_due(), 3)
+
+    def test_status_next_at_ignores_stale_proxy_record(self):
+        (self.root / "state" / "proton.rotation").write_text(
+            json.dumps({"profile": "a", "at": int(time.time())}), encoding="utf-8")
+        self._seed_proxy_provider(int(time.time()) - 30 * 86400)
+        with mock.patch.object(router, "_status_report", return_value=(0, "ok")):
+            data = router.status_json()
+        self.assertGreater(data["rotation"]["next_at"], int(time.time()))
 
 
 class RotationPolicyTests(unittest.TestCase):

@@ -460,6 +460,14 @@ Two more knobs in `"vpn"` control address-family policy:
   443 to 1.1.1.1) on networks that drop UDP 53 to external resolvers while
   allowing outbound TCP 443; the same IP literal is used as the server
   address with `server_port: 443`.
+- `dns_resolver` — which resolver set resolves a WireGuard provider's routed
+  domains. Default `provider` (that provider's own `dns-<provider>` server,
+  see `dns_transport`). `local` routes them through the same OS resolver
+  (`dns-local`) every direct/SOCKS5 lane already uses, for filtered networks
+  that block public UDP 53 *and* intermittently reset DoH to the public
+  endpoint while the network's own resolver still answers. Only the query
+  path changes: destination traffic still exits through the provider's
+  endpoint. `school-warp` selects `local`; `default` restores `provider`.
 
 ## One-time elevation (macOS)
 

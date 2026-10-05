@@ -138,8 +138,16 @@ case "$cmd" in
   failover)
     if [ "$3" = "off" ]; then
       rm -f "${FAKE_ROUTER_FALLBACK_FILE:-/dev/null}"
+      # Mirror the production fallback marker so restore gating is testable.
+      if [ -n "${FAKE_ROUTER_ROOT:-}" ]; then
+        rm -f "$FAKE_ROUTER_ROOT"/state/fallback/*.json
+      fi
     elif [ "$3" = "on" ] && [ -n "${FAKE_ROUTER_FALLBACK_FILE:-}" ]; then
       printf '%s\n' "$2" > "$FAKE_ROUTER_FALLBACK_FILE"
+      if [ -n "${FAKE_ROUTER_ROOT:-}" ]; then
+        mkdir -p "$FAKE_ROUTER_ROOT"/state/fallback
+        printf '%s\n' "{\"provider\": \"$2\"}" > "$FAKE_ROUTER_ROOT"/state/fallback/"$2".json
+      fi
     fi
     exit 0
     ;;
@@ -240,7 +248,7 @@ class KeepaliveHarness:
         self.egress_file.write_text(egress)
         self.fallback_file = self.root / "fallback.state"
         if fallback:
-            self.fallback_file.write_text(fallback)
+            self.park(fallback)
         self.network_file = self.root / "network.state"
         self.network_file.write_text(network)
         self.ssid_file = self.root / "ssid.state"
@@ -263,6 +271,7 @@ class KeepaliveHarness:
         env["FAKE_ROUTER_ENSURE_COUNT"] = str(self.count)
         env["FAKE_ROUTER_EGRESS_FILE"] = str(self.egress_file)
         env["FAKE_ROUTER_FALLBACK_FILE"] = str(self.fallback_file)
+        env["FAKE_ROUTER_ROOT"] = str(self.root)
         env["FAKE_ROUTER_NETWORK_FILE"] = str(self.network_file)
         env["FAKE_ROUTER_NETWORK_FILE"] = str(self.network_file)
         env["FAKE_ROUTER_NETWORK_OFF_FILE"] = str(self.network_off_file)
@@ -284,6 +293,13 @@ class KeepaliveHarness:
         self.proc = subprocess.Popen([str(target)], env=env,
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                      text=True, start_new_session=(os.name == "posix"))
+
+    def park(self, provider: str) -> None:
+        """Simulate a runtime park in both the fake router and marker state."""
+        self.fallback_file.write_text(provider)
+        markers = self.root / "state" / "fallback"
+        markers.mkdir(parents=True, exist_ok=True)
+        (markers / f"{provider}.json").write_text(json.dumps({"provider": provider}))
 
     def lines(self) -> list[str]:
         if not self.log.is_file():
@@ -473,18 +489,18 @@ class KeepaliveEgressCheckTests(unittest.TestCase):
             # must never trigger an EMERGENCY provider rotation.
             rotates = [line for line in lines if line.startswith("rotate proton")]
             self.assertEqual(rotates, [])
-            # cadence: periodic checks every PROBE_EVERY(2) ensures after boot.
-            # `rotate --if-due` entries are tick noise, so measure gaps on the
-            # filtered list. restore_fallbacks() probes once right after the
-            # sweep, so drop the `egress check` that directly follows a sweep
-            # line too (the sweep cadence is measured separately).
+            # Cadence: periodic checks every PROBE_EVERY(2) ensures after boot.
+            # With no parked fallback marker, the full-pool sweep must not add
+            # a duplicate restore probe; keep only the boot and periodic checks.
             checks = [line for line in lines if line == "egress check"]
-            self.assertGreaterEqual(len(checks), 4, f"too few checks: {lines}")
             restore_probes = {
                 i + 1 for i, line in enumerate(lines)
                 if line == "egress sweep --json" and i + 1 < len(lines)
                 and lines[i + 1] == "egress check"
             }
+            self.assertEqual(restore_probes, set(),
+                             f"restore probe ran without a fallback marker: {lines}")
+            self.assertGreaterEqual(len(checks), 3, f"too few checks: {lines}")
             ticks = [line for i, line in enumerate(lines)
                      if i not in restore_probes
                      and line not in {"network-status", "network-status --json",
@@ -644,12 +660,57 @@ class KeepaliveSweepStaggerTests(unittest.TestCase):
         finally:
             h.close()
 
+    def test_sweep_every_zero_disables_sweep_without_defer_noise(self):
+        import time as _time
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "router.json").write_text(
+                json.dumps({"keepalive": {"sweep_every": 0}}))
+            h = KeepaliveHarness(interval="1", root=root)
+            try:
+                rotation = h.root / "state" / "proton.rotation"
+                rotation.write_text(json.dumps({"profile": "a", "at": int(_time.time())}))
+                h.wait_lines(6)
+                self.assertNotIn("egress sweep --json", h.lines(),
+                                 "sweep_every 0 must not run the full-pool sweep")
+                self.assertFalse(any(line.startswith("failover ") for line in h.lines()),
+                                 "no fallback restore work should run without a marker")
+                h.close()
+                self.assertNotIn("sweep deferred", h.err,
+                                 f"sweep_every 0 must silence the stagger note: {h.err!r}")
+            finally:
+                h.close()
+
 
 class KeepaliveFallbackRestoreTests(unittest.TestCase):
-    """restore_fallbacks(): on the sweep cadence, clear the runtime fallback
+    """restore_fallbacks(): on its own cadence, clear the runtime fallback
     marker and probe the primary; keep it cleared when alive, re-activate it
-    when the primary is still dead. The sweep runs on the FIRST successful
-    ensure (last_sweep=0), so both tests observe the restore immediately."""
+    when the primary is still dead. Both clocks start at zero, so the first
+    successful ensure observes the restore immediately."""
+
+    def test_restore_runs_when_full_pool_sweep_is_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "router.json").write_text(json.dumps({
+                "keepalive": {"sweep_every": 0, "fallback_restore_every": 1}
+            }))
+            h = KeepaliveHarness(interval="1", fallback="proton", root=root)
+            try:
+                deadline = time.time() + 10
+                lines = h.lines()
+                while time.time() < deadline and not any(
+                        line.startswith("egress check --provider proton") for line in lines):
+                    time.sleep(0.05)
+                    lines = h.lines()
+                self.assertTrue(
+                    any(line.startswith("failover proton off") for line in lines),
+                    f"restore did not run with sweep_every=0: {lines}",
+                )
+                self.assertIn("egress check --provider proton", lines)
+                self.assertNotIn("egress sweep --json", lines,
+                                 "disabled full-pool sweep must remain disabled")
+            finally:
+                h.close()
 
     def test_restore_clears_fallback_when_primary_alive(self):
         h = KeepaliveHarness(egress="alive", fallback="proton")
