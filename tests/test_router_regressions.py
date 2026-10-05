@@ -496,7 +496,7 @@ def test_egress_sweep_skips_primary_when_fallback_is_active(tmp_path, monkeypatc
     assert data["dead"] == []
     assert data["results"]["proton"] == {
         "status": "fallback", "fallback_provider": "cloudflare",
-        "fallback_profile": None, "ok": True,
+        "fallback_profile": None, "ok": True, "usable": True, "error": None,
     }
 
 
