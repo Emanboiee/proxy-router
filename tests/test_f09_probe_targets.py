@@ -58,16 +58,29 @@ class RedirectHopTests(unittest.TestCase):
         )
 
     def test_private_hop_is_refused(self):
-        self.assertIsNone(self._redirect("http://127.0.0.1:2080/"))
+        with mock.patch.object(self.monitor, "resolve_target_addresses", return_value=[]):
+            self.assertIsNone(self._redirect("http://127.0.0.1:2080/"))
 
     def test_metadata_hop_is_refused(self):
-        self.assertIsNone(self._redirect("http://169.254.169.254/latest/meta-data/"))
+        with mock.patch.object(self.monitor, "resolve_target_addresses", return_value=[]):
+            self.assertIsNone(self._redirect("http://169.254.169.254/latest/meta-data/"))
+
+    def test_dns_rebinding_hop_is_refused(self):
+        target = "https://rebind.example/"
+        with mock.patch.object(
+            self.monitor, "resolve_target_addresses", return_value=["10.0.0.8"]
+        ) as resolve:
+            self.assertIsNone(self._redirect(target))
+        resolve.assert_called_once_with(target)
 
     def test_public_hop_still_follows(self):
-        redirected = self._redirect("https://example.org/")
+        target = "https://example.org/"
+        with mock.patch.object(
+            self.monitor, "resolve_target_addresses", return_value=["93.184.216.34"]
+        ):
+            redirected = self._redirect(target)
         self.assertIsNotNone(redirected)
-        self.assertEqual(redirected.full_url, "https://example.org/")
-
+        self.assertEqual(redirected.full_url, target)
 
 if __name__ == "__main__":
     unittest.main()

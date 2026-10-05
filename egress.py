@@ -56,6 +56,13 @@ def dns_error_markers(text: str) -> bool:
     return bool(text) and bool(_DNS_ERROR_RE.search(text))
 
 
+def _int_or_none(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def egress_rank(record: dict, *, now: int, ok_window: int, slow_latency_ms: float,
                 fail_threshold: int) -> tuple[int, float]:
     """Rotation preference: lower is better. Recently-OK profiles rank by
@@ -69,12 +76,12 @@ def egress_rank(record: dict, *, now: int, ok_window: int, slow_latency_ms: floa
     if not record:
         return (1, float("inf"))
     ok = record.get("ok")
-    last_ok = record.get("last_ok_at") or record.get("checked_at")
-    checked_at = record.get("checked_at")
-    fails = int(record.get("fails") or 0)
+    last_ok = _int_or_none(record.get("last_ok_at") or record.get("checked_at"))
+    checked_at = _int_or_none(record.get("checked_at"))
+    fails = _int_or_none(record.get("fails") or 0) or 0
     window = int(ok_window)
-    fresh = checked_at is not None and now - int(checked_at) < window
-    if ok and last_ok and now - int(last_ok) < window:
+    fresh = checked_at is not None and now - checked_at < window
+    if ok and last_ok is not None and now - last_ok < window:
         latency = float(record.get("latency_ms") or float("inf"))
         if latency < float(slow_latency_ms):
             return (0, latency)
@@ -91,4 +98,3 @@ def lru_key(record: dict) -> int:
         return int(record.get("last_ok_at") or record.get("checked_at") or 0)
     except (TypeError, ValueError):
         return 0
-

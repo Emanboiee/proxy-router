@@ -46,8 +46,19 @@ def test_egress_rank_expires_stale_failure_streaks():
     )[0] == 1
 
 
+def test_egress_rank_treats_malformed_persisted_values_as_unknown():
+    now = 1_000_000
+    limits = {"ok_window": 86400, "slow_latency_ms": 1200, "fail_threshold": 2}
+    malformed_records = (
+        {"ok": False, "fails": 3, "checked_at": "not-an-epoch"},
+        {"ok": False, "fails": "not-a-count", "checked_at": now - 10},
+        {"ok": True, "last_ok_at": "not-an-epoch", "checked_at": now - 10},
+    )
+    for record in malformed_records:
+        assert egress.egress_rank(record, now=now, **limits) == (1, float("inf"))
+
+
 def test_lru_key_prefers_oldest_and_treats_never_used_as_first():
     assert egress.lru_key({"last_ok_at": 100}) == 100
     assert egress.lru_key({"checked_at": 50}) == 50
     assert egress.lru_key({}) == 0
-
