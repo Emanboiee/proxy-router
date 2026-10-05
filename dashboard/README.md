@@ -32,6 +32,22 @@ SOCKS5 credentials, and unrecognized `router.json` fields are not sent to the
 webview. Provider credentials and WireGuard keys belong in the engine's local
 configuration or provider files, never in this directory or source control.
 
-Requires Node supported by Vite 7, Rust, and Tauri 2 platform prerequisites.
+Requires Node 22, stable Rust, and Tauri 2 platform prerequisites. A clean
+checkout can be built and tested with:
+
+```sh
+npm ci
+npm test
+npm run tauri -- build --bundles app
+```
+
+The app bundle is written to
+`src-tauri/target/release/bundle/macos/Proxy Router.app`. The release workflow
+publishes a tested macOS app archive alongside the CLI packages. Extract it to
+`~/Applications` and launch it directly from Finder or Spotlight. Install the
+Python router with the CLI installer before opening the app. Closing the native
+window hides it into its menu-bar tray; **Open Dashboard** focuses the same
+instance and **Quit Proxy Router** exits the shell.
+
 The design, state matrix, runtime map, and Python API contract are in
 `../docs/plans/2026-09-08-dashboard-astra.md`.
