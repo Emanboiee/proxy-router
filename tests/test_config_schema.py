@@ -35,8 +35,16 @@ def test_migration_rejects_unknown_versions():
         raise AssertionError("unknown schema versions must fail closed")
 
 
-def test_router_status_exposes_schema_version_without_redefining_defaults():
+def test_router_status_exposes_schema_version_without_redefining_defaults(tmp_path, monkeypatch):
+    from tests.test_proxy_provider import load_router
+
+    router = load_router(tmp_path)
+    monkeypatch.setattr(router, "_status_report", lambda *, fast=False: (0, "running"))
+    monkeypatch.setattr(router, "_system_proxy_status_readonly", lambda: ("skipped", {}))
+    monkeypatch.setattr(router, "_cached_network_diagnostic", lambda: None)
+    monkeypatch.setattr(router, "_legacy_launch_agents", lambda: [])
+    monkeypatch.setattr(router, "resolve_sing_box", lambda: "/fixture/sing-box")
+    assert router.status_json(fast=True)["schema_version"] == config_schema.SCHEMA_VERSION
     router_source = (ROOT / "router.py").read_text(encoding="utf-8")
     assert "from config_schema import" in router_source
-    assert '"schema_version": SCHEMA_VERSION' in router_source
     assert "DEFAULT_EGRESS_SETTINGS = {" not in router_source
