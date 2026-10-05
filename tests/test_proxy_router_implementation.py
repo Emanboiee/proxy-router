@@ -171,9 +171,12 @@ def test_disconnect_restores_bypass_domains_after_config_reload(tmp_path, monkey
 
     assert router.system_proxy_on(runner=runner) == 0
     record = json.loads(state_file.read_text())
-    applied_domains = router._bypass_domains()
-    assert record["proxy_bypass_domains"] == applied_domains
+    applied_domains = list(dict.fromkeys(router._bypass_domains() + original_domains))
+    assert record["services"][0]["applied_bypass"] == applied_domains
     assert runner.bypass_domains == applied_domains
+
+    # Reconnecting must retain the original operator-owned exceptions.
+    assert router.system_proxy_on(runner=runner) == 0
 
     monkeypatch.setattr(router, "_proxy_bypass_domains", ["after.example"])
     assert router.system_proxy_off(runner=runner) == 0
