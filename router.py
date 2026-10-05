@@ -1273,7 +1273,10 @@ def record_egress(name: str, profile: Path, *, ok: bool, latency_ms: float | Non
         record["latency_ms"] = None
         record["status"] = status
         record["error"] = error or record.get("error")
-    if dns_ok is not None:
+    # Pair DNS evidence with this probe, never an older success.
+    if dns_ok is None:
+        record.pop("dns_ok", None)
+    else:
         record["dns_ok"] = bool(dns_ok)
     write_egress(name, profile, record)
     return record
@@ -2035,8 +2038,20 @@ def _cool_tls_failure(name: str, profile: Path, record: dict) -> None:
         _apply_upstream_failure(name, profile, "tls", 300)
 
 
+def _cool_connection_failure(name: str, profile: Path, record: dict) -> None:
+    """Cool repeated connection failures only with positive tunnel DNS evidence."""
+    if not egress.should_cool_connection(record, int(egress_settings()["fail_threshold"])) or is_cooled_down(name, profile):
+        return
+    reason = _transport_reason(record.get("error"))
+    _action, seconds = policy_action(name, reason)
+    mark_cooldown(name, profile, seconds)
+    print(f"router: marked {profile.stem} failed (transport/{reason}; cooldown {seconds}s)", file=sys.stderr)
+
+
 def probe_profile(name: str, profile: Path, *, port: int | None = None,
-                  _defer_tls_cooldown: bool = False) -> tuple[bool, dict | None]:
+                  _defer_tls_cooldown: bool = False,
+                  _defer_connection_cooldown: bool = False,
+                  timeout: float | None = None) -> tuple[bool, dict | None]:
     """Probe egress for ``profile`` (the provider's active exit) through the
     tunnel, persist the outcome, and add a blocked marker when the probe itself
     hit a Cloudflare reputation block. Returns (ok, record); record is None
@@ -2044,14 +2059,22 @@ def probe_profile(name: str, profile: Path, *, port: int | None = None,
     url = probe_url_for(name)
     if url is None:
         return True, None
-    result = probe_egress(port=port, url=url)
+    deadline = time.monotonic() + timeout if timeout is not None else None
+    probe_options = {"port": port, "url": url}
+    if timeout is not None:
+        probe_options["timeout"] = timeout
+    result = probe_egress(**probe_options)
     dns_ok = None
     if (not result["ok"] and result["status"] is None
             and _transport_reason(result["error"]) != "tls"):
-        # TLS has progressed beyond resolution, but has NOT proved HTTPS
-        # works. Other connection failures still need the DNS distinction.
+        # TLS is beyond resolution; other failures need the DNS distinction.
         host = urllib.parse.urlsplit(url).hostname or ""
-        dns_ok = egress_dns_probe(host, port=port) if host else None
+        if host:
+            remaining = deadline - time.monotonic() if deadline is not None else None
+            if remaining is None:
+                dns_ok = egress_dns_probe(host, port=port)
+            elif remaining > 0:
+                dns_ok = egress_dns_probe(host, port=port, timeout=remaining)
     record = record_egress(name, profile, ok=result["ok"], latency_ms=result["latency_ms"],
                            status=result["status"], error=result["error"], dns_ok=dns_ok,
                            target=url)
@@ -2069,66 +2092,43 @@ def probe_profile(name: str, profile: Path, *, port: int | None = None,
         # blips which can be transient handshake races).
         seconds = int(_providers.get(name, {}).get("cooldown_seconds", 60))
         _apply_upstream_failure(name, profile, "429", seconds)
-    elif (not result["ok"] and result["status"] is None
-          and not is_cooled_down(name, profile)
-          and dns_ok is True
-          and _transport_reason(result["error"]) != "tls"
-          and int(record.get("fails") or 0) >= int(egress_settings()["fail_threshold"])):
-        # Connection-level failure (dial/connect/timeout/reset — no HTTP
-        # status, no TLS handshake): the tunnel path itself is broken, so the
-        # exit is failed for real traffic. Cool it so rotation and
-        # resolve_active avoid it instead of re-picking the same dead exit.
-        # Seconds come from the effective error policy for the reason class
-        # (connection; built-in default matches the merged 300s rule).
-        # Multi-strike: a single transient blip must not dead-mark a healthy
-        # exit; only fail_threshold (default 2) CONSECUTIVE failures cool it,
-        # mirroring keepalive's dead_strikes and _egress_rank.
-        # TLS uses its separate target-scoped streak and quarantine above,
-        # rather than the connection/DNS failure gate here.
-        # dns_ok False is excluded too: resolution rides the direct path, so
-        # a DNS flake never proves the tunnel dead (degraded, not dead).
-        # Only a positive DNS signal permits cooldown. False means the direct
-        # resolver failed; None is inconclusive. Neither proves the tunnel
-        # dead, so DNS failures/flakes never trigger rotation.
-        reason = _transport_reason(result["error"])
-        _action, seconds = policy_action(name, reason)
-        mark_cooldown(name, profile, seconds)
-        print(f"router: marked {profile.stem} failed (transport/{reason}; cooldown {seconds}s)", file=sys.stderr)
+    elif not _defer_connection_cooldown:
+        _cool_connection_failure(name, profile, record)
     return result["ok"], record
 
 
 def _probe_with_settle(name: str, profile: Path, *, port: int | None = None) -> tuple[bool, dict | None]:
-    """Probe once, then quarantine repeated TLS failures after settling.
-
-    A freshly switched WireGuard exit can briefly blackhole inner TLS, so the
-    first failure is deferred through the configured settle window. Steady
-    probes keep their normal multi-strike behavior; setting the window to zero
-    applies the TLS threshold immediately.
-    """
+    """Poll readiness before transport quarantine; HTTP policy stays immediate."""
     try:
         settle = max(0.0, float(egress_settings().get("probe_settle_seconds", 20.0)))
     except (TypeError, ValueError):
         settle = 20.0
-    ok, record = probe_profile(name, profile, port=port,
-                               _defer_tls_cooldown=settle > 0)
-    if ok or settle <= 0:
-        return ok, record
-    print(f"router: probe failed for {profile.stem}; retrying once after {settle:.0f}s settle",
-          file=sys.stderr)
-    # Poll the settle window instead of sleeping through it: an exit whose
-    # handshake completes early is detected within one poll step instead of
-    # always paying the full settle (measured worst case: 20s of dead-riding
-    # traffic per failed rotation).
-    poll_step = min(2.0, max(0.5, settle / 10.0))
     deadline = time.monotonic() + settle
+    probe_timeout = float(egress_settings()["probe_timeout"])
+    ok, record = probe_profile(name, profile, port=port,
+                               _defer_tls_cooldown=settle > 0,
+                               _defer_connection_cooldown=settle > 0,
+                               timeout=min(probe_timeout, settle) if settle > 0 else None)
+    if ok or settle <= 0 or egress.is_http_policy_outcome(record):
+        return ok, record
+    print(f"router: probe failed for {profile.stem}; polling readiness for up to {settle:.0f}s",
+          file=sys.stderr)
+    # Stop on readiness instead of sleeping through the whole window.
+    poll_step = min(2.0, max(0.5, settle / 10.0))
     while time.monotonic() < deadline:
         time.sleep(min(poll_step, max(0.0, deadline - time.monotonic())))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         ok, record = probe_profile(name, profile, port=port,
-                                   _defer_tls_cooldown=True)
-        if ok:
+                                   _defer_tls_cooldown=True,
+                                   _defer_connection_cooldown=True,
+                                   timeout=min(probe_timeout, remaining))
+        if ok or egress.is_http_policy_outcome(record):
             return ok, record
     if record is not None:
         _cool_tls_failure(name, profile, record)
+        _cool_connection_failure(name, profile, record)
     return ok, record
 
 
@@ -2177,9 +2177,13 @@ def egress_dns_probe(host: str, *, port: int | None = None, timeout: float | Non
     openers for tests, no new dependencies.
     """
     timeout = timeout if timeout is not None else max(2.0, min(egress_settings()["probe_timeout"], 5.0))
+    deadline = time.monotonic() + timeout
     if _bounded_getaddrinfo(host, 443, min(timeout, 3.0)) is None:
         return None  # hostname itself unresolvable: not a tunnel signal
-    result = probe_egress(port=port, url=f"http://{host}/", timeout=timeout, opener=opener)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    result = probe_egress(port=port, url=f"http://{host}/", timeout=remaining, opener=opener)
     if result["ok"] or result["status"] is not None:
         return True  # a response rode the tunnel: resolution worked
     if _dns_error_markers(result["error"]):

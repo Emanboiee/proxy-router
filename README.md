@@ -370,8 +370,15 @@ Where it is consumed:
   tunnel dead, so `dns_ok: false` reports `degraded` instead of dead.
   TLS-classed failures use a separate target-scoped consecutive-failure
   counter. After `fail_threshold`, the effective `tls` policy quarantines
-  that profile (built-in 300s); settle retries defer quarantine until the
-  configured settle window ends. A successful probe resets the TLS streak.
+  that profile (built-in 300s). After a switch, settle polling defers both
+  TLS and connection quarantine until the configured window ends, and
+  returns as soon as HTTPS succeeds. The window includes the initial probe;
+  HTTP I/O timeouts use the remaining budget and no retry starts at its
+  deadline (DNS validation and process cleanup can add overhead). HTTP policy
+  outcomes such as 429 and 5xx end transport settling immediately; a truncated
+  response remains retryable. DNS evidence belongs to the latest probe;
+  an inconclusive lookup clears an older successful signal. A successful
+  probe resets the TLS streak.
   A degraded HTTP status (reputation
   block / 5xx) is never cooled. HTTP 429 is the one exception: a probe that
   rides the tunnel to the routed service and gets a 429 is direct evidence
