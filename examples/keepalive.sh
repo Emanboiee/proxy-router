@@ -24,7 +24,7 @@
 # guard). TUN mode still permits read-only checks, but never performs an
 # automatic profile or fallback change. A single-profile pool with no viable
 # rotation candidate parks once on its configured fallback and stays sticky
-# (restore rides its own shorter cadence, see below); base-route gaps ("missing default
+# (restore has its own shorter cadence); base-route gaps ("missing default
 # interface", "no route to internet", "WireGuard is not ready") defer
 # without consuming strike/rotation budget.
 #
@@ -46,13 +46,10 @@
 # skips the background sweep because all providers share one engine. Explicit
 # CLI sweep/rotate commands remain operator-controlled interruptions.
 #
-# Parked-lane restore: a fail-open park must never stay sticky for the full
-# sweep interval. On a filtered network the direct fallback is SNI-blocked, so
-# a parked lane means routed domains are dead while the tunnel still reports
-# green (#139). Restore attempts (clear marker, probe primary, re-park when
-# still dead) are cheap, so they run on their own
+# Parked-lane restore: a fail-open park must not wait for the full-pool sweep,
+# which may be disabled or hours away. Restore attempts run on their own
 # PROXY_KEEPALIVE_FALLBACK_RESTORE_EVERY clock (default 300s) and only when a
-# fallback marker actually exists. They share the sweep's rotation-stagger
+# runtime fallback marker exists. They share the sweep's rotation-stagger
 # window, so a fresh rotation is never chased by a restore.
 #
 # Manual-off quiescence: when `state/manual-off` exists (user disconnected via
@@ -79,7 +76,7 @@
 #   PROXY_KEEPALIVE_STORM_WINDOW   rotation-guard window in seconds    (600)
 #   PROXY_KEEPALIVE_MAX_ROTATIONS  max keepalive rotations per window  (2)
 #   PROXY_KEEPALIVE_SWEEP_EVERY    full-pool egress sweep every N seconds (1800)
-#   PROXY_KEEPALIVE_FALLBACK_RESTORE_EVERY  parked-lane restore every N secs (300)
+#   PROXY_KEEPALIVE_FALLBACK_RESTORE_EVERY  parked-lane restore every N seconds (300)
 #   PROXY_KEEPALIVE_NETWORK_GRACE consecutive Wi-Fi misses before stop (1)
 #   PROXY_KEEPALIVE_WAKE_GAP       sleep/wake gap forcing recovery (20x interval, min 600s)
 #   PROXY_KEEPALIVE_ENABLED        temporary on/off override               (config)
@@ -130,7 +127,7 @@ try:
         print("1" if value not in (False, 0, "0", "false", "off") else "0")
     else:
         value = int(value)
-        if value < 1:
+        if value < 1 and not (key == "sweep_every" and value == 0):
             raise ValueError
         print(value)
 except (OSError, ValueError, TypeError, json.JSONDecodeError):
@@ -149,7 +146,7 @@ try:
         print("1" if value not in (False, 0, "0", "false", "off") else "0")
     else:
         value = int(value)
-        if value < 1:
+        if value < 1 and not (key == "sweep_every" and value == 0):
             raise ValueError
         print(value)
 except (OSError, ValueError, TypeError, json.JSONDecodeError):
@@ -549,13 +546,12 @@ rotate_dead() {
       echo "router: fallback for '$provider' failed; will retry after the next dead check" >&2
       return
     fi
-    echo "router: parked '$provider' on fallback (sticky; restore rides the ${FALLBACK_RESTORE_EVERY}s restore cadence)" >&2
+    echo "router: parked '$provider' on fallback (sticky; restore uses its own cadence)" >&2
   fi
 }
 
-# True when some provider is currently parked on a runtime fallback marker.
-# The restore lane only has work to do when something is parked, so this keeps
-# the common case (nothing parked) free of controller calls.
+# True when a runtime fallback is parked; avoid controller probes in the common
+# case when there is nothing to restore.
 fallback_marker_exists() {
   for marker in "$ROOT"/state/fallback/*.json; do
     [ -e "$marker" ] && return 0
@@ -563,7 +559,6 @@ fallback_marker_exists() {
   return 1
 }
 
-# Latest persisted rotation timestamp, or zero when there is no record.
 newest_rotation_at() {
   local newest=0 rotation_file rotated_at
   for rotation_file in "$ROOT"/state/*.rotation; do
@@ -578,9 +573,8 @@ newest_rotation_at() {
 # One bounded restore attempt per fallback-parked provider: clear the marker,
 # probe the primary live through the tunnel, keep the fallback cleared when the
 # primary answers, re-activate it when the primary is still dead. Runs on its
-# own FALLBACK_RESTORE_EVERY cadence rather than the full-pool sweep cadence
-# (which may be hours; #139), and only when a marker exists -- so a genuinely
-# dead primary still never causes a failover off/on storm.
+# own shorter cadence, so a disabled/long full-pool sweep cannot leave a
+# genuinely dead primary parked indefinitely.
 restore_fallbacks() {
   if is_tun_mode; then
     return
@@ -808,6 +802,10 @@ while true; do
     newest_rotation=$(newest_rotation_at)
     if is_tun_mode; then
       :
+    elif [ "$SWEEP_EVERY" -le 0 ]; then
+      # sweep_every 0 disables the automatic full-pool sweep: every profile hop
+      # is a hard reload, so it is operator-run only (`router.py egress sweep`).
+      :
     elif [ "$newest_rotation" -gt 0 ] && [ $((sweep_now - newest_rotation)) -lt "$STAGGER" ]; then
       echo "router: sweep deferred (rotation ${STAGGER}s stagger window)" >&2
     elif [ "$last_sweep" -eq 0 ] || [ $((sweep_now - last_sweep)) -ge "$SWEEP_EVERY" ]; then
@@ -818,15 +816,10 @@ while true; do
       fi
       last_sweep="$sweep_now"
     fi
-    # Parked-lane restore on its own, shorter clock (#139). A fail-open park
-    # must not stay sticky until the next full-pool sweep: on a filtered
-    # network the direct fallback is SNI-blocked, so the tunnel can report
-    # green while routed domains are dead. Only attempt work when a marker
-    # exists, and honour the same rotation-stagger window as the sweep so a
-    # fresh rotation is never chased by a restore.
-    # The full-pool sweep can switch profiles and record a rotation; refresh
-    # the marker timestamp before deciding whether fallback restore can run.
+    # A sweep may have just switched exits; refresh before considering restore.
     newest_rotation=$(newest_rotation_at)
+    # Restore fail-open parks independently of the optional full-pool sweep.
+    # A disabled sweep must not leave a parked provider sticky indefinitely.
     restore_now=$(date +%s)
     if is_tun_mode; then
       :
