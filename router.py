@@ -223,11 +223,7 @@ _proxy_bypass_domains: list[str] = []
 
 
 def _bypass_domains() -> list[str]:
-    """macOS proxy bypass list: loopback defaults plus configured domains.
-
-    Bypassed hosts never reach the engine, so long-lived app traffic (Drive
-    uploads, Colab kernels) cannot be dropped by an engine reload mid-flight.
-    """
+    """Return configured system proxy exceptions."""
     return system_proxy_bypass_domains()
 _egress_settings: dict = {}
 _error_policy: dict | None = None
