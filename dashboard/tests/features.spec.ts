@@ -16,6 +16,21 @@ test('home profile mode uses an in-app picker', async ({ page }) => {
   await expect(page.getByRole('status')).toHaveText('Profile “OpenCode only” selected');
 });
 
+test('announcements stay mounted while the page content rerenders', async ({ page }) => {
+  const announcement = page.locator('#announcement');
+  await expect(announcement).toHaveAttribute('role', 'status');
+  await expect(announcement).toHaveAttribute('aria-live', 'polite');
+
+  await page.locator('#home-profile').click();
+  await page.getByRole('option', { name: 'OpenCode only', exact: true }).click();
+  await expect(announcement).toHaveText('Profile “OpenCode only” selected');
+
+  await page.getByRole('link', { name: 'Profiles', exact: true }).click();
+  await expect(announcement).toHaveText('Profile “OpenCode only” selected');
+  await page.getByRole('article').filter({ hasText: 'OpenCode only' }).getByRole('button', { name: 'Export' }).click();
+  await expect(announcement).toHaveText('Profile export ready');
+});
+
 test('profiles support create, edit, duplicate, import, export, select, and delete', async ({ page }) => {
   await page.getByRole('link', { name: 'Profiles', exact: true }).click();
   await page.getByRole('button', { name: 'Create profile', exact: true }).click();
