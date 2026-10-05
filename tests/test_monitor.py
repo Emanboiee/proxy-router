@@ -7,6 +7,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import urllib.request
 from pathlib import Path
@@ -123,22 +124,56 @@ class ProbeTests(unittest.TestCase):
         self.assertIn("77", command)
         self.assertIn("/tmp/router", command)
 
-    def test_malformed_monitor_settings_fall_back_to_safe_defaults(self):
+    def test_missing_router_config_uses_explicit_first_run_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "router.json").write_text(json.dumps({
-                "monitor": {
-                    "http_url": "file:///etc/passwd",
-                    "download_url": 123,
-                    "interval_seconds": "bad",
-                    "ping_hosts": "1.1.1.1",
-                }
-            }))
             settings = monitor._monitor_settings(root)
         self.assertEqual(settings["http_url"], monitor.DEFAULT_HTTP_URL)
         self.assertEqual(settings["download_url"], monitor.DEFAULT_DOWNLOAD_URL)
+        self.assertEqual(settings["upload_url"], monitor.DEFAULT_UPLOAD_URL)
         self.assertEqual(settings["interval_seconds"], monitor.DEFAULT_INTERVAL)
         self.assertEqual(settings["ping_hosts"], list(monitor.DEFAULT_PING_HOSTS))
+
+    def test_malformed_router_json_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "router.json").write_text("{\"monitor\":")
+            with self.assertRaisesRegex(monitor.MonitorConfigError, "invalid router.json"):
+                monitor._monitor_settings(root)
+
+    def test_wrong_monitor_field_type_is_reported_before_probing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "router.json").write_text(json.dumps({
+                "monitor": {"ping_hosts": "1.1.1.1"}
+            }))
+            with mock.patch.object(monitor, "measure_http_latency") as http_probe, \
+                 mock.patch.object(monitor, "measure_ping") as ping_probe:
+                with self.assertRaisesRegex(monitor.MonitorConfigError, "ping_hosts"):
+                    monitor.collect_sample(root)
+            http_probe.assert_not_called()
+            ping_probe.assert_not_called()
+
+    def test_worker_records_invalid_config_without_probing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            enabled = monitor.enabled_file(root)
+            enabled.parent.mkdir(parents=True)
+            enabled.touch()
+            (root / "router.json").write_text("{")
+
+            def stop_after_sample(_seconds):
+                enabled.unlink(missing_ok=True)
+
+            with mock.patch.object(monitor, "measure_http_latency") as http_probe, \
+                 mock.patch.object(monitor, "measure_ping") as ping_probe, \
+                 mock.patch.object(monitor.time, "sleep", side_effect=stop_after_sample):
+                self.assertEqual(monitor.worker(root, interval=5), 0)
+
+            samples = [json.loads(line) for line in monitor.tail_logs(root).splitlines()]
+        self.assertIn("MonitorConfigError: invalid router.json", samples[-1]["error"])
+        http_probe.assert_not_called()
+        ping_probe.assert_not_called()
 
 
 class StateTests(unittest.TestCase):
@@ -176,6 +211,83 @@ class StateTests(unittest.TestCase):
             monitor.stop(self.root)
         kill.assert_not_called()
         self.assertFalse(path.exists())
+
+    def test_stop_waits_for_start_to_publish_pid(self):
+        spawn_entered = threading.Event()
+        finish_spawn = threading.Event()
+        stop_lock_contended = threading.Event()
+        stop_done = threading.Event()
+        start_results = []
+        stop_results = []
+        original_spin = monitor.worker_lock._spin
+
+        def spawn(*_args, **_kwargs):
+            spawn_entered.set()
+            if not finish_spawn.wait(3):
+                raise AssertionError("test did not release fake spawn")
+            return mock.Mock(pid=4321)
+
+        def observe_spin(attempt, timeout, path):
+            if threading.current_thread().name != "monitor-stopper":
+                return original_spin(attempt, timeout, path)
+
+            def observe_attempt():
+                acquired = attempt()
+                if not acquired:
+                    stop_lock_contended.set()
+                return acquired
+
+            return original_spin(observe_attempt, timeout, path)
+
+        with (
+            mock.patch.object(monitor.subprocess, "Popen", side_effect=spawn),
+            mock.patch.object(monitor, "_pid_running", return_value=False),
+            mock.patch.object(monitor.worker_lock, "_spin", side_effect=observe_spin),
+        ):
+            starter = threading.Thread(
+                target=lambda: start_results.append(
+                    monitor.start(self.root, interval=77)
+                )
+            )
+            stopper = threading.Thread(
+                target=lambda: (
+                    stop_results.append(monitor.stop(self.root)),
+                    stop_done.set(),
+                ),
+                name="monitor-stopper",
+            )
+            starter.start()
+            self.assertTrue(spawn_entered.wait(2))
+            stopper.start()
+            self.assertTrue(
+                stop_lock_contended.wait(2),
+                "stop did not contend on the start lock",
+            )
+            self.assertFalse(
+                stop_done.is_set(),
+                "stop raced past the active start transaction",
+            )
+            finish_spawn.set()
+            starter.join(3)
+            stopper.join(3)
+
+        self.assertFalse(starter.is_alive())
+        self.assertFalse(stopper.is_alive())
+        self.assertTrue(start_results[0]["started"])
+        self.assertEqual(stop_results[0]["pid"], 4321)
+        self.assertFalse(monitor.pid_file(self.root).exists())
+        self.assertFalse(monitor.enabled_file(self.root).exists())
+
+    def test_stop_reports_lock_timeout_without_clearing_start_state(self):
+        monitor.enabled_file(self.root).parent.mkdir(parents=True, exist_ok=True)
+        monitor.enabled_file(self.root).touch()
+        with mock.patch.object(
+            monitor.worker_lock, "exclusive", side_effect=TimeoutError("worker lock busy")
+        ):
+            result = monitor.stop(self.root)
+        self.assertFalse(result["stopped"])
+        self.assertIn("worker lock busy", result["error"])
+        self.assertTrue(monitor.enabled_file(self.root).exists())
 
     def test_logs_tail_is_bounded(self):
         path = self.root / "state" / "monitor" / "samples.jsonl"
@@ -242,6 +354,60 @@ class ValidatedTargetTests(unittest.TestCase):
         self.assertIn("resolved to private/loopback", result["error"])
         self.assertIn("unsafe monitor target", result["error"])
 
+    def test_default_transport_rechecks_dns_for_all_probe_types(self):
+        with mock.patch.object(
+            monitor, "resolve_target_addresses", return_value=["10.0.0.8"]
+        ) as resolve:
+            results = [
+                monitor.measure_http_latency("https://probe.example/"),
+                monitor.measure_download("https://probe.example/file", max_bytes=8),
+                monitor.measure_upload("https://probe.example/upload", max_bytes=8),
+            ]
+
+        self.assertEqual(resolve.call_count, 3)
+        for result in results:
+            self.assertIn("resolved to private/loopback", result["error"])
+            self.assertIn("unsafe monitor target", result["error"])
+
+    def test_default_transport_pins_dns_answer_used_for_connection(self):
+        with mock.patch.object(
+            monitor,
+            "resolve_target_addresses",
+            side_effect=[["93.184.216.34"], ["10.0.0.8"]],
+        ) as resolve, mock.patch.object(
+            monitor.socket,
+            "create_connection",
+            side_effect=OSError("blocked test socket"),
+        ) as connect:
+            result = monitor.measure_http_latency("https://probe.example/")
+
+        self.assertEqual(resolve.call_count, 1)
+        self.assertEqual(connect.call_count, 1, result)
+        self.assertEqual(connect.call_args.args[0], ("93.184.216.34", 443))
+        self.assertIn("blocked test socket", result["error"])
+
+        connection = monitor._PinnedHTTPSConnection(
+            "probe.example", pinned_addresses=("93.184.216.34",), timeout=1
+        )
+        self.assertEqual(connection.host, "probe.example")
+
+    def test_default_safe_transport_preserves_default_headers(self):
+        response = FakeResponse(b"ok")
+        with mock.patch.object(
+            monitor, "resolve_target_addresses", return_value=["93.184.216.34"]
+        ), mock.patch.object(
+            monitor._SAFE_OPENER, "open", return_value=response
+        ) as open_request:
+            result = monitor.measure_http_latency(
+                "https://probe.example/", clock=iter([1.0, 1.05]).__next__
+            )
+
+        self.assertEqual(result["status"], 200)
+        request = open_request.call_args.args[0]
+        self.assertIsInstance(request, urllib.request.Request)
+        self.assertEqual(request.get_header("User-agent"), monitor.DEFAULT_HEADERS["User-Agent"])
+        self.assertEqual(request.get_header("Accept"), monitor.DEFAULT_HEADERS["Accept"])
+
     def test_explicit_opt_in_allows_private_targets(self):
         with mock.patch.dict(os.environ, {monitor.PRIVATE_TARGET_BYPASS_ENV: "1"}):
             violation = monitor.target_violation("http://127.0.0.1:9090/metrics")
@@ -259,20 +425,16 @@ class ValidatedTargetTests(unittest.TestCase):
         for result in (download, upload):
             self.assertIn("unsafe monitor target", result["error"])
 
-    def test_settings_fall_back_to_defaults_for_unsafe_urls(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "router.json").write_text(json.dumps({
-                "monitor": {
-                    "http_url": "file:///etc/passwd",
-                    "download_url": "http://192.168.0.1/speed",
-                    "upload_url": "https://169.254.169.254/up",
-                }
-            }))
-            settings = monitor._monitor_settings(root)
-        self.assertEqual(settings["http_url"], monitor.DEFAULT_HTTP_URL)
-        self.assertEqual(settings["download_url"], monitor.DEFAULT_DOWNLOAD_URL)
-        self.assertEqual(settings["upload_url"], monitor.DEFAULT_UPLOAD_URL)
+    def test_settings_reject_malformed_or_unsafe_configured_urls(self):
+        invalid_urls = ("https://[invalid", "http://127.0.0.1/speed")
+        with mock.patch.dict(os.environ, {monitor.PRIVATE_TARGET_BYPASS_ENV: ""}):
+            for key in ("http_url", "download_url", "upload_url"):
+                for url in invalid_urls:
+                    with self.subTest(key=key, url=url), tempfile.TemporaryDirectory() as tmp:
+                        root = Path(tmp)
+                        (root / "router.json").write_text(json.dumps({"monitor": {key: url}}))
+                        with self.assertRaisesRegex(monitor.MonitorConfigError, f"monitor\\.{key}"):
+                            monitor._monitor_settings(root)
 
 
 class PingHostValidationTests(unittest.TestCase):
