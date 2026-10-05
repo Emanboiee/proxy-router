@@ -468,6 +468,23 @@ Two more knobs in `"vpn"` control address-family policy:
   endpoint while the network's own resolver still answers. Only the query
   path changes: destination traffic still exits through the provider's
   endpoint. `school-warp` selects `local`; `default` restores `provider`.
+- `public_dns` — optional resolver for direct destinations, SOCKS destinations,
+  and WireGuard routes using `dns_resolver: local`. For example:
+  `{"server":"1.1.1.1","transport":"https","private_domains":["local","ts.net"]}`.
+  The server must be an IP literal so it does not depend on OS DNS to bootstrap.
+  Transports are `https` (default), `udp`, `tcp`, or `tls`. Private suffixes and
+  single-label hostnames keep OS DNS, including MagicDNS and LAN search domains;
+  add your own split DNS suffixes to `private_domains`. SOCKS route hostnames
+  are resolved before the upstream receives them, avoiding a second lookup by
+  a filtered SOCKS resolver. Omit `public_dns` to keep the previous behavior.
+- `tailscale_bypass` — opt-in coexistence for proxy mode (default `false`).
+  Keeps Tailscale control domains, `.ts.net` names, and the Tailscale IPv4/IPv6
+  ranges direct, ahead of provider rules. It adds persistent macOS proxy
+  exceptions while retaining existing exceptions and recording what Disconnect
+  should restore. Proxy mode uses OS socket routing so tailnet connections can
+  reach the Tailscale interface; TUN mode retains its existing interface binding.
+  Keep Tailscale DNS enabled to preserve MagicDNS. Test the configured public
+  DNS transport on the current network before enabling it.
 
 ## One-time elevation (macOS)
 
