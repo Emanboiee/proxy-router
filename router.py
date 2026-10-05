@@ -219,6 +219,12 @@ _port: int = DEFAULT_PORT
 _vpn: dict = {}
 _routing: dict = {}
 _autodetect: dict = {}
+_proxy_bypass_domains: list[str] = []
+
+
+def _bypass_domains() -> list[str]:
+    """Return configured system proxy exceptions."""
+    return system_proxy_bypass_domains()
 _egress_settings: dict = {}
 _error_policy: dict | None = None
 _PROVIDER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
@@ -591,7 +597,7 @@ def _load_autodetect(data: dict, routes: list, providers: dict) -> dict:
 
 
 def load_config() -> int:
-    global _providers, _routes, _port, _vpn, _routing, _autodetect
+    global _providers, _routes, _port, _vpn, _routing, _autodetect, _proxy_bypass_domains
     if not CONFIG_FILE.is_file():
         return fail(f"missing {CONFIG_FILE.name}; run 'router.py init' first")
     try:
@@ -611,6 +617,15 @@ def load_config() -> int:
         return fail("no providers configured")
     if not isinstance(vpn, dict):
         return fail(f"bad {CONFIG_FILE.name}: vpn must be an object")
+    bypass_domains = data.get("proxy_bypass_domains", [])
+    if bypass_domains is None:
+        bypass_domains = []
+    if not isinstance(bypass_domains, list) or not all(
+        isinstance(domain, str) and domain.strip() for domain in bypass_domains
+    ):
+        return fail(
+            f"bad {CONFIG_FILE.name}: proxy_bypass_domains must be a list of non-empty strings"
+        )
     capture = vpn.get("capture")
     if capture is not None and capture not in ("ruleset", "routes"):
         return fail(f"bad {CONFIG_FILE.name}: vpn.capture must be 'ruleset' or 'routes'")
@@ -781,6 +796,7 @@ def load_config() -> int:
     _vpn = vpn
     _routing = dict(routing)
     _autodetect = autodetect
+    _proxy_bypass_domains = [domain.strip() for domain in bypass_domains]
     return 0
 
 
@@ -2781,7 +2797,7 @@ def _public_dns_error(value) -> str | None:
 
 
 def system_proxy_bypass_domains() -> list[str]:
-    domains = list(_LOCAL_PROXY_BYPASS)
+    domains = list(dict.fromkeys(_LOCAL_PROXY_BYPASS + _proxy_bypass_domains))
     if _vpn.get("tailscale_bypass"):
         for domain in _TAILSCALE_DOMAINS:
             domains.extend([domain, f"*.{domain}"])
@@ -6948,7 +6964,11 @@ def system_proxy_on(runner=None) -> int:
     if conflicts:
         return fail("foreign system proxy conflict: " + "; ".join(conflicts))
 
+    # Freeze the exact list that Connect will apply so Disconnect can restore
+    # the captured pre-Connect list even after a config reload.
+    bypass_domains = _bypass_domains()
     state = {"version": 1, "endpoint": {"server": "127.0.0.1", "port": _port},
+             "proxy_bypass_domains": bypass_domains,
              "services": snapshots, "changed_at": int(time.time())}
     try:
         # Persist the ownership intent before the first mutation.  A crash or
@@ -7189,7 +7209,7 @@ def system_proxy_off(runner=None) -> int:
             if before_domains is not None:
                 try:
                     current_domains = _capture_proxy_aux(service, run).get("bypass", {}).get("domains")
-                    ours_domains = record.get("applied_bypass", _LOCAL_PROXY_BYPASS)
+                    ours_domains = record.get("applied_bypass", state.get("proxy_bypass_domains", _LOCAL_PROXY_BYPASS))
                     if current_domains == ours_domains and current_domains != before_domains:
                         _run_result(run, ["networksetup", "-setproxybypassdomains", service, *(before_domains or ["Empty"])],
                                     check=True, capture_output=True, timeout=10)
