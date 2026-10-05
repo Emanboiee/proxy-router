@@ -148,7 +148,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cp router.py setup_tui.py monitor.py route_watcher.py proxy_tray.py domain_autodetect.py egress.py state.py config_schema.py worker_lock.py providers_check.py net_safety.py model_relay.py README.md LICENSE .gitignore router.example.json dist/proxy-router/
+          cp router.py setup_tui.py monitor.py route_watcher.py proxy_tray.py domain_autodetect.py egress.py state.py config_schema.py worker_lock.py providers_check.py net_safety.py model_relay.py status_snapshot.py README.md LICENSE .gitignore router.example.json dist/proxy-router/
           cp -R guides rulesets dist/proxy-router/
           cp privileged_helper.py privileged_installer.py sing-box-release.json dist/proxy-router/
           if [ "${{ matrix.archive }}" = "tar.gz" ]; then
@@ -223,7 +223,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist/proxy-router
-          cp router.py setup_tui.py monitor.py route_watcher.py proxy_tray.py domain_autodetect.py egress.py state.py config_schema.py worker_lock.py providers_check.py net_safety.py model_relay.py README.md LICENSE .gitignore router.example.json pyproject.toml requirements-dev.txt dist/proxy-router/
+          cp router.py setup_tui.py monitor.py route_watcher.py proxy_tray.py domain_autodetect.py egress.py state.py config_schema.py worker_lock.py providers_check.py net_safety.py model_relay.py status_snapshot.py README.md LICENSE .gitignore router.example.json pyproject.toml requirements-dev.txt dist/proxy-router/
           cp -R tests examples guides rulesets install.sh install.ps1 .github dist/proxy-router/
           cp privileged_helper.py privileged_installer.py sing-box-release.json VERSION dist/proxy-router/
           tar -czf "proxy-router-${GITHUB_REF_NAME}-source.tar.gz" -C dist proxy-router
