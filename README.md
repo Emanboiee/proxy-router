@@ -266,10 +266,12 @@ Rotation is then egress-aware instead of blind round-robin:
   arrived but was not ok - e.g. a Cloudflare 1010/403 reputation block or 5xx,
   i.e. NOT a dead tunnel), or `dead` (connection-level failure, no HTTP status
   and no TLS handshake - the tunnel path itself is broken). A TLS-classed
-  failure (SSL EOF / `SSL_ERROR_SYSCALL` / TLS alert) is also `degraded`: the
-  TCP CONNECT rode the tunnel, so the path works and the upstream endpoint is
-  throttling (Proton free tier routinely resets inner TLS ~1s in while real
-  traffic still succeeds) - never a cooldown, never a rotation. A companion
+  failure (SSL EOF / `SSL_ERROR_SYSCALL` / TLS alert) starts as `degraded`.
+  Repeated failures against the same target become `dead` after
+  `fail_threshold` and apply the effective `tls` cooldown. A local proxy's
+  CONNECT acceptance does not prove the remote TLS handshake succeeded;
+  failed TLS probes cannot qualify an exit as usable in a sweep or prove
+  TUN startup readiness. A companion
   DNS probe records `dns_ok` in the egress record when determinable. DNS
   resolution rides the DIRECT path by design, so `dns_ok: false` means the
   direct DNS path failed (e.g. a flaky DoH endpoint on a filtered network) -
@@ -366,9 +368,11 @@ Where it is consumed:
   and only when the DNS probe succeeded (`dns_ok: true`): a failed lookup on
   the direct DNS path (DNS is pinned direct by design) never proves the
   tunnel dead, so `dns_ok: false` reports `degraded` instead of dead.
-  TLS-classed failures are never cooled either: they mean the TCP CONNECT
-  rode the tunnel and the upstream endpoint is throttling, so the exit is
-  reported `degraded` instead of dead. A degraded HTTP status (reputation
+  TLS-classed failures use a separate target-scoped consecutive-failure
+  counter. After `fail_threshold`, the effective `tls` policy quarantines
+  that profile (built-in 300s); settle retries defer quarantine until the
+  configured settle window ends. A successful probe resets the TLS streak.
+  A degraded HTTP status (reputation
   block / 5xx) is never cooled. HTTP 429 is the one exception: a probe that
   rides the tunnel to the routed service and gets a 429 is direct evidence
   the exit's egress IP is rate-limited, so it applies the 429 error-policy
