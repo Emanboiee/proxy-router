@@ -52,6 +52,7 @@ _AUTOCHECK_PRESETS = {
         "storm_window": 600,
         "max_rotations": 2,
         "sweep_every": 1800,
+        "fallback_restore_every": 600,
     },
     "light": {
         "enabled": True,
@@ -62,6 +63,7 @@ _AUTOCHECK_PRESETS = {
         "storm_window": 1800,
         "max_rotations": 1,
         "sweep_every": 7200,
+        "fallback_restore_every": 900,
     },
     "balanced": {
         "enabled": True,
@@ -72,6 +74,7 @@ _AUTOCHECK_PRESETS = {
         "storm_window": 600,
         "max_rotations": 2,
         "sweep_every": 1800,
+        "fallback_restore_every": 300,
     },
     "aggressive": {
         "enabled": True,
@@ -82,6 +85,7 @@ _AUTOCHECK_PRESETS = {
         "storm_window": 300,
         "max_rotations": 3,
         "sweep_every": 900,
+        "fallback_restore_every": 180,
     },
 }
 _AUTOCHECK_NUMERIC = tuple(key for key in _AUTOCHECK_PRESETS["balanced"] if key != "enabled")

@@ -559,6 +559,17 @@ fallback_marker_exists() {
   return 1
 }
 
+newest_rotation_at() {
+  local newest=0 rotation_file rotated_at
+  for rotation_file in "$ROOT"/state/*.rotation; do
+    [ -f "$rotation_file" ] || continue
+    rotated_at=$(sed -n 's/.*"at": *\([0-9]*\).*/\1/p' "$rotation_file" 2>/dev/null || echo 0)
+    case "$rotated_at" in ''|*[!0-9]*) rotated_at=0 ;; esac
+    [ "$rotated_at" -gt "$newest" ] && newest="$rotated_at"
+  done
+  printf '%s\n' "$newest"
+}
+
 # One bounded restore attempt per fallback-parked provider: clear the marker,
 # probe the primary live through the tunnel, keep the fallback cleared when the
 # primary answers, re-activate it when the primary is still dead. Runs on its
@@ -788,13 +799,7 @@ while true; do
     # hop away). PROXY_KEEPALIVE_STAGGER seconds after the newest rotation
     # record, the sweep defers to the next tick.
     STAGGER="${PROXY_KEEPALIVE_STAGGER:-300}"
-    newest_rotation=0
-    for rotation_file in "$ROOT"/state/*.rotation; do
-      [ -f "$rotation_file" ] || continue
-      rotated_at=$(sed -n 's/.*"at": *\([0-9]*\).*/\1/p' "$rotation_file" 2>/dev/null || echo 0)
-      case "$rotated_at" in ''|*[!0-9]*) rotated_at=0 ;; esac
-      [ "$rotated_at" -gt "$newest_rotation" ] && newest_rotation="$rotated_at"
-    done
+    newest_rotation=$(newest_rotation_at)
     if is_tun_mode; then
       :
     elif [ "$SWEEP_EVERY" -le 0 ]; then
@@ -811,6 +816,8 @@ while true; do
       fi
       last_sweep="$sweep_now"
     fi
+    # A sweep may have just switched exits; refresh before considering restore.
+    newest_rotation=$(newest_rotation_at)
     # Restore fail-open parks independently of the optional full-pool sweep.
     # A disabled sweep must not leave a parked provider sticky indefinitely.
     restore_now=$(date +%s)
