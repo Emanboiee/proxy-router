@@ -5924,60 +5924,9 @@ def vpn_status() -> int:
 
 
 def _provider_status(name: str) -> dict:
-    """Machine-readable view of one provider: profiles, active, cooldowns,
-    last rotation, and persisted egress records."""
-    proxy_backed = is_proxy_provider(name)
-    profiles = [] if proxy_backed else [p.stem for p in provider_files(name)]
-    # Report the PERSISTED active profile (what the engine is configured with)
-    # rather than resolve_active(), which skips a cooled-down active when
-    # picking the next candidate. Proxy-backed providers have one synthetic
-    # SOCKS lane; stale WireGuard markers/files must not shadow its status.
-    if proxy_backed:
-        active_stem = _PROXY_PROFILE_STEM
-    else:
-        active_profile = persisted_active(name)
-        active_stem = active_profile.stem if active_profile is not None else None
-    entry = {"profiles": profiles, "active": active_stem}
-    if proxy_backed:
-        try:
-            upstream_host, upstream_port = proxy_upstream(name)
-        except ValueError as exc:
-            entry["upstream_error"] = str(exc)
-        else:
-            entry["upstream"] = f"{upstream_host}:{upstream_port}"
-        proxy_record = read_egress(name, proxy_profile_key(name))
-        if proxy_record:
-            entry["egress"] = {_PROXY_PROFILE_STEM: proxy_record}
-    fallback = fallback_status(name)
-    if fallback["configured"] or fallback["active"]:
-        entry["fallback"] = fallback
-    if not proxy_backed:
-        cooldowns = {}
-        for stem in profiles:
-            path = ROOT / "state" / "cooldowns" / name / f"{stem}.until"
-            try:
-                if path.is_file():
-                    cooldowns[stem] = int(path.read_text().strip())
-            except (ValueError, OSError):
-                pass
-        if cooldowns:
-            entry["cooldown_until"] = cooldowns
-    if not proxy_backed:
-        rotation = ROOT / "state" / f"{name}.rotation"
-        try:
-            if rotation.is_file():
-                entry["last_rotation"] = json.loads(rotation.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
-    if not proxy_backed:
-        egress = {}
-        for stem in profiles:
-            record = read_egress(name, Path(stem + ".conf"))
-            if record:
-                egress[stem] = record
-        if egress:
-            entry["egress"] = egress
-    return entry
+    from status_snapshot import build_provider_status
+
+    return build_provider_status(globals(), name)
 
 
 def _legacy_launch_agents() -> list[str]:
@@ -6064,85 +6013,9 @@ def status_json(*, fast: bool = False) -> dict:
 
 
 def _status_json(*, fast: bool = False) -> dict:
-    rc, line = _status_report(fast=fast)
-    data = {"up": rc == 0, "state": line, "mode": current_mode(), "port": _port,
-            "sing_box": resolve_sing_box(), "schema_version": SCHEMA_VERSION}
-    # Local settings inspection is read-only and does not perform a network
-    # probe. Keep engine liveness separate from proxy readiness so a listener
-    # alone cannot make the tray claim that GUI traffic is connected.
-    proxy_status, effective = _system_proxy_status_readonly()
-    data["system_proxy"] = {"status": proxy_status, "effective": effective}
-    cached = _cached_network_diagnostic()
-    if cached is not None:
-        data["network"] = cached
-    try:
-        if PID_FILE.is_file():
-            data["pid"] = int(PID_FILE.read_text().strip())
-    except (ValueError, OSError):
-        pass
-    data["providers"] = {name: _provider_status(name) for name in _providers}
-    data["degraded_lanes"] = _degraded_lanes()
-    data["error_policy"] = {name: error_policy_for(name) for name in _providers}
-    data["routes"] = [{
-        "id": route.get("id"),
-        "provider": route.get("provider"),
-        "domains": route.get("domains", []),
-        "ip_cidr": route.get("ip_cidr", []),
-    } for route in _routes]
-    data["autodetect"] = autodetect_status()
-    data["routing"] = routing_state()
-    try:
-        cfg = json.loads(CONFIG_FILE.read_text())
-        data["preset"] = cfg.get("preset")
-    except (OSError, json.JSONDecodeError):
-        data["preset"] = None
-    try:
-        import route_watcher
+    from status_snapshot import build_status_snapshot
 
-        data["watcher"] = route_watcher.status(ROOT)
-    except Exception:
-        data["watcher"] = {"running": False, "enabled": False, "scope": "proxy-observable only"}
-    try:
-        data["legacy_agents"] = _legacy_launch_agents()
-    except Exception:
-        data["legacy_agents"] = []
-    # Issue #76: expose the startup-permission state so the tray (and any
-    # dashboard) can tell a permission gap apart from a broken engine and
-    # offer the one-click repair instead of a generic failure.
-    if fast:
-        data["elevation"] = {"platform": sys.platform, "skipped": "fast"}
-    else:
-        helper = None
-        if sys.platform == "darwin" and _effective_uid() != 0:
-            try:
-                helper = _helper_status()
-            except Exception:
-                helper = {"installed": False, "error": "helper status probe crashed"}
-        data["elevation"] = {
-            "platform": sys.platform,
-            "root_engine": _engine_runs_as_root(),
-            "helper_installed": bool(helper and helper.get("installed")),
-            "sudo_grant": _sudoers_installed(),
-            # The one-time fix every consumer should point at when any of the
-            # flags above shows the grant missing.
-            "fix_hint": _HELPER_FIX,
-        }
-        if sys.platform == "darwin":
-            data["elevation"]["tray_agent"] = _launchd_agent_state("com.proxy-router.tray")
-            data["elevation"]["keepalive_agent"] = _launchd_agent_state(
-                "com.proxy-router.keepalive")
-    rotation = {
-        "interval_seconds": scheduled_interval(),
-        "jitter_seconds": int(_rotation.get("jitter_seconds", DEFAULT_ROTATION_SETTINGS["jitter_seconds"]) or 0),
-        "policy": rotation_policy(),
-    }
-    if rotation["interval_seconds"] > 0:
-        next_times = [n for n in (next_rotation_at(name) for name in _rotation_candidates())
-                      if n is not None]
-        if next_times:
-            rotation["next_at"] = min(next_times)
-    data["rotation"] = rotation
-    return data
+    return build_status_snapshot(globals(), fast=fast)
 
 
 def _check_active_fallback(primary: str, fallback: str) -> tuple[Path | None, str, dict | None]:
