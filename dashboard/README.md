@@ -14,9 +14,10 @@ npm run tauri dev       # native window with tray behavior
 npm test                # Playwright + axe checks
 ```
 
-The desktop shell invokes the Python controller from `~/proxy-router` with
-`/opt/anaconda3/bin/python3` by default. Set `PROXY_ROUTER_ROOT` and
-`PROXY_ROUTER_PYTHON` to target another checkout or interpreter. Starting the
+The desktop shell prefers the installed runtime at `~/.local/share/proxy-router`
+and falls back to an existing `~/proxy-router` checkout. It discovers Python
+from PATH and common macOS install locations, including Finder's sparse environment.
+Set `PROXY_ROUTER_ROOT` and `PROXY_ROUTER_PYTHON` to override either choice. Starting the
 app reads status but does not connect automatically. Explicit actions such as
 Connect, Disconnect, preset changes, route changes, and network mappings call
 the real controller and can change live routing state. The tray closes the
