@@ -247,6 +247,7 @@ class ResponseEventStallTests(unittest.TestCase):
         params = {"host": "opencode.ai", "status": 0, "dedupe_seconds": 0}
         params.update(kwargs)
         with mock.patch.object(router, "rotate", return_value=0) as rotate_fn, \
+             mock.patch.object(router, "_usable_profile", return_value=self.root / "providers/proton/live.conf"), \
              mock.patch.object(router, "active_fallback", return_value=None), \
              io.StringIO() as buf, \
              mock.patch("sys.stdout", buf):
