@@ -1,0 +1,309 @@
+import json
+from pathlib import Path
+import pytest
+
+import domain_autodetect
+import router
+
+
+def test_extract_related_hosts_is_suffix_bounded():
+    document = '''
+      <script src="https://static-cdn.jtvnw.net/assets/app.js"></script>
+      <link href="//usher.ttvnw.net/api/channel.m3u8">
+      <a href="https://www.twitch.tv/">home</a>
+      <img src="https://not-twitch.tv/evil.png">
+    '''
+
+    assert domain_autodetect.extract_related_hosts(
+        document, ["twitch.tv", "jtvnw.net", "ttvnw.net"]
+    ) == ["static-cdn.jtvnw.net", "usher.ttvnw.net", "www.twitch.tv"]
+
+
+def test_extract_related_hosts_accepts_explicit_cross_origin_asset_root():
+    document = '''
+      <script src="https://cdn.prod.example.net/app.js"></script>
+      <img src="https://untrusted.example.net/image.png">
+    '''
+
+    assert domain_autodetect.extract_related_hosts(
+        document, ["wayground.com"], extra_roots=["example.net"]
+    ) == ["cdn.prod.example.net", "untrusted.example.net"]
+
+
+def test_merge_state_refreshes_hosts_and_prunes_expired():
+    state = {
+        "domains": {
+            "old.example": {"first_seen": 1, "last_seen": 1, "expires_at": 10},
+            "kept.example": {"first_seen": 1, "last_seen": 2, "expires_at": 100},
+        }
+    }
+
+    merged, changed = domain_autodetect.merge_state(
+        state, ["new.example", "kept.example"], now=20, ttl_seconds=600
+    )
+
+    assert changed is True
+    assert domain_autodetect.active_domains(merged, now=20) == [
+        "kept.example", "new.example"
+    ]
+    assert merged["domains"]["kept.example"]["expires_at"] == 620
+
+
+def test_build_config_includes_non_suffix_learned_hosts(tmp_path, monkeypatch):
+    old = (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
+           router._vpn, router._routing, router._autodetect, router._port)
+    try:
+        router.ROOT = Path(tmp_path)
+        router.CONFIG_FILE = router.ROOT / "router.json"
+        router._providers = {
+            "cloudflare": {"socks5": {"host": "127.0.0.1", "port": 2181}}
+        }
+        router._routes = [{
+            "id": "school", "domains": ["twitch.tv"], "provider": "cloudflare"
+        }]
+        router._vpn = {}
+        router._routing = {"mode": "default", "vpn_domains": []}
+        router._autodetect = {
+            "enabled": True,
+            "sources": {"twitch": {"route_id": "school", "provider": "cloudflare"}},
+        }
+        router._port = 2080
+        state_path = router.ROOT / "state" / "autodetect" / "twitch.json"
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text(json.dumps({
+            "route_id": "school", "provider": "cloudflare",
+            "domains": {
+                "static-cdn.jtvnw.net": {
+                    "first_seen": 1, "last_seen": 2, "expires_at": 9999999999
+                }
+            }
+        }))
+        monkeypatch.setattr(router, "current_mode", lambda: "proxy")
+
+        config, _ = router.build_singbox_config()
+
+        assert {
+            "outbound": "cloudflare",
+            "domain_suffix": ["twitch.tv", "static-cdn.jtvnw.net"],
+        } in config["route"]["rules"]
+    finally:
+        (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
+         router._vpn, router._routing, router._autodetect, router._port) = old
+
+
+def test_build_config_keeps_source_roots_in_vpn_list_mode(tmp_path, monkeypatch):
+    old = (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
+           router._vpn, router._routing, router._autodetect, router._port)
+    try:
+        router.ROOT = Path(tmp_path)
+        router.CONFIG_FILE = router.ROOT / "router.json"
+        router._providers = {
+            "cloudflare": {"socks5": {"host": "127.0.0.1", "port": 2181}}
+        }
+        router._routes = [{
+            "id": "school", "domains": ["twitch.tv"], "provider": "cloudflare"
+        }]
+        router._vpn = {}
+        router._routing = {
+            "mode": "vpn-list",
+            "vpn_domains": ["twitch.tv"],
+        }
+        router._autodetect = {
+            "enabled": True,
+            "sources": {
+                "twitch": {
+                    "route_id": "school", "provider": "cloudflare",
+                    "roots": ["twitch.tv", "jtvnw.net", "ttvnw.net"],
+                }
+            },
+        }
+        router._port = 2080
+        monkeypatch.setattr(router, "current_mode", lambda: "proxy")
+
+        config, _ = router.build_singbox_config()
+
+        rule = next(
+            rule for rule in config["route"]["rules"]
+            if rule.get("outbound") == "cloudflare"
+        )
+        assert "jtvnw.net" in rule["domain_suffix"]
+        assert "ttvnw.net" in rule["domain_suffix"]
+    finally:
+        (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
+         router._vpn, router._routing, router._autodetect, router._port) = old
+
+
+def test_vpn_list_intersects_broader_route_with_narrower_list(tmp_path, monkeypatch):
+    old = (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
+           router._vpn, router._routing, router._autodetect, router._port)
+    try:
+        router.ROOT = Path(tmp_path)
+        router.CONFIG_FILE = router.ROOT / "router.json"
+        router._providers = {
+            "cloudflare": {"socks5": {"host": "127.0.0.1", "port": 2181}}
+        }
+        router._routes = [{
+            "id": "school", "domains": ["example.com"], "provider": "cloudflare"
+        }]
+        router._vpn = {}
+        router._routing = {"mode": "vpn-list", "vpn_domains": ["api.example.com"]}
+        router._autodetect = {"enabled": False, "sources": {}}
+        router._port = 2080
+        monkeypatch.setattr(router, "current_mode", lambda: "proxy")
+
+        config, _ = router.build_singbox_config()
+
+        rule = next(
+            rule for rule in config["route"]["rules"]
+            if rule.get("outbound") == "cloudflare"
+        )
+        assert rule["domain_suffix"] == ["api.example.com"]
+    finally:
+        (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
+         router._vpn, router._routing, router._autodetect, router._port) = old
+
+
+def test_vpn_list_intersection_narrowest_wins():
+    assert router._vpn_list_intersection(
+        ["example.com"], ["api.example.com"]
+    ) == ["api.example.com"]
+    assert router._vpn_list_intersection(
+        ["api.example.com"], ["example.com"]
+    ) == ["api.example.com"]
+    assert router._vpn_list_intersection(
+        ["example.com"], ["example.com"]
+    ) == ["example.com"]
+    assert router._vpn_list_intersection(["a.com"], ["b.com"]) == []
+
+
+def test_build_config_keeps_learned_hosts_when_provider_changes(tmp_path, monkeypatch):
+    old = (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
+           router._vpn, router._routing, router._autodetect, router._port)
+    try:
+        router.ROOT = Path(tmp_path)
+        router.CONFIG_FILE = router.ROOT / "router.json"
+        router._providers = {
+            "proton": {"socks5": {"host": "127.0.0.1", "port": 2182}}
+        }
+        router._routes = [{
+            "id": "school", "domains": ["twitch.tv"], "provider": "proton"
+        }]
+        router._vpn = {}
+        router._routing = {"mode": "default", "vpn_domains": []}
+        router._autodetect = {
+            "enabled": True,
+            "sources": {"twitch": {"route_id": "school", "provider": "proton"}},
+        }
+        router._port = 2080
+        state_path = router.ROOT / "state" / "autodetect" / "twitch.json"
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text(json.dumps({
+            "route_id": "school", "provider": "cloudflare",
+            "domains": {
+                "video-weaver.example.ttvnw.net": {
+                    "first_seen": 1, "last_seen": 2, "expires_at": 9999999999
+                }
+            }
+        }))
+        monkeypatch.setattr(router, "current_mode", lambda: "proxy")
+
+        config, _ = router.build_singbox_config()
+
+        assert {
+            "outbound": "proton",
+            "domain_suffix": ["twitch.tv", "video-weaver.example.ttvnw.net"],
+        } in config["route"]["rules"]
+    finally:
+        (router.ROOT, router.CONFIG_FILE, router._providers, router._routes,
+         router._vpn, router._routing, router._autodetect, router._port) = old
+
+
+def test_load_autodetect_generates_sources_for_unconfigured_routes():
+    settings = router._load_autodetect(
+        {"autodetect": {"enabled": True}},
+        [
+            {"id": "school", "domains": ["twitch.tv", "ttvnw.net"], "provider": "cloudflare"},
+            {"id": "roblox", "domains": ["roblox.com", "rbxcdn.com"], "provider": "proton"},
+        ],
+        {"cloudflare": {}, "proton": {}},
+    )
+
+    assert set(settings["sources"]) == {"route-school", "route-roblox"}
+    assert settings["sources"]["route-roblox"] == {
+        "seed": "https://roblox.com/",
+        "route_id": "roblox",
+        "provider": "proton",
+        "roots": ["rbxcdn.com", "roblox.com"],
+        "ttl_seconds": 1800,
+    }
+
+
+def test_load_autodetect_explicit_source_covers_route():
+    settings = router._load_autodetect(
+        {
+            "autodetect": {
+                "enabled": True,
+                "sources": {
+                    "twitch": {
+                        "seed": "https://www.twitch.tv/",
+                        "route_id": "school",
+                        "provider": "cloudflare",
+                        "roots": ["twitch.tv", "ttvnw.net"],
+                    }
+                },
+            }
+        },
+        [{"id": "school", "domains": ["twitch.tv"], "provider": "cloudflare"}],
+        {"cloudflare": {}},
+    )
+
+    assert set(settings["sources"]) == {"twitch"}
+    assert settings["auto_sources"] is True
+
+
+
+def test_load_autodetect_preserves_explicit_extra_roots():
+    settings = router._load_autodetect(
+        {
+            "autodetect": {
+                "enabled": True,
+                "auto_sources": False,
+                "sources": {
+                    "school": {
+                        "seed": "https://wayground.com/",
+                        "route_id": "school",
+                        "provider": "cloudflare",
+                        "roots": ["wayground.com"],
+                        "extra_roots": ["cdn.prod.website-files.com", "CDN.PROD.WEBSITE-FILES.COM"],
+                    }
+                },
+            }
+        },
+        [{"id": "school", "domains": ["wayground.com"], "provider": "cloudflare"}],
+        {"cloudflare": {}},
+    )
+
+    assert settings["sources"]["school"]["extra_roots"] == ["cdn.prod.website-files.com"]
+
+
+def test_load_autodetect_rejects_invalid_extra_roots():
+    with pytest.raises(ValueError, match="extra_roots"):
+        router._load_autodetect(
+            {
+                "autodetect": {
+                    "enabled": True,
+                    "auto_sources": False,
+                    "sources": {
+                        "school": {
+                            "seed": "https://wayground.com/",
+                            "route_id": "school",
+                            "provider": "cloudflare",
+                            "roots": ["wayground.com"],
+                            "extra_roots": ["not a host"],
+                        }
+                    },
+                }
+            },
+            [{"id": "school", "domains": ["wayground.com"], "provider": "cloudflare"}],
+            {"cloudflare": {}},
+        )

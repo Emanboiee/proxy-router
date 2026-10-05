@@ -1,19 +1,21 @@
 import json
 import os
 import stat
+from pathlib import Path
 
 import pytest
 
 import dashboard_profile_manager as manager
 
 
-WIREGUARD = """[Interface]
-PrivateKey = PRIVATE-TEST-KEY
+TEST_PRIVATE_KEY = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+WIREGUARD = f"""[Interface]
+PrivateKey = {TEST_PRIVATE_KEY}
 Address = 10.20.0.2/32
 DNS = 1.1.1.1
 
 [Peer]
-PublicKey = PUBLIC-TEST-KEY
+PublicKey = AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=
 AllowedIPs = 0.0.0.0/0
 Endpoint = vpn.example.test:51820
 """
@@ -52,9 +54,9 @@ def test_provider_save_keeps_wireguard_secret_out_of_dashboard_state(tmp_path):
     assert provider["server"] == "vpn.example.test:51820"
     assert copied.read_text() == WIREGUARD
     assert stat.S_IMODE(copied.stat().st_mode) == 0o600
-    assert "PRIVATE-TEST-KEY" not in config_text
-    assert "PRIVATE-TEST-KEY" not in store_text
-    assert "PRIVATE-TEST-KEY" not in json.dumps(result)
+    assert TEST_PRIVATE_KEY not in config_text
+    assert TEST_PRIVATE_KEY not in store_text
+    assert TEST_PRIVATE_KEY not in json.dumps(result)
 
 
 def test_profile_create_and_apply_persists_routes_without_connecting(tmp_path):
@@ -244,3 +246,84 @@ def test_provider_used_as_routing_default_cannot_be_deleted(tmp_path):
 
     with pytest.raises(manager.DashboardError, match="routing default"):
         manager.delete_provider(root, provider["id"])
+
+
+def test_current_setup_keeps_mixed_routes_and_routing_policy(tmp_path):
+    root = tmp_path / "router"
+    config_at(root, {"a": {"directory": "providers/a"}, "b": {"directory": "providers/b"}})
+    config = json.loads((root / "router.json").read_text())
+    config["routes"] = [
+        {"id": "first", "domains": ["one.example"], "provider": "a"},
+        {"id": "second", "domains": ["two.example"], "provider": "b", "ip_cidr": ["198.51.100.0/24"]},
+    ]
+    config["routing"] = {"mode": "vpn-list", "vpn_domains": ["one.example", "two.example"]}
+    (root / "router.json").write_text(json.dumps(config))
+    profile = manager.state(root)["profiles"][0]
+    manager.apply_profile(root, profile["id"])
+    assert json.loads((root / "router.json").read_text()) == config
+    manager.save_profile(root, {**profile, "name": "Preserved setup"}, profile["id"])
+    manager.apply_profile(root, profile["id"])
+    assert json.loads((root / "router.json").read_text()) == config
+    assert "_route_snapshot" not in json.dumps(manager.state(root))
+
+
+def test_apply_does_not_remove_other_lanes_fallbacks(tmp_path):
+    root = tmp_path / "router"
+    config_at(root, {
+        "a": {"directory": "providers/a"},
+        "b": {"directory": "providers/b", "fallback_providers": ["c"]},
+        "c": {"directory": "providers/c"},
+    })
+    profile = manager.save_profile(root, {
+        "name": "Only A", "providerId": "a", "routeMode": "selective", "domains": ["one.example"],
+    })["profiles"][0]
+    manager.apply_profile(root, profile["id"])
+    assert json.loads((root / "router.json").read_text())["providers"]["b"]["fallback_providers"] == ["c"]
+
+
+def test_wireguard_conversion_removes_socks_transport(tmp_path):
+    root = tmp_path / "router"
+    config_at(root, {"gateway": {"socks5": {"host": "127.0.0.1", "port": 2181}}})
+    source = tmp_path / "import.conf"
+    source.write_text(WIREGUARD)
+    manager.save_provider(root, {"name": "Converted", "kind": "wireguard"}, "gateway", str(source))
+    config = json.loads((root / "router.json").read_text())
+    assert "socks5" not in config["providers"]["gateway"]
+    manager._validate_config(root, config)
+
+
+def test_invalid_wireguard_key_or_address_is_not_published(tmp_path):
+    root = tmp_path / "router"
+    config_at(root)
+    before = (root / "router.json").read_bytes()
+    source = tmp_path / "broken.conf"
+    for invalid in (WIREGUARD.replace(TEST_PRIVATE_KEY, "invalid"), WIREGUARD.replace("10.20.0.2/32", "invalid")):
+        source.write_text(invalid)
+        with pytest.raises(manager.DashboardError, match="invalid key or IP"):
+            manager.save_provider(root, {"name": "Broken", "kind": "wireguard"}, source_path=str(source))
+        assert (root / "router.json").read_bytes() == before
+        assert not (root / "state" / manager.STORE_NAME).exists()
+
+
+@pytest.mark.parametrize("failure", ["staging", "publish"])
+def test_failed_multi_file_save_preserves_config_store_and_key(tmp_path, monkeypatch, failure):
+    root = tmp_path / "router"
+    config_at(root)
+    provider = add_provider(root)["providers"][0]
+    key = root / "providers" / provider["id"] / "wireguard.conf"
+    paths = (root / "router.json", root / "state" / manager.STORE_NAME, key)
+    before = {path: path.read_bytes() for path in paths}
+    source = tmp_path / "replacement.conf"
+    source.write_text(WIREGUARD.replace("vpn.example.test", "new.example.test"))
+    original_replace = manager.os.replace
+    def replace(source, destination):
+        if failure == "publish" and Path(destination) == root / "state" / manager.STORE_NAME:
+            raise OSError("simulated publish failure")
+        return original_replace(source, destination)
+    if failure == "publish":
+        monkeypatch.setattr(manager.os, "replace", replace)
+    else:
+        monkeypatch.setattr(manager.os, "fsync", lambda fd: (_ for _ in ()).throw(OSError("no space")))
+    with pytest.raises(OSError):
+        manager.save_provider(root, {"name": "Updated", "kind": "wireguard"}, provider["id"], str(source))
+    assert {path: path.read_bytes() for path in paths} == before

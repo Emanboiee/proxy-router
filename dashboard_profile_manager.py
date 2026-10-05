@@ -6,11 +6,19 @@ returned to the webview.
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import configparser
+import contextlib
+import copy
+import importlib.util
+import io
+import ipaddress
 import json
 import os
 import re
 import shutil
+import sys
 import tempfile
 import time
 import uuid
@@ -92,6 +100,80 @@ def _read_store(root: Path) -> dict[str, Any]:
 
 def _save_store(root: Path, store: dict[str, Any]) -> None:
     _atomic_json(root / "state" / STORE_NAME, store)
+
+
+def _validate_config(root: Path, config: dict[str, Any]) -> None:
+    """Use the controller's validator in an isolated module, before publishing."""
+    spec = importlib.util.spec_from_file_location(
+        "_dashboard_candidate_router", Path(__file__).with_name("router.py")
+    )
+    controller = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(controller)
+    with tempfile.TemporaryDirectory(prefix="proxy-router-config-") as directory:
+        path = Path(directory) / "router.json"
+        candidate = copy.deepcopy(config)
+        # An empty dashboard is a supported disconnected setup. Validate its
+        # remaining fields with a temporary provider; never publish that entry.
+        if not candidate.get("providers"):
+            candidate["providers"] = {"dashboard-validation": {"directory": "providers/dashboard-validation"}}
+        _atomic_json(path, candidate)
+        controller.ROOT = root
+        controller.CONFIG_FILE = path
+        with contextlib.redirect_stderr(io.StringIO()):
+            valid = controller.load_config() == 0
+    if not valid:
+        raise DashboardError("The updated configuration is invalid; existing settings were preserved")
+
+
+def _publish_files(files: dict[Path, bytes]) -> None:
+    """Stage every write and rollback file before changing any live file."""
+    staged: dict[Path, str] = {}
+    backups: dict[Path, str | None] = {}
+    published: list[Path] = []
+    def stage(path: Path, content: bytes) -> str:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        staged_paths.append(temporary)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        return temporary
+    staged_paths: list[str] = []
+    try:
+        for path, content in files.items():
+            backups[path] = stage(path, path.read_bytes()) if path.exists() else None
+            staged[path] = stage(path, content)
+        for path, temporary in staged.items():
+            os.replace(temporary, path)
+            published.append(path)
+    except OSError:
+        for path in reversed(published):
+            backup = backups[path]
+            if backup is None:
+                path.unlink(missing_ok=True)
+            else:
+                os.replace(backup, path)
+        raise
+    finally:
+        for temporary in staged_paths:
+            Path(temporary).unlink(missing_ok=True)
+
+
+def _publish_config_store(root: Path, config: dict, store: dict, extra: dict | None = None) -> None:
+    _validate_config(root, config)
+    files = dict(extra or {})
+    for path, value in ((root / "router.json", config), (root / "state" / STORE_NAME, store)):
+        files[path] = (json.dumps(value, indent=2) + "\n").encode()
+    _publish_files(files)
+
+
+def _route_snapshot(config: dict) -> dict:
+    return {
+        "routes": copy.deepcopy(config.get("routes", [])),
+        "routing": copy.deepcopy(config.get("routing")),
+    }
 
 
 def _text(value: Any, field: str, limit: int, *, required: bool = False) -> str:
@@ -196,6 +278,18 @@ def _wireguard_summary(path: Path) -> tuple[str, str]:
         raise DashboardError("WireGuard config needs [Interface] and [Peer] sections") from exc
     if not private_key or not public_key or not allowed_ips:
         raise DashboardError("WireGuard config needs PrivateKey, PublicKey, and AllowedIPs")
+    try:
+        keys = [private_key, public_key]
+        if peer.get("PresharedKey", "").strip():
+            keys.append(peer["PresharedKey"].strip())
+        if any(len(base64.b64decode(key, validate=True)) != 32 for key in keys):
+            raise ValueError("invalid key length")
+        for address in interface.get("Address", "").split(","):
+            ipaddress.ip_interface(address.strip())
+        for network in allowed_ips.split(","):
+            ipaddress.ip_network(network.strip(), strict=False)
+    except (ValueError, binascii.Error) as exc:
+        raise DashboardError("WireGuard config contains an invalid key or IP address") from exc
     if not re.fullmatch(r"(?:\[[0-9A-Fa-f:]+\]|[A-Za-z0-9.-]+):[0-9]{1,5}", endpoint):
         raise DashboardError("WireGuard Endpoint must be a host and port")
     port = int(endpoint.rsplit(":", 1)[-1])
@@ -265,7 +359,8 @@ def state(root: Path) -> dict[str, Any]:
     config = _read_config(root)
     store = _read_store(root)
     providers = _provider_rows(root, config, store)
-    profiles = [item for item in store["profiles"] if isinstance(item, dict)]
+    profiles = [{key: value for key, value in item.items() if key != "_route_snapshot"}
+                for item in store["profiles"] if isinstance(item, dict)]
     if not profiles and not store.get("profiles_initialized", False):
         inferred = _inferred_profile(config, config["providers"])
         if inferred:
@@ -293,6 +388,16 @@ def save_profile(root: Path, value: Any, profile_id: str | None = None) -> dict[
         else:
             raise DashboardError("That profile no longer exists. Refresh and try again.")
     profile = _profile_data(value, config["providers"], old)
+    snapshot = (old or {}).get("_route_snapshot")
+    if old and old.get("id") == "current-setup" and snapshot is None:
+        snapshot = _route_snapshot(config)
+    if snapshot is not None:
+        fields = ("providerId", "fallbackProviderId", "routeMode", "domains", "autoSubdomains", "fallback")
+        changed = any(profile.get(field) != old.get(field) for field in fields)
+        if changed and len(snapshot["routes"]) > 1:
+            raise DashboardError("Current setup has multiple route rules. Create a new profile to replace them.")
+        if not changed:
+            profile["_route_snapshot"] = snapshot
     if old:
         profiles[:] = [profile if item.get("id") == profile_id else item for item in profiles]
         if not any(item.get("id") == profile_id for item in profiles):
@@ -331,42 +436,35 @@ def delete_profile(root: Path, profile_id: str) -> dict[str, Any]:
     remaining_ids = {item.get("id") for item in store["profiles"] if isinstance(item.get("id"), str)}
     if deleting_active or store.get("active_profile_id") not in remaining_ids:
         store["active_profile_id"] = store["profiles"][0]["id"] if store["profiles"] else None
-    _save_store(root, store)
-    if store["active_profile_id"]:
-        apply_profile(root, store["active_profile_id"])
+    if deleting_active and store["active_profile_id"]:
+        next_profile = next(item for item in store["profiles"] if item["id"] == store["active_profile_id"])
+        _apply_profile_config(config, next_profile)
     elif deleting_active:
-        for spec in config["providers"].values():
-            if isinstance(spec, dict):
-                spec.pop("fallback_providers", None)
-                spec.pop("fallback_provider", None)
         config["routes"] = []
         config["routing"] = {"mode": "default"}
-        _atomic_json(root / "router.json", config)
+    _publish_config_store(root, config, store)
     return state(root)
 
 
-def apply_profile(root: Path, profile_id: str) -> dict[str, Any]:
-    root = Path(root).resolve()
-    if not isinstance(profile_id, str) or not _PROVIDER_ID.fullmatch(profile_id):
-        raise DashboardError("Profile ID is invalid")
-    config = _read_config(root)
-    store = _read_store(root)
-    profiles = store["profiles"]
-    profile = next((item for item in profiles if isinstance(item, dict) and item.get("id") == profile_id), None)
-    if profile is None:
-        profile = _inferred_profile(config, config["providers"])
-    if not profile or profile.get("id") != profile_id:
-        raise DashboardError("That profile no longer exists")
-    clean = _profile_data(profile, config["providers"], profile)
+def _apply_profile_config(config: dict, profile: dict) -> dict:
+    clean = dict(profile) if "_route_snapshot" in profile else _profile_data(profile, config["providers"], profile)
     provider_id = clean["providerId"]
     if clean["routeMode"] != "direct" and provider_id not in config["providers"]:
         raise DashboardError("This profile’s connection is missing")
-    for name, spec in config["providers"].items():
-        if isinstance(spec, dict):
-            spec.pop("fallback_providers", None)
-            spec.pop("fallback_provider", None)
-    if clean["fallback"] == "retry":
-        config["providers"][provider_id]["fallback_providers"] = [clean["fallbackProviderId"]]
+    if "_route_snapshot" in clean:
+        snapshot = clean["_route_snapshot"]
+        config["routes"] = copy.deepcopy(snapshot["routes"])
+        if snapshot["routing"] is None:
+            config.pop("routing", None)
+        else:
+            config["routing"] = copy.deepcopy(snapshot["routing"])
+        return clean
+    spec = config["providers"].get(provider_id)
+    if isinstance(spec, dict) and clean["routeMode"] != "direct":
+        spec.pop("fallback_providers", None)
+        spec.pop("fallback_provider", None)
+        if clean["fallback"] == "retry":
+            spec["fallback_providers"] = [clean["fallbackProviderId"]]
     if clean["routeMode"] == "selective":
         config.pop("routing", None)
         config["routes"] = [{
@@ -380,12 +478,29 @@ def apply_profile(root: Path, profile_id: str) -> dict[str, Any]:
     else:
         config["routes"] = []
         config["routing"] = {"mode": "default"}
-    _atomic_json(root / "router.json", config)
+    return clean
+
+
+def apply_profile(root: Path, profile_id: str) -> dict[str, Any]:
+    root = Path(root).resolve()
+    if not isinstance(profile_id, str) or not _PROVIDER_ID.fullmatch(profile_id):
+        raise DashboardError("Profile ID is invalid")
+    config = _read_config(root)
+    store = _read_store(root)
+    profiles = store["profiles"]
+    profile = next((item for item in profiles if isinstance(item, dict) and item.get("id") == profile_id), None)
+    if profile is None:
+        profile = _inferred_profile(config, config["providers"])
+        if profile:
+            profile["_route_snapshot"] = _route_snapshot(config)
+    if not profile or profile.get("id") != profile_id:
+        raise DashboardError("That profile no longer exists")
+    clean = _apply_profile_config(config, profile)
     store["active_profile_id"] = clean["id"]
     if not any(item.get("id") == clean["id"] for item in profiles if isinstance(item, dict)):
         profiles.append(clean)
     store["profiles"] = profiles
-    _save_store(root, store)
+    _publish_config_store(root, config, store)
     return state(root)
 
 
@@ -412,6 +527,7 @@ def save_provider(root: Path, value: Any, provider_id: str | None = None, source
         identifier = provider_id
     else:
         identifier = _new_id(name)
+    pending_files: dict[Path, bytes] = {}
     if source_path:
         source = Path(source_path).expanduser().resolve()
         endpoint, raw = _wireguard_summary(source)
@@ -420,22 +536,11 @@ def save_provider(root: Path, value: Any, provider_id: str | None = None, source
         destination_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(destination_dir, 0o700)
         destination = destination_dir / "wireguard.conf"
-        fd, temporary = tempfile.mkstemp(prefix=".wireguard.", suffix=".tmp", dir=destination_dir)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(raw)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.chmod(temporary, 0o600)
-            os.replace(temporary, destination)
-        finally:
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass
+        pending_files[destination] = raw.encode()
         spec = config["providers"].get(identifier, {})
         if not isinstance(spec, dict):
             spec = {}
+        spec.pop("socks5", None)
         spec["directory"] = str(relative)
         config["providers"][identifier] = spec
         saved = {"name": name, "kind": kind, "endpoint": endpoint, "managed": True}
@@ -447,8 +552,7 @@ def save_provider(root: Path, value: Any, provider_id: str | None = None, source
         endpoint = str(saved.get("endpoint") or identifier)
         saved.update({"name": name, "kind": kind})
     store["providers"][identifier] = saved
-    _atomic_json(root / "router.json", config)
-    _save_store(root, store)
+    _publish_config_store(root, config, store, pending_files)
     return state(root)
 
 
@@ -479,8 +583,7 @@ def delete_provider(root: Path, provider_id: str) -> dict[str, Any]:
         raise DashboardError("Another connection uses this as its fallback")
     saved = store["providers"].pop(provider_id, {})
     spec = config["providers"].pop(provider_id)
-    _atomic_json(root / "router.json", config)
-    _save_store(root, store)
+    _publish_config_store(root, config, store)
     if isinstance(saved, dict) and saved.get("managed") and isinstance(spec, dict):
         directory = spec.get("directory", f"providers/{provider_id}")
         if isinstance(directory, str):
@@ -493,3 +596,30 @@ def delete_provider(root: Path, provider_id: str) -> dict[str, Any]:
             except ValueError:
                 pass
     return state(root)
+
+
+def run_cli(root: Path, args) -> int:
+    try:
+        if args.dashboard_action == "state":
+            value = state(root)
+        elif args.dashboard_action == "profile-save":
+            value = save_profile(
+                root, json.loads(args.json), args.id,
+            )
+        elif args.dashboard_action == "profile-delete":
+            value = delete_profile(root, args.id)
+        elif args.dashboard_action == "profile-apply":
+            value = apply_profile(root, args.id)
+        elif args.dashboard_action == "provider-save":
+            value = save_provider(
+                root, json.loads(args.json), args.id, args.path,
+            )
+        elif args.dashboard_action == "provider-delete":
+            value = delete_provider(root, args.id)
+        else:
+            raise DashboardError("unsupported dashboard operation")
+    except (DashboardError, json.JSONDecodeError, OSError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(json.dumps(value, separators=(",", ":")))
+    return 0

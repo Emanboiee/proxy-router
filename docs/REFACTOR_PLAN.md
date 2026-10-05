@@ -141,3 +141,32 @@ size caps) so regressions fail CI immediately.
 - No new import-time global mutation; DI for unsafe ops → immutable `Config`
   + explicit state/controller parameters.
 - Size/dependency-direction enforcement → lightweight CI check added in step 1.
+
+## Progress and the derived step-3 dependency surface (2026-09-21)
+
+Landed since this plan was written: `state.py`, `egress.py` (classification
+half), `config_schema.py`, `domain_autodetect.py`, and `worker_lock.py` are
+extracted leaves, and `router.py` imports them downward. The lightweight
+enforcement this plan asks for now exists as `tests/test_architecture_guards.py`:
+leaf modules may not import upward, and `router.py` has a line-count cap that
+may only ratchet down.
+
+Step 3 (`providers_check.py`) was re-scoped after reading the code. The three
+targets are `_provider_config_errors` (pure — reads only its `entry`
+argument), `_check_provider_validity`, and `providers_check` (the CLI wrapper).
+
+`_check_provider_validity(name)` currently closes over:
+
+```
+globals : _providers, ROOT
+helpers : is_proxy_provider, proxy_upstream, provider_dir, provider_files,
+          _profile_error, is_cooled_down, persisted_active, resolve_active,
+          _provider_config_errors
+constant: _PROXY_PROFILE_STEM
+```
+
+Because the guard forbids upward imports, the extraction needs an explicit
+dependency seam (a small context object carrying those callables plus the
+provider table and root) rather than importing `router`. `_provider_config_errors`
+can move first on its own — it is already pure — which proves the import
+direction before the seam is designed.

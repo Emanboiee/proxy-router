@@ -1,5 +1,139 @@
 import { test, expect } from '@playwright/test';
 
+test('background polls preserve navigation focus and open profile pickers', async ({ page }) => {
+  await page.clock.install();
+  await page.addInitScript(desktopMock);
+  await page.goto('/');
+  await expect(page.locator('#rail-status')).toHaveText('Disconnected');
+  const profilesLink = page.getByRole('link', { name: 'Profiles', exact: true });
+  await profilesLink.focus();
+  await page.clock.runFor(5500);
+  await expect(profilesLink).toBeFocused();
+  const picker = page.locator('#home-profile');
+  await picker.focus();
+  await picker.press('ArrowDown');
+  const option = page.locator('#home-profile-options [role="option"]').first();
+  await expect(picker).toHaveAttribute('aria-expanded', 'true');
+  await page.clock.runFor(5500);
+  await expect(picker).toHaveAttribute('aria-expanded', 'true');
+  await expect(option).toBeFocused();
+  await option.press('Escape');
+  await expect(picker).toBeFocused();
+});
+
+/** Desktop app: the window's engine controls must reach the real controller. */
+test('desktop connect and disconnect drive the engine, not local state', async ({ page }) => {
+  await page.addInitScript(() => {
+    const state = window as unknown as { __invoke: { command: string; payload?: unknown }[] };
+    state.__invoke = [];
+    Object.defineProperty(window, 'isTauri', { value: true });
+    let connected = false;
+    Object.defineProperty(window, '__TAURI_INTERNALS__', { value: {
+      invoke: (command: unknown, payload?: unknown) => {
+        state.__invoke.push({ command: String(command), payload });
+        if (String(command) === 'get_live_status') {
+          return Promise.resolve({
+            state: connected ? 'connected' : 'disconnected',
+            status: { up: connected, mode: 'proxy', port: 2080, degraded_lanes: [], error: null },
+          });
+        }
+        if (String(command) === 'run_router_action') {
+          const action = (payload as { action?: string } | undefined)?.action;
+          connected = action === 'connect';
+          return Promise.resolve('ok');
+        }
+        return Promise.resolve();
+      },
+    }, configurable: true });
+  });
+
+  await page.goto('/');
+  await expect(page.getByRole('heading', { name: 'Disconnected', exact: true })).toBeVisible();
+
+  await page.getByRole('button', { name: 'Connect' }).click();
+  await expect(page.getByRole('heading', { name: 'Connected', exact: true })).toBeVisible();
+  let actions = await page.evaluate(() => (window as unknown as { __invoke: { command: string; payload?: unknown }[] }).__invoke
+    .filter(entry => entry.command === 'run_router_action')
+    .map(entry => (entry.payload as { action: string }).action));
+  expect(actions).toContain('connect');
+
+  await page.getByRole('button', { name: 'Disconnect' }).click();
+  await expect(page.getByRole('heading', { name: 'Disconnected', exact: true })).toBeVisible();
+  actions = await page.evaluate(() => (window as unknown as { __invoke: { command: string; payload?: unknown }[] }).__invoke
+    .filter(entry => entry.command === 'run_router_action')
+    .map(entry => (entry.payload as { action: string }).action));
+  expect(actions).toContain('disconnect');
+});
+
+test('desktop Home reflects the engine preset and routes', async ({ page }) => {
+  await page.addInitScript(desktopMock);
+  await page.goto('/');
+  await expect(page.locator('#active-preset')).toHaveText('opencode');
+  await expect(page.locator('#home-engine-routes')).toContainText('opencode-zen');
+  await expect(page.locator('#home-engine-routes')).toContainText('proton');
+  await expect(page.locator('#main')).toContainText('Routes: 2 routes · 6 domains');
+  await expect(page.locator('#main')).toContainText('Latency: Unknown');
+  await expect(page.locator('#home-profile')).toHaveCount(1);
+  await expect(page.locator('#rail-status')).toHaveText('Disconnected');
+
+});
+
+test('outside engine changes refresh the confirmed Home configuration', async ({ page }) => {
+  await page.addInitScript(() => {
+    const state = window as unknown as {
+      __invoke: { command: string; payload?: unknown }[];
+      __engineConfig: Record<string, unknown>;
+      __rejectPreset: boolean;
+    };
+    state.__invoke = [];
+    state.__rejectPreset = true;
+    state.__engineConfig = {
+      port: 2080,
+      preset: 'opencode',
+      providers: { proton: { fallback_providers: ['proton2'] }, cloudflare: {} },
+      routes: [{ id: 'opencode-zen', provider: 'proton', domains: ['opencode.ai'] }],
+    };
+    Object.defineProperty(window, 'isTauri', { value: true });
+    Object.defineProperty(window, '__TAURI_INTERNALS__', { value: {
+      invoke: (command: unknown, payload?: unknown) => {
+        const name = String(command);
+        state.__invoke.push({ command: name, payload });
+        if (name === 'get_cached_live_status' || name === 'get_live_status') {
+          return Promise.resolve({ state: 'connected', status: { up: true, mode: 'proxy', port: 2080, degraded_lanes: [], error: null }, age_ms: 0 });
+        }
+        if (name === 'get_config') return Promise.resolve(state.__engineConfig);
+        if (name === 'get_dashboard_state') return Promise.resolve({ profiles: [], providers: [], activeProfileId: null });
+        if (name === 'apply_preset') {
+          if (state.__rejectPreset) return Promise.reject(new Error('preset rejected'));
+          const preset = (payload as { name: string }).name;
+          state.__engineConfig.preset = preset;
+          state.__engineConfig.routes = [{
+            id: `${preset}-games`, provider: 'cloudflare', domains: [`${preset}.example`],
+          }];
+          return Promise.resolve('ok');
+        }
+        if (name === 'get_network') return Promise.resolve({ status: {}, presets: {} });
+        if (name === 'get_routing') return Promise.resolve({ mode: 'default' });
+        return Promise.resolve('ok');
+      },
+    }, configurable: true });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('#active-preset')).toHaveText('opencode');
+  await page.evaluate(() => {
+    const state = window as unknown as { __engineConfig: Record<string, unknown> };
+    state.__engineConfig.preset = 'school-warp';
+    state.__engineConfig.routes = [{ id: 'school-lane', provider: 'proton', domains: ['school.example'] }];
+    const actualNow = Date.now.bind(Date);
+    Date.now = () => actualNow() + 20000;
+  });
+  await expect(page.locator('#active-preset')).toHaveText('school-warp', { timeout: 8000 });
+  await expect(page.locator('#home-engine-routes')).toContainText('school-lane');
+  await expect(page.locator('#rail-status')).toHaveText('Connected');
+});
+
+
 /** A Tauri mock that serves live status, engine config and network detection. */
 const desktopMock = (seedCurrentSetup = false) => {
   const state = window as unknown as { __invoke: { command: string; payload?: unknown }[]; __failApply?: boolean; __dashboard?: unknown };
