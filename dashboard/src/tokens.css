@@ -1,0 +1,31 @@
+:root {
+  color-scheme: dark;
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --text-xs: .72rem; --text-sm: .8rem; --text: 1rem; --text-lg: 1.18rem; --title: 1.95rem; --hero: 3.8rem;
+  --space-1: .5rem;   /* 8px */
+  --space-2: .75rem;  /* 12px */
+  --space-3: 1rem;    /* 16px */
+  --space-4: 1.5rem;  /* 24px */
+  --space-5: 2rem;    /* 32px */
+  --space-6: 3rem;    /* 48px */
+  --space-7: 4rem;    /* 64px */
+  --space-8: 6rem;    /* 96px */
+  /* Legacy aliases for gradual migration */
+  --s1: var(--space-1); --s2: var(--space-1); --s3: var(--space-2); --s4: var(--space-3); --s6: var(--space-4); --s8: var(--space-5); --s12: var(--space-6);
+  --canvas: #090909; --surface: #141414; --raised: #1d1d1d; --raised-2: #242424;
+  --ink: #f5f5f4; --muted: #b4b4bd; --line: #3c3c42; --line-strong: #75757e;
+  --accent: #ff9c66; --accent-strong: #ff7847; --accent-ink: #100a06;
+  --success: #8cdda8; --warning: #efc276; --error: #ffa39c; --focus: #b8ddff;
+  --radius: 10px; --border: 1px solid var(--line); --shadow: 0 12px 36px #0006;
+  --duration: 160ms; --motion-page-duration: 180ms; --motion-dialog-duration: 180ms; --motion-pulse-duration: 1.8s; --ease: ease-out; --target: 44px; --rail: clamp(12rem, 17vw, 15.5rem); --measure: 72rem; --summary-control: 22rem;
+}
+:root[data-scheme="light"] { color-scheme: light; --canvas: #f5f5f2; --surface: #fff; --raised: #ecece8; --raised-2: #e2e2dd; --ink: #171717; --muted: #4e4e55; --line: #c5c5bd; --line-strong: #6d6d68; --accent: #b24d19; --accent-strong: #8d3b14; --accent-ink: #fff; --success: #2d7046; --warning: #8f5d00; --error: #a1261e; --focus: #0d528a; --shadow: 0 12px 36px #24241118; }
+:root[data-scheme="system"] { color-scheme: dark; }
+@media (prefers-color-scheme: light) { :root[data-scheme="system"] { color-scheme: light; --canvas: #f5f5f2; --surface: #fff; --raised: #ecece8; --raised-2: #e2e2dd; --ink: #171717; --muted: #4e4e55; --line: #c5c5bd; --line-strong: #6d6d68; --accent: #b24d19; --accent-strong: #8d3b14; --accent-ink: #fff; --success: #2d7046; --warning: #8f5d00; --error: #a1261e; --focus: #0d528a; --shadow: 0 12px 36px #24241118; } }
+:root[data-accent="ocean"] { --accent: #8bc7ff; --accent-strong: #5fa8ea; --focus: #a9e5ff; }
+:root[data-accent="moss"] { --accent: #a8ddb0; --accent-strong: #78be84; --focus: #c8f6cf; }
+:root[data-accent="iris"] { --accent: #c9b7ff; --accent-strong: #a48bfa; --focus: #e2d9ff; }
+:root[data-contrast="high"] { --line: var(--line-strong); --muted: color-mix(in srgb, var(--ink) 72%, transparent); }
+:root[data-density="comfortable"] { --space-3: 1.15rem; --space-4: 1.8rem; --space-5: 2.4rem; --target: 48px; }
+:root[data-motion-speed="slow"] { --duration: 240ms; --motion-page-duration: 270ms; --motion-dialog-duration: 270ms; --motion-pulse-duration: 2.7s; }
+:root[data-motion-speed="fast"] { --duration: 100ms; --motion-page-duration: 120ms; --motion-dialog-duration: 120ms; --motion-pulse-duration: 1.2s; }
