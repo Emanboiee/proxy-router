@@ -1,5 +1,26 @@
 import { test, expect } from '@playwright/test';
 
+test('background polls preserve navigation focus and unsaved route drafts', async ({ page }) => {
+  await page.clock.install();
+  await page.addInitScript(desktopMock);
+  await page.goto('/');
+  await expect(page.locator('#rail-status')).toHaveText('Connected');
+  const profilesLink = page.getByRole('link', { name: 'Profiles', exact: true });
+  await profilesLink.focus();
+  await page.clock.runFor(5500);
+  await expect(profilesLink).toBeFocused();
+  await profilesLink.click();
+  const domain = page.locator('#route-domain');
+  await domain.fill('draft.example');
+  await page.clock.runFor(5500);
+  await expect(domain).toHaveValue('draft.example');
+  await expect(domain).toBeFocused();
+  await profilesLink.focus();
+  await page.clock.runFor(5500);
+  await expect(domain).toHaveValue('draft.example');
+  await expect(profilesLink).toBeFocused();
+});
+
 /** Desktop app: the window's engine controls must reach the real controller. */
 test('desktop connect and disconnect drive the engine, not local state', async ({ page }) => {
   await page.addInitScript(() => {

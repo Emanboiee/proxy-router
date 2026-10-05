@@ -353,23 +353,29 @@ function aboutPage(): string {
   return `<section class="page-section"><div class="section-heading"><div><h1 tabindex="-1">About</h1><p class="lead">A small native shell around the existing Python router. The dashboard is local-first and ready for the live controller contract.</p></div><span class="badge">v0.1 dashboard</span></div><article class="panel"><div class="panel-heading"><div><span class="label">Diagnostics</span><h2>Recent events</h2></div><button type="button" class="quiet" data-action="export-logs">Export</button></div><ul class="logs">${logs}</ul></article><article class="panel danger-zone"><div><h2>Reset local prototype</h2><p class="muted">Remove saved profiles, themes, and settings from this browser only.</p></div>${button('Reset demo data', 'reset-data', 'quiet danger-text')}</article></section>`;
 }
 
-function render(): void {
+function render(options?: { background?: boolean }): void {
   app.dataset.state = previewState;
   app.dataset.page = page.toLowerCase();
   if (!isTauri() && lastTrayState !== previewState) { lastTrayState = previewState; setTrayStatus(previewState); }
   document.querySelector('#page-label')!.textContent = page; document.title = `${page} — Proxy router`;
   document.querySelector('#rail-status')!.textContent = busy ? 'Saving…' : previewState === 'failed' ? 'Controller unavailable' : `${previewState[0].toUpperCase()}${previewState.slice(1)}`;
   const nav = document.querySelector<HTMLElement>('#nav')!;
-  nav.innerHTML = pages.map(item => {
-    const current = item === page;
-    return `<a href="#${item.toLowerCase()}" class="${current ? 'current' : ''}"${current ? ' aria-current="page"' : ''}>${item}</a>`;
-  }).join('');
-  // The 5s live poll re-renders through here; rebuilding main's DOM while the
-  // user is typing would wipe the input value, selection, and focus. Skip the
-  // rebuild for that tick - the next action-driven render picks the edit up.
-  const editing = document.activeElement instanceof HTMLElement
+  nav.querySelectorAll<HTMLAnchorElement>('a').forEach(link => {
+    const current = link.hash === `#${page.toLowerCase()}`;
+    link.classList.toggle('current', current);
+    if (current) link.setAttribute('aria-current', 'page');
+    else link.removeAttribute('aria-current');
+  });
+  const focused = document.activeElement instanceof HTMLElement
     && main.contains(document.activeElement)
-    && document.activeElement.matches('input, textarea, select, [contenteditable="true"]');
+    && document.activeElement.matches('input, textarea, select, button, a, [contenteditable="true"], [role="option"]');
+  const draft = Array.from(main.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>('input, textarea'))
+    .some(field => field.value !== field.defaultValue
+      || (field instanceof HTMLInputElement && field.checked !== field.defaultChecked));
+  // Background polls update the rail but leave active controls and unsaved
+  // drafts intact. Explicit navigation and actions can rebuild the page.
+  const editing = options?.background && (focused || draft
+    || main.querySelector('[aria-expanded="true"][aria-haspopup="listbox"]') !== null);
   if (!editing) {
     main.innerHTML = page === 'Home' ? homePage() : page === 'Profiles' ? profilesPage() : page === 'Providers' ? providersPage() : page === 'Connectivity' ? connectivityPage() : page === 'Settings' ? settingsPage() : page === 'Appearance' ? appearancePage() : aboutPage();
   }
@@ -401,7 +407,7 @@ function applyLive(live: { state: string; status?: Record<string, unknown> | nul
 async function refreshStatus(options?: { silent?: boolean; poll?: boolean }): Promise<void> {
   const generation = ++requestGeneration;
   const previousState = previewState;
-  if (!options?.silent) { previewState = 'loading'; render(); }
+  if (!options?.silent) { previewState = 'loading'; render({ background: options?.poll }); }
   try { status = await getPreviewStatus(); if (generation !== requestGeneration) return; }
   catch { if (generation !== requestGeneration) return; if (!options?.silent) { previewState = 'failed'; } }
   // In the desktop app the hero and the tray follow the real controller, not
@@ -418,7 +424,7 @@ async function refreshStatus(options?: { silent?: boolean; poll?: boolean }): Pr
           await refreshEngineConfig();
           if (generation !== requestGeneration) return;
         }
-        render();
+        render({ background: options?.poll });
         if (fresh) {
           if (previousState !== previewState) announce(copy[previewState][0]);
           return;
@@ -436,7 +442,7 @@ async function refreshStatus(options?: { silent?: boolean; poll?: boolean }): Pr
     if (!options?.poll) await refreshEngineData();
     else if (Date.now() - engineConfigCheckedAt >= ENGINE_CONFIG_REFRESH_MS) await refreshEngineConfig();
   }
-  render();
+  render({ background: options?.poll });
   if (!options?.poll || previousState !== previewState) announce(copy[previewState][0]);
 }
 
