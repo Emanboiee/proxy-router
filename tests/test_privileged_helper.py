@@ -93,6 +93,16 @@ class GeneratedSchemaTests(unittest.TestCase):
         self.assertEqual(envelope["schema_version"], helper.SCHEMA_VERSION)
         self.assertEqual(helper.validate_config_envelope(envelope), config)
 
+    def test_reject_route_and_dns_rules_are_accepted(self):
+        config = self.base_config()
+        config["dns"]["rules"] = [{"domain_suffix": ["example.com"], "action": "reject"}]
+        config["route"]["rules"] = [{"action": "reject", "domain_suffix": ["example.com"]}]
+
+        self.assertEqual(
+            helper.validate_config_envelope(helper.make_config_envelope(config)),
+            config,
+        )
+
     def test_unknown_top_level_config_key_is_rejected(self):
         envelope = helper.make_config_envelope({
             "log": {"level": "info"},

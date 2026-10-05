@@ -17,8 +17,16 @@ Design rules:
 Usage:
     python3 proxy_tray.py [--root /path/to/proxy-router]
     python3 proxy_tray.py --selftest   # no GUI; validates CLI contract + dispatch
+    python3 proxy_tray.py --headless   # no menu-bar item: supervise the dashboard
+
+Tray ownership (issue #144): the Tauri dashboard app registers its own status
+item, so only ONE of the two may own the menu bar. The supported layouts are
+either the dashboard alone (this agent runs `--headless`, which keeps the app
+alive and never paints a second icon) or this agent alone (no dashboard app
+running). Two status items at once is the bug, not a feature.
 
 Env: PROXY_ROUTER_ROOT overrides the router directory.
+ENV: PROXY_ROUTER_DASHBOARD points at a built `Proxy Router.app`.
 """
 
 from __future__ import annotations
@@ -310,7 +318,8 @@ class RouterStatus:
             preset=d.get("preset") or None,
             system_proxy_status=str(system_proxy.get("status") or (
                 "unknown" if d.get("up") and d.get("mode") == "proxy" else "skipped")),
-            network_status=str(network.get("status") or "unknown"),
+            network_status=("stale" if network.get("stale") is True
+                            else str(network.get("status") or "unknown")),
             degraded_lanes=[str(lane) for lane in (d.get("degraded_lanes") or [])
                             if isinstance(lane, str) and lane],
         )
@@ -788,6 +797,49 @@ def _launch_dashboard_app(app: Path) -> bool:
         return False
 
 
+def open_dashboard(root) -> bool:
+    """Open the Tauri dashboard from the tray, with a TUI fallback."""
+    root = Path(root)
+    app = _dashboard_bundle(root)
+    if app is not None:
+        return _launch_dashboard_app(app)
+    # Keep supporting direct release binaries on platforms that do not bundle
+    # the app as a macOS .app directory.
+    binary = root / "dashboard" / "src-tauri" / "target" / "release" / (
+        "proxy-router-dashboard.exe" if sys.platform == "win32"
+        else "proxy-router-dashboard"
+    )
+    if binary.is_file():
+        try:
+            subprocess.Popen([str(binary)], cwd=str(root),
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except OSError:
+            pass
+    if not (root / "setup_tui.py").is_file():
+        print(f"dashboard: missing {root / 'setup_tui.py'}", file=sys.stderr)
+        return False
+    return _launch_terminal(root, [])
+
+
+def dashboard_app_running() -> bool:
+    """True when a dashboard app process is already alive.
+
+    Checked before launching so supervision can never stack a second app (and
+    therefore a second menu-bar item) on top of a running one.
+    """
+    if sys.platform != "darwin":
+        return False
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "Proxy Router.app/Contents/MacOS/proxy-router-dashboard"],
+            capture_output=True, text=True, timeout=3,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
 def _dashboard_owner_is_fresh(root, now: float | None = None) -> bool:
     """Accept only a recent, well-formed lease for this router root."""
     try:
@@ -817,29 +869,45 @@ def _dashboard_owner_is_fresh(root, now: float | None = None) -> bool:
     return -5.0 <= age <= DASHBOARD_OWNER_TTL
 
 
-def tray_ownership(root, *, now: float | None = None) -> str:
+def tray_ownership(root, *, now: float | None = None, explicit_headless: bool = False) -> str:
     """Return the current owner of the single status item (issue #144).
 
     Python stays resident while headless so it can reveal its icon when the
     dashboard releases its lease or stops refreshing after a crash. Set
     ``PROXY_ROUTER_TRAY_HEADLESS=0`` to force the legacy icon for debugging.
     """
+    if explicit_headless:
+        return "headless"
     if os.environ.get("PROXY_ROUTER_TRAY_HEADLESS", "").strip() == "0":
         return "icon"
     return "headless" if _dashboard_owner_is_fresh(root, now) else "icon"
 
 
-def open_dashboard(root) -> bool:
-    """Open the Tauri dashboard from the tray, with a TUI fallback."""
-    root = Path(root)
-    app = _dashboard_bundle(root)
-    if app is not None:
-        return _launch_dashboard_app(app)
+def supervise_dashboard(root: str, *, interval: float = 30.0,
+                        sleep: Callable | None = None,
+                        max_cycles: int | None = None) -> int:
+    """Keep the dashboard app alive while owning no menu-bar item.
 
-    if not (root / "setup_tui.py").is_file():
-        print(f"dashboard: missing {root / 'setup_tui.py'}", file=sys.stderr)
-        return False
-    return _launch_terminal(root, [])
+    The Tauri dashboard registers the single proxy-router status item
+    (issue #144), so the launchd job runs in this mode: it supervises the app
+    instead of racing it for the menu bar. A missing bundle is reported with a
+    hint rather than a traceback, and an already-running app is left alone.
+    """
+    sleep = sleep or (lambda seconds: threading.Event().wait(seconds))
+    cycles = 0
+    while max_cycles is None or cycles < max_cycles:
+        cycles += 1
+        if not dashboard_app_running():
+            bundle = _dashboard_bundle(Path(root))
+            if bundle is None:
+                print("tray: no dashboard app bundle found; build it or set "
+                      "PROXY_ROUTER_DASHBOARD", file=sys.stderr)
+            elif _launch_dashboard_app(bundle):
+                print(f"tray: launched dashboard {bundle}", file=sys.stderr)
+            else:
+                print("tray: could not launch the dashboard app", file=sys.stderr)
+        sleep(interval)
+    return 0
 
 
 class RouterClient:
@@ -2594,10 +2662,19 @@ def main() -> int:
     ap.add_argument("--root", default=_default_root())
     ap.add_argument("--selftest", action="store_true",
                     help="validate CLI contract, no GUI")
+    ap.add_argument(
+        "--headless", action="store_true",
+        help="run without a menu-bar item and keep the dashboard app alive; "
+             "the dashboard owns the single proxy-router tray icon (issue #144)")
+    ap.add_argument("--headless-interval", type=float, default=30.0,
+                    help="seconds between dashboard liveness checks (headless mode)")
     args = ap.parse_args()
 
     if args.selftest:
         return selftest(args.root)
+
+    if args.headless:
+        return supervise_dashboard(args.root, interval=args.headless_interval)
 
     if pystray is None or Image is None:
         print("pystray + pillow required (pip install pystray pillow)",

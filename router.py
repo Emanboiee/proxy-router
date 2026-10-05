@@ -219,6 +219,12 @@ _port: int = DEFAULT_PORT
 _vpn: dict = {}
 _routing: dict = {}
 _autodetect: dict = {}
+_proxy_bypass_domains: list[str] = []
+
+
+def _bypass_domains() -> list[str]:
+    """Return configured system proxy exceptions."""
+    return system_proxy_bypass_domains()
 _egress_settings: dict = {}
 _error_policy: dict | None = None
 _PROVIDER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
@@ -235,6 +241,9 @@ _PROVIDER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 # loopback and public answers over time). The upstream port must never equal
 # the router's own listener port (proxy loop).
 _PROXY_PROFILE_STEM = "socks"
+_LOCAL_PROXY_BYPASS = ["*.local", "localhost", "127.0.0.1", "::1"]
+_TAILSCALE_DOMAINS = ["tailscale.com", "tailscale.io", "ts.net"]
+_TAILSCALE_CIDRS = ["100.64.0.0/10", "fd7a:115c:a1e0::/48"]
 
 
 def is_proxy_provider(name: str) -> bool:
@@ -588,7 +597,7 @@ def _load_autodetect(data: dict, routes: list, providers: dict) -> dict:
 
 
 def load_config() -> int:
-    global _providers, _routes, _port, _vpn, _routing, _autodetect
+    global _providers, _routes, _port, _vpn, _routing, _autodetect, _proxy_bypass_domains
     if not CONFIG_FILE.is_file():
         return fail(f"missing {CONFIG_FILE.name}; run 'router.py init' first")
     try:
@@ -608,6 +617,15 @@ def load_config() -> int:
         return fail("no providers configured")
     if not isinstance(vpn, dict):
         return fail(f"bad {CONFIG_FILE.name}: vpn must be an object")
+    bypass_domains = data.get("proxy_bypass_domains", [])
+    if bypass_domains is None:
+        bypass_domains = []
+    if not isinstance(bypass_domains, list) or not all(
+        isinstance(domain, str) and domain.strip() for domain in bypass_domains
+    ):
+        return fail(
+            f"bad {CONFIG_FILE.name}: proxy_bypass_domains must be a list of non-empty strings"
+        )
     capture = vpn.get("capture")
     if capture is not None and capture not in ("ruleset", "routes"):
         return fail(f"bad {CONFIG_FILE.name}: vpn.capture must be 'ruleset' or 'routes'")
@@ -620,6 +638,10 @@ def load_config() -> int:
     default_mode = vpn.get("default_mode")
     if default_mode is not None and default_mode not in ("proxy", "tun"):
         return fail(f"bad {CONFIG_FILE.name}: vpn.default_mode must be 'proxy' or 'tun'")
+    if "tailscale_bypass" in vpn and not isinstance(vpn["tailscale_bypass"], bool):
+        return fail(f"bad {CONFIG_FILE.name}: vpn.tailscale_bypass must be a boolean")
+    if error := _public_dns_error(vpn.get("public_dns")):
+        return fail(f"bad {CONFIG_FILE.name}: {error}")
     if not all(isinstance(name, str) and _PROVIDER_NAME.fullmatch(name) and isinstance(entry, dict)
                for name, entry in providers.items()):
         return fail(f"bad {CONFIG_FILE.name}: provider names/entries are invalid")
@@ -722,6 +744,9 @@ def load_config() -> int:
                 f"bad {CONFIG_FILE.name}: route '{route.get('id', '<unnamed>')}' "
                 f"references unknown provider '{route['provider']}'"
             )
+        unavailable_policy = route.get("on_unavailable", "direct")
+        if unavailable_policy not in ("direct", "block"):
+            return fail(f"bad {CONFIG_FILE.name}: route on_unavailable must be 'direct' or 'block'")
         for key in ("domains", "ip_cidr"):
             if key in route and (not isinstance(route[key], list) or not all(isinstance(v, str) for v in route[key])):
                 return fail(f"bad {CONFIG_FILE.name}: route '{route.get('id', '<unnamed>')}' {key} must be a string list")
@@ -774,6 +799,7 @@ def load_config() -> int:
     _vpn = vpn
     _routing = dict(routing)
     _autodetect = autodetect
+    _proxy_bypass_domains = [domain.strip() for domain in bypass_domains]
     return 0
 
 
@@ -865,6 +891,9 @@ def write_default_config(force: bool = False) -> int:
                 "storm_window": 600,
                 "max_rotations": 2,
                 "sweep_every": 1800,
+                # Parked-lane restore clock, independent of sweep_every: a
+                # fail-open park must not wait hours for the full sweep (#139).
+                "fallback_restore_every": 300,
             },
             "error_policy": {
                 "default": {"action": "cooldown", "seconds": 300},
@@ -1436,13 +1465,13 @@ def recover_route(name: str, host: str) -> int:
     """Confirm a stalled route, then try configured alternatives and opt-in direct."""
     if MANUAL_OFF_FILE.exists() or not _automatic_proxy_mode():
         return 3
-    if name not in _providers or response_provider_for_host(host) != name:
-        return fail("recovery target does not belong to the configured provider")
-    if not _diagnostic_host_is_routed(host):
-        return 3
     routing = routing_state()
     if routing["mode"] == "vpn-list" and not any(
             _response_host_matches(host, domain) for domain in _effective_vpn_domains(routing)):
+        return 3
+    if name not in _providers or response_provider_for_host(host) != name:
+        return fail("recovery target does not belong to the configured provider")
+    if not _diagnostic_host_is_routed(host):
         return 3
     url = f"https://{host}/"
     if urllib.parse.urlsplit(url).hostname != host or unsafe_probe_target(url):
@@ -1602,15 +1631,9 @@ def _response_host_matches(host: str, domain: str) -> bool:
 
 
 def response_provider_for_host(host: str) -> str | None:
-    """Return the configured route provider responsible for ``host``."""
-    for route in _routes_with_autodetected_domains(_routes):
-        provider = route.get("provider")
-        if not isinstance(provider, str):
-            continue
-        for domain in route.get("domains", []):
-            if _response_host_matches(host, domain):
-                return provider
-    return None
+    """Attribute responses with the same bypass and availability rules as routing."""
+    from model_relay import route_provider
+    return route_provider(globals(), host)
 
 
 def _response_event_marker(provider: str) -> Path:
@@ -2323,6 +2346,26 @@ def next_rotation_at(name: str) -> int | None:
     return at + interval + offset
 
 
+def _rotation_candidates() -> list[str]:
+    """Providers scheduled rotation can actually switch.
+
+    SOCKS5 proxy providers are a single non-rotating egress (no *.conf pool),
+    and a provider with no profiles has nothing to switch to; both keep a
+    possibly ancient ``state/<name>.rotation`` record that would otherwise
+    pin the scheduled-rotation clock permanently in the past.
+    """
+    candidates = []
+    for name in _providers:
+        if is_proxy_provider(name):
+            continue
+        try:
+            if provider_files(name):
+                candidates.append(name)
+        except ValueError:
+            continue
+    return candidates
+
+
 def rotate_due(provider: str | None = None) -> int:
     """Scheduled rotation pass: rotate every provider whose interval elapsed.
 
@@ -2348,10 +2391,11 @@ def rotate_due(provider: str | None = None) -> int:
         names = [provider]
     else:
         suffix = ".active"
+        candidates = set(_rotation_candidates())
         names = sorted(
             p.name[: -len(suffix)]
             for p in (ROOT / "state").glob(f"*{suffix}")
-            if p.name.endswith(suffix) and p.name[: -len(suffix)] in _providers
+            if p.name.endswith(suffix) and p.name[: -len(suffix)] in candidates
         )
     if not names:
         return 3
@@ -2731,6 +2775,60 @@ def dns_transport() -> str:
     return transport
 
 
+_DNS_RESOLVERS = ("provider", "local")
+
+
+def _public_dns_error(value) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        return "vpn.public_dns must be an object"
+    if not isinstance(value.get("server"), str):
+        return "vpn.public_dns.server must be an IP address (no bootstrap DNS)"
+    try:
+        address = ipaddress.ip_address(value.get("server", ""))
+    except ValueError:
+        return "vpn.public_dns.server must be an IP address (no bootstrap DNS)"
+    if address.is_unspecified or address.is_multicast:
+        return "vpn.public_dns.server must be a unicast address"
+    if value.get("transport", "https") not in ("https", "udp", "tcp", "tls"):
+        return "vpn.public_dns.transport must be 'https', 'udp', 'tcp', or 'tls'"
+    domains = value.get("private_domains", ["local", "ts.net"])
+    if (not isinstance(domains, list)
+            or any(not isinstance(domain, str)
+                   or not re.fullmatch(r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*", domain)
+                   for domain in domains)):
+        return "vpn.public_dns.private_domains must be a list of domain suffixes"
+    return None
+
+
+def system_proxy_bypass_domains() -> list[str]:
+    domains = list(dict.fromkeys(_LOCAL_PROXY_BYPASS + _proxy_bypass_domains))
+    if _vpn.get("tailscale_bypass"):
+        for domain in _TAILSCALE_DOMAINS:
+            domains.extend([domain, f"*.{domain}"])
+        domains.extend(_TAILSCALE_CIDRS)
+    return domains
+
+
+def dns_resolver() -> str:
+    """Resolver set used for a provider's routed domains.
+
+    ``provider`` (default) pins each WireGuard-backed provider's tunneled
+    domains to that provider's own ``dns-<provider>`` resolver (profile
+    ``[Interface] DNS``, fallback 1.1.1.1) over ``dns_transport``. Some
+    filtered networks block public UDP 53 *and* intermittently reset DoH to
+    the public endpoint, so neither transport is dependable there; ``local``
+    resolves those domains through the same OS resolver every other lane
+    already uses (``dns-local``). Destination traffic still exits through the
+    provider's endpoint either way - only the query path changes.
+    """
+    resolver = _vpn.get("dns_resolver", "provider")
+    if resolver not in _DNS_RESOLVERS:
+        return "provider"
+    return resolver
+
+
 def _autodetect_state_path(source: str) -> Path:
     if not isinstance(source, str) or not _PROVIDER_NAME.fullmatch(source):
         raise ValueError("invalid autodetect source")
@@ -2816,7 +2914,7 @@ def _vpn_list_intersection(domains, vpn_domains) -> list[str]:
     """
     out: list[str] = []
     for domain in domains:
-        for vpn in vpn_domains:
+        for vpn in sorted(vpn_domains):
             if domain == vpn or domain.endswith("." + vpn):
                 candidate = domain
             elif vpn.endswith("." + domain):
@@ -2942,7 +3040,7 @@ def _route_capture_cidrs(routes: list[dict], routing: dict,
 
     for route in routes:
         route_provider = _effective_route_provider(route.get("provider", ""))
-        if route_provider not in active:
+        if route_provider not in active and route.get("on_unavailable") != "block":
             continue
         for value in (route.get("domains") or []):
             domain = _capture_domain_name(value)
@@ -3013,6 +3111,13 @@ def _route_capture_cidrs(routes: list[dict], routing: dict,
 
 
 def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tuple[dict, dict[str, Path]]:
+    public_dns = _vpn.get("public_dns")
+    if error := _public_dns_error(public_dns):
+        raise ValueError(error)
+    default_dns = "dns-public" if public_dns else "dns-local"
+    private_domains = list(public_dns.get("private_domains", ["local", "ts.net"])) if public_dns else []
+    if _vpn.get("tailscale_bypass") and "ts.net" not in private_domains:
+        private_domains.append("ts.net")
     active: dict[str, dict] = {}
     selected: dict[str, Path] = {}
     dns_map: dict[str, str] = {}
@@ -3110,6 +3215,12 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
     # implicit fallback. Route DNS rules still pin tunneled domains to the
     # provider's own server.
     dns_servers.append({"type": "local", "tag": "dns-local"})
+    if public_dns:
+        transport = public_dns.get("transport", "https")
+        entry = {"type": transport, "tag": "dns-public", "server": public_dns["server"]}
+        if transport in ("https", "tls"):
+            entry["server_port"] = 443 if transport == "https" else 853
+        dns_servers.append(entry)
     routing = routing_state()
     routing_mode = routing["mode"]
     # health_order: emit provider rules in egress-health order instead of
@@ -3122,29 +3233,37 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
     else:
         build_routes = routed_domains
     dns_rules = []
+    if private_domains:
+        dns_rules.append({"domain_suffix": private_domains, "server": "dns-local"})
+    if public_dns:
+        dns_rules.append({"domain_regex": [r"^[^.]+$"], "server": "dns-local"})
     if routing_mode == "safe-list" and routing["direct_domains"]:
         # Safe-list: trusted domains go DIRECT, so their DNS must resolve via
         # the local resolver, never a provider's DNS server - pinning them to
         # a provider resolver would leak direct traffic's DNS through the
         # tunnel. The rule comes first so a domain listed both here and in a
         # provider route always wins the direct resolver.
-        dns_rules.append({"domain_suffix": list(routing["direct_domains"]), "server": "dns-local"})
+        dns_rules.append({"domain_suffix": list(routing["direct_domains"]), "server": default_dns})
     vpn_domains = _effective_vpn_domains(routing)
     for route in build_routes:
         route_provider = _effective_route_provider(route["provider"])
-        if ((route_provider != "direct" and route_provider not in active
-                and route_provider not in proxy_live)
-                or not route.get("domains")):
+        if not route.get("domains"):
             continue
+        provider_active = route_provider == "direct" or route_provider in active or route_provider in proxy_live
         domains = route["domains"]
         if routing_mode == "vpn-list":
             domains = _vpn_list_intersection(domains, vpn_domains)
         if domains:
-            if route_provider == "direct" or route_provider in proxy_live:
+            if not provider_active:
+                if route.get("on_unavailable") == "block":
+                    dns_rules.append({"domain_suffix": domains, "action": "reject"})
+            elif (route_provider == "direct" or route_provider in proxy_live
+                    or dns_resolver() == "local"):
                 # Direct and SOCKS5-hopped traffic share the local resolver:
                 # there is no tunnel DNS to pin to, and pinning to a
                 # provider resolver would leak direct-path queries.
-                dns_rules.append({"domain_suffix": domains, "server": "dns-local"})
+                # vpn.dns_resolver=local opts WireGuard lanes into it too.
+                dns_rules.append({"domain_suffix": domains, "server": default_dns})
             else:
                 dns_rules.append({"domain_suffix": domains,
                                   "server": dns_alias.get(route_provider, f"dns-{route_provider}")})
@@ -3157,10 +3276,10 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
     provider_rules = []
     for route in build_routes:
         route_provider = _effective_route_provider(route["provider"])
-        if (route_provider != "direct" and route_provider not in active
-                and route_provider not in proxy_live):
+        provider_active = route_provider == "direct" or route_provider in active or route_provider in proxy_live
+        if not provider_active and route.get("on_unavailable") != "block":
             continue
-        rule = {"outbound": route_provider}
+        rule = {"outbound": route_provider} if provider_active else {"action": "reject"}
         if route.get("domains"):
             domains = route["domains"]
             if routing_mode == "vpn-list":
@@ -3173,6 +3292,9 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
             if routing_mode == "vpn-list":
                 continue
             rule["ip_cidr"] = route["ip_cidr"]
+        if public_dns and route_provider in proxy_live and rule.get("domain_suffix"):
+            provider_rules.append({"domain_suffix": list(rule["domain_suffix"]),
+                                   "action": "resolve", "server": default_dns})
         provider_rules.append(rule)
     direct_pins: list[dict] = []
     if routing_mode == "safe-list" and routing["direct_domains"]:
@@ -3183,6 +3305,21 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
     ]
 
     mode = current_mode()
+    private_outbounds = []
+    bypass_rules = []
+    if private_domains or public_dns:
+        private_outbounds.append({"type": "direct", "tag": "direct-private",
+                                  "domain_resolver": "dns-local"})
+    if private_domains:
+        bypass_rules.append({"domain_suffix": private_domains, "outbound": "direct-private"})
+    if public_dns:
+        bypass_rules.append({"domain_regex": [r"^[^.]+$"], "outbound": "direct-private"})
+    if _vpn.get("tailscale_bypass"):
+        bypass_rules.extend([
+            {"domain_suffix": _TAILSCALE_DOMAINS[:2], "outbound": "direct"},
+            {"ip_cidr": list(_TAILSCALE_CIDRS),
+             "outbound": "direct-private" if private_domains else "direct"},
+        ])
     if mode == "tun":
         blockers = _tun_proxy_blockers(build_routes, routing, proxy_live)
         if blockers:
@@ -3310,6 +3447,8 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
                 "cannot emit a dangling route.final (drop *.conf into providers/<name>/ first)"
             )
         route_final = default_provider
+    if public_dns and route_final in proxy_live:
+        rules.append({"action": "resolve", "server": default_dns})
 
     config = {
         # warn in steady state: info logs a line per connection, which costs
@@ -3318,14 +3457,17 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
         "log": {"level": "warn"},
         "inbounds": inbounds,
         "endpoints": list(active.values()),
-        "outbounds": [{"type": "direct", "tag": "direct"}, *proxy_outbounds],
-        # Without dns.final, unmatched queries hit the FIRST server (tunnel-riding
-        # provider DNS); pin them to the always-present local resolver instead.
-        "dns": {"servers": dns_servers, "rules": dns_rules, "strategy": dns_strategy(), "final": "dns-local"},
+        "outbounds": [{"type": "direct", "tag": "direct"}, *private_outbounds, *proxy_outbounds],
+        # Private names keep OS resolution; unmatched names use the explicit
+        # public resolver when configured, otherwise the historical OS default.
+        "dns": {"servers": dns_servers, "rules": dns_rules, "strategy": dns_strategy(), "final": default_dns},
         "route": {
-            "auto_detect_interface": True,
-            "default_domain_resolver": "dns-local",
-            "rules": rules,
+            # Proxy mode needs OS routing for tailnet destinations; binding
+            # every direct socket to the physical NIC defeats that routing.
+            # TUN mode keeps the loop-prevention binding.
+            "auto_detect_interface": mode == "tun" or not _vpn.get("tailscale_bypass"),
+            "default_domain_resolver": default_dns,
+            "rules": bypass_rules + rules,
             "rule_set": rule_sets,
             "final": route_final,
         },
@@ -3514,11 +3656,13 @@ def _pid_matches(pid: int) -> bool:
     return len(parts) == 2 and parts[0].isdigit() and _command_is_our_engine(parts[1])
 
 
-def engine_alive() -> bool:
+def engine_alive(*, skip_helper: bool = False) -> bool:
     """True when a sing-box started by us is still running (tun mode has no
     TCP listener to probe, so process liveness is the health check). Also
-    refuses foreign/recycled PIDs so a stale pid file can't claim liveness."""
-    if sys.platform == "darwin" and _effective_uid() != 0:
+    refuses foreign/recycled PIDs so a stale pid file can't claim liveness.
+
+    skip_helper retains local PID and process-identity checks for fast status polls."""
+    if not skip_helper and sys.platform == "darwin" and _effective_uid() != 0:
         helper = _helper_status()
         if helper and helper.get("installed") and helper.get("running"):
             return True
@@ -3553,12 +3697,14 @@ def engine_alive() -> bool:
         return False
 
 
-def engine_mode_consistent() -> bool:
+def engine_mode_consistent(*, skip_helper: bool = False) -> bool:
     """True when the running engine's config actually matches current_mode.
 
     Prevents the H2 false-positive: a proxy-mode engine running while
-    state/mode says 'tun' (or vice versa) is NOT the state we claim."""
-    if sys.platform == "darwin" and _effective_uid() != 0:
+    state/mode says 'tun' (or vice versa) is NOT the state we claim.
+
+    skip_helper checks the generated config without a privileged probe."""
+    if not skip_helper and sys.platform == "darwin" and _effective_uid() != 0:
         helper = _helper_status()
         if helper and helper.get("installed") and helper.get("running"):
             return helper.get("mode") == current_mode()
@@ -4148,13 +4294,32 @@ def _expected_engine_command() -> str | None:
     return f"{binary} run -c {SING_BOX_CONFIG}"
 
 
-def _command_is_our_engine(cmd: str) -> bool:
-    """Return true only for the exact resolved binary/argv command line."""
+_expected_engine_argv_cache: list[str] | None = None
+_expected_engine_argv_source: str | None = None
+
+
+def _expected_engine_argv() -> list[str] | None:
+    """``_expected_engine_command()`` split once, not per process-table row."""
+    global _expected_engine_argv_cache, _expected_engine_argv_source
     expected = _expected_engine_command()
     if expected is None:
+        return None
+    if _expected_engine_argv_source != expected:
+        try:
+            _expected_engine_argv_cache = shlex.split(expected)
+        except ValueError:
+            return None
+        _expected_engine_argv_source = expected
+    return _expected_engine_argv_cache
+
+
+def _command_is_our_engine(cmd: str) -> bool:
+    """Return true only for the exact resolved binary/argv command line."""
+    expected_argv = _expected_engine_argv()
+    if not expected_argv:
         return False
     try:
-        return shlex.split(str(cmd).strip()) == shlex.split(expected)
+        return shlex.split(str(cmd).strip()) == expected_argv
     except ValueError:
         return False
 
@@ -4166,9 +4331,10 @@ def _find_our_engine_pids() -> list[int]:
     fail-closed: an unavailable process table cannot be treated as proof that
     no owned engine exists.
     """
-    expected = _expected_engine_command()
-    if expected is None:
+    expected_argv = _expected_engine_argv()
+    if not expected_argv:
         raise EngineIdentityError("sing-box binary is unavailable; engine identity is unknown")
+    engine_binary = expected_argv[0]
     if os.name == "nt":
         # The privileged helper owns Windows lifecycle in supported installs;
         # retain a conservative no-result path for the cross-platform CLI.
@@ -4184,6 +4350,7 @@ def _find_our_engine_pids() -> list[int]:
         raise EngineIdentityError(f"cannot scan engine processes: {exc}") from exc
     if result.returncode != 0:
         raise EngineIdentityError("cannot scan engine processes")
+    raw_engine_binary = resolve_sing_box() or ""
     pids: list[int] = []
     for line in (result.stdout or "").splitlines():
         parts = line.strip().split(None, 2)
@@ -4193,6 +4360,12 @@ def _find_our_engine_pids() -> list[int]:
             pid = int(parts[0])
             int(parts[1])  # Parse UID as part of the authenticated row.
         except ValueError:
+            continue
+        # Cheap prefilter: only a row carrying the normalized or raw binary
+        # can match, so unrelated rows skip shlex entirely.
+        if engine_binary not in parts[2] and not (
+            raw_engine_binary and raw_engine_binary in parts[2]
+        ):
             continue
         if pid > 1 and _command_is_our_engine(parts[2]):
             pids.append(pid)
@@ -5406,7 +5579,7 @@ def _degraded_lanes() -> list[str]:
     return lanes
 
 
-def _status_report() -> tuple[int, str]:
+def _status_report(*, fast: bool = False) -> tuple[int, str]:
     """Single liveness check shared by `status` and `vpn status` (M13): both
     commands must report the same up/down state and exit code so automation
     cannot disagree with a human reading one or the other.
@@ -5414,16 +5587,24 @@ def _status_report() -> tuple[int, str]:
     Returns (rc, line) with rc == 0 only when the engine is running AND its
     generated config matches the persisted mode (tun engine for tun mode,
     proxy listener for proxy mode); anything else is a degraded/down state
-    with rc == 1.
+    with rc == 1. Fast status reports skip the privileged helper while keeping
+    local PID, process-identity and generated-config checks.
     """
     mode = current_mode()
+
+    def _engine_alive() -> bool:
+        return engine_alive(skip_helper=True) if fast else engine_alive()
+
+    def _engine_mode_consistent() -> bool:
+        return engine_mode_consistent(skip_helper=True) if fast else engine_mode_consistent()
+
     if mode == "tun":
-        if engine_alive() and engine_mode_consistent():
+        if _engine_alive() and _engine_mode_consistent():
             return 0, "up (tun)"
-        if engine_alive():
+        if _engine_alive():
             return 1, "down (running engine does not match tun mode; run 'vpn on')"
         return 1, "down (mode set to tun; run 'vpn on')"
-    if listener_up() and engine_alive():
+    if listener_up() and _engine_alive():
         proxy_status, _effective = _system_proxy_status_readonly()
         suffix = "" if proxy_status in {"ok", "skipped"} else f"; {proxy_status}"
         degraded = _degraded_lanes()
@@ -5748,79 +5929,15 @@ def vpn_status() -> int:
 
 
 def _provider_status(name: str) -> dict:
-    """Machine-readable view of one provider: profiles, active, cooldowns,
-    last rotation, and persisted egress records."""
-    proxy_backed = is_proxy_provider(name)
-    profiles = [] if proxy_backed else [p.stem for p in provider_files(name)]
-    # Report the PERSISTED active profile (what the engine is configured with)
-    # rather than resolve_active(), which skips a cooled-down active when
-    # picking the next candidate. Proxy-backed providers have one synthetic
-    # SOCKS lane; stale WireGuard markers/files must not shadow its status.
-    if proxy_backed:
-        active_stem = _PROXY_PROFILE_STEM
-    else:
-        active_profile = persisted_active(name)
-        active_stem = active_profile.stem if active_profile is not None else None
-    entry = {"profiles": profiles, "active": active_stem}
-    if proxy_backed:
-        try:
-            upstream_host, upstream_port = proxy_upstream(name)
-        except ValueError as exc:
-            entry["upstream_error"] = str(exc)
-        else:
-            entry["upstream"] = f"{upstream_host}:{upstream_port}"
-        proxy_record = read_egress(name, proxy_profile_key(name))
-        if proxy_record:
-            entry["egress"] = {_PROXY_PROFILE_STEM: proxy_record}
-    fallback = fallback_status(name)
-    if fallback["configured"] or fallback["active"]:
-        entry["fallback"] = fallback
-    if not proxy_backed:
-        cooldowns = {}
-        for stem in profiles:
-            path = ROOT / "state" / "cooldowns" / name / f"{stem}.until"
-            try:
-                if path.is_file():
-                    cooldowns[stem] = int(path.read_text().strip())
-            except (ValueError, OSError):
-                pass
-        if cooldowns:
-            entry["cooldown_until"] = cooldowns
-    if not proxy_backed:
-        rotation = ROOT / "state" / f"{name}.rotation"
-        try:
-            if rotation.is_file():
-                entry["last_rotation"] = json.loads(rotation.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
-    if not proxy_backed:
-        egress = {}
-        for stem in profiles:
-            record = read_egress(name, Path(stem + ".conf"))
-            if record:
-                egress[stem] = record
-        if egress:
-            entry["egress"] = egress
-    return entry
+    from status_snapshot import build_provider_status
+
+    return build_provider_status(globals(), name)
 
 
 def _legacy_launch_agents() -> list[str]:
-    """Read-only probe for known legacy proxy-router launch agents.
+    from status_snapshot import legacy_launch_agents
 
-    An older install (e.g. com.hermes.proxy-router) can coexist with the
-    current keepalive/tray agents and resurrect a stale engine on login.
-    The installer prints migration steps when it finds one; status surfaces
-    the same fact read-only so a live box is never silently half-migrated.
-    """
-    if sys.platform != "darwin":
-        return []
-    agents_dir = Path.home() / "Library" / "LaunchAgents"
-    if not agents_dir.is_dir():
-        return []
-    found = []
-    for plist in sorted(agents_dir.glob("com.hermes.proxy-router*.plist")):
-        found.append(plist.name)
-    return found
+    return legacy_launch_agents(globals())
 
 
 def _launchd_agent_state(label: str) -> bool:
@@ -5834,92 +5951,63 @@ def _launchd_agent_state(label: str) -> bool:
     """
     if sys.platform != "darwin":
         return False
-    try:
-        probe = subprocess.run(
-            ["launchctl", "list"], capture_output=True, text=True, timeout=10,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return f"{label}" in (probe.stdout or "")
+    return f"{label}" in _launchctl_list()
 
 
-def status_json() -> dict:
-    """Full machine-readable status for `status --json`."""
-    rc, line = _status_report()
-    data = {"up": rc == 0, "state": line, "mode": current_mode(), "port": _port,
-            "sing_box": resolve_sing_box(), "schema_version": SCHEMA_VERSION}
-    # Local settings inspection is read-only and does not perform a network
-    # probe. Keep engine liveness separate from proxy readiness so a listener
-    # alone cannot make the tray claim that GUI traffic is connected.
-    proxy_status, effective = _system_proxy_status_readonly()
-    data["system_proxy"] = {"status": proxy_status, "effective": effective}
-    cached = _cached_network_diagnostic()
-    if cached is not None:
-        data["network"] = cached
-    try:
-        if PID_FILE.is_file():
-            data["pid"] = int(PID_FILE.read_text().strip())
-    except (ValueError, OSError):
-        pass
-    data["providers"] = {name: _provider_status(name) for name in _providers}
-    data["degraded_lanes"] = _degraded_lanes()
-    data["error_policy"] = {name: error_policy_for(name) for name in _providers}
-    data["routes"] = [{
-        "id": route.get("id"),
-        "provider": route.get("provider"),
-        "domains": route.get("domains", []),
-        "ip_cidr": route.get("ip_cidr", []),
-    } for route in _routes]
-    data["autodetect"] = autodetect_status()
-    data["routing"] = routing_state()
-    try:
-        cfg = json.loads(CONFIG_FILE.read_text())
-        data["preset"] = cfg.get("preset")
-    except (OSError, json.JSONDecodeError):
-        data["preset"] = None
-    try:
-        import route_watcher
+_launchctl_list_cache: str | None = None
 
-        data["watcher"] = route_watcher.status(ROOT)
-    except Exception:
-        data["watcher"] = {"running": False, "enabled": False, "scope": "proxy-observable only"}
-    try:
-        data["legacy_agents"] = _legacy_launch_agents()
-    except Exception:
-        data["legacy_agents"] = []
-    # Issue #76: expose the startup-permission state so the tray (and any
-    # dashboard) can tell a permission gap apart from a broken engine and
-    # offer the one-click repair instead of a generic failure.
-    helper = None
-    if sys.platform == "darwin" and _effective_uid() != 0:
+
+def _launchctl_list_reset() -> None:
+    """Drop the cached `launchctl list` so the next read probes again."""
+    global _launchctl_list_cache
+    _launchctl_list_cache = None
+
+
+def _launchctl_list() -> str:
+    """`launchctl list` output, probed once per read pass.
+
+    A status read asks about the tray and keepalive agents in the same pass;
+    one spawn covers both instead of two identical `launchctl` calls.
+    """
+    global _launchctl_list_cache
+    if _launchctl_list_cache is None:
         try:
-            helper = _helper_status()
-        except Exception:
-            helper = {"installed": False, "error": "helper status probe crashed"}
-    data["elevation"] = {
-        "platform": sys.platform,
-        "root_engine": _engine_runs_as_root(),
-        "helper_installed": bool(helper and helper.get("installed")),
-        "sudo_grant": _sudoers_installed(),
-        # The one-time fix every consumer should point at when any of the
-        # flags above shows the grant missing.
-        "fix_hint": _HELPER_FIX,
-    }
-    if sys.platform == "darwin":
-        data["elevation"]["tray_agent"] = _launchd_agent_state("com.proxy-router.tray")
-        data["elevation"]["keepalive_agent"] = _launchd_agent_state(
-            "com.proxy-router.keepalive")
-    rotation = {
-        "interval_seconds": scheduled_interval(),
-        "jitter_seconds": int(_rotation.get("jitter_seconds", DEFAULT_ROTATION_SETTINGS["jitter_seconds"]) or 0),
-        "policy": rotation_policy(),
-    }
-    if rotation["interval_seconds"] > 0:
-        next_times = [n for n in (next_rotation_at(name) for name in _providers) if n is not None]
-        if next_times:
-            rotation["next_at"] = min(next_times)
-    data["rotation"] = rotation
-    return data
+            probe = subprocess.run(
+                ["launchctl", "list"], capture_output=True, text=True, timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            _launchctl_list_cache = ""
+        else:
+            _launchctl_list_cache = probe.stdout or ""
+    return _launchctl_list_cache
+
+
+def status_json(*, fast: bool = False) -> dict:
+    """Full machine-readable status for `status --json`.
+
+    ``fast`` skips the elevation/launchd probes, which cost a `sudo -n`
+    round trip plus a `launchctl list` spawn and cannot change between polls;
+    pollers that only need engine/provider/routing state should use it.
+    """
+    # Open a lazy probe scope: the first of engine_alive / elevation /
+    # _sudoers_installed probes, the rest reuse it. Priming eagerly would
+    # bypass callers that replace _helper_status, and leaving the scope off
+    # makes all three call sites spawn `sudo -n` independently.
+    _helper_status_memo.clear()
+    _launchctl_list_reset()
+    if sys.platform == "darwin" and _effective_uid() != 0:
+        _helper_status_memo.append(_HELPER_STATUS_PENDING)
+    try:
+        return _status_json(fast=fast)
+    finally:
+        _helper_status_memo.clear()
+        _launchctl_list_reset()
+
+
+def _status_json(*, fast: bool = False) -> dict:
+    from status_snapshot import build_status_snapshot
+
+    return build_status_snapshot(globals(), fast=fast)
 
 
 def _check_active_fallback(primary: str, fallback: str) -> tuple[Path | None, str, dict | None]:
@@ -6798,6 +6886,9 @@ def system_proxy_on(runner=None) -> int:
     if not services:
         return fail("could not determine any macOS network services")
     strict = injected or sys.platform == "darwin"
+    previous = _proxy_state_read() or {}
+    previous_records = {record["service"]: record for record in previous.get("services", [])
+                        if isinstance(record, dict) and "service" in record}
     snapshots = []
     conflicts = []
     for service in services:
@@ -6809,14 +6900,28 @@ def system_proxy_on(runner=None) -> int:
                     conflicts.append(f"{service} {protocol} proxy state unavailable")
                 elif state.get("enabled") and not _proxy_endpoint_matches(state, _port):
                     conflicts.append(f"{service} {protocol} proxy {state.get('server')}:{state.get('port')}")
+        aux = _capture_proxy_aux(service, run)
+        current_bypass = aux.get("bypass", {}).get("domains") or []
+        applied_bypass = list(dict.fromkeys(system_proxy_bypass_domains() + current_bypass))
+        prior = previous_records.get(service, {})
+        if current_bypass == prior.get("applied_bypass", _LOCAL_PROXY_BYPASS):
+            # Reconnects must retain the original bypass list, rather than
+            # treating our last applied list as the user's pre-existing one.
+            original = prior.get("aux", {}).get("bypass")
+            if original is not None:
+                aux["bypass"] = original
         snapshots.append({"service": service, "service_id": service, "port": _port,
-                          "before": before,
-                          "aux": _capture_proxy_aux(service, run),
+                          "before": before, "aux": aux,
+                          "applied_bypass": applied_bypass,
                           "owned": {"http": False, "https": False}})
     if conflicts:
         return fail("foreign system proxy conflict: " + "; ".join(conflicts))
 
+    # Freeze the exact list that Connect will apply so Disconnect can restore
+    # the captured pre-Connect list even after a config reload.
+    bypass_domains = _bypass_domains()
     state = {"version": 1, "endpoint": {"server": "127.0.0.1", "port": _port},
+             "proxy_bypass_domains": bypass_domains,
              "services": snapshots, "changed_at": int(time.time())}
     try:
         # Persist the ownership intent before the first mutation.  A crash or
@@ -6835,7 +6940,7 @@ def system_proxy_on(runner=None) -> int:
                 # 127.0.0.1:2080 for GUI apps.
                 ["networksetup", "-setautoproxystate", service, "off"],
                 ["networksetup", "-setproxyautodiscovery", service, "off"],
-                ["networksetup", "-setproxybypassdomains", service, "*.local", "localhost", "127.0.0.1", "::1"],
+                ["networksetup", "-setproxybypassdomains", service, *record["applied_bypass"]],
             ]
             for index, command in enumerate(commands):
                 _run_result(run, command, check=True, capture_output=True, timeout=10)
@@ -6908,7 +7013,7 @@ def system_proxy_on(runner=None) -> int:
             if "bypass" in aux and aux["bypass"].get("domains") is not None:
                 try:
                     _run_result(run, ["networksetup", "-setproxybypassdomains", service,
-                                      *aux["bypass"].get("domains", [])], check=True,
+                                      *(aux["bypass"].get("domains") or ["Empty"])], check=True,
                                 capture_output=True, timeout=10)
                 except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError, TypeError) as rollback_exc:
                     rollback_errors.append(f"{service} bypass: {rollback_exc}")
@@ -7057,9 +7162,9 @@ def system_proxy_off(runner=None) -> int:
             if before_domains is not None:
                 try:
                     current_domains = _capture_proxy_aux(service, run).get("bypass", {}).get("domains")
-                    ours_domains = ["*.local", "localhost", "127.0.0.1", "::1"]
+                    ours_domains = record.get("applied_bypass", state.get("proxy_bypass_domains", _LOCAL_PROXY_BYPASS))
                     if current_domains == ours_domains and current_domains != before_domains:
-                        _run_result(run, ["networksetup", "-setproxybypassdomains", service, *before_domains],
+                        _run_result(run, ["networksetup", "-setproxybypassdomains", service, *(before_domains or ["Empty"])],
                                     check=True, capture_output=True, timeout=10)
                 except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError, TypeError) as exc:
                     failures.append(f"{service} bypass: {exc}")
@@ -7324,7 +7429,15 @@ def _helper_command(operation: str, uid: int | None = None) -> list[str]:
     ]
 
 
-def _helper_status() -> dict | None:
+# A single status read asks for the helper three times (engine_alive, the
+# elevation block, and _sudoers_installed), and every miss spawns `sudo -n`
+# (~200ms under load). status_json() primes this so one pass probes once;
+# an empty list means "probe on demand" so direct callers stay uncached.
+_helper_status_memo: list = []
+_HELPER_STATUS_PENDING = object()
+
+
+def _probe_helper_status() -> dict | None:
     """Return canonical helper status, or None when exact NOPASSWD is absent."""
     try:
         result = subprocess.run(
@@ -7349,6 +7462,21 @@ def _helper_status() -> dict | None:
     required = {"installed", "running", "pid", "mode", "schema_version"}
     if not isinstance(value, dict) or not required <= set(value) or value.get("schema_version") != 1:
         return {"installed": False, "error": "helper status schema mismatch"}
+    return value
+
+
+def _helper_status() -> dict | None:
+    """Helper status, probed once per status pass (see ``status_json``).
+
+    Outside a pass this probes directly, so callers that replace this
+    function (tests, diagnostics) keep full control.
+    """
+    if not _helper_status_memo:
+        return _probe_helper_status()
+    value = _helper_status_memo[0]
+    if value is _HELPER_STATUS_PENDING:
+        value = _probe_helper_status()
+        _helper_status_memo[0] = value
     return value
 
 
@@ -7576,7 +7704,16 @@ def main() -> int:
     doctor_parser.add_argument("--network", action="store_true",
                                help="run bounded direct/routed connectivity and DNS checks")
     status.add_argument("--json", action="store_true", help="machine-readable status (JSON)")
+    status.add_argument("--fast", action="store_true",
+                        help="skip the elevation/launchd probes (for pollers)")
     sub.add_parser("reload")
+    relay = sub.add_parser("model-relay", help="retry free-model 429s through rotating exits before client fallback")
+    relay.add_argument("--port", type=int, default=2082, help="loopback API port (default 2082)")
+    relay.add_argument("--upstream", default="https://opencode.ai/zen/v1", help="HTTPS API base URL")
+    relay.add_argument("--max-retries", type=int, default=32)
+    relay.add_argument("--timeout", type=int, default=180, help="upstream socket timeout in seconds")
+    relay.add_argument("--retry-window", type=int, default=180, help="bounded recovery window in seconds")
+    relay.add_argument("--free-model", action="append", default=[], help="additional free model ID (repeatable)")
     autodetect = sub.add_parser("autodetect", help="discover routed web-app dependency hostnames")
     autodetect.add_argument("source", nargs="?", default="twitch",
                             help="configured discovery source (default: twitch)")
@@ -7757,6 +7894,19 @@ def main() -> int:
     profile_copy_parser.add_argument("--provider", required=True,
                                     help="configured destination provider (e.g. proton)")
 
+    dashboard = sub.add_parser("dashboard", help=argparse.SUPPRESS)
+    dashboard_sub = dashboard.add_subparsers(dest="dashboard_action", required=True)
+    dashboard_sub.add_parser("state", help=argparse.SUPPRESS)
+    for action in ("profile-save", "provider-save"):
+        command = dashboard_sub.add_parser(action, help=argparse.SUPPRESS)
+        command.add_argument("--json", required=True, help=argparse.SUPPRESS)
+        command.add_argument("--id", default=None, help=argparse.SUPPRESS)
+        if action == "provider-save":
+            command.add_argument("--path", default=None, help=argparse.SUPPRESS)
+    for action in ("profile-delete", "profile-apply", "provider-delete"):
+        command = dashboard_sub.add_parser(action, help=argparse.SUPPRESS)
+        command.add_argument("--id", required=True, help=argparse.SUPPRESS)
+
     elevate = sub.add_parser("elevate", help="one-time passwordless-sudo grant (install|uninstall|status)")
     elevate.add_argument("action", choices=["install", "uninstall", "status"])
 
@@ -7780,6 +7930,10 @@ def main() -> int:
         help="for action 'auto': enable/disable automatic preset switching")
 
     args, passthrough = parser.parse_known_args()
+    if args.cmd == "dashboard":
+        import dashboard_profile_manager as dashboard_profiles
+
+        return _with_lock(lambda: dashboard_profiles.run_cli(ROOT, args), timeout=5.0)
     if args.cmd == "elevate":
         return cmd_elevate(args.action)
     if args.cmd == "network-check":
@@ -8009,27 +8163,40 @@ def main() -> int:
     if args.cmd == "status":
         if resolve_sing_box() is None:
             print(f"router: {_sing_box_missing_message()}", file=sys.stderr)
-        rc, line = _status_report()
         if args.json:
-            print(json.dumps(status_json(), indent=2, sort_keys=True))
-        else:
-            print(line)
-            try:
-                legacy = _legacy_launch_agents()
-            except Exception:
-                legacy = []
-            if legacy:
-                names = ", ".join(legacy)
-                print(f"router: legacy launch agent(s) still installed: {names}",
-                      file=sys.stderr)
-                print("router: migrate with `router.py elevate install` or remove "
-                      "them from ~/Library/LaunchAgents", file=sys.stderr)
+            # status_json already ran the report; reuse its verdict instead of
+            # paying a second _status_report() just for the exit code.
+            data = status_json(fast=args.fast)
+            print(json.dumps(data, indent=2, sort_keys=True))
+            return 0 if data["up"] else 1
+        rc, line = _status_report()
+        print(line)
+        try:
+            legacy = _legacy_launch_agents()
+        except Exception:
+            legacy = []
+        if legacy:
+            names = ", ".join(legacy)
+            print(f"router: legacy launch agent(s) still installed: {names}",
+                  file=sys.stderr)
+            print("router: migrate with `router.py elevate install` or remove "
+                  "them from ~/Library/LaunchAgents", file=sys.stderr)
         return rc
     if args.cmd == "reload":
         rc = _with_lock(engine_reload)
         if rc == 0:
             route_watcher_start()
         return rc
+    if args.cmd == "model-relay":
+        if not 1 <= args.port <= 65535 or args.port == _port:
+            return fail("model-relay port must be valid and differ from the proxy listener")
+        if not 0 <= args.max_retries <= 64 or args.timeout < 1 or args.retry_window < 1:
+            return fail("invalid model-relay retry or timeout limit")
+        from model_relay import serve
+        try:
+            return serve(sys.modules[__name__], args)
+        except (ValueError, OSError) as exc:
+            return fail(f"model-relay: {exc}")
     if args.cmd == "autodetect":
         return _with_lock(lambda: autodetect_source(
             args.source, reload=not args.no_reload, quiet=args.quiet
