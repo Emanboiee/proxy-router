@@ -1320,7 +1320,8 @@ class DashboardOpenerTests(unittest.TestCase):
         self.assertIn("setup_tui.py", " ".join(calls[0]))
 
     def test_macos_terminal_failure_fails_quietly(self):
-        with mock.patch.object(tray.sys, "platform", "darwin"), \
+        with mock.patch.object(tray, "_dashboard_bundle", return_value=None), \
+             mock.patch.object(tray.sys, "platform", "darwin"), \
              mock.patch.object(tray.subprocess, "Popen",
                                side_effect=OSError("no Terminal")):
             self.assertFalse(tray.open_dashboard(self.root))
