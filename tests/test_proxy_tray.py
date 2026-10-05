@@ -1339,7 +1339,8 @@ class DashboardOpenerTests(unittest.TestCase):
         self.assertIn("setup_tui.py", " ".join(calls[0]))
 
     def test_macos_terminal_failure_fails_quietly(self):
-        with mock.patch.object(tray.sys, "platform", "darwin"), \
+        with mock.patch.object(tray, "_dashboard_bundle", return_value=None), \
+             mock.patch.object(tray.sys, "platform", "darwin"), \
              mock.patch.object(tray.subprocess, "Popen",
                                side_effect=OSError("no Terminal")):
             self.assertFalse(tray.open_dashboard(self.root))
@@ -1611,6 +1612,77 @@ class DashboardLifecycleTests(unittest.TestCase):
         self.assertIsNone(controller.window)
 
 
+def _is_window_server_unavailable_error(exc):
+    message = str(exc)
+    name = str(getattr(exc, "name", "") or "")
+    reason = str(getattr(exc, "reason", "") or "")
+    if not name:
+        name, _, parsed_reason = message.partition(" - ")
+        reason = reason or parsed_reason
+    if name in {
+        "NSWindowServerCommunicationException",
+        "NSWindowServerException",
+    }:
+        return True
+    reason = reason.lower().replace("windowserver", "window server")
+    return (
+        name == "NSInternalInconsistencyException"
+        and "window server" in reason
+        and any(
+            phrase in reason
+            for phrase in (
+                "not available",
+                "unavailable",
+                "unable to connect",
+                "cannot connect",
+            )
+        )
+    )
+
+
+def _make_dashboard_window_or_skip(test_case, factory, *args):
+    try:
+        return factory(*args)
+    except tray.objc.error as exc:
+        if _is_window_server_unavailable_error(exc):
+            test_case.skipTest(f"no window server: {exc}")
+        raise
+
+
+class DashboardRenderWindowConstructionTests(unittest.TestCase):
+    def test_only_known_window_server_errors_skip(self):
+        class FakeObjCError(Exception):
+            def __init__(self, name, reason):
+                self.name = name
+                self.reason = reason
+                super().__init__(f"{name} - {reason}")
+
+        def raising(exc):
+            def factory(*_args):
+                raise exc
+            return factory
+
+        with mock.patch.object(tray, "objc", SimpleNamespace(error=FakeObjCError)):
+            for name, reason in (
+                ("NSWindowServerCommunicationException", "server unavailable"),
+                ("NSInternalInconsistencyException", "WindowServer is not available"),
+            ):
+                with self.subTest(name=name), self.assertRaises(unittest.SkipTest):
+                    _make_dashboard_window_or_skip(
+                        self, raising(FakeObjCError(name, reason)))
+
+            cocoa_bug = FakeObjCError(
+                "NSInvalidArgumentException", "setTitle_ received an invalid value")
+            with self.assertRaises(FakeObjCError) as caught:
+                _make_dashboard_window_or_skip(self, raising(cocoa_bug))
+            self.assertIs(caught.exception, cocoa_bug)
+
+            python_bug = RuntimeError("_apply_status failed")
+            with self.assertRaises(RuntimeError) as caught:
+                _make_dashboard_window_or_skip(self, raising(python_bug))
+            self.assertIs(caught.exception, python_bug)
+
+
 class DashboardRenderTests(unittest.TestCase):
     """The dashboard must survive a real AppKit repaint.
 
@@ -1638,12 +1710,9 @@ class DashboardRenderTests(unittest.TestCase):
     def test_window_draw_survives_repaint(self):
         client = tray.RouterClient("/tmp")
         app = tray.TrayApp(client, None)
-        try:
-            window = app.dashboard.window_factory(
-                client, app._dispatch_dashboard_action,
-                tray.RouterStatus(up=True, port=2080))
-        except Exception as exc:
-            self.skipTest(f"no window server: {exc}")
+        window = _make_dashboard_window_or_skip(
+            self, app.dashboard.window_factory, client,
+            app._dispatch_dashboard_action, tray.RouterStatus(up=True, port=2080))
 
         self.render(window.root)
         self.render(window.root)
@@ -1810,8 +1879,58 @@ class DashboardTrayIntegrationTests(unittest.TestCase):
         app.action_setup.assert_called_once_with()
 
 
+class TrayHeadlessTests(unittest.TestCase):
+    """Issue #144: the tray job can run without owning a menu-bar item."""
+
+    def test_headless_launches_the_app_when_absent(self):
+        launched = []
+        bundle = Path("/tmp/Proxy Router.app")
+        with mock.patch.object(tray, "dashboard_app_running", return_value=False), \
+                mock.patch.object(tray, "_dashboard_bundle", return_value=bundle), \
+                mock.patch.object(tray, "_launch_dashboard_app",
+                                  side_effect=lambda app: launched.append(app) or True):
+            rc = tray.supervise_dashboard("/tmp/root", interval=0,
+                                          sleep=lambda _seconds: None,
+                                          max_cycles=1)
+        self.assertEqual(rc, 0)
+        self.assertEqual(launched, [bundle])
+
+    def test_headless_never_stacks_a_second_app(self):
+        with mock.patch.object(tray, "dashboard_app_running", return_value=True), \
+                mock.patch.object(tray, "_launch_dashboard_app") as launch:
+            rc = tray.supervise_dashboard("/tmp/root", interval=0,
+                                          sleep=lambda _seconds: None,
+                                          max_cycles=3)
+        self.assertEqual(rc, 0)
+        launch.assert_not_called()
+
+    def test_headless_without_a_bundle_reports_a_hint(self):
+        stderr = io.StringIO()
+        with mock.patch.object(tray, "dashboard_app_running", return_value=False), \
+                mock.patch.object(tray, "_dashboard_bundle", return_value=None), \
+                mock.patch.object(sys, "stderr", stderr):
+            rc = tray.supervise_dashboard("/tmp/root", interval=0,
+                                          sleep=lambda _seconds: None,
+                                          max_cycles=1)
+        self.assertEqual(rc, 0)
+        self.assertIn("no dashboard app bundle found", stderr.getvalue())
+
+    def test_main_routes_headless_without_needing_pystray(self):
+        with mock.patch.object(tray, "supervise_dashboard", return_value=0) as sup, \
+                mock.patch.object(sys, "argv",
+                                  ["proxy_tray.py", "--root", "/tmp/root",
+                                   "--headless", "--headless-interval", "5"]):
+            rc = tray.main()
+        self.assertEqual(rc, 0)
+        sup.assert_called_once_with("/tmp/root", interval=5.0)
+
+    def test_dashboard_app_running_is_false_off_darwin(self):
+        with mock.patch.object(sys, "platform", "linux"):
+            self.assertFalse(tray.dashboard_app_running())
+
+
 class TrayOwnershipTests(unittest.TestCase):
-    """Issue #144: exactly one proxy-router menu-bar item — the dashboard app."""
+    """Issue #144: exactly one proxy-router menu-bar item."""
 
     def _bundle(self, root: Path, name: str, *, executable=None, include_binary=True):
         app = root / name
@@ -1872,12 +1991,21 @@ class TrayOwnershipTests(unittest.TestCase):
         ):
             self.assertEqual(tray.tray_ownership("/tmp/root"), "icon")
 
-    def test_main_refuses_the_icon_when_the_dashboard_owns_the_menubar(self):
+    def test_explicit_headless_flag_wins_over_env(self):
+        with (
+            mock.patch.object(tray, "_dashboard_bundle", return_value=None),
+            mock.patch.dict(tray.os.environ, {"PROXY_ROUTER_TRAY_HEADLESS": "0"}),
+        ):
+            self.assertEqual(
+                tray.tray_ownership("/tmp/root", explicit_headless=True), "headless")
+
+    def test_main_supervises_dashboard_without_starting_a_second_tray(self):
         stderr = io.StringIO()
         with (
             mock.patch.object(
                 tray, "_dashboard_bundle", return_value=Path("/tmp/Proxy Router.app")
             ),
+            mock.patch.object(tray, "supervise_dashboard", return_value=0) as sup,
             mock.patch.object(tray, "RouterClient") as client,
             mock.patch.object(tray, "TrayApp") as tray_app,
             mock.patch.object(sys, "stderr", stderr),
@@ -1887,9 +2015,10 @@ class TrayOwnershipTests(unittest.TestCase):
         ):
             rc = tray.main()
         self.assertEqual(rc, 0)
+        sup.assert_called_once_with("/tmp/root", interval=30.0)
         client.assert_not_called()
         tray_app.assert_not_called()
-        self.assertIn("not starting a second status item", stderr.getvalue())
+        self.assertIn("running headless", stderr.getvalue())
 
 
 if __name__ == "__main__":
