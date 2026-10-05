@@ -460,6 +460,31 @@ Two more knobs in `"vpn"` control address-family policy:
   443 to 1.1.1.1) on networks that drop UDP 53 to external resolvers while
   allowing outbound TCP 443; the same IP literal is used as the server
   address with `server_port: 443`.
+- `dns_resolver` — which resolver set resolves a WireGuard provider's routed
+  domains. Default `provider` (that provider's own `dns-<provider>` server,
+  see `dns_transport`). `local` routes them through the same OS resolver
+  (`dns-local`) every direct/SOCKS5 lane already uses, for filtered networks
+  that block public UDP 53 *and* intermittently reset DoH to the public
+  endpoint while the network's own resolver still answers. Only the query
+  path changes: destination traffic still exits through the provider's
+  endpoint. `school-warp` selects `local`; `default` restores `provider`.
+- `public_dns` — optional resolver for direct destinations, SOCKS destinations,
+  and WireGuard routes using `dns_resolver: local`. For example:
+  `{"server":"1.1.1.1","transport":"https","private_domains":["local","ts.net"]}`.
+  The server must be an IP literal so it does not depend on OS DNS to bootstrap.
+  Transports are `https` (default), `udp`, `tcp`, or `tls`. Private suffixes and
+  single-label hostnames keep OS DNS, including MagicDNS and LAN search domains;
+  add your own split DNS suffixes to `private_domains`. SOCKS route hostnames
+  are resolved before the upstream receives them, avoiding a second lookup by
+  a filtered SOCKS resolver. Omit `public_dns` to keep the previous behavior.
+- `tailscale_bypass` — opt-in coexistence for proxy mode (default `false`).
+  Keeps Tailscale control domains, `.ts.net` names, and the Tailscale IPv4/IPv6
+  ranges direct, ahead of provider rules. It adds persistent macOS proxy
+  exceptions while retaining existing exceptions and recording what Disconnect
+  should restore. Proxy mode uses OS socket routing so tailnet connections can
+  reach the Tailscale interface; TUN mode retains its existing interface binding.
+  Keep Tailscale DNS enabled to preserve MagicDNS. Test the configured public
+  DNS transport on the current network before enabling it.
 
 ## One-time elevation (macOS)
 
@@ -613,6 +638,29 @@ macOS login autostart (launchd agent):
 examples/install-tray.sh            # fills the plist template, bootstraps gui/$UID agent
 examples/install-tray.sh --remove   # unload + remove ~/Library/LaunchAgents/com.proxy-router.tray.plist
 ```
+
+### One tray at a time (dashboard app vs tray agent)
+
+The Tauri dashboard app (`dashboard/`, opened by the tray's left click)
+registers its **own** menu-bar item, so running both at once shows two
+proxy-router icons — and they can disagree, because the dashboard tray paints
+its own state while this agent polls `router.py status --json`. Pick one owner:
+
+- **Dashboard owns the tray** (use this when the desktop app runs at login).
+  Start the agent headless: it supervises the app without painting a second
+  icon, and the app reports live connected / degraded / failed state.
+
+  ```sh
+  python3 proxy_tray.py --headless                      # no menu-bar item
+  python3 proxy_tray.py --headless --headless-interval 15
+  ```
+
+- **Agent owns the tray** — close the dashboard app instead; its tray icon is
+  the duplicate, and `proxy_tray.py` already shows the accurate status colour.
+
+`--headless` never stacks a second app on top of a running one, and reports a
+hint (rather than a traceback) when no `Proxy Router.app` bundle is built —
+build it, or point `PROXY_ROUTER_DASHBOARD` at one. See issue #144.
 
 Rerunning the installer is safe: with the same root it re-renders and
 re-bootstraps (a real upgrade); with a different root it unloads the stale
@@ -805,6 +853,55 @@ every provider is probed through the tunnel and the pool ends on the best
 alive exit, with health/cooldown/block markers persisted along the way.
 
 ## Hermes integration
+
+For free-model 429 recovery **before Hermes activates a fallback model**, run
+proxy-router's model relay and use its API endpoint:
+
+```sh
+./router.py model-relay --free-model big-pickle
+# OpenAI-compatible base URL: http://127.0.0.1:2082/v1
+```
+
+The relay connects to `https://opencode.ai/zen/v1` through the router's mixed
+proxy. Enable `opencode.ai` in `routing.vpn_domains` when using `vpn-list`, and
+assign it to a provider with a profile pool and optional fallback providers.
+In Hermes, use a custom Zen provider with `base_url` set to the relay. The
+registered `opencode-zen` provider uses its existing `OPENCODE_ZEN_BASE_URL`
+override instead (a `providers.opencode-zen.base_url` entry alone is ignored
+by its runtime resolver). Clients must already send a Zen-compatible request;
+the relay preserves its format. For ordinary Hermes/OpenAI requests to free
+models, use the existing OC2API adapter at `http://127.0.0.1:8090/v1` (including
+as the registered Zen URL override). OC2API can use
+`ZEN_API_BASE_URL=http://127.0.0.1:2082/v1` and
+`ZEN_CONNECT_TIMEOUT_MS=300000` so OpenCode and Hermes both benefit.
+Set client request timeouts to at least 300 seconds and streaming first-byte
+timeouts to 240 seconds to allow the bounded recovery window.
+Set `NO_PROXY` and `no_proxy` to include `localhost,127.0.0.1,::1`, preserving
+any existing exceptions. Python HTTP clients can discover macOS's system proxy
+while ignoring its bypass list. Without this explicit loopback exception,
+the client-to-OC2API connection passes through the rotating engine and can fail
+during a successful 429 recovery. The relay's explicit upstream CONNECT still
+uses the router, independent of these client exceptions.
+
+On a rejected free-model HTTP 429, the router marks the current exit with its
+configured 429 policy (default: exhausted for 900 seconds), selects another
+profile, and retries the identical request. When a pool runs out, it follows
+the configured provider fallback chain. Late concurrent responses from an old
+exit cannot exhaust the new exit. Retries stop when no exit is available, after
+32 switches (`--max-retries`), or at the 180-second recovery window
+(`--retry-window`; an in-flight attempt/switch can finish after that window).
+Only then does the client receive the final 429 and apply its normal fallback.
+Models ending in `-free` or `:free`, explicit `--free-model` IDs, and semantic
+`FreeUsageLimitError` responses qualify. Raw JSON limit errors returned with
+HTTP 200 are recognized before success headers are sent. Paid-model generic
+429s pass through.
+The relay never replays a partially delivered successful stream. It listens
+only on loopback, verifies upstream TLS, and logs no prompts or credentials.
+The engine must be running; manual-off does not restart it.
+
+Hermes's error hooks are observer-only in the inspected version: a plugin's
+`retry_primary` return is discarded before eager rate-limit fallback. Keeping
+the recovery below Hermes avoids depending on that hook or patching its core.
 
 Point `hermes` at the proxy (`http://127.0.0.1:2080` via
 `https_proxy`/`http_proxy`). `examples/hermes-opencode.sh` wraps model runs:
