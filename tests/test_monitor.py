@@ -408,6 +408,22 @@ class ValidatedTargetTests(unittest.TestCase):
         self.assertEqual(request.get_header("User-agent"), monitor.DEFAULT_HEADERS["User-Agent"])
         self.assertEqual(request.get_header("Accept"), monitor.DEFAULT_HEADERS["Accept"])
 
+    def test_pinned_https_keeps_hostname_for_tls(self):
+        context = mock.Mock()
+        raw_socket = mock.Mock()
+        connection = monitor._PinnedHTTPSConnection(
+            "public.example", pinned_addresses=("93.184.216.34",),
+            timeout=3, context=context,
+        )
+        with mock.patch.object(
+            monitor.socket, "create_connection", return_value=raw_socket
+        ) as dial:
+            connection.connect()
+        dial.assert_called_once_with(("93.184.216.34", 443), 3, None)
+        context.wrap_socket.assert_called_once_with(
+            raw_socket, server_hostname="public.example"
+        )
+
     def test_explicit_opt_in_allows_private_targets(self):
         with mock.patch.dict(os.environ, {monitor.PRIVATE_TARGET_BYPASS_ENV: "1"}):
             violation = monitor.target_violation("http://127.0.0.1:9090/metrics")
