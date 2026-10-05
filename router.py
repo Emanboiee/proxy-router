@@ -1443,13 +1443,13 @@ def recover_route(name: str, host: str) -> int:
     """Confirm a stalled route, then try configured alternatives and opt-in direct."""
     if MANUAL_OFF_FILE.exists() or not _automatic_proxy_mode():
         return 3
-    if name not in _providers or response_provider_for_host(host) != name:
-        return fail("recovery target does not belong to the configured provider")
-    if not _diagnostic_host_is_routed(host):
-        return 3
     routing = routing_state()
     if routing["mode"] == "vpn-list" and not any(
             _response_host_matches(host, domain) for domain in _effective_vpn_domains(routing)):
+        return 3
+    if name not in _providers or response_provider_for_host(host) != name:
+        return fail("recovery target does not belong to the configured provider")
+    if not _diagnostic_host_is_routed(host):
         return 3
     url = f"https://{host}/"
     if urllib.parse.urlsplit(url).hostname != host or unsafe_probe_target(url):
@@ -1609,15 +1609,9 @@ def _response_host_matches(host: str, domain: str) -> bool:
 
 
 def response_provider_for_host(host: str) -> str | None:
-    """Return the configured route provider responsible for ``host``."""
-    for route in _routes_with_autodetected_domains(_routes):
-        provider = route.get("provider")
-        if not isinstance(provider, str):
-            continue
-        for domain in route.get("domains", []):
-            if _response_host_matches(host, domain):
-                return provider
-    return None
+    """Attribute responses with the same bypass and availability rules as routing."""
+    from model_relay import route_provider
+    return route_provider(globals(), host)
 
 
 def _response_event_marker(provider: str) -> Path:
@@ -7715,6 +7709,13 @@ def main() -> int:
                                help="run bounded direct/routed connectivity and DNS checks")
     status.add_argument("--json", action="store_true", help="machine-readable status (JSON)")
     sub.add_parser("reload")
+    relay = sub.add_parser("model-relay", help="retry free-model 429s through rotating exits before client fallback")
+    relay.add_argument("--port", type=int, default=2082, help="loopback API port (default 2082)")
+    relay.add_argument("--upstream", default="https://opencode.ai/zen/v1", help="HTTPS API base URL")
+    relay.add_argument("--max-retries", type=int, default=32)
+    relay.add_argument("--timeout", type=int, default=180, help="upstream socket timeout in seconds")
+    relay.add_argument("--retry-window", type=int, default=180, help="bounded recovery window in seconds")
+    relay.add_argument("--free-model", action="append", default=[], help="additional free model ID (repeatable)")
     autodetect = sub.add_parser("autodetect", help="discover routed web-app dependency hostnames")
     autodetect.add_argument("source", nargs="?", default="twitch",
                             help="configured discovery source (default: twitch)")
@@ -8168,6 +8169,16 @@ def main() -> int:
         if rc == 0:
             route_watcher_start()
         return rc
+    if args.cmd == "model-relay":
+        if not 1 <= args.port <= 65535 or args.port == _port:
+            return fail("model-relay port must be valid and differ from the proxy listener")
+        if not 0 <= args.max_retries <= 64 or args.timeout < 1 or args.retry_window < 1:
+            return fail("invalid model-relay retry or timeout limit")
+        from model_relay import serve
+        try:
+            return serve(sys.modules[__name__], args)
+        except (ValueError, OSError) as exc:
+            return fail(f"model-relay: {exc}")
     if args.cmd == "autodetect":
         return _with_lock(lambda: autodetect_source(
             args.source, reload=not args.no_reload, quiet=args.quiet
