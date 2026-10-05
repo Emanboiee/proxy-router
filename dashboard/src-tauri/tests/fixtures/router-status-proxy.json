@@ -6,7 +6,9 @@
     "status": "ok"
   },
   "network": {
-    "status": "ok"
+    "status": "ok",
+    "stale": false,
+    "age_seconds": 1.0
   },
   "error": null
 }

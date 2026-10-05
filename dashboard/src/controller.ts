@@ -26,7 +26,7 @@ export interface Status {
 }
 export interface Profile {
   id: string; name: string; description: string; providerId: string;
-  routeMode: RouteMode; domains: string[]; autoSubdomains: boolean; fallback: FallbackMode; updatedAt: number;
+  fallbackProviderId?: string; routeMode: RouteMode; domains: string[]; autoSubdomains: boolean; fallback: FallbackMode; updatedAt: number;
 }
 export interface Provider {
   id: string; name: string; kind: ProviderKind;
@@ -247,7 +247,8 @@ export async function applyEngineAction(action: EngineAction): Promise<void> {
  * Apply the real routing for a profile choice.
  *
  * `direct` stops the engine (no routed sites); the other built-in profiles
- * apply their matching preset. Unknown profiles stay local-only.
+ * apply their matching preset. Unknown local profiles are not installed in
+ * the engine and must be rejected instead of appearing active.
  */
 export async function applyProfileToEngine(profileId: string): Promise<void> {
   if (!isTauri()) return;
@@ -257,6 +258,7 @@ export async function applyProfileToEngine(profileId: string): Promise<void> {
   }
   const preset = PROFILE_PRESET[profileId];
   if (preset) await invoke('apply_preset', { name: preset });
+  else throw new Error(`Profile “${profileId}” is not installed in the router`);
 }
 
 /** Redacted router.json view (allowlisted keys only). */
@@ -287,6 +289,47 @@ export const presetChoices = ['opencode', 'school-warp', 'roblox', 'default'] as
 export async function getConfig(): Promise<EngineConfig> {
   if (!isTauri()) throw new Error('Live config requires the desktop app');
   return await invoke<EngineConfig>('get_config');
+}
+
+/** Saved dashboard profiles and providers, with no WireGuard secret material. */
+export interface DashboardState {
+  profiles: Profile[];
+  providers: Provider[];
+  activeProfileId: string | null;
+}
+
+export async function getDashboardState(): Promise<DashboardState> {
+  if (!isTauri()) throw new Error('Saved profiles require the desktop app');
+  return await invoke<DashboardState>('get_dashboard_state');
+}
+
+export async function saveDashboardProfile(profile: Omit<Profile, 'id' | 'updatedAt'>, profileId?: string): Promise<DashboardState> {
+  return await invoke<DashboardState>('save_dashboard_profile', { profile, profileId: profileId ?? null });
+}
+
+export async function deleteDashboardProfile(profileId: string): Promise<DashboardState> {
+  return await invoke<DashboardState>('delete_dashboard_profile', { profileId });
+}
+
+/** Writes routing choices for the next explicit connection; it never reloads or starts the engine. */
+export async function applyDashboardProfile(profileId: string): Promise<DashboardState> {
+  return await invoke<DashboardState>('apply_dashboard_profile', { profileId });
+}
+
+export async function saveDashboardProvider(
+  provider: { name: string; kind: 'wireguard' | 'custom' },
+  providerId?: string,
+  sourcePath?: string,
+): Promise<DashboardState> {
+  return await invoke<DashboardState>('save_dashboard_provider', {
+    provider,
+    providerId: providerId ?? null,
+    sourcePath: sourcePath ?? null,
+  });
+}
+
+export async function deleteDashboardProvider(providerId: string): Promise<DashboardState> {
+  return await invoke<DashboardState>('delete_dashboard_provider', { providerId });
 }
 
 export async function getNetwork(): Promise<{ status: Record<string, unknown>; presets: NetworkPresetState }> {

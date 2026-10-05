@@ -134,6 +134,7 @@ class ConfigBuildTests(unittest.TestCase):
             {"id": "roblox", "domains": ["roblox.com"], "provider": "cloudflare"},
         ]
         router._port = 2080
+        router._vpn = {}
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -166,6 +167,19 @@ class ConfigBuildTests(unittest.TestCase):
         rules = config["route"]["rules"]
         self.assertIn({"outbound": "proton", "domain_suffix": ["example.com"]}, rules)
         self.assertNotIn({"outbound": "cloudflare", "domain_suffix": ["roblox.com"]}, rules)
+
+    def test_unavailable_block_route_rejects_traffic_and_dns(self):
+        router._routes = [{
+            "id": "roblox", "domains": ["roblox.com"], "provider": "cloudflare",
+            "on_unavailable": "block",
+        }]
+
+        config, active = router.build_singbox_config()
+
+        self.assertEqual(set(active), {"proton"})
+        self.assertIn({"action": "reject", "domain_suffix": ["roblox.com"]}, config["route"]["rules"])
+        self.assertIn({"domain_suffix": ["roblox.com"], "action": "reject"}, config["dns"]["rules"])
+        self.assertEqual(config["route"]["final"], "direct")
 
     def test_build_retains_persisted_profile_when_every_profile_is_cooled(self):
         profile = self.root / "providers" / "cloudflare" / "warp.conf"
@@ -217,6 +231,68 @@ class RoutesTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(router.CONFIG_FILE.stat().st_mode), 0o600)
 
 
+class ResponseEventStallTests(unittest.TestCase):
+    """response-event --reason: real-traffic stalls must rotate the exit.
+
+    Small egress probes cannot see an exit that answers probes yet
+    throttles long streams (observed live: opencode.ai stalled 23s while
+    probes stayed green). A stall report flows through the error-policy
+    table into cooldown + rotate, falling back when the pool is empty --
+    the same transaction 429 uses.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(router, self.root)
+        (self.root / "providers" / "proton").mkdir(parents=True)
+        router.CONFIG_FILE.write_text(json.dumps({
+            "port": 2080,
+            "providers": {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}},
+            "routes": [{"id": "zen", "domains": ["opencode.ai"], "provider": "proton"}],
+        }))
+        self.assertEqual(router.load_config(), 0)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _event(self, **kwargs):
+        params = {"host": "opencode.ai", "status": 0, "dedupe_seconds": 0}
+        params.update(kwargs)
+        with mock.patch.object(router, "rotate", return_value=0) as rotate_fn, \
+             mock.patch.object(router, "_usable_profile", return_value=self.root / "providers/proton/live.conf"), \
+             mock.patch.object(router, "active_fallback", return_value=None), \
+             io.StringIO() as buf, \
+             mock.patch("sys.stdout", buf):
+            rc = router.response_event(**params)
+        return rc, rotate_fn
+
+    def test_stall_reason_rotates_exit(self):
+        rc, rotate_fn = self._event(reason="timeout")
+        self.assertEqual(rc, 0)
+        rotate_fn.assert_called_once_with("proton", reason="timeout")
+
+    def test_unknown_reason_fails_closed(self):
+        rc, rotate_fn = self._event(reason="bogus")
+        self.assertNotEqual(rc, 0)
+        rotate_fn.assert_not_called()
+
+    def test_non_429_without_reason_still_ignored(self):
+        rc, rotate_fn = self._event(status=503)
+        self.assertEqual(rc, 0)
+        rotate_fn.assert_not_called()
+
+    def test_unrouted_host_with_reason_fails(self):
+        rc, rotate_fn = self._event(host="example.com", reason="timeout")
+        self.assertNotEqual(rc, 0)
+        rotate_fn.assert_not_called()
+
+    def test_429_path_unchanged(self):
+        rc, rotate_fn = self._event(status=429)
+        self.assertEqual(rc, 0)
+        rotate_fn.assert_called_once_with("proton", reason="429")
+
+
 class ConfigValidationTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -237,6 +313,17 @@ class ConfigValidationTests(unittest.TestCase):
     def test_load_config_rejects_provider_path_escape(self):
         router.CONFIG_FILE.write_text(json.dumps({
             "port": 2080, "providers": {"proton": {"directory": "../outside"}}, "routes": []
+        }))
+        self.assertEqual(router.load_config(), 1)
+
+    def test_load_config_rejects_invalid_route_unavailable_policy(self):
+        router.CONFIG_FILE.write_text(json.dumps({
+            "port": 2080,
+            "providers": {"proton": {}},
+            "routes": [{
+                "id": "example-com", "domains": ["example.com"], "provider": "proton",
+                "on_unavailable": "fallback",
+            }],
         }))
         self.assertEqual(router.load_config(), 1)
 
@@ -356,6 +443,20 @@ class VpnModeTests(unittest.TestCase):
         router.set_mode("tun")
         config, _ = router.build_singbox_config()
         self.assertEqual(config["route"]["rules"][0], {"protocol": "dns", "action": "hijack-dns"})
+
+    def test_tun_captures_unavailable_block_route(self):
+        router._routes = [{
+            "id": "missing", "domains": ["blocked.example"], "provider": "cloudflare",
+            "on_unavailable": "block",
+        }]
+        router._vpn["capture"] = "routes"
+        router.set_mode("tun")
+        with mock.patch.object(router, "_bounded_getaddrinfo", return_value=["203.0.113.7"]):
+            config, _ = router.build_singbox_config()
+
+        captured = config["route"]["rule_set"][0]["rules"][0]["ip_cidr"]
+        self.assertIn("203.0.113.7/32", captured)
+        self.assertIn({"action": "reject", "domain_suffix": ["blocked.example"]}, config["route"]["rules"])
 
     def test_proxy_mode_has_no_hijack_rule(self):
         router.set_mode("proxy")
@@ -565,6 +666,48 @@ class DnsStrategyTests(unittest.TestCase):
         self.assertEqual(config["dns"]["strategy"], "ipv4_prefer")
 
 
+class DnsResolverTests(unittest.TestCase):
+    """vpn.dns_resolver picks the resolver set for a WireGuard provider's
+    routed domains: its own dns-<provider> server, or the OS resolver."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        _relocate(router, self.root)
+        (self.root / "providers" / "proton").mkdir(parents=True)
+        _write_conf(self.root / "providers" / "proton" / "a.conf")
+        router._providers = {"proton": {"directory": "providers/proton", "cooldown_seconds": 60}}
+        router._routes = [{"id": "example-com", "domains": ["example.com"], "provider": "proton"}]
+        router._port = 2080
+        router._vpn = {}
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _proton_dns_rule(self) -> dict:
+        config, _ = router.build_singbox_config()
+        return next(r for r in config["dns"]["rules"]
+                    if "example.com" in r.get("domain_suffix", []))
+
+    def test_defaults_to_provider(self):
+        self.assertEqual(router.dns_resolver(), "provider")
+
+    def test_configured_local_used(self):
+        router._vpn = {"dns_resolver": "local"}
+        self.assertEqual(router.dns_resolver(), "local")
+
+    def test_invalid_falls_back_to_provider(self):
+        router._vpn = {"dns_resolver": "bogus"}
+        self.assertEqual(router.dns_resolver(), "provider")
+
+    def test_default_pins_provider_resolver(self):
+        self.assertEqual(self._proton_dns_rule()["server"], "dns-proton")
+
+    def test_local_uses_the_os_resolver(self):
+        router._vpn = {"dns_resolver": "local"}
+        self.assertEqual(self._proton_dns_rule()["server"], "dns-local")
+
+
 class ParseEndpointEdgeTests(unittest.TestCase):
     def test_bracketed_v6_requires_port(self):
         with self.assertRaises(SystemExit):
@@ -631,6 +774,50 @@ class StatusReportTests(unittest.TestCase):
             rc, line = router._status_report()
         self.assertEqual(rc, 0)
         self.assertIn("up", line)
+
+    def test_proxy_mode_up_with_fail_open_park_reports_degraded(self):
+        old = (router._providers, router._routes)
+        router._providers = {
+            "cloudflare": {
+                "socks5": {"host": "127.0.0.1", "port": 2181},
+                "fallback_providers": ["proton"],
+                "fail_open_direct": True,
+            },
+            "proton": {"directory": "providers/proton"},
+        }
+        router._routes = [
+            {"id": "school", "domains": ["twitch.tv"], "provider": "cloudflare"},
+        ]
+        marker = Path(router.ROOT) / "state" / "fallback" / "cloudflare.json"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({"provider": "direct", "reason": "timeout"}))
+        try:
+            with mock.patch.object(router, "listener_up", return_value=True), \
+                 mock.patch.object(router, "engine_alive", return_value=True):
+                rc, line = router._status_report()
+        finally:
+            router._providers, router._routes = old
+        self.assertEqual(rc, 0)
+        self.assertIn("up (proxy", line)
+        self.assertIn("DEGRADED", line)
+        self.assertIn("school", line)
+
+    def test_proxy_mode_up_without_park_has_no_degraded_suffix(self):
+        old = (router._providers, router._routes)
+        router._providers = {
+            "proton": {"directory": "providers/proton"},
+        }
+        router._routes = [
+            {"id": "opencode-zen", "domains": ["opencode.ai"], "provider": "proton"},
+        ]
+        try:
+            with mock.patch.object(router, "listener_up", return_value=True), \
+                 mock.patch.object(router, "engine_alive", return_value=True):
+                rc, line = router._status_report()
+        finally:
+            router._providers, router._routes = old
+        self.assertEqual(rc, 0)
+        self.assertNotIn("DEGRADED", line)
 
     def test_vpn_status_uses_shared_report(self):
         router.set_mode("tun")
@@ -776,6 +963,130 @@ class WaitEngineTests(unittest.TestCase):
             self.assertTrue(router.wait_engine(timeout=2.0))
 
 
+class SystemProxyScopeTests(unittest.TestCase):
+    """Reconnect speed without stranding traffic: the proxy toggle must hit
+    the active service only, while off() sweeps stale ON states elsewhere.
+
+    Toggling all 9 services is 63 sequential networksetup spawns (~5s)
+    on every connect. Only the default route's service is used by macOS
+    clients; an unknown active service falls back to all (old behavior).
+    The sweep exists because stale 127.0.0.1:2080 ON states (e.g. on the
+    ProtonVPN/Tailscale services) strand traffic at a dead listener with
+    ERR_PROXY_CONNECTION_FAILED once the engine stops.
+    """
+
+    def setUp(self):
+        self._port = router._port
+        self._state_file = router.SYSTEM_PROXY_STATE_FILE
+        self._tmp = tempfile.TemporaryDirectory()
+        router.SYSTEM_PROXY_STATE_FILE = Path(self._tmp.name) / "system-proxy.json"
+        router._port = 2080
+
+    def tearDown(self):
+        router._port = self._port
+        router.SYSTEM_PROXY_STATE_FILE = self._state_file
+        self._tmp.cleanup()
+
+    def _run_toggle(self, func, active, stale=()):
+        sets = []
+
+        def fake_run(command, **kwargs):
+            if command[1].startswith("-set"):
+                sets.append((command[1], command[2]))
+            if command[:2] == ["scutil", "--proxy"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=("<dictionary> {\n"
+                            "  HTTPEnable : 1\n  HTTPProxy : 127.0.0.1\n"
+                            "  HTTPPort : 2080\n  HTTPSEnable : 1\n"
+                            "  HTTPSProxy : 127.0.0.1\n  HTTPSPort : 2080\n"
+                            "}\n"),
+                )
+            if command[0] == "networksetup" and command[1] in {
+                    "-getwebproxy", "-getsecurewebproxy"}:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="Enabled: Yes\nServer: 127.0.0.1\nPort: 2080\n",
+                )
+            return SimpleNamespace(returncode=0, stdout="")
+
+        with mock.patch.object(router, "active_service_name", return_value=active), \
+             mock.patch.object(router, "network_services", return_value=["Wi-Fi", "Ethernet"]) as all_fn, \
+             mock.patch.object(router, "_proxy_points_at_us", side_effect=lambda s: s in stale), \
+             mock.patch("subprocess.run", side_effect=fake_run), \
+             io.StringIO() as buf, \
+             mock.patch("sys.stdout", buf):
+            self.assertEqual(func(), 0)
+        return sets, all_fn
+
+    def test_proxy_on_targets_active_service_only(self):
+        sets, all_fn = self._run_toggle(router.system_proxy_on, "Wi-Fi")
+        self.assertTrue(sets)
+        self.assertEqual({service for _, service in sets}, {"Wi-Fi"})
+        all_fn.assert_not_called()
+
+    def test_proxy_off_targets_active_service_only(self):
+        sets, all_fn = self._run_toggle(router.system_proxy_off, "Wi-Fi")
+        self.assertEqual({service for _, service in sets}, {"Wi-Fi"})
+        all_fn.assert_called_once()  # the stale-endpoint sweep ran
+
+    def test_proxy_off_sweeps_stale_other_service(self):
+        sets, _ = self._run_toggle(router.system_proxy_off, "Wi-Fi", stale=("Ethernet",))
+        self.assertIn(("-setwebproxystate", "Ethernet"), sets)
+        self.assertIn(("-setsecurewebproxystate", "Ethernet"), sets)
+
+    def test_proxy_falls_back_to_all_services_when_active_unknown(self):
+        sets, all_fn = self._run_toggle(router.system_proxy_on, None)
+        self.assertEqual({service for _, service in sets}, {"Wi-Fi", "Ethernet"})
+        all_fn.assert_called_once()
+
+    def test_proxy_off_aggregates_stale_service_clear_failure(self):
+        def failing_run(command, **kwargs):
+            if command[:2] == ["networksetup", "-setwebproxystate"] and command[2] == "Ethernet":
+                raise subprocess.CalledProcessError(1, command)
+            if command[:2] == ["scutil", "--proxy"]:
+                return SimpleNamespace(returncode=0, stdout="<dictionary> {\n}\n")
+            if command[0] == "networksetup" and command[1] in {"-getwebproxy", "-getsecurewebproxy"}:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="Enabled: Yes\nServer: 127.0.0.1\nPort: 2080\n",
+                )
+            return SimpleNamespace(returncode=0, stdout="")
+
+        stderr_text = ""
+        with mock.patch.object(router, "active_service_name", return_value="Wi-Fi"), \
+             mock.patch.object(router, "network_services", return_value=["Wi-Fi", "Ethernet"]), \
+             mock.patch.object(router, "_proxy_points_at_us",
+                               side_effect=lambda service: service == "Ethernet"), \
+             mock.patch("subprocess.run", side_effect=failing_run), \
+             io.StringIO() as out_buf, io.StringIO() as err_buf, \
+             mock.patch("sys.stdout", out_buf), mock.patch("sys.stderr", err_buf):
+            rc = router.system_proxy_off()
+            stderr_text = err_buf.getvalue()
+
+        self.assertNotEqual(rc, 0)
+        self.assertIn("could not fully disable system proxy", stderr_text)
+        self.assertIn("Ethernet", stderr_text)
+
+    def _points_at_us(self, stdout):
+        with mock.patch("subprocess.run", return_value=SimpleNamespace(stdout=stdout)):
+            return router._proxy_points_at_us("Ethernet")
+
+    def test_stale_detector_matches_our_endpoint(self):
+        self.assertTrue(self._points_at_us(
+            "Enabled: Yes\nServer: 127.0.0.1\nPort: 2080\n"
+            "Authenticated Proxy Enabled: 0\n"
+        ))
+
+    def test_stale_detector_ignores_foreign_proxy(self):
+        self.assertFalse(self._points_at_us(
+            "Enabled: Yes\nServer: 10.0.0.5\nPort: 8080\n"
+        ))
+
+    def test_stale_detector_ignores_switched_off(self):
+        self.assertFalse(self._points_at_us("Enabled: No\nServer: 127.0.0.1\nPort: 2080\n"))
+
+
 class ProcessIdentityTests(unittest.TestCase):
     """Issue #62: whole-process-table liveness/ownership must be row-scoped.
     A foreign sing-box run plus an unrelated process carrying our config
@@ -868,7 +1179,8 @@ class EngineStopTerminationTests(unittest.TestCase):
             [sys.executable, "-c", child_code], stdout=subprocess.DEVNULL)
         try:
             router.PID_FILE.write_text(f"{proc.pid}\n")
-            with mock.patch.object(router, "_pid_matches", return_value=True):
+            with mock.patch.object(router, "_pid_matches", return_value=True), \
+                 mock.patch.object(router, "_find_our_engine_pids", return_value=[]):
                 self.assertTrue(
                     router._pid_matches(proc.pid),
                     "precondition: stand-in engine must be recognized as ours")
@@ -1315,19 +1627,18 @@ class ProbeEgressTests(unittest.TestCase):
         self.assertIs(record["dns_ok"], False)
         self.assertFalse(router.is_cooled_down("proton", self.profile))
 
-    def test_probe_tls_throttle_never_cools_even_repeated(self):
-        # TLS-handshake EOF (SSL_ERROR_SYSCALL / UNEXPECTED_EOF) happens AFTER
-        # the TCP CONNECT rode the tunnel: the path works, the upstream is
-        # throttling. Even two consecutive TLS failures must NOT cool — this
-        # is the GLM "all exits work" reality vs probe false-death gap.
+    def test_probe_repeated_tls_failure_cools_after_threshold(self):
+        # A server closing mid-handshake is not proof of throttling; repeated
+        # TLS errors with no HTTP response use the TLS quarantine policy.
         with mock.patch.object(router, "probe_egress", return_value=self._tls_fail()):
             _, record = router.probe_profile("proton", self.profile)
             self.assertEqual(record["fails"], 1)
+            self.assertFalse(router.is_cooled_down("proton", self.profile))
             _, record = router.probe_profile("proton", self.profile)
             self.assertEqual(record["fails"], 2)
-        self.assertFalse(router.is_cooled_down("proton", self.profile))
+        self.assertTrue(router.is_cooled_down("proton", self.profile))
 
-    def test_check_egress_live_tls_throttle_is_degraded_not_dead(self):
+    def test_check_egress_live_first_tls_strike_is_degraded_not_dead(self):
         with mock.patch.object(router, "probe_egress", return_value=self._tls_fail()), \
              mock.patch.object(router.time, "sleep"):
             status, record = router.check_egress_live("proton", self.profile)
@@ -1515,6 +1826,15 @@ class RotationEgressTests(unittest.TestCase):
             self.assertEqual(router.rotate("proton"), 1)
         self.assertEqual(self._active(), "a")
         self.assertFalse(router.is_cooled_down("proton", self._profile("a")))
+
+    def test_persisted_active_missing_last_good_keeps_marker(self):
+        router.set_active("proton", self._profile("a"))
+        router.LAST_GOOD_FILE.unlink(missing_ok=True)
+        with mock.patch.object(router, "engine_alive", return_value=True), \
+                mock.patch.object(router, "configured_profile", return_value=self._profile("b")):
+            active = router.persisted_active("proton")
+        self.assertEqual(active.stem, "a")
+        self.assertEqual(self._active(), "a")
 
     def test_rotate_probe_failure_without_previous_keeps_switch(self):
         with mock.patch.object(router, "listener_up", return_value=True), \
@@ -1941,33 +2261,30 @@ class EgressLiveCheckTests(unittest.TestCase):
         self.assertIs(record["dns_ok"], False)
         self.assertFalse(router.is_cooled_down("proton", self.profile))
 
-    def test_transport_failure_alone_is_still_dead(self):
-        # no HTTP status at all = the tunnel path is broken even when the DNS
-        # companion check cannot be determined - never leave it unhealed.
+    def test_transport_failure_with_unknown_dns_is_degraded(self):
+        # An unknown direct DNS result is insufficient evidence to blame the
+        # tunnel; keep the exit degraded and avoid cooldown/rotation.
         with mock.patch.object(router, "probe_egress", return_value=self._probe(
                 error="TimeoutError: timed out")), \
              mock.patch.object(router, "egress_dns_probe", return_value=None):
             status, record = router.check_egress_live("proton", self.profile)
-        self.assertEqual(status, "dead")
+        self.assertEqual(status, "degraded")
         self.assertFalse(record["ok"])
         self.assertNotIn("dns_ok", record)  # only persisted when determined
 
-    def test_transport_death_applies_cooldown(self):
-        # Connection-level death (no HTTP status, no TLS handshake) must cool
-        # the exit so resolve_active/rotation stop re-picking it for the
-        # cooldown window. Multi-strike: only the SECOND consecutive dead
-        # check cools (mirroring keepalive dead_strikes). TLS-classed errors
-        # never cool (degraded = upstream throttle), covered separately.
+    def test_transport_death_with_unknown_dns_never_cools(self):
+        # Connection-level failure with an unknown direct DNS signal is not
+        # enough evidence to cool the exit. The explicit network diagnostic
         with mock.patch.object(router, "probe_egress", return_value=self._probe(
                 error="URLError: <urlopen error [Errno 61] Connection refused>")), \
              mock.patch.object(router, "egress_dns_probe", return_value=None), \
              mock.patch.object(router.time, "sleep"):
             status, _ = router.check_egress_live("proton", self.profile)
-            self.assertEqual(status, "dead")
+            self.assertEqual(status, "degraded")
             self.assertFalse(router.is_cooled_down("proton", self.profile))
             status, _ = router.check_egress_live("proton", self.profile)
-            self.assertEqual(status, "dead")
-            self.assertTrue(router.is_cooled_down("proton", self.profile))
+            self.assertEqual(status, "degraded")
+            self.assertFalse(router.is_cooled_down("proton", self.profile))
 
     def test_degraded_http_status_does_not_cooldown(self):
         # A 403/1010 reputation block marks blocked (stronger than cooldown);
@@ -2003,10 +2320,9 @@ class EgressLiveCheckTests(unittest.TestCase):
         self.assertTrue(router.is_cooled_down("proton", self.profile))
         self.assertNotIn("block_reason", record or {})
 
-    def test_probe_profile_tls_throttle_never_cools(self):
-        # TLS-handshake failure (TCP CONNECT rode the tunnel, server closed
-        # mid-handshake = upstream throttle): must not cool even on repeated
-        # strikes through the probe_profile path either.
+    def test_probe_profile_repeated_tls_failure_cools(self):
+        # A server closing mid-handshake is not proof of throttling; repeated
+        # TLS alerts with no HTTP response use the TLS quarantine policy.
         with mock.patch.object(router, "probe_egress", return_value=self._probe(
                 error="URLError: <urlopen error [SSL: TLSV1_ALERT_INTERNAL_ERROR]>")), \
              mock.patch.object(router, "record_egress", wraps=router.record_egress):
@@ -2014,7 +2330,7 @@ class EgressLiveCheckTests(unittest.TestCase):
             self.assertEqual(record["fails"], 1)
             _, record = router.probe_profile("proton", self.profile)
             self.assertEqual(record["fails"], 2)
-        self.assertFalse(router.is_cooled_down("proton", self.profile))
+        self.assertTrue(router.is_cooled_down("proton", self.profile))
         self.assertNotIn("block_reason", record or {})
 
     def test_probe_profile_http_failure_does_not_cooldown(self):
@@ -2676,7 +2992,9 @@ class LastGoodConfigTests(unittest.TestCase):
         router.LAST_GOOD_FILE.write_text(known_good)
         with mock.patch.object(router, "validate_config", side_effect=[False, True]), \
              mock.patch.object(router, "wait_engine", side_effect=[True]) as wait:
-            self.assertEqual(router.engine_reload(), 0)
+            # F04: the rollback recovered service on the OLD config, so the
+            # requested change must report as failed, not as reload success.
+            self.assertEqual(router.engine_reload(), 1)
         # restored file == last-good content
         self.assertEqual(router.SING_BOX_CONFIG.read_text(), known_good)
         seen_kills = [c for c in router.os.kill.mock_calls]  # noqa: F841
@@ -2710,7 +3028,8 @@ class LastGoodConfigTests(unittest.TestCase):
             # no pid file -> reload must start the engine
             router.PID_FILE.unlink(missing_ok=True)
             rc = router.engine_reload()
-        self.assertEqual(rc, 0)
+        # F04: restore_rc 0 means service is back, but the candidate never ran.
+        self.assertEqual(rc, 1)
         restore.assert_called_once()
 
     def test_successful_reload_refreshes_last_good(self):
@@ -2728,7 +3047,8 @@ class LastGoodConfigTests(unittest.TestCase):
         with mock.patch.object(router, "validate_config", side_effect=[False, True]), \
              mock.patch.object(router, "engine_start", return_value=0) as start:
             rc = router.engine_reload()
-        self.assertEqual(rc, 0)
+        # F04: engine is back on the last-good config; the reload still failed.
+        self.assertEqual(rc, 1)
         start.assert_called_once_with(use_existing_config=True)
 
 
@@ -2811,9 +3131,13 @@ class ErrorPolicyTests(unittest.TestCase):
     def test_seconds_override_honored_by_rotate_reason(self):
         router.set_active("proton", self.profile)
         router._providers["proton"]["error_policy"] = {"503": {"action": "cooldown", "seconds": 45}}
+        before = int(time.time())
         with mock.patch.object(router, "probe_profile", return_value=(True, {"ok": True})):
             self.assertEqual(router.rotate("proton", reason="503"), 0)
-        self.assertEqual(self._cooldown_until(), int(time.time()) + 45)  # exact policy seconds
+        after = int(time.time())
+        cooldown_until = self._cooldown_until()
+        self.assertGreaterEqual(cooldown_until, before + 45)
+        self.assertLessEqual(cooldown_until, after + 45)  # exact policy seconds
         record = router.read_egress("proton", self.profile)
         self.assertEqual(record["upstream_error"], "503")
         self.assertFalse(record.get("exhausted"))
@@ -2861,7 +3185,7 @@ class ErrorPolicyTests(unittest.TestCase):
             "proton", self.profile, "[SSL: UNEXPECTED_EOF_WHILE_READING]", 60)
         self.assertGreaterEqual(self._cooldown_until(), int(time.time()) + 40)
 
-    def test_check_egress_live_dead_uses_connection_seconds(self):
+    def test_check_egress_live_unknown_dns_never_cools(self):
         router._error_policy = {"connection": {"action": "cooldown", "seconds": 20}}
         with mock.patch.object(router, "probe_egress", return_value={
                 "ok": False, "latency_ms": None, "status": None,
@@ -2870,11 +3194,11 @@ class ErrorPolicyTests(unittest.TestCase):
              mock.patch.object(router, "egress_dns_probe", return_value=None), \
              mock.patch.object(router.time, "sleep"):
             status, _ = router.check_egress_live("proton", self.profile)
-            self.assertEqual(status, "dead")
+            self.assertEqual(status, "degraded")
             self.assertFalse(router.is_cooled_down("proton", self.profile))
             status, _ = router.check_egress_live("proton", self.profile)
-            self.assertEqual(status, "dead")
-            self.assertGreaterEqual(self._cooldown_until(), int(time.time()) + 15)
+            self.assertEqual(status, "degraded")
+            self.assertFalse(router.is_cooled_down("proton", self.profile))
 
     def test_load_config_validates_and_merges_error_policy(self):
         (self.root / "router.json").write_text(json.dumps({
@@ -3273,6 +3597,31 @@ class ScheduledRotationTests(unittest.TestCase):
             data = router.status_json()
         self.assertEqual(data["rotation"]["interval_seconds"], 3600)
         self.assertIn("next_at", data["rotation"])
+
+    def _seed_proxy_provider(self, stale_at: int) -> None:
+        """A SOCKS5 lane that never rotates keeps an ancient rotation record."""
+        router._providers["cloudflare"] = {
+            "socks5": {"host": "127.0.0.1", "port": 2181}, "cooldown_seconds": 60}
+        (self.root / "state" / "cloudflare.active").write_text("warp", encoding="utf-8")
+        (self.root / "state" / "cloudflare.rotation").write_text(
+            json.dumps({"profile": "warp", "at": stale_at}), encoding="utf-8")
+
+    def test_rotate_due_skips_proxy_provider(self):
+        router.set_active("proton", self.root / "providers" / "proton" / "a.conf")
+        (self.root / "state" / "proton.rotation").write_text(
+            json.dumps({"profile": "a", "at": int(time.time())}), encoding="utf-8")
+        self._seed_proxy_provider(int(time.time()) - 30 * 86400)
+        with mock.patch.object(router, "rotate", side_effect=AssertionError(
+                "a SOCKS5 lane has nothing to rotate")):
+            self.assertEqual(router.rotate_due(), 3)
+
+    def test_status_next_at_ignores_stale_proxy_record(self):
+        (self.root / "state" / "proton.rotation").write_text(
+            json.dumps({"profile": "a", "at": int(time.time())}), encoding="utf-8")
+        self._seed_proxy_provider(int(time.time()) - 30 * 86400)
+        with mock.patch.object(router, "_status_report", return_value=(0, "ok")):
+            data = router.status_json()
+        self.assertGreater(data["rotation"]["next_at"], int(time.time()))
 
 
 class RotationPolicyTests(unittest.TestCase):
