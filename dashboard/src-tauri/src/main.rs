@@ -23,23 +23,46 @@ use tauri::{
 
 struct LaunchTime(Instant);
 
+/// One complete controller reading, published and read as a unit.
+#[derive(Default)]
+struct LiveReading {
+    state: String,
+    payload: Option<Value>,
+    detail: Option<String>,
+    at: Option<Instant>,
+}
+
 /// Latest live controller reading, shared with the frontend.
 #[derive(Default)]
 struct LiveStatus {
-    state: Mutex<String>,
-    payload: Mutex<Option<Value>>,
-    detail: Mutex<Option<String>>,
-    at: Mutex<Option<Instant>>,
+    reading: Mutex<LiveReading>,
 }
 
 impl LiveStatus {
-    /// One consistent read of the cache: state, payload, error, age.
+    /// Publish a complete reading so cache consumers cannot mix poll cycles.
+    fn publish(&self, state: String, payload: Option<Value>, detail: Option<String>) {
+        if let Ok(mut reading) = self.reading.lock() {
+            *reading = LiveReading {
+                state,
+                payload,
+                detail,
+                at: Some(Instant::now()),
+            };
+        }
+    }
+
+    /// One atomic read of the cache: state, payload, error, age.
     fn snapshot(&self) -> (String, Option<Value>, Option<String>, Option<u128>) {
-        let state = self.state.lock().map(|s| s.clone()).unwrap_or_default();
-        let payload = self.payload.lock().ok().and_then(|p| p.clone());
-        let detail = self.detail.lock().ok().and_then(|d| d.clone());
-        let age = self.at.lock().ok().and_then(|a| *a).map(|t| t.elapsed().as_millis());
-        (state, payload, detail, age)
+        let Ok(reading) = self.reading.lock() else {
+            return (String::new(), None, None, None);
+        };
+        let age = reading.at.map(|time| time.elapsed().as_millis());
+        (
+            reading.state.clone(),
+            reading.payload.clone(),
+            reading.detail.clone(),
+            age,
+        )
     }
 }
 
@@ -124,18 +147,7 @@ fn refresh_live_status<R: Runtime>(
         Err(error) => (None, Some(error)),
     };
     if let Some(live) = app.try_state::<LiveStatus>() {
-        if let Ok(mut slot) = live.state.lock() {
-            *slot = state.clone();
-        }
-        if let Ok(mut slot) = live.payload.lock() {
-            *slot = payload.clone();
-        }
-        if let Ok(mut slot) = live.detail.lock() {
-            *slot = detail.clone();
-        }
-        if let Ok(mut slot) = live.at.lock() {
-            *slot = Some(Instant::now());
-        }
+        live.publish(state.clone(), payload.clone(), detail.clone());
     }
     if let Err(error) = apply_tray_state(app, &state) {
         eprintln!("tray: {error}");
@@ -217,7 +229,7 @@ fn action_args(action: &str, payload: Option<&Value>) -> Result<Vec<String>, Str
 fn run_router_action<R: Runtime>(app: AppHandle<R>, action: String) -> Result<String, String> {
     let payload = app
         .try_state::<LiveStatus>()
-        .and_then(|live| live.payload.lock().ok().and_then(|slot| slot.clone()));
+        .and_then(|live| live.snapshot().1);
     let args = action_args(&action, payload.as_ref())?;
     let root = controller::router_root();
     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -246,11 +258,133 @@ fn apply_preset(app: AppHandle, name: String) -> Result<String, String> {
     Ok(applied)
 }
 
-/// Config keys the dashboard may read. Explicit allowlist: router.json is
-/// handed to the webview, so no key is exposed implicitly.
-const CONFIG_KEYS: [&str; 8] = [
-    "port", "preset", "providers", "routes", "routing", "vpn", "keepalive", "rotation",
-];
+/// Keep the webview config contract narrow, including inside nested objects.
+/// Provider paths and SOCKS credentials stay in router.json and never cross
+/// the Tauri bridge.
+fn dashboard_config(source: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+
+    if let Some(port) = source.get("port").filter(|value| value.is_number()) {
+        out.insert("port".into(), port.clone());
+    }
+    copy_string_field(source, &mut out, "preset");
+
+    if let Some(routes) = source.get("routes").and_then(Value::as_array) {
+        let routes = routes
+            .iter()
+            .filter_map(Value::as_object)
+            .map(|route| {
+                let route = Value::Object(route.clone());
+                let mut safe = serde_json::Map::new();
+                copy_string_field(&route, &mut safe, "id");
+                copy_string_field(&route, &mut safe, "provider");
+                if let Some(domains) = route.get("domains").and_then(Value::as_array) {
+                    safe.insert(
+                        "domains".into(),
+                        Value::Array(
+                            domains
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(|domain| Value::String(domain.to_string()))
+                                .collect(),
+                        ),
+                    );
+                }
+                Value::Object(safe)
+            })
+            .collect();
+        out.insert("routes".into(), Value::Array(routes));
+    }
+
+    if let Some(providers) = source.get("providers").and_then(Value::as_object) {
+        let mut safe_providers = serde_json::Map::new();
+        for (name, provider) in providers {
+            let Some(provider) = provider.as_object() else {
+                continue;
+            };
+            let mut safe = serde_json::Map::new();
+            if provider
+                .get("directory")
+                .and_then(Value::as_str)
+                .is_some_and(|directory| !directory.is_empty())
+            {
+                safe.insert("directory".into(), Value::Bool(true));
+            }
+            if provider.get("socks5").and_then(Value::as_object).is_some() {
+                safe.insert("socks5".into(), Value::Bool(true));
+            }
+            if let Some(fallbacks) = provider.get("fallback_providers").and_then(Value::as_array) {
+                safe.insert(
+                    "fallback_providers".into(),
+                    Value::Array(
+                        fallbacks
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(|name| Value::String(name.to_string()))
+                            .collect(),
+                    ),
+                );
+            } else if let Some(fallback) = provider.get("fallback_provider").and_then(Value::as_str)
+            {
+                safe.insert(
+                    "fallback_providers".into(),
+                    Value::Array(vec![Value::String(fallback.to_string())]),
+                );
+            }
+            safe_providers.insert(name.clone(), Value::Object(safe));
+        }
+        out.insert("providers".into(), Value::Object(safe_providers));
+    }
+
+    if let Some(routing) = source.get("routing") {
+        let mut safe = serde_json::Map::new();
+        copy_string_field(routing, &mut safe, "mode");
+        out.insert("routing".into(), Value::Object(safe));
+    }
+
+    if let Some(vpn) = source.get("vpn") {
+        let mut safe = serde_json::Map::new();
+        for key in ["default_mode", "capture", "dns_transport"] {
+            copy_string_field(vpn, &mut safe, key);
+        }
+        copy_number_field(vpn, &mut safe, "mtu");
+        out.insert("vpn".into(), Value::Object(safe));
+    }
+
+    if let Some(keepalive) = source.get("keepalive") {
+        let mut safe = serde_json::Map::new();
+        copy_bool_field(keepalive, &mut safe, "enabled");
+        copy_number_field(keepalive, &mut safe, "interval");
+        out.insert("keepalive".into(), Value::Object(safe));
+    }
+
+    if let Some(rotation) = source.get("rotation") {
+        let mut safe = serde_json::Map::new();
+        copy_number_field(rotation, &mut safe, "interval_seconds");
+        copy_number_field(rotation, &mut safe, "jitter_seconds");
+        out.insert("rotation".into(), Value::Object(safe));
+    }
+
+    Value::Object(out)
+}
+
+fn copy_string_field(source: &Value, target: &mut serde_json::Map<String, Value>, key: &str) {
+    if let Some(value) = source.get(key).and_then(Value::as_str) {
+        target.insert(key.to_string(), Value::String(value.to_string()));
+    }
+}
+
+fn copy_number_field(source: &Value, target: &mut serde_json::Map<String, Value>, key: &str) {
+    if let Some(value) = source.get(key).filter(|value| value.is_number()) {
+        target.insert(key.to_string(), value.clone());
+    }
+}
+
+fn copy_bool_field(source: &Value, target: &mut serde_json::Map<String, Value>, key: &str) {
+    if let Some(value) = source.get(key).and_then(Value::as_bool) {
+        target.insert(key.to_string(), Value::Bool(value));
+    }
+}
 
 /// Preset/SSID slug rules, mirrored from the engine's validation.
 fn valid_slug(value: &str, max: usize) -> bool {
@@ -260,7 +394,7 @@ fn valid_slug(value: &str, max: usize) -> bool {
     // them unmappable from the UI.
     let trimmed = value.trim();
     !trimmed.is_empty()
-        && trimmed.len() <= max
+        && trimmed.chars().count() <= max
         && !trimmed.contains(|c: char| c.is_control())
 }
 
@@ -273,13 +407,7 @@ fn get_config() -> Result<Value, String> {
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
     let parsed: Value = serde_json::from_str(&raw)
         .map_err(|error| format!("invalid router.json: {error}"))?;
-    let mut out = serde_json::Map::new();
-    for key in CONFIG_KEYS {
-        if let Some(value) = parsed.get(key) {
-            out.insert(key.to_string(), value.clone());
-        }
-    }
-    Ok(Value::Object(out))
+    Ok(dashboard_config(&parsed))
 }
 
 /// Live network detection: current Wi-Fi + the SSID -> preset mapping.
@@ -580,5 +708,113 @@ mod tests {
         // (main-thread command), not a tray-menu verb.
         assert!(action_args("stop", None).is_err());
         assert!(action_args("rotate", Some(&serde_json::json!({}))).is_err());
+    }
+
+    #[test]
+    fn live_readings_are_published_and_read_as_a_complete_snapshot() {
+        let live = LiveStatus::default();
+        live.publish(
+            "failed".to_string(),
+            None,
+            Some("controller unavailable".to_string()),
+        );
+
+        let (state, payload, detail, age) = live.snapshot();
+        assert_eq!(state, "failed");
+        assert_eq!(payload, None);
+        assert_eq!(detail.as_deref(), Some("controller unavailable"));
+        assert!(age.is_some());
+    }
+
+    #[test]
+    fn dashboard_config_only_contains_typed_display_fields() {
+        let source = serde_json::json!({
+            "port": 2080,
+            "preset": "school-warp",
+            "providers": {
+                "wireguard": {
+                    "directory": "/Users/alice/private/wg",
+                    "private_key": "provider-private-key",
+                    "fallback_providers": ["proton", 42],
+                    "auth_token": "provider-token"
+                },
+                "socks": {
+                    "socks5": {
+                        "host": "127.0.0.1",
+                        "port": 2181,
+                        "password": "socks-password"
+                    },
+                    "api_key": "provider-api-key"
+                },
+                "legacy": {"fallback_provider": "wireguard", "password": "legacy-secret"},
+                "malformed": "provider-secret"
+            },
+            "routes": [{
+                "id": "twitch",
+                "provider": "wireguard",
+                "domains": ["twitch.tv", "assets.twitch.tv", 123],
+                "access_token": "route-token"
+            }],
+            "routing": {"mode": "vpn-list", "secret": "routing-secret"},
+            "vpn": {
+                "default_mode": "custom",
+                "capture": "selective",
+                "mtu": 1280,
+                "dns_transport": "https",
+                "auth_token": "vpn-token",
+                "extra": {"secret": "nested-secret"}
+            },
+            "keepalive": {"enabled": true, "interval": 30, "password": "keepalive-secret"},
+            "rotation": {"interval_seconds": 600, "jitter_seconds": 20, "secret": "rotation-secret"},
+            "unrecognized_secret": "top-level-secret"
+        });
+
+        let safe = dashboard_config(&source);
+        assert_eq!(safe["port"], 2080);
+        assert_eq!(safe["preset"], "school-warp");
+        assert_eq!(safe["providers"]["wireguard"]["directory"], true);
+        assert_eq!(
+            safe["providers"]["wireguard"]["fallback_providers"],
+            serde_json::json!(["proton"])
+        );
+        assert_eq!(safe["providers"]["socks"]["socks5"], true);
+        assert_eq!(
+            safe["providers"]["legacy"]["fallback_providers"],
+            serde_json::json!(["wireguard"])
+        );
+        assert_eq!(
+            safe["routes"][0]["domains"],
+            serde_json::json!(["twitch.tv", "assets.twitch.tv"])
+        );
+        assert_eq!(safe["routing"]["mode"], "vpn-list");
+        assert_eq!(safe["vpn"]["mtu"], 1280);
+
+        let serialized = safe.to_string();
+        for secret in [
+            "/Users/alice/private/wg",
+            "provider-private-key",
+            "provider-token",
+            "socks-password",
+            "provider-api-key",
+            "legacy-secret",
+            "route-token",
+            "routing-secret",
+            "vpn-token",
+            "nested-secret",
+            "keepalive-secret",
+            "rotation-secret",
+            "top-level-secret",
+            "provider-secret",
+        ] {
+            assert!(!serialized.contains(secret), "leaked {secret}");
+        }
+    }
+
+    #[test]
+    fn network_name_validation_allows_spaces_and_counts_unicode_characters() {
+        assert!(valid_slug("School Wi-Fi", 255));
+        assert!(valid_slug(&"界".repeat(255), 255));
+        assert!(!valid_slug(&"界".repeat(256), 255));
+        assert!(!valid_slug("bad\nnetwork", 255));
     }
 }

@@ -6,7 +6,8 @@
       "cooldown_seconds": 60,
       "fallback_providers": [
         "fallback-vpn"
-      ]
+      ],
+      "probe_route_id": "opencode-zen"
     },
     "fallback-vpn": {
       "directory": "providers/fallback-vpn",
@@ -83,6 +84,12 @@
     "slow_latency_ms": 1200,
     "ok_window": 86400
   },
+  "autodetect": {
+    "enabled": false,
+    "interval_seconds": 300,
+    "timeout_seconds": 12,
+    "sources": {}
+  },
   "rotation": {
     "interval_seconds": 7200,
     "jitter_seconds": 300,
@@ -97,7 +104,8 @@
     "dead_strikes": 2,
     "storm_window": 600,
     "max_rotations": 2,
-    "sweep_every": 1800
+    "sweep_every": 1800,
+    "fallback_restore_every": 300
   },
   "error_policy": {
     "default": {

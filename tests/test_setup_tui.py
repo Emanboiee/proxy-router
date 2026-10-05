@@ -94,6 +94,29 @@ class ImportProfilesTests(unittest.TestCase):
         self.assertEqual(result["imported"], 2)
         self.assertEqual(result["rejected"], 0)
 
+    def test_import_stamps_roam_keepalive_when_missing(self):
+        # Roaming fix: an idle client never re-advertises its address
+        # after a Wi-Fi switch, so every imported profile gets the
+        # keepalive default unless it already sets one.
+        src = self.root / "roam.conf"
+        _write_valid_conf(src)
+        result = setup_tui.import_profiles(src, self.dest)
+        self.assertEqual(result["imported"], 1)
+        text = (self.dest / "roam.conf").read_text()
+        self.assertIn("PersistentKeepalive = 25", text)
+        self.assertTrue(setup_tui.validate_profile(self.dest / "roam.conf"))
+
+    def test_import_preserves_explicit_roam_keepalive(self):
+        src = self.root / "custom.conf"
+        _write_valid_conf(src)
+        with open(src, "a") as handle:
+            handle.write("PersistentKeepalive = 15\n")
+        result = setup_tui.import_profiles(src, self.dest)
+        self.assertEqual(result["imported"], 1)
+        text = (self.dest / "custom.conf").read_text()
+        self.assertIn("PersistentKeepalive = 15", text)
+        self.assertNotIn("PersistentKeepalive = 25", text)
+
     def test_reject_missing_file(self):
         result = setup_tui.import_profiles(self.root / "nope.conf", self.dest)
         self.assertEqual(result["imported"], 0)
@@ -150,15 +173,35 @@ class ApplyPresetsTests(unittest.TestCase):
 
     def test_adds_opencode_route(self):
         result = setup_tui.apply_presets(self.config)
-        self.assertEqual(result["added"], ["opencode-zen", "roblox"])
+        self.assertEqual(result["added"], ["opencode-zen", "roblox", "reddit"])
         data = json.loads(self.config.read_text())
         route = next(r for r in data["routes"] if r["id"] == "opencode-zen")
         self.assertEqual(route["domains"], ["opencode.ai"])
         self.assertEqual(route["provider"], "proton")
 
+    def test_adds_reddit_route_via_cloudflare(self):
+        setup_tui.apply_presets(self.config)
+        data = json.loads(self.config.read_text())
+        route = next(r for r in data["routes"] if r["id"] == "reddit")
+        self.assertEqual(route["provider"], "cloudflare")
+        self.assertIn("reddit.com", route["domains"])
+
     def test_adds_roblox_route(self):
         setup_tui.apply_presets(self.config)
         self.assertIn("roblox", [r["id"] for r in json.loads(self.config.read_text())["routes"]])
+
+    def test_enables_autodetect_by_default(self):
+        setup_tui.apply_presets(self.config)
+        data = json.loads(self.config.read_text())
+        self.assertTrue(data["autodetect"]["enabled"])
+
+    def test_preserves_explicit_autodetect_opt_out(self):
+        config = json.loads(self.config.read_text())
+        config["autodetect"] = {"enabled": False}
+        self.config.write_text(json.dumps(config))
+        setup_tui.apply_presets(self.config)
+        data = json.loads(self.config.read_text())
+        self.assertFalse(data["autodetect"]["enabled"])
 
     def test_idempotent_does_not_duplicate(self):
         setup_tui.apply_presets(self.config)
@@ -207,6 +250,49 @@ class CustomPresetTests(unittest.TestCase):
         self.assertIn("school-warp", names)
         self.assertIn("default", names)
 
+    def test_every_builtin_preset_includes_reddit(self):
+        for name, preset in setup_tui._BUILTIN_PRESETS.items():
+            with self.subTest(preset=name):
+                self.assertIn("reddit", [route.get("id") for route in preset.get("routes", [])])
+
+    def test_every_builtin_preset_enables_autodetect(self):
+        for name, preset in setup_tui._BUILTIN_PRESETS.items():
+            with self.subTest(preset=name):
+                self.assertEqual(
+                    preset.get("autodetect"), {"enabled": True, "auto_sources": True}
+                )
+
+    def test_apply_builtin_preset_enables_autodetect(self):
+        for name in setup_tui._BUILTIN_PRESETS:
+            with self.subTest(preset=name):
+                setup_tui.apply_preset_by_name(self.root, name)
+                data = json.loads(self.config.read_text())
+                self.assertTrue(data["autodetect"]["enabled"])
+                self.assertTrue(data["autodetect"]["auto_sources"])
+
+    def test_apply_preset_keeps_tuned_autodetect_settings(self):
+        self.config.write_text(json.dumps({
+            "providers": {"cloudflare": {"directory": "providers/cloudflare"}},
+            "routes": [],
+            "autodetect": {
+                "enabled": False,
+                "interval_seconds": 900,
+                "sources": {
+                    "twitch": {
+                        "seed": "https://www.twitch.tv/",
+                        "route_id": "school",
+                        "provider": "cloudflare",
+                        "roots": ["twitch.tv"],
+                    }
+                },
+            },
+        }))
+        setup_tui.apply_preset_by_name(self.root, "school-warp")
+        data = json.loads(self.config.read_text())
+        self.assertTrue(data["autodetect"]["enabled"])
+        self.assertEqual(data["autodetect"]["interval_seconds"], 900)
+        self.assertIn("twitch", data["autodetect"]["sources"])
+
     def test_apply_school_warp_sets_vpn_list(self):
         result = setup_tui.apply_preset_by_name(self.root, "school-warp")
         self.assertEqual(result["mode"], "vpn-list")
@@ -214,16 +300,18 @@ class CustomPresetTests(unittest.TestCase):
         self.assertEqual(data["routing"]["mode"], "vpn-list")
         self.assertIn("discord.com", data["routing"]["vpn_domains"])
         for domain in (
-            "wayground.com",
-            "quizizz.com",
-            "joinmyquiz.com",
-            "quizizz.app.link",
+            "discordapp.net",
+            "discord.media",
+            "twimg.com",
+            "t.co",
             "challenges.cloudflare.com",
             "pro.ip-api.com",
         ):
             self.assertIn(domain, data["routing"]["vpn_domains"])
         school = next(r for r in data["routes"] if r["id"] == "school")
         self.assertEqual(school["provider"], "cloudflare")
+        for domain in ("discordapp.net", "discord.media", "twimg.com", "t.co"):
+            self.assertIn(domain, school["domains"])
         self.assertIn("cloudflare", data["providers"])
 
     def test_school_warp_enables_doh_and_default_restores_udp(self):
@@ -236,6 +324,14 @@ class CustomPresetTests(unittest.TestCase):
         setup_tui.apply_preset_by_name(self.root, "default")
         data = json.loads(self.config.read_text())
         self.assertEqual(data["vpn"]["dns_transport"], "udp")
+
+    def test_school_warp_resolves_locally_and_default_restores_provider(self):
+        setup_tui.apply_preset_by_name(self.root, "school-warp")
+        data = json.loads(self.config.read_text())
+        self.assertEqual(data["vpn"]["dns_resolver"], "local")
+        setup_tui.apply_preset_by_name(self.root, "default")
+        data = json.loads(self.config.read_text())
+        self.assertEqual(data["vpn"]["dns_resolver"], "provider")
 
     def test_apply_preset_idempotent(self):
         setup_tui.apply_preset_by_name(self.root, "school-warp")
@@ -420,6 +516,110 @@ class BridgeTests(unittest.TestCase):
         state = setup_tui.apply_key(setup_tui.TuiState(), "b")
         self.assertEqual(state.action, ("bridge_install",))
         self.assertFalse(state.quit)
+
+
+class DashboardSafetyTests(unittest.TestCase):
+    def test_default_render_root_is_not_the_live_module_root(self):
+        state = setup_tui.TuiState()
+        self.assertNotEqual(state.root, setup_tui.ROOT)
+        with mock.patch.object(setup_tui, "_tui_engine_up", return_value=False) as probe:
+            setup_tui.render_frame(state)
+        probe.assert_not_called()
+
+    def test_engine_up_requires_exact_sing_box_process_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "sing-box.json"
+            config.write_text("{}")
+            (root / "sing-box.pid").write_text("4242")
+            with mock.patch.object(
+                    setup_tui, "_tui_process_argv",
+                    return_value=["/opt/homebrew/bin/sing-box", "run", "-c",
+                                  str(config.resolve())]) as argv:
+                self.assertTrue(setup_tui._tui_engine_up(root))
+            argv.assert_called_once_with(4242)
+            with mock.patch.object(
+                    setup_tui, "_tui_process_argv",
+                    return_value=["/other/sing-box", "run", "-c",
+                                  "/other/sing-box.json"]):
+                self.assertFalse(setup_tui._tui_engine_up(root))
+
+    def test_engine_up_preserves_config_paths_with_spaces(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "root with space"
+            root.mkdir()
+            config = root / "sing-box.json"
+            config.write_text("{}")
+            (root / "sing-box.pid").write_text("4242")
+            argv = ["/opt/homebrew/bin/sing-box", "run", "-c",
+                    str(config.resolve())]
+            with mock.patch.object(setup_tui, "_tui_process_argv",
+                                   return_value=argv):
+                self.assertTrue(setup_tui._tui_engine_up(root))
+
+    def test_active_blocked_exit_is_not_counted_healthy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider_dir = root / "providers" / "proton"
+            provider_dir.mkdir(parents=True)
+            (provider_dir / "a.conf").write_text("profile")
+            (root / "router.json").write_text(json.dumps({
+                "providers": {"proton": {"directory": "providers/proton"}},
+                "egress": {"ok_window": 86400},
+            }))
+            state_dir = root / "state" / "egress" / "proton"
+            state_dir.mkdir(parents=True)
+            (root / "state" / "proton.active").write_text("a")
+            (state_dir / "a.json").write_text(json.dumps({
+                "checked_at": time.time(), "ok": False, "blocked": True,
+            }))
+            rows = setup_tui._tui_profiles(root, "proton")
+            self.assertEqual(rows, [("a", "active-blocked")])
+            joined = "\n".join(setup_tui.render_frame(setup_tui.TuiState(root=root)))
+            self.assertIn("0/1 healthy", joined)
+            self.assertIn("active-blocked", joined)
+
+    def test_failed_rotation_and_failover_do_not_claim_success(self):
+        actions = (
+            ("rotate_provider", "proton"),
+            ("rotate_to", "proton", "a"),
+            ("failover_on", "proton"),
+            ("failover_off", "proton"),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with mock.patch.object(setup_tui, "_router_command", return_value=1):
+                for action in actions:
+                    with self.subTest(action=action):
+                        text, rc = setup_tui._execute_action(action, root)
+                        self.assertEqual(rc, 1)
+                        self.assertIn("failed", text.lower())
+                        self.assertNotIn("rotated", text.lower())
+                        self.assertNotIn("primary restored", text.lower())
+
+
+    def test_vpn_toggle_uses_verified_running_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with mock.patch.object(setup_tui, "_tui_engine_state",
+                                   return_value=(True, "tun")) as state, \
+                 mock.patch.object(setup_tui, "_router_command", return_value=0) as command:
+                text, rc = setup_tui._execute_action(("vpn_toggle",), root)
+        self.assertEqual(rc, 0, text)
+        state.assert_called_once_with(root)
+        command.assert_called_once_with(root, "vpn", "off")
+        self.assertIn("TUN mode off", text)
+
+    def test_vpn_toggle_fails_closed_when_running_mode_is_unverified(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with mock.patch.object(setup_tui, "_tui_engine_state",
+                                   return_value=(False, "unknown")), \
+                 mock.patch.object(setup_tui, "_router_command") as command:
+                text, rc = setup_tui._execute_action(("vpn_toggle",), root)
+        self.assertEqual(rc, 1)
+        command.assert_not_called()
+        self.assertIn("unverified", text.lower())
 
 
 class FullScreenTuiTests(unittest.TestCase):
@@ -968,7 +1168,12 @@ class AtomicImportSecurityTests(unittest.TestCase):
         result = setup_tui.import_profiles(src, self.dest)
         self.assertEqual(result["imported"], 1)
         written = self.dest / "new.conf"
-        self.assertEqual(written.read_text(), src.read_text())
+        # Import stamps the roaming keepalive default, so byte identity
+        # holds against the stamped source, not the raw one.
+        self.assertEqual(
+            written.read_text(),
+            setup_tui._stamp_roam_keepalive(src.read_text()),
+        )
         mode = stat.S_IMODE(written.stat().st_mode)
         self.assertEqual(mode, 0o600)
 

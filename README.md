@@ -53,6 +53,17 @@ cd proxy-router
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
+The installer skips resource directories that are absent from a release
+archive, creates `bin\proxy-router.cmd` and `bin\proxy-router.ps1` launchers,
+and preserves an existing `router.json` on upgrades. Pass `-SetPath` to make
+the command launcher available in new shells. Windows supervision uses the
+native `bin\proxy-router-keepalive.ps1` script, which can be registered with
+Task Scheduler; it does not require Bash or the Unix `examples/keepalive.sh`.
+Proxy mode works without extra files. TUN mode requires `wintun.dll` beside
+`bin\sing-box.exe`; the installer warns with that exact path when the DLL is
+missing. Provider profiles and generated state receive explicit ACLs for the
+installing user, SYSTEM, and Administrators.
+
 The installer creates `router.json` from `router.example.json` on first run
 (once — reruns never clobber it), so there is nothing to initialize by hand.
 `init` is only for creating a fresh config from a bare checkout, and it
@@ -109,10 +120,10 @@ examples/keepalive.sh        re-arms the engine if the listener dies
 examples/com.proxy-router.keepalive.plist.template   launchd agent loading keepalive
 examples/hermes-opencode.sh  bounded model-run wrapper with automatic rotation
 examples/proxy-manager.sh   bridge for the Hermes opencode-server-rotation plugin
-tests/                       unit tests (unittest, no deps)
+tests/                       unit tests (pytest; see Development)
 providers/<provider>/        WireGuard configs, one file per profile (chmod 600)
 state/                       active profile + cooldown markers (gitignored)
-sing-box.json / .pid / .log  runtime state (gitignored)
+logs/                       sing-box runtime logs and rotations (gitignored)
 ```
 
 ## Usage
@@ -147,6 +158,10 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py rotate <provider> --to 01-NL-FREE-140  # switch to this exact exit profile (used by the tray's Provider picker)
 ./router.py response-event --host example.com --status 429 [--provider proton]
                                  # feed an observed upstream status into cooldown/error-policy handling
+./router.py autodetect [source] [--quiet] [--no-reload]  # discover routed web-app dependency hostnames
+./router.py response-event --host example.com --status 0 --reason timeout|tls|connection
+                                 # report a real-traffic stall with no usable response: rotates the exit
+                                 # through error-policy handling (for throttled exits that still pass probes)
 ./router.py profile copy <path...> --provider proton
                                  # copy validated .conf file(s)/directory into a provider
 ./router.py watcher status       # routed-connection watcher state (JSON)
@@ -156,6 +171,8 @@ sing-box.json / .pid / .log  runtime state (gitignored)
 ./router.py network-check        # auto-apply the preset mapped to the current Wi-Fi (run by the route watcher every 30s)
 ./router.py failover <provider> on [--to <fallback>]  # route the provider's domains through its configured fallback chain (first valid entry, or the named member)
 ./router.py failover <provider> off    # clear fallback and restore the provider's routes
+./router.py failover <provider> recover --host <domain>  # confirm a stalled route, then try VPN fallbacks and opt-in direct
+./router.py failover <provider> restore --host <domain>  # test a direct fallback's primary VPN and restore it after two wins
 ./router.py failover <provider> status --json   # configured chain + active fallback
 ./router.py provider-count proton # rotation candidates (retry budget)
 ./router.py providers check [provider] [--json]  # offline validity preflight: which providers can carry traffic at all (exit 1 = some invalid)
@@ -242,6 +259,7 @@ Rotation is then egress-aware instead of blind round-robin:
   changes because every provider shares one engine. Explicit `rotate`,
   `egress sweep`, and `failover` commands remain available for intentional
   operator-controlled interruptions.
+- For proxy-mode recovery, set `"fail_open_direct": true` in a provider's configuration to permit its routes to leave the VPN when configured VPN fallbacks also fail. This is off by default and never applies to TUN mode. The watcher confirms the failing hostname, tries up to two configured VPN alternatives, then direct. Each provider has a 120-second recovery cooldown. Once direct is serving, the watcher tests the primary VPN at most every five minutes and keeps direct until two consecutive HTTP responses succeed; a failed check immediately reinstates direct. Recovery takes seconds plus reload time, and existing connections may need a refresh.
 - `egress check` is the read-only liveness view used by the keepalive self-heal
   loop: it probes the ACTIVE exit(s) through the running tunnel and classifies
   each one `alive` (HTTP response rode the tunnel), `degraded` (an HTTP status
@@ -287,6 +305,14 @@ for existing configs (a single name or list; both keys together are an
 error). New configurations should use `"fallback_providers"`.
 
 Tunables live in `router.json` under `"egress"` (see `router.example.json`).
+
+When a provider serves multiple routes, set `providers.<name>.probe_route_id`
+to the route that represents the real client path (for example,
+`"opencode-zen"`). The router validates that the route exists, belongs to the
+provider, and has a tunneled domain, then probes that route instead of silently
+using the first route in the table. If the explicitly pinned route is no longer
+eligible for tunneling, selection returns no probe rather than measuring an
+unrelated target.
 
 ## Error policy table (`error_policy`)
 
@@ -399,6 +425,25 @@ list from `rulesets/<name>.json` — only use it when you want TUN to
 capture exactly one site; with it set, all other domains fall out to
 direct and are NOT tunneled.
 
+### What TUN capture can and cannot enforce
+
+Capture is destination-IP based, resolved from route hostnames at
+build/reload time. It is not process-aware, and it is **not a kill
+switch** — traffic outside the captured set leaves directly, and a
+provider with no live exits simply stops carrying its captured domains
+(the proxy-mode `fail_open_direct` policy does not apply in TUN).
+
+| Routing mode | `capture: routes` (default) | `capture: ruleset` + `selective` |
+|---|---|---|
+| `default` | route domains captured via their resolved IPs | only the ruleset's CIDRs are captured |
+| `vpn-list` | captured domains intersected with `vpn_domains` | cannot express a domain list — use `routes` |
+| `safe-list` | not enforceable: "everything but the direct list" needs full capture | not enforceable |
+
+A DNS answer can change without a reload, so re-run `router.py reload`
+after a DNS change. SOCKS-backed providers cannot ride TUN at all: the
+engine rejects that combination at build time, because a TCP-only SOCKS
+hop would silently bypass UDP.
+
 Two more knobs in `"vpn"` control address-family policy:
 
 - `dns_strategy` — how domain *destinations* are resolved by the DNS module.
@@ -415,6 +460,31 @@ Two more knobs in `"vpn"` control address-family policy:
   443 to 1.1.1.1) on networks that drop UDP 53 to external resolvers while
   allowing outbound TCP 443; the same IP literal is used as the server
   address with `server_port: 443`.
+- `dns_resolver` — which resolver set resolves a WireGuard provider's routed
+  domains. Default `provider` (that provider's own `dns-<provider>` server,
+  see `dns_transport`). `local` routes them through the same OS resolver
+  (`dns-local`) every direct/SOCKS5 lane already uses, for filtered networks
+  that block public UDP 53 *and* intermittently reset DoH to the public
+  endpoint while the network's own resolver still answers. Only the query
+  path changes: destination traffic still exits through the provider's
+  endpoint. `school-warp` selects `local`; `default` restores `provider`.
+- `public_dns` — optional resolver for direct destinations, SOCKS destinations,
+  and WireGuard routes using `dns_resolver: local`. For example:
+  `{"server":"1.1.1.1","transport":"https","private_domains":["local","ts.net"]}`.
+  The server must be an IP literal so it does not depend on OS DNS to bootstrap.
+  Transports are `https` (default), `udp`, `tcp`, or `tls`. Private suffixes and
+  single-label hostnames keep OS DNS, including MagicDNS and LAN search domains;
+  add your own split DNS suffixes to `private_domains`. SOCKS route hostnames
+  are resolved before the upstream receives them, avoiding a second lookup by
+  a filtered SOCKS resolver. Omit `public_dns` to keep the previous behavior.
+- `tailscale_bypass` — opt-in coexistence for proxy mode (default `false`).
+  Keeps Tailscale control domains, `.ts.net` names, and the Tailscale IPv4/IPv6
+  ranges direct, ahead of provider rules. It adds persistent macOS proxy
+  exceptions while retaining existing exceptions and recording what Disconnect
+  should restore. Proxy mode uses OS socket routing so tailnet connections can
+  reach the Tailscale interface; TUN mode retains its existing interface binding.
+  Keep Tailscale DNS enabled to preserve MagicDNS. Test the configured public
+  DNS transport on the current network before enabling it.
 
 ## One-time elevation (macOS)
 
@@ -552,6 +622,16 @@ python3 proxy_tray.py --selftest   # no GUI needed: validates CLI contract + dis
 python3 proxy_tray.py              # run it in the foreground
 ```
 
+On macOS, the tray uses the Cocoa support already installed with pystray's
+Darwin backend. A **left click** opens or focuses proxy-router's custom dark
+Home dashboard. It is a normal proxy-router window with a navigation rail,
+connection hero, Connect/Disconnect action, routing mode, provider health, and
+route status. It does not open System Settings and it ships no provider-brand
+artwork. A **right click** opens the existing pystray status/action menu; its
+RouterClient and CLI ownership are unchanged. If Cocoa is unavailable, the
+core CLI and `--selftest` remain usable and the native dashboard path fails
+closed.
+
 ### Native dashboard app (macOS)
 
 The macOS app is published as
@@ -579,6 +659,29 @@ macOS login autostart (launchd agent):
 examples/install-tray.sh            # fills the plist template, bootstraps gui/$UID agent
 examples/install-tray.sh --remove   # unload + remove ~/Library/LaunchAgents/com.proxy-router.tray.plist
 ```
+
+### One tray at a time (dashboard app vs tray agent)
+
+The Tauri dashboard app (`dashboard/`, opened by the tray's left click)
+registers its **own** menu-bar item, so running both at once shows two
+proxy-router icons — and they can disagree, because the dashboard tray paints
+its own state while this agent polls `router.py status --json`. Pick one owner:
+
+- **Dashboard owns the tray** (use this when the desktop app runs at login).
+  Start the agent headless: it supervises the app without painting a second
+  icon, and the app reports live connected / degraded / failed state.
+
+  ```sh
+  python3 proxy_tray.py --headless                      # no menu-bar item
+  python3 proxy_tray.py --headless --headless-interval 15
+  ```
+
+- **Agent owns the tray** — close the dashboard app instead; its tray icon is
+  the duplicate, and `proxy_tray.py` already shows the accurate status colour.
+
+`--headless` never stacks a second app on top of a running one, and reports a
+hint (rather than a traceback) when no `Proxy Router.app` bundle is built —
+build it, or point `PROXY_ROUTER_DASHBOARD` at one. See issue #144.
 
 Rerunning the installer is safe: with the same root it re-renders and
 re-bootstraps (a real upgrade); with a different root it unloads the stale
@@ -648,9 +751,41 @@ Linux/Windows: run `examples/keepalive.sh` under a supervisor of your choice
 The keepalive waits `PROXY_KEEPALIVE_INTERVAL` (default 15s) between checks,
 but while `ensure` keeps failing the wait grows exponentially (15, 30, 60, ...)
 up to `PROXY_KEEPALIVE_MAX_BACKOFF` (default 300s), so a dead engine is not
-hammered; one successful check resets the wait. `sing-box.log` is also rotated
-to `sing-box.log.1` once it exceeds 10 MB (at engine start, when no engine
+hammered; one successful check resets the wait. `logs/sing-box.log` is also rotated
+to `logs/sing-box.log.1` once it exceeds 10 MB (at engine start, when no engine
 holds the log).
+A fresh engine start creates `logs/`; existing root-level logs are copied there once for compatibility.
+
+On macOS the keepalive also guards the physical Wi-Fi link. It runs
+`router.py network-status` before supervision; after one missed SSID check
+(`PROXY_KEEPALIVE_NETWORK_GRACE`, default `1`) it disables only proxy-router's
+owned system-proxy settings, stops the engine, and writes `state/network-off`.
+While that latch exists, `ensure` stays quiescent. Once Wi-Fi returns,
+keepalive runs `router.py network-reconnect`, verifies the engine and proxy
+surface, then clears the latch. This automatic latch is separate from
+`state/manual-off`: `router.py stop` still requires an explicit `start` and is
+never auto-reconnected.
+
+The lifecycle commands are also available for diagnostics:
+
+```sh
+proxy-router network-status --json
+proxy-router network-disconnect
+proxy-router network-reconnect
+```
+
+
+For proxy-mode recovery, set `"fail_open_direct": true` in a provider's
+configuration to permit its routes to leave the VPN when fallback providers
+also fail. This is off by default and never applies to TUN mode. Direct traffic
+uses local DNS and can still be blocked by the network. The watcher confirms
+the failing hostname, tries up to two configured VPN alternatives, then direct.
+Each provider has a 120-second recovery cooldown; HTTP responses and DNS
+failures do not trigger failover. Recovery takes seconds plus reload time,
+and existing connections may need a refresh. Direct fallback stays active
+until restored with `failover <provider> off` or existing maintenance.
+Use `router.py failover <provider> recover --host <routed-host>` for the same
+confirmed recovery from the CLI.
 
 `ensure` only proves the process is alive, so the keepalive ALSO self-heals a
 dead-but-listening tunnel (WireGuard handshake/route dead while the port still
@@ -740,6 +875,55 @@ alive exit, with health/cooldown/block markers persisted along the way.
 
 ## Hermes integration
 
+For free-model 429 recovery **before Hermes activates a fallback model**, run
+proxy-router's model relay and use its API endpoint:
+
+```sh
+./router.py model-relay --free-model big-pickle
+# OpenAI-compatible base URL: http://127.0.0.1:2082/v1
+```
+
+The relay connects to `https://opencode.ai/zen/v1` through the router's mixed
+proxy. Enable `opencode.ai` in `routing.vpn_domains` when using `vpn-list`, and
+assign it to a provider with a profile pool and optional fallback providers.
+In Hermes, use a custom Zen provider with `base_url` set to the relay. The
+registered `opencode-zen` provider uses its existing `OPENCODE_ZEN_BASE_URL`
+override instead (a `providers.opencode-zen.base_url` entry alone is ignored
+by its runtime resolver). Clients must already send a Zen-compatible request;
+the relay preserves its format. For ordinary Hermes/OpenAI requests to free
+models, use the existing OC2API adapter at `http://127.0.0.1:8090/v1` (including
+as the registered Zen URL override). OC2API can use
+`ZEN_API_BASE_URL=http://127.0.0.1:2082/v1` and
+`ZEN_CONNECT_TIMEOUT_MS=300000` so OpenCode and Hermes both benefit.
+Set client request timeouts to at least 300 seconds and streaming first-byte
+timeouts to 240 seconds to allow the bounded recovery window.
+Set `NO_PROXY` and `no_proxy` to include `localhost,127.0.0.1,::1`, preserving
+any existing exceptions. Python HTTP clients can discover macOS's system proxy
+while ignoring its bypass list. Without this explicit loopback exception,
+the client-to-OC2API connection passes through the rotating engine and can fail
+during a successful 429 recovery. The relay's explicit upstream CONNECT still
+uses the router, independent of these client exceptions.
+
+On a rejected free-model HTTP 429, the router marks the current exit with its
+configured 429 policy (default: exhausted for 900 seconds), selects another
+profile, and retries the identical request. When a pool runs out, it follows
+the configured provider fallback chain. Late concurrent responses from an old
+exit cannot exhaust the new exit. Retries stop when no exit is available, after
+32 switches (`--max-retries`), or at the 180-second recovery window
+(`--retry-window`; an in-flight attempt/switch can finish after that window).
+Only then does the client receive the final 429 and apply its normal fallback.
+Models ending in `-free` or `:free`, explicit `--free-model` IDs, and semantic
+`FreeUsageLimitError` responses qualify. Raw JSON limit errors returned with
+HTTP 200 are recognized before success headers are sent. Paid-model generic
+429s pass through.
+The relay never replays a partially delivered successful stream. It listens
+only on loopback, verifies upstream TLS, and logs no prompts or credentials.
+The engine must be running; manual-off does not restart it.
+
+Hermes's error hooks are observer-only in the inspected version: a plugin's
+`retry_primary` return is discarded before eager rate-limit fallback. Keeping
+the recovery below Hermes avoids depending on that hook or patching its core.
+
 Point `hermes` at the proxy (`http://127.0.0.1:2080` via
 `https_proxy`/`http_proxy`). `examples/hermes-opencode.sh` wraps model runs:
 on rate-limit/transient-http/transport failures it rotates the provider pool
@@ -790,8 +974,12 @@ multiple providers) fails closed with exit 2 instead of guessing. Set
 
 ## Development
 
+The suite runs under pytest with the socket-disabling safety layer, so invoke it
+through pytest rather than `unittest discover`:
+
 ```sh
-python3 -m unittest discover tests
+python3 -m pip install -r requirements-dev.txt
+python3 -m pytest tests -q --randomly-seed=58
 ```
 
 ## License
