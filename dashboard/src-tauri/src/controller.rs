@@ -215,58 +215,96 @@ fn run_controller_raw(
     args: &[&str],
     timeout: Duration,
 ) -> Result<std::process::Output, String> {
+    run_controller_with_python(root, args, timeout, &router_python())
+}
+
+fn run_controller_with_python(
+    root: &Path,
+    args: &[&str],
+    timeout: Duration,
+    python: impl AsRef<std::ffi::OsStr>,
+) -> Result<std::process::Output, String> {
     let script = controller_path(root);
     if !script.is_file() {
         return Err(format!("controller not found: {}", script.display()));
     }
-    let mut child = Command::new(router_python())
-        .arg(&script)
-        .args(args)
-        .current_dir(root)
+    let mut command = Command::new(python);
+    command.arg(&script).args(args).current_dir(root)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
+        .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn()
         .map_err(|error| format!("could not run controller: {error}"))?;
+    let stdout_reader = child.stdout.take().map(read_pipe);
+    let stderr_reader = child.stderr.take().map(read_pipe);
     let deadline = std::time::Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                return output_with_status(child, status);
+    let timed_out = || format!("controller timed out after {}ms: {}",
+                               timeout.as_millis(), args.join(" "));
+    let result = (|| {
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let stdout = finish_pipe_reader(stdout_reader, deadline)?;
+                    let stderr = finish_pipe_reader(stderr_reader, deadline)?;
+                    return Ok(std::process::Output { status, stdout, stderr });
+                }
+                Ok(None) => {}
+                Err(error) => return Err(format!("could not run controller: {error}")),
             }
-            Ok(None) => {}
-            Err(error) => return Err(format!("could not run controller: {error}")),
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(timed_out());
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(10)));
         }
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!(
-                "controller timed out after {}s: {}",
-                timeout.as_secs(),
-                args.join(" ")
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(25));
+    })();
+    if result.is_err() {
+        terminate_controller(child);
+    }
+    result
+}
+
+type PipeReader = std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>;
+
+fn read_pipe<R: std::io::Read + Send + 'static>(mut stream: R) -> PipeReader {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let result = stream.read_to_end(&mut output).map(|_| output);
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
+fn finish_pipe_reader(
+    reader: Option<PipeReader>,
+    deadline: std::time::Instant,
+) -> Result<Vec<u8>, String> {
+    let Some(reader) = reader else { return Ok(Vec::new()); };
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    match reader.recv_timeout(remaining) {
+        Ok(result) => result.map_err(|error| format!("could not read controller output: {error}")),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) =>
+            Err("controller timed out while draining output".to_string()),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) =>
+            Err("controller output reader stopped".to_string()),
     }
 }
 
-fn output_with_status(
-    mut child: std::process::Child,
-    status: std::process::ExitStatus,
-) -> Result<std::process::Output, String> {
-    use std::io::Read;
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    if let Some(mut stream) = child.stdout.take() {
-        let _ = stream.read_to_end(&mut stdout);
+fn terminate_controller(mut child: std::process::Child) {
+    // Children inheriting pipes must die too. Reaping never extends the caller's
+    // deadline; pipe readers finish independently once the group closes them.
+    #[cfg(unix)]
+    {
+        extern "C" { fn kill(pid: i32, signal: i32) -> i32; }
+        unsafe { kill(-(child.id() as i32), 9); }
     }
-    if let Some(mut stream) = child.stderr.take() {
-        let _ = stream.read_to_end(&mut stderr);
-    }
-    Ok(std::process::Output {
-        status,
-        stdout,
-        stderr,
-    })
+    let _ = child.kill();
+    std::thread::spawn(move || { let _ = child.wait(); });
 }
 
 /// Parse a read-only JSON subcommand's stdout.
@@ -323,6 +361,37 @@ pub fn state_for_result(result: &Result<Value, String>) -> &'static str {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestControllerRoot(PathBuf);
+
+    impl TestControllerRoot {
+        fn new(script: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock before unix epoch")
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "proxy-router-controller-{}-{unique}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&root).expect("create temporary controller root");
+            fs::write(root.join("router.py"), script).expect("write temporary controller");
+            Self(root)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestControllerRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn healthy_status_is_connected() {
@@ -440,6 +509,71 @@ mod tests {
         assert_eq!(router_root_for(&home, None), installed);
 
         std::fs::remove_dir_all(home).unwrap_or(());
+    }
+
+    #[test]
+    fn controller_drains_large_stdout_and_stderr_concurrently() {
+        let root = TestControllerRoot::new(
+            "import sys\nsys.stdout.write('out' * 131072)\nsys.stdout.flush()\nsys.stderr.write('err' * 131072)\nsys.stderr.flush()\n",
+        );
+        let output =
+            run_controller_with_python(root.path(), &[], Duration::from_secs(10), "python3")
+                .expect("controller completes after writing beyond both pipe capacities");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"out".repeat(131072));
+        assert_eq!(output.stderr, b"err".repeat(131072));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_pipes_cannot_extend_controller_deadline() {
+        for parent_waits in [false, true] {
+            let wait = if parent_waits { "import time; time.sleep(60)" } else { "" };
+            let script = format!(
+                "import subprocess, sys\nsubprocess.Popen([sys.executable, '-c', 'import time; time.sleep(2)'])\n{wait}\n"
+            );
+            let root = TestControllerRoot::new(&script);
+            let started = std::time::Instant::now();
+            let result = run_controller_with_python(
+                root.path(), &[], Duration::from_millis(200), "python3",
+            );
+            assert!(result.unwrap_err().contains("timed out"));
+            assert!(started.elapsed() < Duration::from_millis(800),
+                    "inherited pipes exceeded deadline: {:?}", started.elapsed());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timed_out_controller_is_killed_and_reaped() {
+        let root = TestControllerRoot::new(
+            "import pathlib, sys, time\npathlib.Path(sys.argv[1]).write_text(str(__import__('os').getpid()))\ntime.sleep(60)\n",
+        );
+        let pid_file = root.path().join("child.pid");
+        let pid_argument = pid_file.to_str().expect("temporary path is valid UTF-8");
+        let result = run_controller_with_python(
+            root.path(),
+            &[pid_argument],
+            Duration::from_secs(2),
+            "python3",
+        );
+
+        let error = result.expect_err("hung controller should time out");
+        assert!(error.contains("controller timed out"), "{error}");
+        let pid = fs::read_to_string(pid_file)
+            .expect("child started before timeout")
+            .parse::<u32>()
+            .expect("child wrote a process id");
+        let still_running = Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .expect("check child process");
+        assert!(
+            !still_running.success(),
+            "timed out child {pid} is still running"
+        );
     }
 
     #[test]
