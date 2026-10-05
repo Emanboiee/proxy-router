@@ -129,6 +129,17 @@ def test_normal_json_success_is_preserved_without_recovery(relay_path):
     assert recovery.switches == 0
 
 
+def test_fragmented_json_limit_preamble_is_detected(relay_path, monkeypatch):
+    request, statuses, attempts, recovery, body = relay_path
+    read1 = http.client.HTTPResponse.read1
+    # Force byte-sized reads so whitespace arrives separately from the JSON.
+    monkeypatch.setattr(http.client.HTTPResponse, 'read1', lambda response, size=-1: read1(response, 1))
+    statuses.extend([(200, b' \n {"error":{"type":"FreeUsageLimitError"}}'), 200])
+    assert request() == (200, body, '1')
+    assert recovery.switches == 1
+    assert attempts[0] == attempts[1]
+
+
 def setup_router(tmp_path, monkeypatch):
     r = load_router(tmp_path)
     conf = proxy_config()

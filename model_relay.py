@@ -224,9 +224,17 @@ class RelayHandler(BaseHTTPRequestHandler):
                     status = response.status
                     if status == 200 and self.command == "POST":
                         # Some Zen rejections arrive as raw JSON under HTTP 200,
-                        # even with an SSE content type. Inspect one available
-                        # chunk before committing headers; normal SSE stays live.
+                        # even with an SSE content type. Inspect the first
+                        # meaningful byte before committing headers; normal SSE
+                        # stays live even when its first chunk is fragmented.
                         prefix = response.read1(64 * 1024)
+                        while prefix and not prefix.strip():
+                            if len(prefix) >= 64 * 1024:
+                                raise http.client.HTTPException("oversized response preamble")
+                            chunk = response.read1(64 * 1024 - len(prefix))
+                            if not chunk:
+                                break
+                            prefix += chunk
                         if prefix.lstrip().startswith(b"{"):
                             prefix += response.read(MAX_BODY + 1 - len(prefix))
                             if len(prefix) > MAX_BODY:
