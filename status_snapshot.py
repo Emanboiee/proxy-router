@@ -145,3 +145,14 @@ def build_provider_status(namespace: dict, name: str) -> dict:
         if egress:
             entry["egress"] = egress
     return entry
+
+
+def legacy_launch_agents(namespace: dict) -> list[str]:
+    """Read known older agents that can resurrect a stale engine at login."""
+    router = SimpleNamespace(**namespace)
+    if router.sys.platform != "darwin":
+        return []
+    agents_dir = router.Path.home() / "Library" / "LaunchAgents"
+    if not agents_dir.is_dir():
+        return []
+    return [path.name for path in sorted(agents_dir.glob("com.hermes.proxy-router*.plist"))]

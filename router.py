@@ -744,6 +744,9 @@ def load_config() -> int:
                 f"bad {CONFIG_FILE.name}: route '{route.get('id', '<unnamed>')}' "
                 f"references unknown provider '{route['provider']}'"
             )
+        unavailable_policy = route.get("on_unavailable", "direct")
+        if unavailable_policy not in ("direct", "block"):
+            return fail(f"bad {CONFIG_FILE.name}: route on_unavailable must be 'direct' or 'block'")
         for key in ("domains", "ip_cidr"):
             if key in route and (not isinstance(route[key], list) or not all(isinstance(v, str) for v in route[key])):
                 return fail(f"bad {CONFIG_FILE.name}: route '{route.get('id', '<unnamed>')}' {key} must be a string list")
@@ -3037,7 +3040,7 @@ def _route_capture_cidrs(routes: list[dict], routing: dict,
 
     for route in routes:
         route_provider = _effective_route_provider(route.get("provider", ""))
-        if route_provider not in active:
+        if route_provider not in active and route.get("on_unavailable") != "block":
             continue
         for value in (route.get("domains") or []):
             domain = _capture_domain_name(value)
@@ -3244,15 +3247,17 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
     vpn_domains = _effective_vpn_domains(routing)
     for route in build_routes:
         route_provider = _effective_route_provider(route["provider"])
-        if ((route_provider != "direct" and route_provider not in active
-                and route_provider not in proxy_live)
-                or not route.get("domains")):
+        if not route.get("domains"):
             continue
+        provider_active = route_provider == "direct" or route_provider in active or route_provider in proxy_live
         domains = route["domains"]
         if routing_mode == "vpn-list":
             domains = _vpn_list_intersection(domains, vpn_domains)
         if domains:
-            if (route_provider == "direct" or route_provider in proxy_live
+            if not provider_active:
+                if route.get("on_unavailable") == "block":
+                    dns_rules.append({"domain_suffix": domains, "action": "reject"})
+            elif (route_provider == "direct" or route_provider in proxy_live
                     or dns_resolver() == "local"):
                 # Direct and SOCKS5-hopped traffic share the local resolver:
                 # there is no tunnel DNS to pin to, and pinning to a
@@ -3271,10 +3276,10 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
     provider_rules = []
     for route in build_routes:
         route_provider = _effective_route_provider(route["provider"])
-        if (route_provider != "direct" and route_provider not in active
-                and route_provider not in proxy_live):
+        provider_active = route_provider == "direct" or route_provider in active or route_provider in proxy_live
+        if not provider_active and route.get("on_unavailable") != "block":
             continue
-        rule = {"outbound": route_provider}
+        rule = {"outbound": route_provider} if provider_active else {"action": "reject"}
         if route.get("domains"):
             domains = route["domains"]
             if routing_mode == "vpn-list":
@@ -5930,22 +5935,9 @@ def _provider_status(name: str) -> dict:
 
 
 def _legacy_launch_agents() -> list[str]:
-    """Read-only probe for known legacy proxy-router launch agents.
+    from status_snapshot import legacy_launch_agents
 
-    An older install (e.g. com.hermes.proxy-router) can coexist with the
-    current keepalive/tray agents and resurrect a stale engine on login.
-    The installer prints migration steps when it finds one; status surfaces
-    the same fact read-only so a live box is never silently half-migrated.
-    """
-    if sys.platform != "darwin":
-        return []
-    agents_dir = Path.home() / "Library" / "LaunchAgents"
-    if not agents_dir.is_dir():
-        return []
-    found = []
-    for plist in sorted(agents_dir.glob("com.hermes.proxy-router*.plist")):
-        found.append(plist.name)
-    return found
+    return legacy_launch_agents(globals())
 
 
 def _launchd_agent_state(label: str) -> bool:
@@ -7902,6 +7894,19 @@ def main() -> int:
     profile_copy_parser.add_argument("--provider", required=True,
                                     help="configured destination provider (e.g. proton)")
 
+    dashboard = sub.add_parser("dashboard", help=argparse.SUPPRESS)
+    dashboard_sub = dashboard.add_subparsers(dest="dashboard_action", required=True)
+    dashboard_sub.add_parser("state", help=argparse.SUPPRESS)
+    for action in ("profile-save", "provider-save"):
+        command = dashboard_sub.add_parser(action, help=argparse.SUPPRESS)
+        command.add_argument("--json", required=True, help=argparse.SUPPRESS)
+        command.add_argument("--id", default=None, help=argparse.SUPPRESS)
+        if action == "provider-save":
+            command.add_argument("--path", default=None, help=argparse.SUPPRESS)
+    for action in ("profile-delete", "profile-apply", "provider-delete"):
+        command = dashboard_sub.add_parser(action, help=argparse.SUPPRESS)
+        command.add_argument("--id", required=True, help=argparse.SUPPRESS)
+
     elevate = sub.add_parser("elevate", help="one-time passwordless-sudo grant (install|uninstall|status)")
     elevate.add_argument("action", choices=["install", "uninstall", "status"])
 
@@ -7925,6 +7930,10 @@ def main() -> int:
         help="for action 'auto': enable/disable automatic preset switching")
 
     args, passthrough = parser.parse_known_args()
+    if args.cmd == "dashboard":
+        import dashboard_profile_manager as dashboard_profiles
+
+        return _with_lock(lambda: dashboard_profiles.run_cli(ROOT, args), timeout=5.0)
     if args.cmd == "elevate":
         return cmd_elevate(args.action)
     if args.cmd == "network-check":

@@ -39,7 +39,7 @@ RELEASE_TAG="${PROXY_ROUTER_RELEASE:-$(cat "$SCRIPT_DIR/VERSION" 2>/dev/null || 
 install_runtime() {
   local dest="$1"
   mkdir -p "$dest/bin"
-  for runtime_file in router.py setup_tui.py monitor.py route_watcher.py proxy_tray.py privileged_helper.py privileged_installer.py domain_autodetect.py egress.py state.py config_schema.py worker_lock.py providers_check.py net_safety.py model_relay.py status_snapshot.py; do
+  for runtime_file in router.py setup_tui.py monitor.py route_watcher.py proxy_tray.py privileged_helper.py privileged_installer.py domain_autodetect.py egress.py state.py config_schema.py worker_lock.py providers_check.py net_safety.py model_relay.py status_snapshot.py dashboard_profile_manager.py; do
     cp "$SCRIPT_DIR/$runtime_file" "$dest/$runtime_file"
     chmod 755 "$dest/$runtime_file"
   done
@@ -152,7 +152,7 @@ ln -sfn "releases/$RELEASE_TAG" "$CURRENT"
 # existing scripts and muscle memory keep working after the layout change.
 for f in router.py setup_tui.py monitor.py route_watcher.py proxy_tray.py \
          privileged_helper.py privileged_installer.py \
-         domain_autodetect.py egress.py state.py config_schema.py worker_lock.py providers_check.py net_safety.py model_relay.py status_snapshot.py \
+         domain_autodetect.py egress.py state.py config_schema.py worker_lock.py providers_check.py net_safety.py model_relay.py status_snapshot.py dashboard_profile_manager.py \
          router.example.json README.md LICENSE sing-box-release.json; do
   ln -sfn "current/$f" "$PREFIX/$f"
 done
