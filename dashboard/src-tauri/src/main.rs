@@ -811,6 +811,20 @@ mod tests {
     }
 
     #[test]
+    fn config_bridge_rejects_objects_in_display_fields() {
+        let source = serde_json::json!({
+            "preset": {"secret": "display-secret"},
+            "vpn": {"mtu": {"secret": "display-secret"}},
+            "providers": {"vpn": {"fallback_providers": [{"secret": "display-secret"}]}}
+        });
+        let safe = dashboard_config(&source);
+        assert!(!safe.to_string().contains("display-secret"));
+        assert!(safe.get("preset").is_none());
+        assert!(safe["vpn"].get("mtu").is_none());
+        assert_eq!(safe["providers"]["vpn"]["fallback_providers"], serde_json::json!([]));
+    }
+
+    #[test]
     fn network_name_validation_allows_spaces_and_counts_unicode_characters() {
         assert!(valid_slug("School Wi-Fi", 255));
         assert!(valid_slug(&"界".repeat(255), 255));
