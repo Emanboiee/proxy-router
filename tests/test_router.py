@@ -951,6 +951,24 @@ class WaitEngineTests(unittest.TestCase):
              mock.patch.object(router, "_tun_egress_probe", return_value=False):
             self.assertFalse(router.wait_engine(timeout=0.6))
 
+    def test_tun_probe_rejects_tls_failure_without_http_response(self):
+        with mock.patch.object(router, "_providers", {"proton": {}}), \
+             mock.patch.object(router, "active_fallback", return_value=None), \
+             mock.patch.object(router, "_usable_profile", return_value=Path("test.conf")), \
+             mock.patch.object(router, "probe_url_for", return_value="https://example.com/"), \
+             mock.patch.object(router, "probe_egress", return_value={
+                 "ok": False, "status": None, "error": "curl(35): SSL_ERROR_SYSCALL"}):
+            self.assertFalse(router._tun_egress_probe(1.0))
+
+    def test_tun_probe_accepts_http_response_even_if_service_rejects_it(self):
+        with mock.patch.object(router, "_providers", {"proton": {}}), \
+             mock.patch.object(router, "active_fallback", return_value=None), \
+             mock.patch.object(router, "_usable_profile", return_value=Path("test.conf")), \
+             mock.patch.object(router, "probe_url_for", return_value="https://example.com/"), \
+             mock.patch.object(router, "probe_egress", return_value={
+                 "ok": False, "status": 403, "error": "HTTP 403"}):
+            self.assertTrue(router._tun_egress_probe(1.0))
+
     def test_tun_readiness_passes_with_egress_probe(self):
         # wait_engine burns a mandatory 0.5s settle on the first OK poll;
         # a 0.6s timeout leaves <0.1s of CPU budget for the follow-up
@@ -2146,6 +2164,16 @@ class ProbeCurlTransportTests(unittest.TestCase):
         self.assertIn("SSL_ERROR_SYSCALL", result["error"])
         self.assertEqual(router._transport_reason(result["error"]), "tls")
 
+    def test_curl_truncated_http_response_is_not_healthy(self):
+        result_run = self._run(returncode=18, stdout=b"partial body\n200 0.050000",
+                               stderr=b"curl: (18) end of response with 100 bytes missing")
+        with mock.patch.object(router.shutil, "which", return_value="/usr/bin/curl"), \
+                mock.patch.object(router.subprocess, "run", return_value=result_run):
+            result = router.probe_egress(port=2080, url="https://example.com/x")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], 200)
+        self.assertIn("curl(18)", result["error"])
+
     def test_curl_body_still_classifies_reputation_blocks(self):
         body = b"error code: 1010 cloudflare\n403 0.250000"
         with mock.patch.object(router.shutil, "which", return_value="/usr/bin/curl"), \
@@ -2664,20 +2692,51 @@ class EgressSweepTests(unittest.TestCase):
         assert active is not None
         self.assertEqual(active.stem, "a")
 
-    def test_tls_throttled_pool_counts_usable_not_dead(self):
-        # TLS-classed failures (the TCP CONNECT rode the tunnel; the upstream
-        # is throttling) count as usable: an all-throttled pool reads as
-        # alive, exits 0, and ends on the original profile instead of
-        # reporting "zero alive" and churning.
+    def test_tls_failure_pool_is_not_usable(self):
+        # CONNECT acceptance does not prove that HTTPS crossed the tunnel.
+        # No profile completed TLS, so preserve the original for rollback
+        # without reporting a healthy pool or selecting another failed exit.
         router.set_active("proton", self._profile("a"))
         tls = (False, {"ok": False, "latency_ms": None, "status": None,
                        "error": "URLError: <urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING]>"})
         self._probe(tls, tls, tls)
         rc = router.egress_sweep("proton")
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         self.assertEqual(router.persisted_active("proton").stem, "a")
-        # a->b, b->c, then back to the (still current) best: no dead pool
+        # a->b, b->c, then restore the original without claiming recovery.
         self.assertEqual(self.engine_reload.call_count, 3)
+
+    def test_proxy_backed_tls_failure_is_not_usable(self):
+        router._providers = {"cloudflare": {"socks5": {"host": "127.0.0.1", "port": 2181}}}
+        self._probe((False, {"ok": False, "latency_ms": None, "status": None,
+                             "error": "curl(35): SSL_ERROR_SYSCALL"}))
+        self.assertEqual(router.egress_sweep("cloudflare"), 1)
+        self.engine_reload.assert_not_called()
+
+    def test_fallback_tls_failure_is_not_usable(self):
+        with mock.patch.object(router, "active_fallback", return_value="cloudflare"), \
+             mock.patch.object(router, "_check_active_fallback", return_value=(
+                 Path("socks"), "degraded", {"ok": False, "status": None,
+                                            "error": "curl(35): SSL_ERROR_SYSCALL"})):
+            with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+                self.assertEqual(router.egress_sweep("proton", as_json=True), 1)
+        payload = json.loads(output.getvalue())
+        self.assertFalse(payload["results"]["proton"]["usable"])
+        self.assertIn("curl(35)", payload["results"]["proton"]["error"])
+        self.engine_reload.assert_not_called()
+
+    def test_sweep_reports_tls_failure_and_selects_verified_exit(self):
+        router.set_active("proton", self._profile("a"))
+        tls = (False, {"ok": False, "latency_ms": None, "status": None,
+                       "error": "curl(35): SSL_ERROR_SYSCALL"})
+        self._probe(tls, (True, {"ok": True, "latency_ms": 50.0, "status": 200}), tls)
+        with mock.patch("builtins.print") as output:
+            self.assertEqual(router.egress_sweep("proton", as_json=True), 0)
+        payload = next(json.loads(call.args[0]) for call in output.call_args_list
+                       if isinstance(call.args[0], str) and call.args[0].startswith('{'))
+        self.assertFalse(payload["results"]["proton"]["a"]["usable"])
+        self.assertEqual(payload["results"]["proton"]["a"]["error"], "curl(35): SSL_ERROR_SYSCALL")
+        self.assertEqual(router.persisted_active("proton").stem, "b")
 
     def test_ends_on_best_alive_profile(self):
         router.set_active("proton", self._profile("a"))

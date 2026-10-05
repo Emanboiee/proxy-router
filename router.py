@@ -1954,6 +1954,8 @@ def _probe_via_curl(*, port: int, url: str, timeout: float) -> dict:
         return {"ok": False, "latency_ms": None, "status": None,
                 "error": error, "block_reason": None}
     error, block_reason = _probe_failure_reason(status, body[:4096])
+    if result.returncode != 0 and error is None:
+        error = f"curl({result.returncode}): {err.strip()[-200:] or 'incomplete response'}"
     return {
         "ok": error is None,
         "latency_ms": latency_ms,
@@ -2081,10 +2083,8 @@ def probe_profile(name: str, profile: Path, *, port: int | None = None,
         # Multi-strike: a single transient blip must not dead-mark a healthy
         # exit; only fail_threshold (default 2) CONSECUTIVE failures cool it,
         # mirroring keepalive's dead_strikes and _egress_rank.
-        # TLS-classified failures (SSL EOF / SSL_ERROR_SYSCALL / TLS alert)
-        # are deliberately excluded: the TCP CONNECT already rode the tunnel,
-        # so the path works and the upstream is throttling — never a cooldown.
-        # TLS uses its separate target-scoped streak above, never HTTP fails.
+        # TLS uses its separate target-scoped streak and quarantine above,
+        # rather than the connection/DNS failure gate here.
         # dns_ok False is excluded too: resolution rides the direct path, so
         # a DNS flake never proves the tunnel dead (degraded, not dead).
         # Only a positive DNS signal permits cooldown. False means the direct
@@ -2265,10 +2265,9 @@ def check_egress_live(name: str, profile: Path, *, port: int | None = None,
         # is failed for real traffic. Cool it so resolve_active/rotation stop
         # re-picking the same dead exit. Seconds come from the effective error
         # policy for the reason class (connection; built-in default is the
-        # merged 300s rule). TLS-classified failures never reach here — they
-        # are degraded (upstream throttle), not dead. Multi-strike: a single
-        # transient blip must not dead-mark an exit that recovers; only
-        # fail_threshold CONSECUTIVE dead checks cool it (keepalive's
+        # merged 300s rule). TLS failures use their own target-scoped gate
+        # above. A single transient blip must not dead-mark an exit that
+        # recovers; only fail_threshold CONSECUTIVE dead checks cool it (keepalive's
         # dead_strikes=2 gate already rotates only on repeated deaths).
         reason = _transport_reason(probe["error"])
         _action, seconds = policy_action(name, reason)
@@ -3749,9 +3748,9 @@ def log_has_fatal(after: int) -> bool:
 def _tun_egress_probe(timeout: float) -> bool:
     """Tun-mode egress proof: at least one routed target must answer through
     the local proxy listener (which coexists with the TUN and rides the same
-    rules). A TLS-classed failure still counts as the path working (CONNECT
-    rode the tunnel); a connection-level failure means the tunnel is
-    up-but-dead. Returns True when nothing routed exists to prove."""
+    rules). A local CONNECT response or failed TLS handshake does not prove
+    the remote path works; require a response from the target. Returns True
+    when nothing routed exists to prove."""
     for name in _providers:
         if active_fallback(name):
             continue
@@ -3762,8 +3761,6 @@ def _tun_egress_probe(timeout: float) -> bool:
             continue
         result = probe_egress(url=url, timeout=timeout)
         if result.get("ok") or result.get("status") is not None:
-            return True
-        if _transport_reason(result.get("error") or "") == "tls":
             return True
         return False
     return True
@@ -6242,15 +6239,18 @@ def egress_sweep(name: str | None = None, as_json: bool = False,
         fallback = active_fallback(provider)
         if fallback:
             fallback_profile, status, record = _check_active_fallback(provider, fallback)
+            usable = status == "alive"
             results[provider] = {
                 "status": "fallback",
                 "fallback_provider": fallback,
                 "fallback_profile": fallback_profile.stem if fallback_profile else None,
-                "ok": status != "dead",
+                "ok": usable,
+                "usable": usable,
+                "error": record.get("error") if record else None,
             }
             if record is not None and record.get("dns_ok") is not None:
                 results[provider]["dns_ok"] = record["dns_ok"]
-            if status == "dead":
+            if not usable:
                 dead.append(provider)
             continue
         # Keep only parseable profiles so one bad *.conf cannot wedge the
@@ -6267,12 +6267,13 @@ def egress_sweep(name: str | None = None, as_json: bool = False,
             key = proxy_profile_key(provider)
             ok, record = _probe_with_settle(provider, key)
             error = record.get("error") if record else None
-            usable = ok or _transport_reason(error) == "tls"
+            usable = ok
             results[provider] = {key.stem: {
                 "ok": ok,
                 "usable": usable,
                 "latency_ms": record.get("latency_ms") if record else None,
                 "status": record.get("status") if record else None,
+                "error": error,
             }}
             if not usable:
                 dead.append(provider)
@@ -6355,17 +6356,16 @@ def egress_sweep(name: str | None = None, as_json: bool = False,
                 break
             ok, record = _probe_with_settle(provider, profile)
             error = record.get("error") if record else None
-            # A TLS-classed failure means the TCP CONNECT rode the tunnel and
-            # the upstream endpoint is throttling: the exit still serves real
-            # traffic (probes false-dead while traffic succeeds), so count it
-            # usable — an all-throttled pool must not read as "zero alive"
-            # and strand keepalive on fallback or churn the active profile.
-            usable = ok or _transport_reason(error) == "tls"
+            # CONNECT acceptance is local proxy state, not proof of a usable
+            # tunnel. Only a completed probe can qualify a candidate; an
+            # SSL EOF may be a broken path rather than upstream throttling.
+            usable = ok
             entry[profile.stem] = {
                 "ok": ok,
                 "usable": usable,
                 "latency_ms": record.get("latency_ms") if record else None,
                 "status": record.get("status") if record else None,
+                "error": error,
             }
         if MANUAL_OFF_FILE.is_file():
             switch_failed = True
