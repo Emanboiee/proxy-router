@@ -614,6 +614,11 @@ Notes on claims vs reality:
 every click shells out to `router.py`, so rotation ownership, cooldowns, and
 keepalive semantics stay exactly where they are.
 
+The Tauri dashboard publishes an atomic tray-owner lease under
+`state/dashboard-owns-tray.json` and refreshes it every 15 seconds. The Python
+tray stays resident but hides its icon while that lease is fresh; it shows the
+icon again after a clean dashboard quit or when the lease expires after a crash.
+
 The tray needs two GUI dependencies beyond the stdlib-only core:
 
 ```sh
@@ -662,22 +667,19 @@ examples/install-tray.sh --remove   # unload + remove ~/Library/LaunchAgents/com
 
 ### One tray at a time (dashboard app vs tray agent)
 
-The Tauri dashboard app (`dashboard/`, opened by the tray's left click)
-registers its **own** menu-bar item, so running both at once shows two
-proxy-router icons — and they can disagree, because the dashboard tray paints
-its own state while this agent polls `router.py status --json`. Pick one owner:
+Run the Python tray normally to coordinate with the Tauri dashboard. The
+dashboard publishes `state/dashboard-owns-tray.json` every 15 seconds. Python
+stays resident and hides its icon while that lease is fresh. Clean quit removes
+the lease; after a crash, Python reveals its icon when the 60-second lease expires.
+Installing an app bundle alone does not hide the Python tray.
 
-- **Dashboard owns the tray** (use this when the desktop app runs at login).
-  Start the agent headless: it supervises the app without painting a second
-  icon, and the app reports live connected / degraded / failed state.
+For installations that explicitly want the native app supervised without a
+Python fallback icon, use:
 
-  ```sh
-  python3 proxy_tray.py --headless                      # no menu-bar item
-  python3 proxy_tray.py --headless --headless-interval 15
-  ```
-
-- **Agent owns the tray** — close the dashboard app instead; its tray icon is
-  the duplicate, and `proxy_tray.py` already shows the accurate status colour.
+```sh
+python3 proxy_tray.py --headless
+python3 proxy_tray.py --headless --headless-interval 15
+```
 
 `--headless` never stacks a second app on top of a running one, and reports a
 hint (rather than a traceback) when no `Proxy Router.app` bundle is built —

@@ -617,15 +617,18 @@ class KeepaliveEgressCheckTests(unittest.TestCase):
         # STORM_WINDOW=0: every rotation_allowed() call sees the window as
         # expired, so the guard must NOT block (tests the reset path).
         h = KeepaliveHarness(egress="dead", probe_every="1", dead_strikes="1",
-                             storm_window="0", max_rotations="1")
+                             storm_window="0", max_rotations="1", clock=1000)
         try:
-            deadline = time.time() + 5
             rotates = []
-            while time.time() < deadline:
-                rotates = [line for line in h.lines() if line.startswith("rotate proton")]
-                if len(rotates) >= 4:
-                    break
-                time.sleep(0.05)
+            for expected in range(1, 5):
+                h.advance_clock(2)
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    rotates = [line for line in h.lines() if line.startswith("rotate proton")]
+                    if len(rotates) >= expected:
+                        break
+                    time.sleep(0.05)
+                self.assertGreaterEqual(len(rotates), expected, f"rotation stopped: {rotates}")
             self.assertGreaterEqual(len(rotates), 4, f"expected rotation churn: {rotates}")
         finally:
             h.close()

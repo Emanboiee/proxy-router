@@ -266,7 +266,7 @@ function syncProfileDialog(): void {
     profileDialog.returnValue = '';
     profileDialog.innerHTML = profileForm(profile);
     profileDialog.showModal();
-    requestAnimationFrame(() => profileDialog.querySelector<HTMLInputElement>('#profile-name')?.focus({ preventScroll: true }));
+    profileDialog.querySelector<HTMLInputElement>('#profile-name')?.focus({ preventScroll: true });
   }
 }
 function syncProviderDialog(): void {
@@ -288,7 +288,7 @@ function syncProviderDialog(): void {
     providerDialog.returnValue = '';
     providerDialog.innerHTML = providerForm(context);
     if (!providerDialog.open) providerDialog.showModal();
-    requestAnimationFrame(() => providerDialog.querySelector<HTMLInputElement>('#provider-name')?.focus({ preventScroll: true }));
+    providerDialog.querySelector<HTMLInputElement>('#provider-name')?.focus({ preventScroll: true });
   }
 }
 function providersPage(): string {

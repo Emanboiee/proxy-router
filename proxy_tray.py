@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import plistlib
 import re
@@ -42,6 +43,7 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -77,6 +79,9 @@ _REAL_DARWIN_PYSTRAY = bool(
 
 POLL_SECONDS = 5.0  # live-enough menu state without spawning 24 CLI procs/min
 COMMAND_TIMEOUT = 20
+# The Tauri dashboard refreshes this shared lease every 15 seconds.
+DASHBOARD_OWNER_FILE = Path("state/dashboard-owns-tray.json")
+DASHBOARD_OWNER_TTL = 60.0
 # Rotation legitimately runs long: SIGHUP reload (tun readiness budget 12s)
 # plus the post-switch egress probe (8s) plus a 60s probe settle window plus
 # possible rollback. A 20s kill murders a healthy rotation after it has
@@ -313,7 +318,8 @@ class RouterStatus:
             preset=d.get("preset") or None,
             system_proxy_status=str(system_proxy.get("status") or (
                 "unknown" if d.get("up") and d.get("mode") == "proxy" else "skipped")),
-            network_status=str(network.get("status") or "unknown"),
+            network_status=("stale" if network.get("stale") is True
+                            else str(network.get("status") or "unknown")),
             degraded_lanes=[str(lane) for lane in (d.get("degraded_lanes") or [])
                             if isinstance(lane, str) and lane],
         )
@@ -834,19 +840,47 @@ def dashboard_app_running() -> bool:
     return result.returncode == 0
 
 
-def tray_ownership(root, *, explicit_headless: bool = False) -> str:
-    """Which side owns the single menu-bar item: ``"headless"`` or ``"icon"``.
+def _dashboard_owner_is_fresh(root, now: float | None = None) -> bool:
+    """Accept only a recent, well-formed lease for this router root."""
+    try:
+        root_path = Path(root).expanduser().resolve()
+        record = json.loads(
+            (root_path / DASHBOARD_OWNER_FILE).read_text(encoding="utf-8"))
+        recorded_root = Path(record["root"]).expanduser().resolve()
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
 
-    The dashboard app registers its own status item (issue #144), so this agent
-    must never paint a second one while that app is installed. An explicit
-    ``PROXY_ROUTER_TRAY_HEADLESS=0`` opts back into the legacy icon for local
-    debugging.
+    if not isinstance(record, dict) or recorded_root != root_path:
+        return False
+    pid = record.get("pid")
+    at = record.get("at")
+    owner_id = record.get("owner_id")
+    if (isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0
+            or not isinstance(owner_id, str) or not owner_id
+            or isinstance(at, bool) or not isinstance(at, (int, float))):
+        return False
+    try:
+        timestamp_is_finite = math.isfinite(at)
+    except OverflowError:
+        return False
+    if not timestamp_is_finite:
+        return False
+    age = (time.time() if now is None else now) - at
+    return -5.0 <= age <= DASHBOARD_OWNER_TTL
+
+
+def tray_ownership(root, *, now: float | None = None, explicit_headless: bool = False) -> str:
+    """Return the current owner of the single status item (issue #144).
+
+    Python stays resident while headless so it can reveal its icon when the
+    dashboard releases its lease or stops refreshing after a crash. Set
+    ``PROXY_ROUTER_TRAY_HEADLESS=0`` to force the legacy icon for debugging.
     """
     if explicit_headless:
         return "headless"
     if os.environ.get("PROXY_ROUTER_TRAY_HEADLESS", "").strip() == "0":
         return "icon"
-    return "headless" if _dashboard_bundle(Path(root)) is not None else "icon"
+    return "headless" if _dashboard_owner_is_fresh(root, now) else "icon"
 
 
 def supervise_dashboard(root: str, *, interval: float = 30.0,
@@ -1680,6 +1714,8 @@ class TrayApp:
         self._menu_sig: str | None = None
         self._icon_sig: str | None = None
         self._menu_lock = threading.Lock()
+        self._ownership_lock = threading.Lock()
+        self._ownership_icon_visible: bool | None = None
 
         # Issue #60: mutations used to run on independent daemon threads, so
         # two clicks raced each other inside router.py and an older
@@ -1706,6 +1742,23 @@ class TrayApp:
         # Quit's bounded drain window (tests shrink it; production uses
         # MUTATION_DRAIN_TIMEOUT so a hung job cannot make Quit unkillable).
         self._drain_timeout = MUTATION_DRAIN_TIMEOUT
+
+    def _sync_tray_ownership(self, now: float | None = None) -> bool:
+        """Show only this agent's item when no fresh dashboard lease exists."""
+        if self.tray is None:
+            return False
+        visible = tray_ownership(self.client.root, now=now) == "icon"
+        with self._ownership_lock:
+            if self._ownership_icon_visible == visible:
+                return visible
+            try:
+                self.tray.visible = visible
+            except Exception as exc:
+                print(f"tray: ownership sync failed: {type(exc).__name__}",
+                      file=sys.stderr)
+                return False
+            self._ownership_icon_visible = visible
+        return visible
 
     # ---- status polling ------------------------------------------------
     def _status_signature(self, st: RouterStatus) -> str:
@@ -1806,6 +1859,7 @@ class TrayApp:
 
     def poll_loop(self) -> None:
         while not self.quit_flag.is_set():
+            self._sync_tray_ownership()
             epoch: int | None = None
             try:
                 # Claim the epoch BEFORE fetching (issue #60): a poll that
@@ -1821,6 +1875,7 @@ class TrayApp:
                 # Keep the poll's epoch so a late failure cannot overwrite a
                 # newer action snapshot that landed while status() was out.
                 self._publish_status(RouterStatus(error=str(e)[:80]), epoch)
+            self._sync_tray_ownership()
             self.quit_flag.wait(POLL_SECONDS)
 
     def _snapshot(self) -> RouterStatus:
@@ -2509,12 +2564,11 @@ class TrayApp:
                 pass
 
         def on_ready(icon):
-            # Custom setup replaces pystray's default setup; explicitly show
-            # the status item or the agent runs invisibly on macOS.
+            # Reconcile only after pystray has registered this status item.
             bind = getattr(icon, "_bind_status_button", None)
             if callable(bind):
                 bind()
-            icon.visible = True
+            self._sync_tray_ownership()
             threading.Thread(target=self.poll_loop, daemon=True,
                              name="tray-status").start()
 
@@ -2619,11 +2673,7 @@ def main() -> int:
     if args.selftest:
         return selftest(args.root)
 
-    if tray_ownership(args.root, explicit_headless=args.headless) == "headless":
-        if not args.headless:
-            print("tray: dashboard app owns the menu bar; running headless "
-                  "(set PROXY_ROUTER_TRAY_HEADLESS=0 to force the legacy icon)",
-                  file=sys.stderr)
+    if args.headless:
         return supervise_dashboard(args.root, interval=args.headless_interval)
 
     if pystray is None or Image is None:

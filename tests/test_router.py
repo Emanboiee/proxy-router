@@ -1713,6 +1713,9 @@ class RotationEgressTests(unittest.TestCase):
         router._vpn = {}
         # unit tests: no settle-retry (dedicated tests exercise it explicitly)
         router._egress_settings = {**router.DEFAULT_EGRESS_SETTINGS, "probe_settle_seconds": 0}
+        self.rotation_patch = mock.patch.object(router, '_rotation', {'policy': 'latency'})
+        self.rotation_patch.start()
+        self.addCleanup(self.rotation_patch.stop)
         self.reload_patch = mock.patch.object(router, "engine_reload", return_value=0)
         self.engine_reload = self.reload_patch.start()
         self.switch_patch = mock.patch.object(router, "engine_switch", return_value=0)
