@@ -9,18 +9,21 @@ from __future__ import annotations
 
 import argparse
 import collections
+import functools
 import http.client
 import ipaddress
 import json
+import math
 import os
 import platform
 import re
-import signal
 import shlex
+import signal
 import socket
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,6 +49,11 @@ DEFAULT_HEADERS = {
     "User-Agent": "proxy-router-monitor/1.0",
     "Accept": "*/*",
 }
+
+
+class MonitorConfigError(ValueError):
+    """An existing router.json cannot safely guide monitor probes."""
+
 
 # --- Issue #64: validated monitor targets -----------------------------------
 # Trust model: router.json's monitor URLs point at public internet endpoints
@@ -127,125 +135,107 @@ def _reject_unsafe_url(url: str) -> str | None:
     return target_violation(url)
 
 
-def _validated_target_addresses(url: str) -> list[str]:
-    """Resolve and validate every target address before a connection is made."""
-    violation = target_violation(url)
-    if violation is not None:
-        raise ValueError(violation)
-    try:
-        addresses = resolve_target_addresses(url)
-    except Exception as exc:
-        raise ValueError("target DNS resolution failed") from exc
-    if not addresses:
-        raise ValueError("target did not resolve to an IP address")
-    violation = target_violation(url, resolved_addresses=addresses)
-    if violation is not None:
-        raise ValueError(violation)
-    return addresses
-
-
-def _resolved_target_violation(url: str) -> str | None:
-    try:
-        _validated_target_addresses(url)
-    except ValueError as exc:
-        return str(exc)
-    return None
-
-
-def _connect_pinned(addresses, port, timeout, source_address):
-    errors = []
-    for address in addresses:
-        try:
-            return socket.create_connection((address, port), timeout, source_address)
-        except OSError as exc:
-            errors.append(exc)
-    raise errors[-1]
-
-
-class _PinnedHTTPConnection(http.client.HTTPConnection):
-    """Dial one of the already-validated numeric addresses, never the hostname."""
-
-    def __init__(self, host, *, addresses, **kwargs):
-        super().__init__(host, **kwargs)
-        self._validated_addresses = addresses
-
-    def connect(self):
-        self.sock = _connect_pinned(
-            self._validated_addresses, self.port, self.timeout, self.source_address
-        )
-
-
-class _PinnedHTTPSConnection(http.client.HTTPSConnection):
-    """Dial a validated IP while retaining the original host for TLS SNI."""
-
-    def __init__(self, host, *, addresses, **kwargs):
-        super().__init__(host, **kwargs)
-        self._validated_addresses = addresses
-
-    def connect(self):
-        sock = _connect_pinned(
-            self._validated_addresses, self.port, self.timeout, self.source_address
-        )
-        if self._tunnel_host:
-            self.sock = sock
-            self._tunnel()
-            sock = self.sock
-        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
-
-
-def _pinned_connection_factory(connection_class, req):
-    addresses = _validated_target_addresses(req.full_url)
-
-    def build(host, **kwargs):
-        return connection_class(host, addresses=addresses, **kwargs)
-
-    return build
-
-
-class _ValidatedHTTPHandler(urllib.request.HTTPHandler):
-    def http_open(self, req):
-        return self.do_open(_pinned_connection_factory(_PinnedHTTPConnection, req), req)
-
-
-class _ValidatedHTTPSHandler(urllib.request.HTTPSHandler):
-    def https_open(self, req):
-        return self.do_open(
-            _pinned_connection_factory(_PinnedHTTPSConnection, req),
-            req,
-            context=self._context,
-            check_hostname=self._check_hostname,
-        )
-
-
 class _ValidatedRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Follow redirects only when the destination resolves to safe addresses."""
+    """Reject redirect hops that fail the monitor target policy."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        try:
-            _validated_target_addresses(newurl)
-        except ValueError:
+        violation = target_violation(
+            newurl, resolved_addresses=resolve_target_addresses(newurl)
+        )
+        if violation is not None:
             return None
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+def _validated_connection_addresses(url: str) -> tuple[str, ...]:
+    """Resolve and validate once; the returned IPs are the only dial targets."""
+    violation = target_violation(url)
+    if violation is not None:
+        raise urllib.error.URLError(f"unsafe monitor target: {violation}")
+
+    addresses = tuple(resolve_target_addresses(url))
+    if not addresses:
+        raise urllib.error.URLError("monitor target did not resolve to an address")
+    violation = target_violation(url, resolved_addresses=addresses)
+    if violation is not None:
+        raise urllib.error.URLError(f"unsafe monitor target: {violation}")
+    return addresses
+
+
+class _PinnedConnectMixin:
+    """Dial only validated numeric IPs while retaining the URL hostname."""
+
+    def __init__(self, host, *args, pinned_addresses, **kwargs):
+        self._pinned_addresses = tuple(pinned_addresses)
+        super().__init__(host, *args, **kwargs)
+        # HTTPConnection stores socket.create_connection on the instance, so
+        # replace that attribute after its initializer returns.
+        self._create_connection = self._create_pinned_connection
+
+    def _create_pinned_connection(self, address, timeout=None, source_address=None):
+        host, port = address
+        if host != self.host:
+            raise OSError("monitor connection host changed after validation")
+
+        last_error = None
+        for pinned_address in self._pinned_addresses:
+            try:
+                return socket.create_connection(
+                    (pinned_address, port), timeout, source_address
+                )
+            except OSError as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        raise OSError("monitor connection has no validated addresses")
+
+
+class _PinnedHTTPConnection(_PinnedConnectMixin, http.client.HTTPConnection):
+    pass
+
+
+class _PinnedHTTPSConnection(_PinnedConnectMixin, http.client.HTTPSConnection):
+    pass
+
+
+def _pinned_connection_factory(url: str, connection_type):
+    addresses = _validated_connection_addresses(url)
+    return functools.partial(connection_type, pinned_addresses=addresses)
+
+
+class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        connection = _pinned_connection_factory(req.full_url, _PinnedHTTPConnection)
+        return self.do_open(connection, req)
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        connection = _pinned_connection_factory(req.full_url, _PinnedHTTPSConnection)
+        return self.do_open(
+            connection,
+            req,
+            context=getattr(self, "_context", None),
+        )
+
+
+# A proxy would resolve the destination outside this process, bypassing pinning.
 _SAFE_OPENER = urllib.request.build_opener(
     urllib.request.ProxyHandler({}),
-    _ValidatedHTTPHandler(),
-    _ValidatedHTTPSHandler(),
-    _ValidatedRedirectHandler(),
+    _ValidatedRedirectHandler,
+    _PinnedHTTPHandler,
+    _PinnedHTTPSHandler,
 )
 
 
 def _safe_urlopen(url, timeout=None):
-    """Default direct transport with DNS-pinned, redirect-aware validation."""
+    """Default monitor transport: validate and pin every request and redirect."""
     return _SAFE_OPENER.open(url, timeout=timeout)
 
 
-def _probe_target_violation(url: str, opener) -> str | None:
-    violation = target_violation(url)
-    if violation is None and opener in (urllib.request.urlopen, _safe_urlopen):
-        violation = _resolved_target_violation(url)
-    return violation
+def _uses_urllib_transport(opener) -> bool:
+    """True for built-in transports that accept urllib Request objects."""
+    return opener is _safe_urlopen or opener is urllib.request.urlopen
 
 
 def validate_ping_host(host: str) -> str | None:
@@ -272,10 +262,17 @@ def validate_ping_host(host: str) -> str | None:
     return None
 
 
+def _open_request(opener, request, timeout: float):
+    """Route urllib transports through DNS-pinned connections."""
+    transport = _safe_urlopen if _uses_urllib_transport(opener) else opener
+    return transport(request, timeout=timeout)
+
+
 def _open(opener, url: str, timeout: float):
-    """Use browser-like headers for safe urllib; leave injected openers simple."""
-    if opener in (urllib.request.urlopen, _safe_urlopen):
-        return opener(urllib.request.Request(url, headers=DEFAULT_HEADERS), timeout=timeout)
+    """Use browser-like headers for urllib transports; keep injected openers simple."""
+    if _uses_urllib_transport(opener):
+        request = urllib.request.Request(url, headers=DEFAULT_HEADERS)
+        return _open_request(opener, request, timeout)
     return opener(url, timeout=timeout)
 
 
@@ -355,11 +352,10 @@ def measure_http_latency(url: str = DEFAULT_HTTP_URL, *, opener=_safe_urlopen,
                          clock=time.monotonic, timeout: float = 5) -> dict:
     started = clock()
     response = None
-    violation = _probe_target_violation(url, opener)
+    violation = target_violation(url)
     if violation is not None:
         return _network_error(ValueError(f"unsafe monitor target: {violation}"),
                               url, target=_safe_target(url))
-    opener = _safe_urlopen if opener is urllib.request.urlopen else opener
     try:
         response = _open(opener, url, timeout)
         response.read(1)
@@ -389,10 +385,9 @@ def measure_download(url: str = DEFAULT_DOWNLOAD_URL, *, max_bytes: int = DEFAUL
     started = clock()
     response = None
     total = 0
-    violation = _probe_target_violation(url, opener)
+    violation = target_violation(url)
     if violation is not None:
         return _network_error(ValueError(f"unsafe monitor target: {violation}"), url, bytes=0)
-    opener = _safe_urlopen if opener is urllib.request.urlopen else opener
     try:
         response = _open(opener, url, timeout)
         while total < max_bytes:
@@ -416,13 +411,12 @@ def measure_upload(url: str = DEFAULT_UPLOAD_URL, *, max_bytes: int = DEFAULT_MA
     payload = b"0" * max_bytes
     started = clock()
     response = None
-    violation = _probe_target_violation(url, opener)
+    violation = target_violation(url)
     if violation is not None:
         return _network_error(ValueError(f"unsafe monitor target: {violation}"), url, bytes=max_bytes)
-    opener = _safe_urlopen if opener is urllib.request.urlopen else opener
     try:
         request = urllib.request.Request(url, data=payload, headers=DEFAULT_HEADERS, method="POST")
-        response = opener(request, timeout=timeout)
+        response = _open_request(opener, request, timeout)
         response.read(1)
         elapsed = clock() - started
         return {"bytes": max_bytes, "mbps": _throughput(max_bytes, elapsed),
@@ -473,58 +467,56 @@ def _monitor_settings(root: Path) -> dict:
     }
     config = root / "router.json"
     try:
-        data = json.loads(config.read_text())
-        custom = data.get("monitor", {}) if isinstance(data, dict) else {}
-        if isinstance(custom, dict):
-            for key in settings:
-                if key in custom:
-                    settings[key] = custom[key]
-    except (OSError, json.JSONDecodeError):
-        pass
+        raw = config.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raw = None
+    except (OSError, UnicodeError) as exc:
+        raise MonitorConfigError(f"cannot read router.json: {exc}") from exc
+    if raw is not None:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise MonitorConfigError(
+                f"invalid router.json: {exc.msg} (line {exc.lineno}, column {exc.colno})"
+            ) from exc
+        if not isinstance(data, dict):
+            raise MonitorConfigError("invalid router.json: top level must be an object")
+        custom = data.get("monitor", {})
+        if not isinstance(custom, dict):
+            raise MonitorConfigError("invalid router.json: monitor must be an object")
+        for key in settings:
+            if key in custom:
+                settings[key] = custom[key]
+
     for key in ("http_url", "download_url", "upload_url"):
+        if not isinstance(settings[key], str):
+            raise MonitorConfigError(f"invalid router.json: monitor.{key} must be a string")
+    for key in ("interval_seconds", "max_bytes", "timeout_seconds"):
         value = settings[key]
         try:
-            parsed = urlsplit(value) if isinstance(value, str) else None
-        except ValueError:
-            parsed = None
-        if parsed is None or parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            settings[key] = {
-                "http_url": DEFAULT_HTTP_URL,
-                "download_url": DEFAULT_DOWNLOAD_URL,
-                "upload_url": DEFAULT_UPLOAD_URL,
-            }[key]
-        else:
-            # Issue #64: config-time target validation. A URL that aims the
-            # worker at loopback/LAN/link-local/metadata (or a non-http
-            # scheme smuggled past the check above) falls back to the safe
-            # default instead of being probed.
-            violation = _reject_unsafe_url(settings[key])
-            if violation is not None:
-                settings[key] = {
-                    "http_url": DEFAULT_HTTP_URL,
-                    "download_url": DEFAULT_DOWNLOAD_URL,
-                    "upload_url": DEFAULT_UPLOAD_URL,
-                }[key]
-    try:
-        settings["interval_seconds"] = max(5, int(settings["interval_seconds"]))
-    except (TypeError, ValueError):
-        settings["interval_seconds"] = DEFAULT_INTERVAL
-    try:
-        settings["max_bytes"] = min(max(1, int(settings["max_bytes"])), 10_000_000)
-    except (TypeError, ValueError):
-        settings["max_bytes"] = DEFAULT_MAX_BYTES
-    try:
-        settings["timeout_seconds"] = min(max(1, float(settings["timeout_seconds"])), 60)
-    except (TypeError, ValueError):
-        settings["timeout_seconds"] = DEFAULT_TIMEOUT
+            finite = math.isfinite(value)
+        except (OverflowError, TypeError):
+            finite = False
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not finite:
+            raise MonitorConfigError(f"invalid router.json: monitor.{key} must be a finite number")
     hosts = settings["ping_hosts"]
-    if not isinstance(hosts, (list, tuple)):
-        hosts = DEFAULT_PING_HOSTS
+    if not isinstance(hosts, list) or any(not isinstance(host, str) for host in hosts):
+        raise MonitorConfigError("invalid router.json: monitor.ping_hosts must be an array of strings")
+
+    for key in ("http_url", "download_url", "upload_url"):
+        violation = _reject_unsafe_url(settings[key])
+        if violation is not None:
+            raise MonitorConfigError(
+                f"invalid router.json: monitor.{key} is unsafe: {violation}"
+            )
+    settings["interval_seconds"] = max(5, int(settings["interval_seconds"]))
+    settings["max_bytes"] = min(max(1, int(settings["max_bytes"])), 10_000_000)
+    settings["timeout_seconds"] = min(max(1, float(settings["timeout_seconds"])), 60)
     # Issue #64: keep only conservative DNS/IP values; anything option-like or
     # metacharacter-bearing is dropped rather than passed to the ping argv.
     settings["ping_hosts"] = [
-        str(x) for x in hosts
-        if str(x) and validate_ping_host(str(x)) is None
+        host for host in hosts
+        if host and validate_ping_host(host) is None
     ][:8]
     return settings
 
@@ -666,6 +658,14 @@ STOP_CONFIRM_SECONDS = 3.0
 
 def stop(root: Path | None = None) -> dict:
     root = Path(root) if root is not None else ROOT
+    try:
+        with worker_lock.exclusive(monitor_dir(root) / "start.lock"):
+            return _stop_locked(root)
+    except TimeoutError as exc:
+        return {"stopped": False, "confirmed": False, "error": str(exc)}
+
+
+def _stop_locked(root: Path) -> dict:
     pid = _read_pid(root)
     confirmed = True
     if pid and _pid_running(pid, root):

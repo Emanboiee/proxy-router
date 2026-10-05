@@ -935,14 +935,12 @@ def _inbound_listen_port(metadata: RuntimeMetadata) -> int | None:
 
 def _probe_tcp_connect(port: int, *, timeout: float = 0.25) -> bool:
     try:
-        probe = socket.socket()
-        probe.settimeout(timeout)
-        probe.connect(("127.0.0.1", port))
-        return True
+        with socket.socket() as probe:
+            probe.settimeout(timeout)
+            probe.connect(("127.0.0.1", port))
+            return True
     except OSError:
         return False
-    finally:
-        probe.close()
 
 
 def _wait_ready(
