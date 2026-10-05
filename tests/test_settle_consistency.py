@@ -109,7 +109,8 @@ def test_truncated_http_response_still_gets_a_transport_retry(lane, monkeypatch)
     router, profile = lane
     router._egress_settings["probe_settle_seconds"] = 4
     fake_clock(router, monkeypatch)
-    probe = Mock(side_effect=[outcome("curl(18): incomplete response", 200), outcome(None, 200)])
+    truncated = {**outcome("curl(18): incomplete response", 200), "ok": False}
+    probe = Mock(side_effect=[truncated, outcome(None, 200)])
     monkeypatch.setattr(router, "probe_egress", probe)
     assert router._probe_with_settle("proton", profile)[0]
     assert probe.call_count == 2
