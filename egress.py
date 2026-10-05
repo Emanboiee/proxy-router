@@ -28,6 +28,20 @@ def transport_reason(error_text: object) -> str:
     return "connection"
 
 
+def should_cool_connection(record: dict, fail_threshold: int) -> bool:
+    """Require current positive DNS evidence for repeated connection failures."""
+    return (not record.get("ok") and record.get("status") is None
+            and record.get("dns_ok") is True
+            and transport_reason(record.get("error")) != "tls"
+            and int(record.get("fails") or 0) >= fail_threshold)
+
+
+def is_http_policy_outcome(record: dict | None) -> bool:
+    """HTTP policy ends warmup; a truncated curl response remains retryable."""
+    return (record is not None and record.get("status") is not None
+            and not str(record.get("error") or "").startswith("curl("))
+
+
 def classify_probe_body(status: int, text: str) -> str | None:
     """Return a reputation-block reason for an HTTP response body, if any."""
     if re.search(
