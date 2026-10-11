@@ -540,6 +540,12 @@ test('mixed preset editor shows route connections and missing WARP without a fal
   await expect(dialog.getByRole('row', { name: 'opencode proton opencode.ai' })).toBeVisible();
   await expect(dialog.locator('[name="providerId"]')).toHaveCount(0);
   await expect(dialog).toContainText('Missing connections: cloudflare');
+  for (const width of [1440, 390]) {
+    await page.setViewportSize({ width, height: 900 });
+    await page.screenshot({ path: `test-results/mixed-preset-${width}.png` });
+    expect(await dialog.evaluate(node => node.getBoundingClientRect().right <= window.innerWidth)).toBe(true);
+  }
+  await page.setViewportSize({ width: 1440, height: 900 });
   await dialog.locator('[name="description"]').fill('Mixed connections');
   await dialog.getByRole('button', { name: 'Save changes' }).click();
   const calls = await page.evaluate(() => (window as unknown as { __invoke: { command: string; payload?: unknown }[] }).__invoke);
