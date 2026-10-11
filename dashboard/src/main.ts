@@ -36,6 +36,7 @@ let networkState: NetworkPresetState | null = null;
 let livePayload: Record<string, unknown> | null = null;
 let routingState: RoutingState | null = null;
 let selectedServerProvider='';
+let renderedPageMarkup = '';
 let serverDialogOpener: HTMLElement | null=null;
 const app = document.querySelector<HTMLDivElement>('#app')!;
 
@@ -483,7 +484,19 @@ function render(options?: { background?: boolean }): void {
   const editing = options?.background && (focused || draft
     || main.querySelector('[aria-expanded="true"][aria-haspopup="listbox"]') !== null);
   if (!editing) {
-    main.innerHTML = page === 'Home' ? homePage() : page === 'Profiles' ? profilesPage() : page === 'Providers' ? providersPage() : page === 'Connectivity' ? connectivityPage() : page === 'Settings' ? settingsPage() : page === 'Appearance' ? appearancePage() : aboutPage();
+    const markup = page === 'Home' ? homePage() : page === 'Profiles' ? profilesPage() : page === 'Providers' ? providersPage() : page === 'Connectivity' ? connectivityPage() : page === 'Settings' ? settingsPage() : page === 'Appearance' ? appearancePage() : aboutPage();
+    if (!options?.background || markup !== renderedPageMarkup) {
+      const scrollTop = main.scrollTop;
+      const scrollLeft = main.scrollLeft;
+      const openDetails = Array.from(main.querySelectorAll('details')).map(item => item.open);
+      main.innerHTML = markup;
+      renderedPageMarkup = markup;
+      if (options?.background) {
+        main.querySelectorAll('details').forEach((item, index) => { item.open = openDetails[index] ?? false; });
+        main.scrollTop = scrollTop;
+        main.scrollLeft = scrollLeft;
+      }
+    }
   }
   syncProfileDialog();
   syncProviderDialog();
