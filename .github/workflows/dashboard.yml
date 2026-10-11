@@ -112,3 +112,51 @@ jobs:
           name: proxy-router-dashboard-ci-macos-arm64
           path: proxy-router-dashboard-ci-macos-arm64.zip
           if-no-files-found: error
+
+  windows:
+    name: Windows desktop build and smoke
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - name: Prepare Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default stable
+      - name: Install dashboard dependencies
+        working-directory: dashboard
+        run: npm ci
+      - name: Install Playwright browser
+        working-directory: dashboard
+        run: npx playwright install chromium
+      - name: Build frontend
+        working-directory: dashboard
+        run: npm run build
+      - name: Run browser tests
+        working-directory: dashboard
+        run: npm test
+      - name: Run native tests
+        run: cargo test --locked --manifest-path dashboard/src-tauri/Cargo.toml
+      - name: Build Windows installer
+        working-directory: dashboard
+        run: npm run tauri -- build --bundles nsis
+      - name: Verify Windows artifacts
+        shell: pwsh
+        run: |
+          $exe = 'dashboard/src-tauri/target/release/proxy-router-dashboard.exe'
+          if (!(Test-Path $exe)) { throw 'Missing Windows executable' }
+          $installers = Get-ChildItem dashboard/src-tauri/target/release/bundle/nsis/*.exe
+          if ($installers.Count -eq 0) { throw 'Missing NSIS installer' }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: proxy-router-dashboard-windows
+          path: dashboard/src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
