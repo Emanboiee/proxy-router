@@ -30,11 +30,33 @@ const COMMON_PYTHON_PATHS: &[&str] = &[];
 /// Resolve the installed router first, while retaining explicit overrides and
 /// the old source-checkout layout for development.
 pub fn router_root() -> PathBuf {
-    let home = std::env::var_os("HOME")
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
         .map(PathBuf::from)
         .unwrap_or_default();
+    #[cfg(windows)]
+    return windows_router_root_for(&home, std::env::var_os("LOCALAPPDATA").as_deref(),
+                                  std::env::var_os("PROXY_ROUTER_ROOT").as_deref());
+    #[cfg(not(windows))]
     router_root_for(&home, std::env::var_os("PROXY_ROUTER_ROOT").as_deref())
 }
+
+fn windows_router_root_for(home: &Path, local_appdata: Option<&OsStr>, override_root: Option<&OsStr>) -> PathBuf {
+    if let Some(root) = override_root.filter(|value| !value.to_string_lossy().trim().is_empty()) {
+        return PathBuf::from(root);
+    }
+    let base = local_appdata.filter(|value| !value.to_string_lossy().trim().is_empty())
+        .map(PathBuf::from).unwrap_or_else(|| home.join("AppData/Local"));
+    let installed = base.join("proxy-router");
+    if controller_path(&installed).is_file() { return installed; }
+    let development = home.join("proxy-router");
+    if controller_path(&development).is_file() { return development; }
+    installed
+}
+
+#[cfg(windows)]
+const PYTHON_NAMES: &[&str] = &["python.exe", "python3.exe"];
+#[cfg(not(windows))]
+const PYTHON_NAMES: &[&str] = &["python3"];
 
 fn router_root_for(home: &Path, override_root: Option<&OsStr>) -> PathBuf {
     if let Some(root) = override_root {
@@ -92,9 +114,9 @@ fn router_python_with_paths(
         .iter()
         .filter(|directory| !is_system_bin(directory))
     {
-        let candidate = directory.join("python3");
-        if is_executable_file(&candidate) {
-            return candidate;
+        for name in PYTHON_NAMES {
+            let candidate = directory.join(name);
+            if is_executable_file(&candidate) { return candidate; }
         }
     }
 
@@ -109,15 +131,15 @@ fn router_python_with_paths(
         .iter()
         .filter(|directory| is_system_bin(directory))
     {
-        let candidate = directory.join("python3");
-        if is_executable_file(&candidate) {
-            return candidate;
+        for name in PYTHON_NAMES {
+            let candidate = directory.join(name);
+            if is_executable_file(&candidate) { return candidate; }
         }
     }
 
     // Let Command perform its usual PATH lookup and return its normal spawn
     // error when no Python installation is available.
-    PathBuf::from("python3")
+    PathBuf::from(PYTHON_NAMES[0])
 }
 
 fn is_system_bin(directory: &Path) -> bool {
@@ -236,6 +258,11 @@ fn run_controller_with_python(
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW: no console flash per poll
     }
     let mut child = command.spawn()
         .map_err(|error| format!("could not run controller: {error}"))?;
@@ -515,6 +542,24 @@ mod tests {
     }
 
     #[test]
+    fn windows_root_matches_powershell_installer_and_preserves_override() {
+        let home = temporary_home("windows-root");
+        let local = home.join("custom-local-appdata");
+        let installed = local.join("proxy-router");
+        write_controller(&installed);
+        assert_eq!(windows_router_root_for(&home, Some(local.as_os_str()), None), installed);
+        let custom = home.join("override");
+        assert_eq!(windows_router_root_for(&home, Some(local.as_os_str()), Some(custom.as_os_str())), custom);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn windows_root_uses_userprofile_appdata_when_environment_is_missing() {
+        let home = temporary_home("windows-fallback");
+        assert_eq!(windows_router_root_for(&home, None, None), home.join("AppData/Local/proxy-router"));
+    }
+
+    #[test]
     fn router_root_prefers_installer_managed_runtime() {
         let home = temporary_home("installed-root");
         let installed = home.join(".local/share/proxy-router");
@@ -567,7 +612,7 @@ mod tests {
             "import sys\nsys.stdout.write('out' * 131072)\nsys.stdout.flush()\nsys.stderr.write('err' * 131072)\nsys.stderr.flush()\n",
         );
         let output =
-            run_controller_with_python(root.path(), &[], Duration::from_secs(10), "python3")
+            run_controller_with_python(root.path(), &[], Duration::from_secs(10), router_python())
                 .expect("controller completes after writing beyond both pipe capacities");
 
         assert!(output.status.success());
@@ -640,7 +685,7 @@ mod tests {
         let home = temporary_home("python-path");
         let bin = home.join("bin");
         std::fs::create_dir_all(&bin).expect("create fixture bin");
-        let python = bin.join("python3");
+        let python = bin.join(PYTHON_NAMES[0]);
         std::fs::write(&python, "#!/bin/sh\nexit 0\n").expect("write Python fixture");
         #[cfg(unix)]
         {
@@ -662,7 +707,7 @@ mod tests {
     fn python_falls_back_to_path_lookup_when_no_candidate_exists() {
         assert_eq!(
             router_python_with_paths(None, None, &[]),
-            PathBuf::from("python3")
+            PathBuf::from(PYTHON_NAMES[0])
         );
     }
 }
