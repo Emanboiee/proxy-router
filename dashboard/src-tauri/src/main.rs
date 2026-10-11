@@ -599,6 +599,30 @@ fn delete_dashboard_provider(provider_id: String) -> Result<Value, String> {
 }
 
 #[tauri::command]
+fn save_server_preference(provider_id: String, server: String) -> Result<Value, String> {
+    dashboard_json(&["dashboard", "server-preference", "--id", &provider_id, "--server", &server])
+}
+
+#[tauri::command]
+fn switch_dashboard_server(app: AppHandle, provider_id: String, server: String) -> Result<String, String> {
+    // Persist/validate against current inventory before passing an exact ID to
+    // the existing rotation path, which handles cooldowns, probes and rollback.
+    let root = controller::router_root();
+    if controller::live_status_fast(&root)?.get("up").and_then(Value::as_bool) != Some(true) {
+        return Err("Connect before switching a server".into());
+    }
+    save_server_preference(provider_id.clone(), server.clone())?;
+    let args = if server.is_empty() {
+        vec!["rotate", provider_id.as_str()]
+    } else {
+        vec!["rotate", provider_id.as_str(), "--to", server.as_str()]
+    };
+    let result = controller::run_controller(&root, &args);
+    refresh_live_status(&app, false);
+    result
+}
+
+#[tauri::command]
 fn set_tray_status<R: Runtime>(app: AppHandle<R>, state: String) -> Result<(), String> {
     apply_tray_state(&app, &state)
 }
@@ -794,6 +818,8 @@ fn main() {
             apply_dashboard_profile,
             save_dashboard_provider,
             delete_dashboard_provider,
+            save_server_preference,
+            switch_dashboard_server,
             set_tray_status,
             preview_rendered
         ])

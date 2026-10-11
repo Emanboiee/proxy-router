@@ -1,6 +1,7 @@
+import {connectionControls, serverInventory} from './server-controls';
 import './tokens.css';
 import './style.css';
-import { LocalController, applyEngineAction, applyDashboardProfile, deleteDashboardProfile, deleteDashboardProvider, getCachedLiveStatus, getDashboardState, getLiveStatus, getPreviewStatus, reportPreviewFrame, saveDashboardProfile, saveDashboardProvider, setTrayStatus, states, type Accent, type Connection, type DashboardState, type Density, type FallbackMode, type LayoutPreset, type MotionSpeed, type PreviewState, type Profile, type Provider, type ProviderKind, type RouteMode, type Scheme, type Snapshot, type Status, type TailscaleMode } from './controller';
+import { LocalController, saveServerPreference, switchDashboardServer, applyEngineAction, applyDashboardProfile, deleteDashboardProfile, deleteDashboardProvider, getCachedLiveStatus, getDashboardState, getLiveStatus, getPreviewStatus, reportPreviewFrame, saveDashboardProfile, saveDashboardProvider, setTrayStatus, states, type Accent, type Connection, type DashboardState, type Density, type FallbackMode, type LayoutPreset, type MotionSpeed, type PreviewState, type Profile, type Provider, type ProviderKind, type RouteMode, type Scheme, type Snapshot, type Status, type TailscaleMode } from './controller';
 import { open as openNativeFile } from '@tauri-apps/plugin-dialog';
 import { isTauri } from '@tauri-apps/api/core';
 import { addRoute, applyPreset, getConfig, getNetwork, getRouting, presetChoices, removeNetworkPreset, removeRoute, runNetworkAction, setNetworkAuto, setNetworkPreset, setRoutingMode, type EngineConfig, type NetworkPresetState, type RoutingState } from './controller';
@@ -34,6 +35,8 @@ let engineConfigCheckedAt = 0;
 let networkState: NetworkPresetState | null = null;
 let livePayload: Record<string, unknown> | null = null;
 let routingState: RoutingState | null = null;
+let selectedServerProvider='';
+let serverDialogOpener: HTMLElement | null=null;
 const app = document.querySelector<HTMLDivElement>('#app')!;
 
 const copy: Record<PreviewState, [string, string]> = {
@@ -52,6 +55,9 @@ const accents: { id: Accent; name: string; colour: string }[] = [
 ];
 
 app.innerHTML = `<aside class="rail"><header><img class="rail-logo" src="/gremlin-cat-goblin-cat.gif" alt="" width="32" height="32" decoding="async"><strong>proxy router</strong><button id="menu" aria-expanded="false" aria-controls="nav">Menu</button></header><nav id="nav" aria-label="Primary">${pages.map(item => `<a href="#${item.toLowerCase()}">${item}</a>`).join('')}</nav><div class="rail-status"><span class="status-dot" aria-hidden="true"></span><span id="rail-status">Local controller</span></div></aside><div class="workspace"><div class="topbar" role="banner"><span id="page-label">Home</span><span class="topbar-actions"><span class="badge" id="prototype-badge">Local prototype</span><span id="toast" role="status" aria-live="polite"></span></span></div><main id="main" tabindex="-1"></main><footer><span>Local data · router changes stay behind the controller</span><button id="preview" type="button">Preview states</button></footer></div><dialog id="preview-dialog" aria-labelledby="dialog-title"><form method="dialog"><h2 id="dialog-title">Preview a connection state</h2><p>These examples review the interface. They do not change your network or VPN.</p><label for="scenario">Connection state</label><select id="scenario">${states.map(item => `<option value="${item}">${copy[item][0]}</option>`).join('')}</select><div class="dialog-actions"><button value="cancel" autofocus>Cancel</button><button value="apply" class="primary">Show preview</button></div></form></dialog><dialog id="import-dialog" aria-labelledby="import-title"><form id="import-form" method="dialog"><h2 id="import-title">Import a profile</h2><p>Paste a proxy-router profile export. It is saved locally on this computer.</p><label for="profile-json">Profile JSON</label><textarea id="profile-json" rows="8" required placeholder="Profile export JSON"></textarea><div class="dialog-actions"><button value="cancel">Cancel</button><button value="import" class="primary">Import profile</button></div></form></dialog><dialog id="profile-dialog" aria-labelledby="profile-dialog-title"></dialog><dialog id="provider-dialog" aria-labelledby="provider-dialog-title"></dialog>`;
+app.insertAdjacentHTML('beforeend', '<dialog id="server-dialog" aria-labelledby="server-dialog-title"><div class="server-dialog-heading"><h2 id="server-dialog-title">Installed servers</h2><button type="button" data-action="close-servers">Close</button></div><label for="server-search">Search installed servers</label><input id="server-search" type="search" placeholder="Server name"><div id="server-inventory"></div><p id="server-dialog-feedback" role="status"></p></dialog>');
+const serverDialog=document.querySelector<HTMLDialogElement>('#server-dialog')!;
+serverDialog.addEventListener('close',()=>{ const opener=serverDialogOpener?.isConnected?serverDialogOpener:main.querySelector<HTMLElement>('[data-action="manage-servers"]'); opener?.focus(); });
 const main = document.querySelector<HTMLElement>('#main')!;
 const previewDialog = document.querySelector<HTMLDialogElement>('#preview-dialog')!;
 const importDialog = document.querySelector<HTMLDialogElement>('#import-dialog')!;
@@ -65,11 +71,11 @@ app.querySelector('#toast')?.removeAttribute('aria-live');
 function esc(value: string): string { return value.replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character] ?? character)); }
 function activeProfile(): Profile { return snapshot.profiles.find(item => item.id === snapshot.activeProfileId) ?? snapshot.profiles[0] ?? controller.activeProfile(); }
 function activeProvider(): Provider { return snapshot.providers.find(item => item.id === activeProfile().providerId) ?? snapshot.providers[0] ?? controller.snapshot().providers[0]; }
-function installDashboardState(next: DashboardState): void {
+function installDashboardState(next: DashboardState, renderNow=true): void {
   dashboardStateReady = true;
   dashboardStateError = null;
   snapshot = { ...snapshot, profiles: next.profiles, providers: next.providers, activeProfileId: next.activeProfileId };
-  render();
+  if(renderNow) render();
 }
 async function refreshDashboardState(): Promise<DashboardState> {
   const next = await getDashboardState();
@@ -160,6 +166,37 @@ function homePage(): string {
   </section>`;
 }
 
+function homeConnectionControls(): string {
+ const routes=engineConfig?.routes??[];
+ const ids=new Set(routes.flatMap(r=>typeof r.provider==='string'?[r.provider]:[]));
+ const defaultProvider=engineConfig?.routing?.default_provider;
+ if(typeof defaultProvider==='string') ids.add(defaultProvider);
+ const providers=snapshot.providers.filter(p=>ids.has(p.id));
+ if(!providers.some(p=>p.id===selectedServerProvider)) selectedServerProvider=providers.find(p=>p.capabilities?.serverSelection)?.id??providers[0]?.id??'';
+ return connectionControls(providers,selectedServerProvider,busy,livePayload?.up===true);
+}
+function updateServerInventory(): void {
+ const provider=snapshot.providers.find(p=>p.id===selectedServerProvider);
+ if(!provider)return;
+ document.querySelector('#server-inventory')!.innerHTML=serverInventory(provider,document.querySelector<HTMLInputElement>('#server-search')!.value);
+}
+async function chooseServer(server: string, switchNow=false): Promise<void>{
+ if(busy)return;
+ busy=true;render();
+ try{
+  installDashboardState(await saveServerPreference(selectedServerProvider,server));
+  if(switchNow){
+   await switchDashboardServer(selectedServerProvider,server);
+   await refreshStatus({silent:true});
+  }
+  const message=switchNow?'Server switch completed.':'Preference saved. Current connection unchanged.';
+  announce(message);document.querySelector('#server-dialog-feedback')!.textContent=message;
+ }catch(error){
+  const message=error instanceof Error?error.message:'Could not select server';
+  announce(message);document.querySelector('#server-dialog-feedback')!.textContent=message;
+ }finally{busy=false;render();if(serverDialog.open)updateServerInventory();}
+}
+
 /** Desktop Home reports only values read from the engine configuration. */
 function liveHomePage(): string {
   const [title, description] = statusTitle();
@@ -203,8 +240,9 @@ function liveHomePage(): string {
       ${dashboardStateReady && snapshot.profiles.length ? `<div class="mode-selector" data-profile-picker><span id="home-profile-label">Profile</span><span class="select-wrap custom-select"><button type="button" role="combobox" class="select-trigger" id="home-profile" data-profile-trigger aria-labelledby="home-profile-label" aria-haspopup="listbox" aria-expanded="false" aria-controls="home-profile-options"><span class="select-value">${esc(activeProfile().name)}</span><span class="select-chevron" aria-hidden="true"></span></button><div class="select-menu" id="home-profile-options" role="listbox" aria-labelledby="home-profile-label" hidden>${profileMenuOptions(snapshot.activeProfileId)}</div></span></div>` : ''}
 
       <p class="connection-status" aria-label="Live engine configuration"><span>Preset: <strong id="active-preset">${esc(preset)}</strong> · Providers: ${providerSummary} · Routes: ${esc(routeSummary)} · Latency: ${esc(latency)}</span><a class="text-link" href="#profiles">Manage routes <span aria-hidden="true">↗</span></a></p>
+      ${homeConnectionControls()}
     </div>
-    <article class="panel"><div class="panel-heading"><div><span class="label">Engine routes</span><h2>Current routing</h2></div></div>${configNote}<ul class="route-list" id="home-engine-routes">${routeRows || (hasCurrentConfig ? '<li class="muted">No routes configured.</li>' : '')}</ul></article>
+    <details class="home-route-details"><summary>Current routing</summary>${configNote}<ul class="route-list" id="home-engine-routes">${routeRows || (hasCurrentConfig ? '<li class="muted">No routes configured.</li>' : '')}</ul></details>
   </section>`;
 }
 
@@ -519,6 +557,8 @@ async function refreshEngineConfig(): Promise<void> {
   engineConfigCheckedAt = Date.now();
   try { engineConfig = await getConfig(); engineConfigUnavailable = false; }
   catch { engineConfigUnavailable = true; }
+  try { installDashboardState(await getDashboardState(),false); }
+  catch { /* Preserve the current profile inventory if discovery is unavailable. */ }
 }
 
 /** Refresh the engine's config + network detection after dashboard actions. */
@@ -708,6 +748,12 @@ app.addEventListener('click', event => {
     if (isTauri()) void chooseDashboardProvider(target.dataset.provider);
     else void perform(() => controller.setProvider(target.dataset.provider!));
   }
+  else if (action === 'manage-servers') {
+    serverDialogOpener=target;document.querySelector<HTMLInputElement>('#server-search')!.value='';updateServerInventory();serverDialog.showModal();document.querySelector<HTMLInputElement>('#server-search')!.focus();
+  }
+  else if (action === 'close-servers') serverDialog.close();
+  else if (action === 'prefer-server' && target.dataset.server) void chooseServer(target.dataset.server);
+  else if (action === 'switch-server') void chooseServer(document.querySelector<HTMLSelectElement>('#preferred-server')!.value,true);
   else if (action === 'refresh-health') void perform(() => controller.refreshHealth());
   else if (action === 'network-check' || action === 'network-reconnect' || action === 'network-disconnect') void networkAction(action);
   else if (action === 'network-auto') void networkAuto(target.dataset.networkState === 'on');
@@ -787,6 +833,8 @@ app.addEventListener('change', event => {
     const exitNode = app.querySelector<HTMLInputElement>('[name="tailscaleExitNode"]');
     if (exitNode) exitNode.required = kind === 'tailscale';
   }
+  else if (target.id==='server-provider') {selectedServerProvider=target.value;render();}
+  else if (target.id==='preferred-server') void chooseServer(target.value);
   else if (target.dataset.serverProvider) void perform(() => controller.setServer(target.dataset.serverProvider!, target.value));
   else if (target.hasAttribute('data-theme-scheme')) void perform(() => controller.updateTheme({ scheme: target.value as Scheme }));
   else if (target.hasAttribute('data-theme-accent')) void perform(() => controller.updateTheme({ accent: target.value as Accent }));
@@ -801,6 +849,7 @@ app.addEventListener('change', event => {
 });
 app.addEventListener('input', event => {
   const target = event.target as HTMLInputElement;
+  if(target.id==='server-search'){updateServerInventory();return;}
   if (target.hasAttribute('data-setting-number') && Number.isFinite(Number(target.value))) {
     const key = target.dataset.settingNumber as 'proxyPort'; void perform(() => controller.updateSettings({ [key]: Number(target.value) }));
   }

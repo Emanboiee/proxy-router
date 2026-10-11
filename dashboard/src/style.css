@@ -630,3 +630,20 @@ button.primary:active,
   color: var(--muted);
 }
 .diag-stamp { color: var(--muted); font-size: var(--text-sm); }
+
+.home-server-controls{display:grid;gap:var(--s2);width:min(100%,26rem);margin:var(--s4) auto;text-align:left}
+.home-server-controls label{color:var(--muted);font-size:var(--text-sm)}
+.server-current,.server-hint{font-size:var(--text-sm);margin:0}
+.server-preference-row{display:flex;gap:var(--s2)}
+.server-preference-row select{min-width:0;flex:1}
+.server-preference-row button{white-space:nowrap}
+.home-route-details{max-width:42rem;margin:var(--s4) auto}
+.home-route-details summary{cursor:pointer;min-height:44px;color:var(--muted)}
+#server-dialog{width:min(calc(100% - 32px),46rem)}
+.server-dialog-heading{display:flex;justify-content:space-between;gap:var(--s4);align-items:center;margin-bottom:var(--s4)}
+#server-search{width:100%;margin:var(--s2) 0 var(--s4)}
+.server-inventory-scroll{max-height:52dvh;overflow:auto;overscroll-behavior:contain}
+.server-inventory-scroll table{width:100%;border-collapse:collapse}
+.server-inventory-scroll th,.server-inventory-scroll td{padding:var(--s3);text-align:left;border-bottom:var(--border)}
+.server-inventory-scroll th{position:sticky;top:0;background:var(--surface);z-index:1}
+@media(max-width:650px){.server-preference-row{flex-wrap:wrap}.server-preference-row select{flex-basis:100%}.server-preference-row button{width:100%}}

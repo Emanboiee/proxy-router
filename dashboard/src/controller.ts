@@ -30,8 +30,8 @@ export interface Profile {
 }
 export interface Provider {
   id: string; name: string; kind: ProviderKind;
-  status: 'healthy' | 'degraded' | 'offline'; latency: number | null;
-  server: string; servers: string[]; connection?: ProviderConnection;
+  status: 'healthy' | 'degraded' | 'offline' | 'unknown'; latency: number | null;
+  server: string; servers: string[]; preferredServer?: string | null; capabilities?: { serverSelection: boolean; reconnect: boolean }; connection?: ProviderConnection;
 }
 export interface ThemeSettings {
   scheme: Scheme; accent: Accent; density: Density; layout: LayoutPreset; contrast: 'standard' | 'high'; motionSpeed: MotionSpeed; reducedMotion: boolean;
@@ -388,3 +388,10 @@ export async function removeRoute(id: string): Promise<void> {
 }
 
 export function reportPreviewFrame(): void { if (isTauri()) void invoke('preview_rendered').catch(() => {}); }
+
+export async function saveServerPreference(providerId: string, server: string): Promise<DashboardState> {
+  return await invoke<DashboardState>("save_server_preference", { providerId, server });
+}
+export async function switchDashboardServer(providerId: string, server: string): Promise<void> {
+  await invoke("switch_dashboard_server", { providerId, server });
+}
