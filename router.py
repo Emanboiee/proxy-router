@@ -7898,18 +7898,8 @@ def main() -> int:
     profile_copy_parser.add_argument("--provider", required=True,
                                     help="configured destination provider (e.g. proton)")
 
-    dashboard = sub.add_parser("dashboard", help=argparse.SUPPRESS)
-    dashboard_sub = dashboard.add_subparsers(dest="dashboard_action", required=True)
-    dashboard_sub.add_parser("state", help=argparse.SUPPRESS)
-    for action in ("profile-save", "provider-save"):
-        command = dashboard_sub.add_parser(action, help=argparse.SUPPRESS)
-        command.add_argument("--json", required=True, help=argparse.SUPPRESS)
-        command.add_argument("--id", default=None, help=argparse.SUPPRESS)
-        if action == "provider-save":
-            command.add_argument("--path", default=None, help=argparse.SUPPRESS)
-    for action in ("profile-delete", "profile-apply", "provider-delete"):
-        command = dashboard_sub.add_parser(action, help=argparse.SUPPRESS)
-        command.add_argument("--id", required=True, help=argparse.SUPPRESS)
+    import dashboard_profile_manager
+    dashboard_profile_manager.configure_parser(sub)
 
     elevate = sub.add_parser("elevate", help="one-time passwordless-sudo grant (install|uninstall|status)")
     elevate.add_argument("action", choices=["install", "uninstall", "status"])

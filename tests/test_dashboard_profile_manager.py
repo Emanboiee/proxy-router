@@ -51,7 +51,8 @@ def test_provider_save_keeps_wireguard_secret_out_of_dashboard_state(tmp_path):
 
     assert provider["name"] == "Home tunnel"
     assert provider["kind"] == "custom"
-    assert provider["server"] == "vpn.example.test:51820"
+    assert provider["server"] == "Unknown"
+    assert provider["servers"] == ["wireguard"]
     assert copied.read_text() == WIREGUARD
     assert stat.S_IMODE(copied.stat().st_mode) == 0o600
     assert TEST_PRIVATE_KEY not in config_text
@@ -327,3 +328,38 @@ def test_failed_multi_file_save_preserves_config_store_and_key(tmp_path, monkeyp
     with pytest.raises(OSError):
         manager.save_provider(root, {"name": "Updated", "kind": "wireguard"}, provider["id"], str(source))
     assert {path: path.read_bytes() for path in paths} == before
+
+
+def test_server_inventory_discovers_all_files_and_keeps_preference_separate(tmp_path):
+    config_at(tmp_path, {"proton": {"directory": "providers/proton"},
+                         "warp": {"socks5": {"server": "127.0.0.1", "port": 2181}}})
+    directory = tmp_path / "providers/proton"
+    directory.mkdir(parents=True)
+    for index in range(23):
+        (directory / f"server-{index:02}.conf").write_text(WIREGUARD)
+    (tmp_path / "state").mkdir()
+    active = tmp_path / "state/proton.active"
+    active.write_text("server-00")
+    provider = next(p for p in manager.state(tmp_path)["providers"] if p["id"] == "proton")
+    assert len(provider["servers"]) == 23
+    assert provider["server"] == "server-00"
+    assert provider["preferredServer"] is None
+    result = manager.save_server_preference(tmp_path, "proton", "server-22")
+    provider = next(p for p in result["providers"] if p["id"] == "proton")
+    assert provider["preferredServer"] == "server-22"
+    assert active.read_text() == "server-00"
+    warp = next(p for p in result["providers"] if p["id"] == "warp")
+    assert warp["servers"] == []
+    assert not warp["capabilities"]["serverSelection"]
+    assert TEST_PRIVATE_KEY not in json.dumps(result)
+    manager.save_server_preference(tmp_path, "proton", None)
+    assert next(p for p in manager.state(tmp_path)["providers"] if p["id"] == "proton")["preferredServer"] is None
+
+
+def test_preference_rejects_unknown_removed_and_proxy_servers_without_writing(tmp_path):
+    config_at(tmp_path, {"proton": {"directory": "providers/proton"},
+                         "warp": {"socks5": {"server": "127.0.0.1", "port": 2181}}})
+    for provider, server in [("proton", "../private"), ("warp", "Automatic"), ("missing", "anything")]:
+        with pytest.raises(manager.DashboardError):
+            manager.save_server_preference(tmp_path, provider, server)
+    assert not (tmp_path / "state" / manager.STORE_NAME).exists()
