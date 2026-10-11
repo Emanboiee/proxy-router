@@ -363,3 +363,24 @@ def test_preference_rejects_unknown_removed_and_proxy_servers_without_writing(tm
         with pytest.raises(manager.DashboardError):
             manager.save_server_preference(tmp_path, provider, server)
     assert not (tmp_path / "state" / manager.STORE_NAME).exists()
+
+
+def test_socks_provider_round_trip_and_invalid_endpoint_rollback(tmp_path):
+    config_at(tmp_path)
+    state = manager.save_provider(tmp_path, {"name": "WARP", "kind": "warp",
+                                            "host": "127.0.0.1", "port": 2181})
+    provider = state["providers"][0]
+    assert provider["id"] == "cloudflare"
+    assert provider["kind"] == "warp"
+    assert provider["connection"] == {"kind": "socks5", "host": "127.0.0.1", "port": 2181}
+    assert provider["servers"] == []
+    before = (tmp_path / "router.json").read_bytes()
+    for host, port in [("https://localhost", 2181), ("127.0.0.1", 2080),
+                       ("localhost", True), ("localhost", 65536)]:
+        with pytest.raises(manager.DashboardError):
+            manager.save_provider(tmp_path, {"name": "WARP", "kind": "warp",
+                                            "host": host, "port": port}, provider["id"])
+        assert (tmp_path / "router.json").read_bytes() == before
+    state = manager.save_provider(tmp_path, {"name": "WARP", "kind": "warp",
+                                            "host": "::1", "port": 40000}, provider["id"])
+    assert state["providers"][0]["connection"]["host"] == "::1"

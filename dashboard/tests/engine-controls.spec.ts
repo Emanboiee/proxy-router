@@ -517,3 +517,52 @@ test('desktop Settings shows engine values and switches routing mode', async ({ 
     .map(entry => (entry.payload as { mode: string }).mode));
   expect(modes).toContain('vpn-list');
 });
+
+
+test('mixed preset editor shows route connections and missing WARP without a false single-provider selector', async ({ page }) => {
+  await page.addInitScript(desktopMock);
+  await page.addInitScript(() => {
+    const state = window as unknown as { __dashboard: { profiles: unknown[]; providers: unknown[] } };
+    state.__dashboard.profiles = [{
+      id: 'preset-school', name: 'School mixed', description: 'Saved preset',
+      presetName: 'school', providerId: 'cloudflare', routeMode: 'selective',
+      domains: ['discord.com', 'opencode.ai'], autoSubdomains: true, fallback: 'direct', updatedAt: 0,
+      presetRoutes: [
+        { id: 'school', providerId: 'cloudflare', domains: ['discord.com'], available: false },
+        { id: 'opencode', providerId: 'proton', domains: ['opencode.ai'], available: true },
+      ],
+    }];
+  });
+  await page.goto('/#profiles');
+  await page.getByRole('button', { name: 'Edit', exact: true }).click();
+  const dialog = page.locator('#profile-dialog');
+  await expect(dialog.getByRole('row', { name: 'school cloudflare · Not configured discord.com' })).toBeVisible();
+  await expect(dialog.getByRole('row', { name: 'opencode proton opencode.ai' })).toBeVisible();
+  await expect(dialog.locator('[name="providerId"]')).toHaveCount(0);
+  await expect(dialog).toContainText('Missing connections: cloudflare');
+  await dialog.locator('[name="description"]').fill('Mixed connections');
+  await dialog.getByRole('button', { name: 'Save changes' }).click();
+  const calls = await page.evaluate(() => (window as unknown as { __invoke: { command: string; payload?: unknown }[] }).__invoke);
+  expect(calls.filter(call => call.command === 'save_dashboard_profile').at(-1)?.payload).toMatchObject({
+    profileId: 'preset-school', profile: { providerId: 'cloudflare', description: 'Mixed connections' },
+  });
+});
+
+test('desktop adds WARP proxy using its configured port without requiring a WireGuard file', async ({ page }) => {
+  await page.addInitScript(desktopMock);
+  await page.goto('/#providers');
+  await page.getByRole('button', { name: 'Add provider', exact: true }).click();
+  const dialog = page.locator('#provider-dialog');
+  await dialog.locator('[name="name"]').fill('Cloudflare WARP');
+  await dialog.locator('[name="kind"]').selectOption('warp');
+  await expect(dialog.locator('[data-provider-fields="config"]')).not.toBeVisible();
+  await expect(dialog.locator('[name="socksHost"]')).toBeVisible();
+  await dialog.locator('[name="socksPort"]').fill('2181');
+  await dialog.getByRole('button', { name: 'Add provider', exact: true }).click();
+  await expect(dialog).not.toBeVisible();
+  const calls = await page.evaluate(() => (window as unknown as { __invoke: { command: string; payload?: unknown }[] }).__invoke);
+  expect(calls.filter(call => call.command === 'save_dashboard_provider').at(-1)?.payload).toMatchObject({
+    provider: { name: 'Cloudflare WARP', kind: 'warp', host: '127.0.0.1', port: 2181 }, sourcePath: null,
+  });
+  expect(calls.some(call => call.command === 'run_router_action')).toBe(false);
+});
