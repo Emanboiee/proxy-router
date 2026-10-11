@@ -647,3 +647,11 @@ button.primary:active,
 .server-inventory-scroll th,.server-inventory-scroll td{padding:var(--s3);text-align:left;border-bottom:var(--border)}
 .server-inventory-scroll th{position:sticky;top:0;background:var(--surface);z-index:1}
 @media(max-width:650px){.server-preference-row{flex-wrap:wrap}.server-preference-row select{flex-basis:100%}.server-preference-row button{width:100%}}
+
+/* Mixed presets keep each route's connection visible without flattening rules. */
+.preset-route-scroll { overflow-x: auto; }
+.preset-route-table { width: 100%; border-collapse: collapse; font-size: var(--text-sm); text-align: left; }
+.preset-route-table caption { text-align: left; color: var(--muted); padding: var(--space-2) 0; }
+.preset-route-table th, .preset-route-table td { padding: var(--space-2); vertical-align: top; border-bottom: var(--border); }
+.preset-route-table td:last-child { overflow-wrap: anywhere; }
+.preset-route-table thead th { color: var(--muted); }

@@ -84,3 +84,34 @@ def test_removing_inactive_preset_keeps_original_file_and_hides_it_on_refresh(tm
     assert manager.state(tmp_path) == state
     with pytest.raises(manager.DashboardError, match="Choose another"):
         manager.delete_profile(tmp_path, "preset-opencode-only")
+
+
+def test_mixed_preset_keeps_missing_cloudflare_routes_and_metadata_edit(tmp_path):
+    write_config(tmp_path)
+    routes = [
+        {"id": "school", "provider": "cloudflare", "domains": ["discord.com"]},
+        {"id": "opencode", "provider": "proton", "domains": ["opencode.ai"]},
+    ]
+    (tmp_path / "presets/school.json").write_text(json.dumps({
+        "routes": routes,
+        "routing": {"mode": "vpn-list", "vpn_domains": ["discord.com", "opencode.ai"]},
+    }))
+    school = next(p for p in manager.state(tmp_path)["profiles"] if p["id"] == "preset-school")
+    assert school["providerId"] == "cloudflare"
+    assert school["presetRoutes"] == [
+        {"id": "school", "providerId": "cloudflare", "domains": ["discord.com"], "available": False},
+        {"id": "opencode", "providerId": "proton", "domains": ["opencode.ai"], "available": True},
+    ]
+    manager.save_profile(tmp_path, {**school, "name": "School access"}, school["id"])
+    before = (tmp_path / "router.json").read_bytes()
+    with pytest.raises(manager.DashboardError):
+        manager.apply_profile(tmp_path, school["id"])
+    assert (tmp_path / "router.json").read_bytes() == before
+    manager.save_provider(tmp_path, {"name": "Cloudflare WARP", "kind": "warp",
+                                     "host": "127.0.0.1", "port": 2181})
+    state = manager.apply_profile(tmp_path, school["id"])
+    school = next(p for p in state["profiles"] if p["id"] == "preset-school")
+    assert school["name"] == "School access"
+    assert all(route["available"] for route in school["presetRoutes"])
+    assert json.loads((tmp_path / "router.json").read_text())["routes"] == routes
+    assert not (tmp_path / "sing-box.json").exists()
