@@ -582,6 +582,14 @@ test('generic command provider saves command and port without executing on save'
   const dialog = page.locator('#provider-dialog');
   await dialog.locator('[name="name"]').fill('My proxy');
   await dialog.locator('[name="kind"]').selectOption('socks5');
+  await expect(dialog.locator('[name="startupCommand"]')).not.toBeVisible();
+  await dialog.locator('[name="startupMode"]').selectOption('command');
+  await expect(dialog.locator('[name="startupCommand"]')).toBeVisible();
+  const help = await dialog.locator('#startup-help').boundingBox();
+  const endpointHelp = await dialog.locator('#proxy-help').boundingBox();
+  expect(help && endpointHelp && help.y + help.height <= endpointHelp.y).toBeTruthy();
+  await dialog.locator('[name="startupMode"]').selectOption('external');
+  await expect(dialog.locator('[name="startupCommand"]')).not.toBeVisible();
   await dialog.locator('[name="startupMode"]').selectOption('command');
   await dialog.locator('[name="startupCommand"]').fill('my-proxy --listen 127.0.0.1:9000');
   await dialog.locator('[name="socksPort"]').fill('9000');
