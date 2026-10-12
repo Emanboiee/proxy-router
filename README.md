@@ -1041,3 +1041,28 @@ preferences, and routing. Re-importing identical content adds no duplicate.
 Different configs with the same filename receive a suffix rather than
 overwriting an existing server. Saving an import does not connect or switch
 the engine. Legacy Custom VPN entries are displayed as WireGuard.
+
+### Wi-Fi mappings and network-loss protection
+
+Connectivity remembers up to five distinct Wi-Fi networks after their names
+become readable. Show names reveals them for this app session. macOS requires
+Location Services authorization to read an SSID; Proxy Router requests it only
+when you click Show names. Hidden or redacted names are never mapping keys.
+
+Choose a saved profile for each current or recent network, then enable Wi-Fi
+auto-switch. These mappings use the same profile application path as Profiles,
+including mixed WARP and WireGuard routes. A network check never starts a stopped
+router. Existing SSID-to-preset mappings remain supported.
+
+Network-loss protection is enabled by default and independent of auto-switch.
+The built-in network guard starts with Connect, waits for two lost-link readings,
+disables the owned proxy and stops the engine, then stays alive to reconnect after
+two connected readings. It applies a readable network's mapping before reconnect.
+Manual Disconnect stays off. Probe failures and missing permissions never count
+as link loss; unsupported platforms leave the connection alone. macOS discovers
+Wi-Fi interfaces, Windows checks physical adapters, and Linux uses NetworkManager
+when available. This protects against lost links, not every upstream outage.
+
+Network history and the disconnect setting are local private files in state/.
+CLI: `network-preset disconnect --state on|off` changes protection;
+`network-preset set --ssid NAME --preset profile:ID` maps a saved profile.

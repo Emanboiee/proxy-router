@@ -4,7 +4,7 @@ import './style.css';
 import { LocalController, manageDashboardServer, saveServerPreference, switchDashboardServer, applyEngineAction, applyDashboardProfile, deleteDashboardProfile, deleteDashboardProvider, getCachedLiveStatus, getDashboardState, getLiveStatus, getPreviewStatus, reportPreviewFrame, saveDashboardProfile, saveDashboardProvider, setTrayStatus, states, type Accent, type Connection, type DashboardState, type Density, type FallbackMode, type LayoutPreset, type MotionSpeed, type PreviewState, type Profile, type Provider, type ProviderKind, type RouteMode, type Scheme, type Snapshot, type Status, type TailscaleMode } from './controller';
 import { open as openNativeFile } from '@tauri-apps/plugin-dialog';
 import { isTauri } from '@tauri-apps/api/core';
-import { addRoute, applyPreset, getConfig, getNetwork, getRouting, presetChoices, removeNetworkPreset, removeRoute, runNetworkAction, setNetworkAuto, setNetworkPreset, setRoutingMode, type EngineConfig, type NetworkPresetState, type RoutingState } from './controller';
+import { addRoute, applyPreset, getConfig, getNetwork, revealNetwork, setNetworkDisconnect, getRouting, presetChoices, removeNetworkPreset, removeRoute, runNetworkAction, setNetworkAuto, setNetworkPreset, setRoutingMode, type EngineConfig, type NetworkPresetState, type RoutingState } from './controller';
 
 const pages = ['Home', 'Profiles', 'Providers', 'Connectivity', 'Settings', 'Appearance', 'About'] as const;
 type Page = typeof pages[number];
@@ -26,6 +26,8 @@ let profileReturnFocus: { action: 'new-profile' } | { action: 'edit-profile'; id
 let providerReturnFocusContext: 'providers' | 'profile' | undefined;
 let requestGeneration = 0;
 let busy = false;
+let networkNamesVisible = false;
+let networkIdentityNotice = '';
 let actionQueue: Promise<void> = Promise.resolve();
 let lastTrayState: PreviewState | undefined;
 let engineConfig: EngineConfig | null = null;
@@ -381,12 +383,23 @@ function liveConnectivityPage(): string {
   const mapped = net?.mapped_preset ?? null;
   const auto = net?.auto ?? false;
   const last = (net?.last_applied ?? {}) as Record<string, unknown>;
-  const options = presetChoices.map(
-    name => `<option value="${esc(name)}" ${mapped === name ? 'selected' : ''}>${esc(name)}</option>`
+  const choices = snapshot.profiles.map(p => ({value: `profile:${p.id}`, label: p.name}));
+  for (const name of Object.values(net?.presets ?? {})) {
+    if (!choices.some(p => p.value === name)) choices.push({value: name, label: name.startsWith('profile:') ? 'Unavailable saved profile' : name});
+  }
+  if (!choices.length) choices.push(...presetChoices.map(name => ({value: name, label: name})));
+  const select = (value: string | null) => '<option value="">Keep current profile</option>' + choices.map(
+    item => `<option value="${esc(item.value)}" ${value === item.value ? 'selected' : ''}>${esc(item.label)}</option>`
   ).join('');
+  const options = select(mapped);
+  const label = (name: string) => networkNamesVisible ? esc(name) : 'Hidden network';
   const detected = ssid
-    ? `Detected <strong>${esc(ssid)}</strong>${mapped ? ` — uses <strong>${esc(mapped)}</strong>` : ' — no preset mapped'}`
-    : 'No Wi-Fi network detected';
+    ? `Connected to <strong>${label(ssid)}</strong>${mapped ? ` — uses <strong>${esc(mapped)}</strong>` : ' — keeps the current profile'}`
+    : net?.connected ? 'Connected — Wi-Fi name is unavailable' : 'No Wi-Fi connection';
+  const recent = (net?.recent ?? []).map((entry, index) => {
+    const mapped = net?.presets[entry.ssid] ?? null;
+    return `<li class="network-history-row"><div><strong>${label(entry.ssid)}</strong><small class="muted">${entry.ssid === ssid ? 'Connected now' : 'Previously connected'}</small></div><label class="sr-only" for="recent-network-${index}">Profile for recent network ${index + 1}</label><select id="recent-network-${index}" data-network-index="${index}">${select(mapped)}</select>${button('Save', 'network-map', 'quiet', `data-network-index="${index}"`)}</li>`;
+  }).join('');
 
   const routes = Array.isArray(engineConfig?.routes) ? engineConfig!.routes! : [];
   const routeRows = routes.map(route => {
@@ -409,10 +422,13 @@ function liveConnectivityPage(): string {
     : '';
 
   return `<section class="page-section"><div class="section-heading"><div><h1 tabindex="-1">Connectivity</h1><p class="lead">The Wi-Fi network you are on, the preset it maps to, and the routes the engine is serving right now.</p></div><div class="section-actions">${button('Check network', 'network-check', 'primary')}${button('Reconnect', 'network-reconnect', 'quiet')}</div></div>
-<article class="panel" id="network-panel"><div class="panel-heading"><div><span class="label">Network detection</span><h2>This Wi-Fi network</h2></div><span class="badge">${auto ? 'Auto-switch on' : 'Auto-switch off'}</span></div><p>${detected}</p>${laneNote}
-<div class="provider-controls"><label for="network-preset-select">Preset for this network</label><select id="network-preset-select">${options}</select>${button('Save mapping', 'network-map', 'primary')}${mapped ? button('Remove mapping', 'network-remove-mapping', 'quiet') : ''}</div>
-<div class="card-actions">${auto ? button('Turn auto-switch off', 'network-auto', 'quiet', 'data-network-state="off"') : button('Turn auto-switch on', 'network-auto', 'quiet', 'data-network-state="on"')}${button('Disconnect until Wi-Fi returns', 'network-disconnect', 'quiet danger-text')}</div>
-<p class="muted">Last applied: ${esc(String(last.preset ?? 'never'))}${last.ssid ? ` on ${esc(String(last.ssid))}` : ''}</p></article>
+<article class="panel" id="network-panel"><div class="panel-heading"><div><span class="label">Network detection</span><h2>This Wi-Fi network</h2></div><span class="badge">${auto ? 'Auto-switch on' : 'Auto-switch off'}</span></div><p>${detected} ${button(networkNamesVisible ? 'Hide names' : 'Show names', 'network-reveal', 'quiet', `aria-pressed="${networkNamesVisible}"`)}</p>${networkIdentityNotice ? `<p role="status" class="muted">${esc(networkIdentityNotice)}</p>` : ''}${laneNote}
+${ssid ? `<div class="provider-controls"><label for="network-preset-select">Profile for this network</label><select id="network-preset-select">${options}</select>${button('Save mapping', 'network-map', 'primary')}${mapped ? button('Remove mapping', 'network-remove-mapping', 'quiet') : ''}</div>` : '<p class="muted">Show names to allow Wi-Fi access. You can map networks once their names are readable.</p>'}
+<div class="card-actions">${auto ? button('Turn auto-switch off', 'network-auto', 'quiet', 'data-network-state="off"') : button('Turn auto-switch on', 'network-auto', 'quiet', 'data-network-state="on"')}</div>
+<label class="setting-row"><span><strong>Disconnect when the network is lost</strong><small>Pause the router after two failed link checks; reconnect when the network returns. Manual disconnect stays off.</small></span><input type="checkbox" data-network-disconnect ${net?.disconnect_on_loss !== false ? 'checked' : ''}></label>
+<p class="muted">Wi-Fi auto-switch chooses a mapped profile. Network-loss protection works independently.</p>
+<h3>Last five connected networks</h3><ul class="route-list">${recent || '<li class="muted">Readable Wi-Fi names will appear here as you connect. No nearby networks are scanned.</li>'}</ul>
+<p class="muted">Last applied: ${esc(String(last.preset ?? 'never'))}</p></article>
 <div class="two-column"><article class="panel"><h2>Routes</h2><ul class="route-list" id="engine-routes">${routeRows}</ul></article><article class="panel"><h2>Providers</h2><ul class="route-list" id="engine-providers">${providerRows}</ul></article></div></section>`;
 }
 
@@ -452,7 +468,7 @@ function liveSettingsPage(): string {
   return `<section class="page-section"><div class="section-heading"><div><h1 tabindex="-1">Settings</h1><p class="lead">Values the engine is actually running with.</p></div><span class="badge">from router.json</span></div>
 <article class="panel"><h2>Routing mode</h2><div class="card-actions">${modes}</div><p class="muted">Current mode: <strong>${esc(String(mode))}</strong></p></article>
 <article class="panel"><h2>Engine</h2><ul class="route-list">${row('Proxy port', engineConfig?.port)}${row('Preset', engineConfig?.preset)}${row('VPN default mode', vpn.default_mode)}${row('Capture', vpn.capture)}${row('MTU', vpn.mtu)}${row('DNS transport', vpn.dns_transport)}</ul></article>
-<article class="panel"><h2>Network detection</h2><ul class="route-list">${row('Auto-switch on Wi-Fi change', net?.auto === true ? 'on' : 'off')}${row('Mapped networks', Object.keys(net?.presets ?? {}).length)}${row('Current network', net?.ssid ?? 'none')}</ul><div class="card-actions">${net?.auto ? button('Turn auto-switch off', 'network-auto', 'quiet', 'data-network-state="off"') : button('Turn auto-switch on', 'network-auto', 'quiet', 'data-network-state="on"')}<a class="text-link" href="#connectivity">Map a network <span aria-hidden="true">↗</span></a></div></article>
+<article class="panel"><h2>Network detection</h2><ul class="route-list">${row('Auto-switch on Wi-Fi change', net?.auto === true ? 'on' : 'off')}${row('Mapped networks', Object.keys(net?.presets ?? {}).length)}${row('Current network', net?.ssid ? (networkNamesVisible ? net.ssid : 'hidden') : 'unavailable')}</ul><div class="card-actions">${net?.auto ? button('Turn auto-switch off', 'network-auto', 'quiet', 'data-network-state="off"') : button('Turn auto-switch on', 'network-auto', 'quiet', 'data-network-state="on"')}<a class="text-link" href="#connectivity">Map a network <span aria-hidden="true">↗</span></a></div></article>
 <article class="panel"><h2>Rotation & keepalive</h2><ul class="route-list">${row('Rotate every (s)', (engineConfig?.rotation as Record<string, unknown> | undefined)?.interval_seconds)}${row('Rotation jitter (s)', (engineConfig?.rotation as Record<string, unknown> | undefined)?.jitter_seconds)}${row('Keepalive enabled', (engineConfig?.keepalive as Record<string, unknown> | undefined)?.enabled)}${row('Keepalive interval (s)', (engineConfig?.keepalive as Record<string, unknown> | undefined)?.interval)}</ul></article></section>`;
 }
 
@@ -822,7 +838,8 @@ app.addEventListener('click', event => {
   else if (action === 'refresh-health') void perform(() => controller.refreshHealth());
   else if (action === 'network-check' || action === 'network-reconnect' || action === 'network-disconnect') void networkAction(action);
   else if (action === 'network-auto') void networkAuto(target.dataset.networkState === 'on');
-  else if (action === 'network-map') void networkMap();
+  else if (action === 'network-map') void networkMap(target.dataset.networkIndex);
+  else if (action === 'network-reveal') void toggleNetworkNames();
   else if (action === 'preset-apply' && target.dataset.preset) void applyPresetAction(target.dataset.preset);
   else if (action === 'routing-mode' && target.dataset.mode) void routingModeAction(target.dataset.mode);
   else if (action === 'route-add') void routeAddAction();
@@ -910,6 +927,7 @@ app.addEventListener('change', event => {
   else if (target.hasAttribute('data-theme-motion')) void perform(() => controller.updateTheme({ reducedMotion: (target as HTMLInputElement).checked }));
   else if (target.hasAttribute('data-theme-speed')) void perform(() => controller.updateTheme({ motionSpeed: target.value as MotionSpeed }));
   else if (target.hasAttribute('data-tailscale-mode')) void perform(() => controller.updateTailscale({ mode: target.value as TailscaleMode }));
+  else if (target.hasAttribute('data-network-disconnect')) void changeNetworkDisconnect((target as HTMLInputElement).checked);
   else if (target.dataset.setting) { const key = target.dataset.setting as 'launchAtLogin' | 'closeToTray' | 'disconnectOnNetworkLoss' | 'autoSwitch' | 'fullTunnel'; void perform(() => controller.updateSettings({ [key]: (target as HTMLInputElement).checked })); }
   else if (target.dataset.settingNumber) { const key = target.dataset.settingNumber as 'proxyPort'; void perform(() => controller.updateSettings({ [key]: Number(target.value) })); }
   else if (target.dataset.settingSelect) { const key = target.dataset.settingSelect as 'switchAfterErrors' | 'logLevel'; const value = key === 'logLevel' ? target.value as 'normal' | 'verbose' : Number(target.value); void perform(() => controller.updateSettings({ [key]: value } as Partial<Snapshot['settings']>)); }
@@ -1002,6 +1020,25 @@ async function networkAction(action: 'network-check' | 'network-reconnect' | 'ne
   render();
 }
 
+async function toggleNetworkNames(): Promise<void> {
+  if (networkNamesVisible) { networkNamesVisible = false; render(); return; }
+  try {
+    networkState = (await revealNetwork()).presets;
+    networkNamesVisible = true;
+    networkIdentityNotice = networkState.ssid ? '' : networkState.identity === 'permission' ? 'Allow Proxy Router in System Settings → Privacy & Security → Location Services, then check the network again. macOS requires this permission to read Wi-Fi names.' : 'The network name is unavailable. Connect to Wi-Fi and check the network again.';
+  } catch (error) {
+    networkIdentityNotice = error instanceof Error ? error.message : 'Could not read Wi-Fi names. Try again.';
+  }
+  render();
+}
+async function changeNetworkDisconnect(enabled: boolean): Promise<void> {
+  try {
+    networkState = await setNetworkDisconnect(enabled ? 'on' : 'off');
+    announce(enabled ? 'Network-loss protection on' : 'Network-loss protection off');
+  } catch (error) { announce(error instanceof Error ? error.message : 'Could not save network-loss protection'); }
+  render();
+}
+
 async function networkAuto(on: boolean): Promise<void> {
   try {
     networkState = await setNetworkAuto(on ? 'on' : 'off');
@@ -1012,14 +1049,14 @@ async function networkAuto(on: boolean): Promise<void> {
   render();
 }
 
-async function networkMap(): Promise<void> {
-  const ssid = networkState?.ssid;
-  const preset = document.querySelector<HTMLSelectElement>('#network-preset-select')?.value;
+async function networkMap(index?: string): Promise<void> {
+  const ssid = index === undefined ? networkState?.ssid : networkState?.recent?.[Number(index)]?.ssid;
+  const preset = document.querySelector<HTMLSelectElement>(index === undefined ? '#network-preset-select' : `#recent-network-${Number(index)}`)?.value;
   if (!ssid) { announce('No Wi-Fi network detected'); return; }
-  if (!preset) { announce('Pick a preset first'); return; }
+  if (preset === undefined) return;
   try {
-    networkState = await setNetworkPreset(ssid, preset);
-    announce(`Saved: ${ssid} → ${preset}`);
+    networkState = preset ? await setNetworkPreset(ssid, preset) : await removeNetworkPreset(ssid);
+    announce(preset ? 'Network mapping saved' : 'Network will keep the current profile');
   } catch (error) {
     announce(error instanceof Error ? error.message : 'Could not save the mapping');
   }
@@ -1031,7 +1068,7 @@ async function networkRemoveMapping(): Promise<void> {
   if (!ssid) { announce('No Wi-Fi network detected'); return; }
   try {
     networkState = await removeNetworkPreset(ssid);
-    announce(`Removed mapping for ${ssid}`);
+    announce('Network mapping removed');
   } catch (error) {
     announce(error instanceof Error ? error.message : 'Could not remove the mapping');
   }
