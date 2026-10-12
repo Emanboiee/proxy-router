@@ -689,3 +689,17 @@ input[type="number"]::-webkit-inner-spin-button,
 input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
 
 .web-select-error:empty { display: none; }
+
+/* Keep modal surfaces in one WKWebView paint layer; animated translucent
+   backdrops can leave the form invisible while accessibility still sees it. */
+dialog#provider-dialog::backdrop, dialog#profile-dialog::backdrop {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  animation: none;
+}
+dialog#provider-dialog[open] .provider-editor,
+dialog#profile-dialog[open] .profile-editor {
+  animation: none;
+  opacity: 1;
+  transform: none;
+}
