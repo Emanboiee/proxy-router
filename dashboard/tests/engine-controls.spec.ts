@@ -564,11 +564,33 @@ test('desktop adds WARP proxy using its configured port without requiring a Wire
   await expect(dialog.locator('[data-provider-fields="config"]')).not.toBeVisible();
   await expect(dialog.locator('[name="socksHost"]')).toBeVisible();
   await dialog.locator('[name="socksPort"]').fill('2181');
+  await dialog.locator('[name="startupMode"]').selectOption('warp');
   await dialog.getByRole('button', { name: 'Add provider', exact: true }).click();
   await expect(dialog).not.toBeVisible();
   const calls = await page.evaluate(() => (window as unknown as { __invoke: { command: string; payload?: unknown }[] }).__invoke);
   expect(calls.filter(call => call.command === 'save_dashboard_provider').at(-1)?.payload).toMatchObject({
-    provider: { name: 'Cloudflare WARP', kind: 'warp', host: '127.0.0.1', port: 2181 }, sourcePath: null,
+    provider: { name: 'Cloudflare WARP', kind: 'warp', host: '127.0.0.1', port: 2181, startup: { mode: 'warp' } }, sourcePath: null,
+  });
+  expect(calls.some(call => call.command === 'run_router_action')).toBe(false);
+});
+
+
+test('generic command provider saves command and port without executing on save', async ({ page }) => {
+  await page.addInitScript(desktopMock);
+  await page.goto('/#providers');
+  await page.getByRole('button', { name: 'Add provider', exact: true }).click();
+  const dialog = page.locator('#provider-dialog');
+  await dialog.locator('[name="name"]').fill('My proxy');
+  await dialog.locator('[name="kind"]').selectOption('socks5');
+  await dialog.locator('[name="startupMode"]').selectOption('command');
+  await dialog.locator('[name="startupCommand"]').fill('my-proxy --listen 127.0.0.1:9000');
+  await dialog.locator('[name="socksPort"]').fill('9000');
+  await dialog.getByRole('button', { name: 'Add provider', exact: true }).click();
+  await expect(dialog).not.toBeVisible();
+  const calls = await page.evaluate(() => (window as unknown as { __invoke: { command: string; payload?: unknown }[] }).__invoke);
+  expect(calls.filter(call => call.command === 'save_dashboard_provider').at(-1)?.payload).toMatchObject({
+    provider: { name: 'My proxy', kind: 'socks5', host: '127.0.0.1', port: 9000,
+      startup: { mode: 'command', command: 'my-proxy --listen 127.0.0.1:9000' } },
   });
   expect(calls.some(call => call.command === 'run_router_action')).toBe(false);
 });

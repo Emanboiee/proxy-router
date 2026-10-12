@@ -2214,6 +2214,15 @@ def check_egress_live(name: str, profile: Path, *, port: int | None = None,
     ``dns_ok`` when determined) and reputation-block reasons still raise a
     blocked marker, exactly like probe_profile.
     """
+    if is_proxy_provider(name) and SING_BOX_CONFIG.is_file() and engine_alive():
+        import provider_lifecycle
+        try:
+            configured = json.loads(SING_BOX_CONFIG.read_text())
+            if name in provider_lifecycle.referenced_providers(configured):
+                host, upstream_port = proxy_upstream(name)
+                provider_lifecycle.ensure(ROOT, name, host, upstream_port)
+        except (OSError, ValueError, TimeoutError) as exc:
+            return "dead", {"detail": f"provider startup failed: {exc}", "dns_ok": None}
     url = url or probe_url_for(name)
     if url is None:
         return "alive", None
@@ -3960,6 +3969,14 @@ def trim_live_log_if_needed() -> None:
         pass
 
 
+def ensure_managed_proxy_providers(config: dict) -> None:
+    import provider_lifecycle
+    for name in provider_lifecycle.referenced_providers(config):
+        if is_proxy_provider(name):
+            host, port = proxy_upstream(name)
+            provider_lifecycle.ensure(ROOT, name, host, port)
+
+
 def engine_start(use_existing_config: bool = False, *, recover: bool = True) -> int:
     sing_box = resolve_sing_box()
     if sing_box is None:
@@ -4000,6 +4017,10 @@ def engine_start(use_existing_config: bool = False, *, recover: bool = True) -> 
                 print("router: generated config failed validation; restoring last-good", file=sys.stderr)
                 return restore_last_good()
             return fail("sing-box config check failed")
+    try:
+        ensure_managed_proxy_providers(json.loads(SING_BOX_CONFIG.read_text()) if use_existing_config else config)
+    except (OSError, ValueError, TimeoutError) as exc:
+        return fail(f"provider startup failed: {exc}")
     try:
         prepare_log_directory()
     except OSError as exc:
@@ -4860,6 +4881,10 @@ def engine_reload(active_overrides: dict[str, Path] | None = None) -> int:
         # not leave the proxy dead while a known-good config exists).
         print("router: new sing-box config failed validation; restoring last-good", file=sys.stderr)
         return _rejected_change_after_restore(restore_last_good())
+    try:
+        ensure_managed_proxy_providers(config)
+    except (OSError, ValueError, TimeoutError) as exc:
+        return fail(f"provider startup failed: {exc}")
     if sys.platform == "darwin" and _effective_uid() != 0:
         helper = _helper_status()
         if helper and helper.get("installed") and helper.get("running"):
