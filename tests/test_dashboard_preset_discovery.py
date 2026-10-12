@@ -180,3 +180,17 @@ def test_removing_route_removes_only_its_autodetect_source(tmp_path):
     actual = json.loads((tmp_path / "router.json").read_text())
     assert actual["autodetect"]["sources"] == {}
     assert actual["routes"][0]["id"] == "replacement"
+
+
+def test_full_routing_default_connection_can_change_without_route_edits(tmp_path):
+    config = write_config(tmp_path)
+    config["providers"]["second"] = {"directory": "providers/second"}
+    (tmp_path / "router.json").write_text(json.dumps(config))
+    profile = manager.state(tmp_path)["profiles"][0]
+    profile["routeMode"] = "full"
+    manager.save_profile(tmp_path, profile, profile["id"])
+    profile = next(p for p in manager.state(tmp_path)["profiles"] if p["id"] == profile["id"])
+    profile["providerId"] = "second"
+    manager.save_profile(tmp_path, profile, profile["id"])
+    manager.apply_profile(tmp_path, profile["id"])
+    assert json.loads((tmp_path / "router.json").read_text())["routing"]["default_provider"] == "second"

@@ -610,10 +610,14 @@ def _save_profile(root: Path, value: Any, profile_id: str | None = None) -> dict
     if "routeRules" in value:
         if snapshot is None:
             snapshot = {"routes": [], "routing": {"mode": "default"}}
-        if value["routeRules"] != _editable_routes(snapshot["routes"], snapshot.get("routing")) or profile["routeMode"] != (old or {}).get("routeMode"):
+        if value["routeRules"] != _editable_routes(snapshot["routes"], snapshot.get("routing")) or profile["routeMode"] != (old or {}).get("routeMode") or (profile["routeMode"] == "full" and profile["providerId"] != (old or {}).get("providerId")):
             snapshot = _edit_route_snapshot(root, config, snapshot, value["routeRules"], profile["routeMode"], profile["providerId"])
         profile["_route_snapshot"] = snapshot
         profile["routeRules"] = _editable_routes(snapshot["routes"], snapshot.get("routing"))
+        if profile["routeMode"] == "selective":
+            routing = snapshot.get("routing") or {}
+            profile["domains"] = (routing.get("vpn_domains", []) if routing.get("mode") == "vpn-list" else
+                                  list(dict.fromkeys(d for route in snapshot["routes"] for d in route.get("domains", []))))
     elif snapshot is not None:
         fields = ("providerId", "fallbackProviderId", "routeMode", "domains", "autoSubdomains", "fallback")
         if any(profile.get(field) != old.get(field) for field in fields):
