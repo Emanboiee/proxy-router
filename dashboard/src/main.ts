@@ -393,8 +393,9 @@ function liveConnectivityPage(): string {
   ).join('');
   const options = select(mapped);
   const label = (name: string) => networkNamesVisible ? esc(name) : 'Hidden network';
-  const detected = ssid
-    ? `Connected to <strong>${label(ssid)}</strong>${mapped ? ` — uses <strong>${esc(mapped)}</strong>` : ' — keeps the current profile'}`
+  const mappedLabel = choices.find(choice => choice.value === mapped)?.label ?? mapped;
+  const detected = !net ? 'Checking the network…' : ssid
+    ? `Connected to <strong>${label(ssid)}</strong>${mapped ? ` — uses <strong>${esc(mappedLabel ?? mapped)}</strong>` : ' — keeps the current profile'}`
     : net?.connected ? 'Connected — Wi-Fi name is unavailable' : 'No Wi-Fi connection';
   const recent = (net?.recent ?? []).map((entry, index) => {
     const mapped = net?.presets[entry.ssid] ?? null;

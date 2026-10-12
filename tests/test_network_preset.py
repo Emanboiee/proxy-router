@@ -65,6 +65,8 @@ def test_current_ssid_skips_failed_interface(tmp_path):
     def _run(cmd, **kwargs):
         if cmd[0] == "networksetup":
             return _FakeComplete(stdout="Hardware Port: Wi-Fi\nDevice: en0\nHardware Port: Wi-Fi\nDevice: en1\n")
+        if cmd[0] == "ifconfig":
+            return _FakeComplete(stdout="", returncode=1)
         if cmd[2] == "en0":
             return _FakeComplete(stdout="", returncode=1)
         return _FakeComplete(stdout="  SSID : OtherNet\n")

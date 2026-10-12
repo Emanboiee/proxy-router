@@ -270,3 +270,18 @@ def test_exception_during_mapping_restores_exact_original_bytes(tmp_path):
         net.apply_mapping(router, tmp_path)
     assert path.read_bytes() == before
     assert (tmp_path / "state/dashboard_profiles.json").read_bytes() == before_store
+
+
+def test_wifi_off_can_be_confirmed_without_ipconfig_summary(tmp_path):
+    def run(args, **kwargs):
+        if args[0] == "networksetup":
+            return SimpleNamespace(
+                returncode=0, stdout="Hardware Port: Wi-Fi\nDevice: en7\n"
+            )
+        if args[0] == "ipconfig":
+            return SimpleNamespace(returncode=1, stdout="")
+        return SimpleNamespace(returncode=0, stdout="status: inactive\n")
+
+    state = net.probe(tmp_path, runner=run, platform="darwin")
+    assert state["supported"] is True
+    assert state["connected"] is False

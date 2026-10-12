@@ -117,6 +117,14 @@ def probe(root, runner=None, platform=None):
                     timeout=5,
                 )
                 if out.returncode:
+                    link = runner(
+                        ["ifconfig", iface], capture_output=True, text=True, timeout=5
+                    )
+                    if link.returncode == 0 and "status: inactive" in link.stdout:
+                        successful = True
+                    elif link.returncode == 0 and "status: active" in link.stdout:
+                        result.update(connected=True, supported=True)
+                        return result
                     continue
                 successful = True
                 for line in out.stdout.splitlines():
