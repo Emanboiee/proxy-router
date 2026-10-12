@@ -152,6 +152,39 @@ function moveProfileOption(trigger: HTMLElement, direction: number): void {
   options[(index + direction + options.length) % options.length].focus();
 }
 
+function networkProfilePicker(id: string, label: string, selected: string | null, choices: {value: string; label: string}[]): string {
+  const value = selected ?? '';
+  const items = [{value: '', label: 'Keep current profile'}, ...choices];
+  const selectedLabel = items.find(item => item.value === value)?.label ?? 'Unavailable saved profile';
+  return `<span class="custom-select network-profile-picker" data-profile-picker data-network-picker>
+    <span id="${id}-label" class="sr-only">${esc(label)}</span>
+    <input type="hidden" id="${id}" value="${esc(value)}">
+    <button type="button" class="select-trigger" role="combobox" data-profile-trigger aria-labelledby="${id}-label" aria-haspopup="listbox" aria-expanded="false" aria-controls="${id}-options" ${busy ? 'disabled' : ''}><span class="select-value">${esc(selectedLabel)}</span><span class="select-chevron" aria-hidden="true"></span></button>
+    <span class="select-menu" id="${id}-options" role="listbox" aria-labelledby="${id}-label" hidden>${items.map(item => `<button type="button" role="option" tabindex="-1" aria-selected="${item.value === value}" data-profile-option="${esc(item.value)}"><span>${esc(item.label)}</span>${item.value === value ? '<span class="option-check" aria-hidden="true">✓</span>' : ''}</button>`).join('')}</span>
+  </span>`;
+}
+
+function chooseProfileOption(option: HTMLElement): void {
+  const picker = option.closest<HTMLElement>('[data-profile-picker]');
+  const trigger = picker?.querySelector<HTMLElement>('[data-profile-trigger]');
+  if (!trigger) return;
+  profileMenu(trigger, false);
+  if (picker?.hasAttribute('data-network-picker')) {
+    const input = picker.querySelector<HTMLInputElement>('input')!;
+    input.value = option.dataset.profileOption ?? '';
+    picker.dataset.networkDraft = 'true';
+    picker.querySelectorAll('.option-check').forEach(check => check.remove());
+    const check = document.createElement('span');
+    check.className = 'option-check';
+    check.setAttribute('aria-hidden', 'true');
+    check.textContent = '✓';
+    option.append(check);
+    picker.querySelectorAll<HTMLElement>('[role="option"]').forEach(item => item.setAttribute('aria-selected', String(item === option)));
+    trigger.querySelector('.select-value')!.textContent = option.querySelector('span')!.textContent;
+    trigger.focus();
+  } else if (option.dataset.profileOption) void selectProfile(option.dataset.profileOption);
+}
+
 function homePage(): string {
   if (isTauri()) return liveHomePage();
   const [title, description] = statusTitle(); const profile = activeProfile(); const provider = activeProvider();
@@ -244,6 +277,7 @@ function liveHomePage(): string {
       ${dashboardStateReady && snapshot.profiles.length ? `<div class="mode-selector" data-profile-picker><span id="home-profile-label">Profile</span><span class="select-wrap custom-select"><button type="button" role="combobox" class="select-trigger" id="home-profile" data-profile-trigger aria-labelledby="home-profile-label" aria-haspopup="listbox" aria-expanded="false" aria-controls="home-profile-options"><span class="select-value">${esc(activeProfile().name)}</span><span class="select-chevron" aria-hidden="true"></span></button><div class="select-menu" id="home-profile-options" role="listbox" aria-labelledby="home-profile-label" hidden>${profileMenuOptions(snapshot.activeProfileId)}</div></span></div>` : ''}
 
       <p class="connection-status" aria-label="Live engine configuration"><span>Preset: <strong id="active-preset">${esc(preset)}</strong> · Providers: ${providerSummary} · Routes: ${esc(routeSummary)} · Latency: ${esc(latency)}</span><a class="text-link" href="#profiles">Manage routes <span aria-hidden="true">↗</span></a></p>
+      <p class="connection-status" id="home-network-status"><span>Wi-Fi auto-switch: <strong>${networkState ? networkState.auto ? 'On' : 'Off' : 'Unknown'}</strong> · Network-loss protection: <strong>${networkState ? networkState.disconnect_on_loss !== false ? 'On' : 'Off' : 'Unknown'}</strong></span><a class="text-link" href="#connectivity">Network settings <span aria-hidden="true">↗</span></a></p>
       ${homeConnectionControls()}
     </div>
     <details class="home-route-details"><summary>Current routing</summary>${configNote}<ul class="route-list" id="home-engine-routes">${routeRows || (hasCurrentConfig ? '<li class="muted">No routes configured.</li>' : '')}</ul></details>
@@ -388,10 +422,6 @@ function liveConnectivityPage(): string {
     if (!choices.some(p => p.value === name)) choices.push({value: name, label: name.startsWith('profile:') ? 'Unavailable saved profile' : name});
   }
   if (!choices.length) choices.push(...presetChoices.map(name => ({value: name, label: name})));
-  const select = (value: string | null) => '<option value="">Keep current profile</option>' + choices.map(
-    item => `<option value="${esc(item.value)}" ${value === item.value ? 'selected' : ''}>${esc(item.label)}</option>`
-  ).join('');
-  const options = select(mapped);
   const label = (name: string) => networkNamesVisible ? esc(name) : 'Hidden network';
   const mappedLabel = choices.find(choice => choice.value === mapped)?.label ?? mapped;
   const detected = !net ? 'Checking the network…' : ssid
@@ -399,7 +429,7 @@ function liveConnectivityPage(): string {
     : net?.connected ? 'Connected — Wi-Fi name is unavailable' : 'No Wi-Fi connection';
   const recent = (net?.recent ?? []).map((entry, index) => {
     const mapped = net?.presets[entry.ssid] ?? null;
-    return `<li class="network-history-row"><div><strong>${label(entry.ssid)}</strong><small class="muted">${entry.ssid === ssid ? 'Connected now' : 'Previously connected'}</small></div><label class="sr-only" for="recent-network-${index}">Profile for recent network ${index + 1}</label><select id="recent-network-${index}" data-network-index="${index}">${select(mapped)}</select>${button('Save', 'network-map', 'quiet', `data-network-index="${index}" data-network-ssid="${esc(entry.ssid)}"`)}</li>`;
+    return `<li class="network-history-row"><div><strong>${label(entry.ssid)}</strong><small class="muted">${entry.ssid === ssid ? 'Connected now' : 'Previously connected'}</small></div>${networkProfilePicker(`recent-network-${index}`, `Profile for recent network ${index + 1}`, mapped, choices)}${button('Save', 'network-map', 'quiet', `data-network-index="${index}" data-network-ssid="${esc(entry.ssid)}"`)}</li>`;
   }).join('');
 
   const routes = Array.isArray(engineConfig?.routes) ? engineConfig!.routes! : [];
@@ -423,8 +453,8 @@ function liveConnectivityPage(): string {
     : '';
 
   return `<section class="page-section"><div class="section-heading"><div><h1 tabindex="-1">Connectivity</h1><p class="lead">The Wi-Fi network you are on, the preset it maps to, and the routes the engine is serving right now.</p></div><div class="section-actions">${button('Check network', 'network-check', 'primary')}${button('Reconnect', 'network-reconnect', 'quiet')}</div></div>
-<article class="panel" id="network-panel"><div class="panel-heading"><div><span class="label">Network detection</span><h2>This Wi-Fi network</h2></div><span class="badge">${auto ? 'Auto-switch on' : 'Auto-switch off'}</span></div><p>${detected} ${button(networkNamesVisible ? 'Hide names' : 'Show names', 'network-reveal', 'quiet', `aria-pressed="${networkNamesVisible}"`)}</p>${networkIdentityNotice ? `<p role="status" class="muted">${esc(networkIdentityNotice)}</p>` : ''}${laneNote}
-${ssid ? `<div class="provider-controls"><label for="network-preset-select">Profile for this network</label><select id="network-preset-select">${options}</select>${button('Save mapping', 'network-map', 'primary', `data-network-ssid="${esc(ssid)}"`)}${mapped ? button('Remove mapping', 'network-remove-mapping', 'quiet', `data-network-ssid="${esc(ssid)}"`) : ''}</div>` : '<p class="muted">Show names to allow Wi-Fi access. You can map networks once their names are readable.</p>'}
+<article class="panel" id="network-panel"><div class="panel-heading"><div><span class="label">Network detection</span><h2>This Wi-Fi network</h2></div><span class="badge">${auto ? 'Auto-switch on' : 'Auto-switch off'}</span></div><p>${detected} ${button(networkNamesVisible ? 'Hide names' : 'Show names', 'network-reveal', 'quiet', `aria-pressed="${networkNamesVisible}"`)}</p>${networkIdentityNotice && !ssid ? `<p role="status" class="muted">${esc(networkIdentityNotice)}</p>` : ''}${laneNote}
+${ssid ? `<div class="provider-controls"><span>Profile for this network</span>${networkProfilePicker('network-preset-select', 'Profile for this network', mapped, choices)}${button('Save mapping', 'network-map', 'primary', `data-network-ssid="${esc(ssid)}"`)}${mapped ? button('Remove mapping', 'network-remove-mapping', 'quiet', `data-network-ssid="${esc(ssid)}"`) : ''}</div>` : '<p class="muted">Show names to allow Wi-Fi access. You can map networks once their names are readable.</p>'}
 <div class="card-actions">${auto ? button('Turn auto-switch off', 'network-auto', 'quiet', 'data-network-state="off"') : button('Turn auto-switch on', 'network-auto', 'quiet', 'data-network-state="on"')}</div>
 <label class="setting-row"><span><strong>Disconnect when the network is lost</strong><small>Pause the router after two failed link checks; reconnect when the network returns. Manual disconnect stays off.</small></span><input type="checkbox" data-network-disconnect ${net?.disconnect_on_loss !== false ? 'checked' : ''}></label>
 <p class="muted">Wi-Fi auto-switch chooses a mapped profile. Network-loss protection works independently.</p>
@@ -519,7 +549,7 @@ function render(options?: { background?: boolean }): void {
       : field.value !== field.defaultValue || (field instanceof HTMLInputElement && field.checked !== field.defaultChecked));
   // Background polls update the rail but leave active controls and unsaved
   // drafts intact. Explicit navigation and actions can rebuild the page.
-  const editing = options?.background && (focused || draft
+  const editing = options?.background && (focused || draft || main.querySelector('[data-network-draft="true"]') !== null
     || main.querySelector('[aria-expanded="true"][aria-haspopup="listbox"]') !== null);
   if (!editing) {
     const markup = page === 'Home' ? homePage() : page === 'Profiles' ? profilesPage() : page === 'Providers' ? providersPage() : page === 'Connectivity' ? connectivityPage() : page === 'Settings' ? settingsPage() : page === 'Appearance' ? appearancePage() : aboutPage();
@@ -751,10 +781,8 @@ app.addEventListener('click', event => {
   const trigger = profileMenuTriggerFor(element);
   if (trigger) { const isOpen = trigger.getAttribute('aria-expanded') === 'true'; closeProfileMenus(trigger); profileMenu(trigger, !isOpen); return; }
   const option = element.closest<HTMLElement>('[data-profile-option]');
-  if (option?.dataset.profileOption) {
-    const owningTrigger = option.closest<HTMLElement>('[data-profile-picker]')?.querySelector<HTMLElement>('[data-profile-trigger]');
-    if (owningTrigger) profileMenu(owningTrigger, false);
-    void selectProfile(option.dataset.profileOption!);
+  if (option) {
+    chooseProfileOption(option);
     return;
   }
   closeProfileMenus();
@@ -864,8 +892,9 @@ app.addEventListener('keydown', event => {
   const isOpen = trigger.getAttribute('aria-expanded') === 'true';
   if (element.matches('[data-profile-option]') && (event.key === 'Enter' || event.key === ' ')) {
     event.preventDefault();
-    const profileId = element.dataset.profileOption;
-    if (profileId) { profileMenu(trigger, false); void selectProfile(profileId); }
+    chooseProfileOption(element);
+  } else if (event.key === 'Tab') {
+    profileMenu(trigger, false);
   } else if (event.key === 'Escape') {
     event.preventDefault(); profileMenu(trigger, false); trigger.focus();
   } else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
@@ -1054,7 +1083,7 @@ async function networkAuto(on: boolean): Promise<void> {
 }
 
 async function networkMap(ssid?: string, index?: string): Promise<void> {
-  const preset = document.querySelector<HTMLSelectElement>(index === undefined ? '#network-preset-select' : `#recent-network-${Number(index)}`)?.value;
+  const preset = document.querySelector<HTMLInputElement>(index === undefined ? '#network-preset-select' : `#recent-network-${Number(index)}`)?.value;
   if (!ssid) { announce('No Wi-Fi network detected'); return; }
   if (preset === undefined) return;
   try {
