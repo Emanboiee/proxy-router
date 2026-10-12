@@ -609,12 +609,12 @@ async function refreshEngineConfig(): Promise<void> {
   catch { engineConfigUnavailable = true; }
   try { installDashboardState(await getDashboardState(),false); }
   catch { /* Preserve the current profile inventory if discovery is unavailable. */ }
+  try { networkState = (await getNetwork()).presets; } catch { /* Keep the last readable network state. */ }
 }
 
 /** Refresh the engine's config + network detection after dashboard actions. */
 async function refreshEngineData(): Promise<void> {
   await refreshEngineConfig();
-  try { networkState = (await getNetwork()).presets; } catch { /* keep the last good read */ }
   try { routingState = await getRouting(); } catch { /* keep the last good read */ }
 }
 function navigate(focus: boolean): void { const name = location.hash.slice(1).toLowerCase(); if (name === 'routing') { history.replaceState(null, '', '#profiles'); page = 'Profiles'; } else page = pages.find(item => item.toLowerCase() === name) ?? 'Home'; menu.setAttribute('aria-expanded', 'false'); render(); resetMainScroll(); if (focus) main.querySelector<HTMLElement>('h1')?.focus({ preventScroll: true }); }
