@@ -677,3 +677,15 @@ button.primary:active,
 
 .network-profile-picker { position: relative; display: block; min-width: 0; flex: 1; }
 @media (max-width: 650px) { .provider-controls > .network-profile-picker { flex-basis: 100%; } }
+
+.web-select { position: relative; display: block; min-width: 0; width: 100%; }
+.web-select > select { display: none !important; }
+.web-select-menu { position: fixed; inset: auto; margin: 0; }
+.web-select-menu [role="option"]:disabled { opacity: .5; cursor: not-allowed; }
+.provider-controls > .web-select { flex: 1; min-width: 0; }
+.select-trigger[aria-invalid="true"] { border-color: var(--danger); }
+input[type="number"] { appearance: textfield; -moz-appearance: textfield; }
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+
+.web-select-error:empty { display: none; }
