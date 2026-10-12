@@ -50,7 +50,7 @@ def test_provider_save_keeps_wireguard_secret_out_of_dashboard_state(tmp_path):
     store_text = (root / "state" / manager.STORE_NAME).read_text()
 
     assert provider["name"] == "Home tunnel"
-    assert provider["kind"] == "custom"
+    assert provider["kind"] == "wireguard"
     assert provider["server"] == "Unknown"
     assert provider["servers"] == ["wireguard"]
     assert copied.read_text() == WIREGUARD
@@ -402,3 +402,56 @@ def test_command_startup_is_local_metadata_and_saving_never_runs_it(tmp_path, mo
                                         "host": "127.0.0.1", "port": 9001,
                                         "startup": {"mode": "command", "command": "sudo bad"}})
     assert (tmp_path / "state" / manager.STORE_NAME).read_bytes() == before
+
+
+def test_add_server_preserves_pool_directory_preference_and_active_connection(tmp_path):
+    root = tmp_path / "router"
+    directory = root / "connections/proton"
+    directory.mkdir(parents=True)
+    config_at(root, {"proton": {"directory": "connections/proton", "cooldown_seconds": 60}})
+    original = directory / "sg.conf"
+    original.write_text(WIREGUARD)
+    (root / "state").mkdir()
+    (root / "state/proton.active").write_text("sg")
+    manager._save_store(root, {"providers": {"proton": {"name": "Proton", "kind": "custom",
+        "preferredServer": "sg", "managed": False}}, "profiles": [], "active_profile_id": None})
+    source = tmp_path / "jp.conf"
+    second = WIREGUARD.replace("vpn.example.test", "jp.example.test")
+    source.write_text(second)
+    result = manager.save_provider(root, {"name": "Proton", "kind": "wireguard"}, "proton", str(source))
+    assert len(result["providers"]) == 1
+    provider = result["providers"][0]
+    assert provider["servers"] == ["jp", "sg"]
+    assert provider["server"] == "sg"
+    assert provider["preferredServer"] == "sg"
+    assert provider["managed"] is False
+    assert provider["kind"] == "wireguard"
+    assert original.read_text() == WIREGUARD
+    assert (directory / "jp.conf").read_text() == second
+    assert stat.S_IMODE((directory / "jp.conf").stat().st_mode) == 0o600
+    assert json.loads((root / "router.json").read_text())["providers"]["proton"] == {
+        "directory": "connections/proton", "cooldown_seconds": 60}
+    assert TEST_PRIVATE_KEY not in json.dumps(result)
+    # Re-importing the same file adds no duplicate server.
+    repeated = manager.save_provider(root, {"name": "Proton", "kind": "wireguard"}, "proton", str(source))
+    assert repeated["providers"][0]["servers"] == ["jp", "sg"]
+
+
+def test_same_filename_adds_server_without_overwriting_and_invalid_import_preserves_pool(tmp_path):
+    root = tmp_path / "router"
+    config_at(root)
+    result = add_provider(root)
+    provider_id = result["providers"][0]["id"]
+    directory = root / "providers" / provider_id
+    source = tmp_path / "wireguard.conf"
+    source.write_text(WIREGUARD.replace("vpn.example.test", "second.example.test"))
+    manager.save_provider(root, {"name": "Primary", "kind": "wireguard"}, provider_id, str(source))
+    assert (directory / "wireguard.conf").read_text() == WIREGUARD
+    assert (directory / "wireguard-2.conf").read_text() == source.read_text()
+    before = {path.name: path.read_bytes() for path in directory.glob("*.conf")}
+    config_before = (root / "router.json").read_bytes()
+    source.write_text("invalid")
+    with pytest.raises(manager.DashboardError):
+        manager.save_provider(root, {"name": "Primary", "kind": "wireguard"}, provider_id, str(source))
+    assert {path.name: path.read_bytes() for path in directory.glob("*.conf")} == before
+    assert (root / "router.json").read_bytes() == config_before
