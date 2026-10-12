@@ -254,3 +254,19 @@ def test_manual_off_never_applies_network_profile(tmp_path):
     assert net.apply_mapping(router, tmp_path)["reason"] == "manually disconnected"
     router.engine_alive.assert_not_called()
     assert net.profile_error(tmp_path, "profile:missing") is not None
+
+
+def test_exception_during_mapping_restores_exact_original_bytes(tmp_path):
+    router, identifier = profile_fixture(tmp_path)
+    path = tmp_path / "router.json"
+    path.write_text(json.dumps(json.loads(path.read_text()), indent=4) + "\n")
+    before = path.read_bytes()
+    before_store = (tmp_path / "state/dashboard_profiles.json").read_bytes()
+    router.engine_alive.return_value = True
+    router.engine_reload.side_effect = RuntimeError("reload broke")
+    import pytest
+
+    with pytest.raises(RuntimeError, match="reload broke"):
+        net.apply_mapping(router, tmp_path)
+    assert path.read_bytes() == before
+    assert (tmp_path / "state/dashboard_profiles.json").read_bytes() == before_store

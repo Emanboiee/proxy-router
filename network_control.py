@@ -35,17 +35,21 @@ def read_json(path):
         return {}
 
 
-def write_json(path, value):
+def write_bytes(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, name = tempfile.mkstemp(dir=path.parent)
     try:
-        with os.fdopen(fd, "w") as handle:
-            json.dump(value, handle)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(value)
         os.replace(name, path)
     finally:
         if os.path.exists(name):
             os.unlink(name)
+
+
+def write_json(path, value):
+    write_bytes(path, json.dumps(value).encode("utf-8"))
 
 
 def remember(root, ssid, now=None):
@@ -262,11 +266,12 @@ def apply_mapping(router, root, reload_engine=True):
     if not mapped:
         return {"applied": False, "reason": "no network mapping", "checked_at": now}
     config_path = root / "router.json"
-    previous_config = read_json(config_path)
+    original_config = config_path.read_bytes()
+    previous_config = json.loads(original_config)
     import dashboard_profile_manager as manager
 
     store_path = root / "state" / manager.STORE_NAME
-    previous_store = read_json(store_path)
+    original_store = store_path.read_bytes() if store_path.exists() else None
     is_profile = mapped.startswith("profile:")
     if is_profile:
         current = manager.state(root).get("activeProfileId")
@@ -281,29 +286,45 @@ def apply_mapping(router, root, reload_engine=True):
             "checked_at": now,
         }
     was_running = router.engine_alive() if reload_engine else False
-    if is_profile:
-        if error := profile_error(root, mapped):
-            return {"applied": False, "error": error, "reload_rc": 1}
-        manager.apply_profile(root, mapped[8:])
-        result = {}
-    else:
-        from setup_tui import apply_preset_by_name
 
-        result = apply_preset_by_name(root, mapped)
-    # Reload must read the new route table, not globals loaded before applying it.
-    rc = router.load_config()
-    if rc == 0 and was_running and not (root / "state" / "manual-off").exists():
-        rc = (
-            router._elevated_reload()
-            if router._engine_runs_as_root()
-            else router.engine_reload()
-        )
-    if rc:
-        write_json(config_path, previous_config)
+    def restore():
+        write_bytes(config_path, original_config)
         if is_profile:
-            write_json(store_path, previous_store)
+            if original_store is None:
+                store_path.unlink(missing_ok=True)
+            else:
+                write_bytes(store_path, original_store)
         router.load_config()
-        return {"applied": False, "preset": mapped, "reload_rc": rc, "checked_at": now}
+
+    try:
+        if is_profile:
+            if error := profile_error(root, mapped):
+                return {"applied": False, "error": error, "reload_rc": 1}
+            manager.apply_profile(root, mapped[8:])
+            result = {}
+        else:
+            from setup_tui import apply_preset_by_name
+
+            result = apply_preset_by_name(root, mapped)
+        # Reload must read the new route table, not pre-apply globals.
+        rc = router.load_config()
+        if rc == 0 and was_running and not (root / "state" / "manual-off").exists():
+            rc = (
+                router._elevated_reload()
+                if router._engine_runs_as_root()
+                else router.engine_reload()
+            )
+        if rc:
+            restore()
+            return {
+                "applied": False,
+                "preset": mapped,
+                "reload_rc": rc,
+                "checked_at": now,
+            }
+    except (Exception, SystemExit):
+        restore()
+        raise
     write_json(
         root / "state" / "network-preset.json",
         {"ssid": router.current_ssid(), "preset": mapped, "applied_at": now},
