@@ -6,11 +6,17 @@ test('unchanged background status keeps the page DOM and expanded routing intact
   await page.addInitScript(desktopMock);
   await page.goto('/');
   await expect(page.locator('#active-preset')).toHaveText('opencode');
+  await expect(page.locator('.home-route-details')).toBeHidden();
+  await page.locator('.home-more-trigger').focus();
+  await page.keyboard.press('Enter');
+  await expect(page.locator('.home-route-details')).toBeVisible();
   await page.locator('.home-route-details').evaluate(node => { (node as HTMLDetailsElement).open = true; });
+  await page.locator('h1').focus();
   await page.locator('#main').evaluate(node => {
     (window as unknown as { __originalHero: Element | null }).__originalHero = node.querySelector('.connection-hero');
   });
   await page.clock.runFor(31000);
+  await expect(page.locator('.home-more-details')).toHaveAttribute('open', '');
   await expect(page.locator('.home-route-details')).toHaveAttribute('open', '');
   expect(await page.evaluate(() => document.querySelector('.connection-hero') ===
     (window as unknown as { __originalHero: Element | null }).__originalHero)).toBe(true);

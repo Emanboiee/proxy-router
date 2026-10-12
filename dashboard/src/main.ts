@@ -280,9 +280,12 @@ function liveHomePage(): string {
 
       <p class="connection-status" aria-label="Live engine configuration"><span>Preset: <strong id="active-preset">${esc(preset)}</strong> · Providers: ${providerSummary} · Routes: ${esc(routeSummary)} · Latency: ${esc(latency)}</span><a class="text-link" href="#profiles">Manage routes <span aria-hidden="true">↗</span></a></p>
       <p class="connection-status" id="home-network-status"><span>Wi-Fi auto-switch: <strong>${networkState ? networkState.auto ? 'On' : 'Off' : 'Unknown'}</strong> · Network-loss protection: <strong>${networkState ? networkState.disconnect_on_loss !== false ? 'On' : 'Off' : 'Unknown'}</strong></span><a class="text-link" href="#connectivity">Network settings <span aria-hidden="true">↗</span></a></p>
-      ${homeConnectionControls()}
+      <details class="home-more-details">
+        <summary class="home-more-trigger"><span class="more-label">View more</span><span class="less-label">View less</span><span class="select-chevron" aria-hidden="true"></span></summary>
+        ${homeConnectionControls()}
+        <details class="home-route-details"><summary>Current routing</summary>${configNote}<ul class="route-list" id="home-engine-routes">${routeRows || (hasCurrentConfig ? '<li class="muted">No routes configured.</li>' : '')}</ul></details>
+      </details>
     </div>
-    <details class="home-route-details"><summary>Current routing</summary>${configNote}<ul class="route-list" id="home-engine-routes">${routeRows || (hasCurrentConfig ? '<li class="muted">No routes configured.</li>' : '')}</ul></details>
   </section>`;
 }
 
@@ -559,8 +562,14 @@ function render(options?: { background?: boolean }): void {
       const scrollTop = main.scrollTop;
       const scrollLeft = main.scrollLeft;
       const openDetails = Array.from(main.querySelectorAll('details')).map(item => item.open);
+      const homeMoreOpen = main.querySelector<HTMLDetailsElement>('.home-more-details')?.open ?? false;
+      const homeRoutesOpen = main.querySelector<HTMLDetailsElement>('.home-route-details')?.open ?? false;
       main.innerHTML = markup;
       renderedPageMarkup = markup;
+      const homeMore = main.querySelector<HTMLDetailsElement>('.home-more-details');
+      if (homeMore) homeMore.open = homeMoreOpen;
+      const homeRoutes = main.querySelector<HTMLDetailsElement>('.home-route-details');
+      if (homeRoutes) homeRoutes.open = homeRoutesOpen;
       if (headingFocused) main.querySelector<HTMLElement>('h1')?.focus({ preventScroll: true });
       if (options?.background) {
         main.querySelectorAll('details').forEach((item, index) => { item.open = openDetails[index] ?? false; });
