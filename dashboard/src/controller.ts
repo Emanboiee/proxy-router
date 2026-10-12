@@ -280,6 +280,10 @@ export interface EngineConfig {
 export interface NetworkPresetState {
   ssid: string | null;
   connected: boolean;
+  supported?: boolean;
+  identity?: string;
+  recent?: Array<{ssid: string; last_seen: number}>;
+  disconnect_on_loss?: boolean;
   auto: boolean;
   mapped_preset: string | null;
   presets: Record<string, string>;
@@ -401,4 +405,11 @@ export async function switchDashboardServer(providerId: string, server: string):
 
 export async function manageDashboardServer(providerId: string, server: string, restore = false): Promise<DashboardState> {
   return await invoke<DashboardState>('manage_dashboard_server', { providerId, server, restore });
+}
+
+export async function revealNetwork(): Promise<{status: Record<string, unknown>; presets: NetworkPresetState}> {
+  return await invoke('reveal_network');
+}
+export async function setNetworkDisconnect(state: 'on' | 'off'): Promise<NetworkPresetState> {
+  return await invoke('set_network_disconnect', {state});
 }

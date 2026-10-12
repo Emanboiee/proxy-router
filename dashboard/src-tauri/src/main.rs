@@ -8,6 +8,7 @@
 //! (Emanboiee/proxy-router#144).
 
 mod controller;
+mod wifi_identity;
 mod network_refresh;
 mod tray_owner;
 use crate::tray_owner::TrayOwnerLease;
@@ -432,9 +433,38 @@ fn get_config() -> Result<Value, String> {
 #[tauri::command]
 fn get_network() -> Result<Value, String> {
     let root = controller::router_root();
-    let status = controller::json_command(&root, &["network-status", "--json"])?;
-    let presets = controller::json_command(&root, &["network-preset", "show"])?;
-    Ok(serde_json::json!({ "status": status, "presets": presets }))
+    let native_ssid = wifi_identity::ssid();
+    let mut presets = if let Some(ref ssid) = native_ssid {
+        controller::json_command(&root, &["network-preset", "observe", "--ssid", ssid])?
+    } else {
+        controller::json_command(&root, &["network-preset", "show"])?
+    };
+    if let Some(ssid) = native_ssid {
+        presets["mapped_preset"] = presets["presets"]
+            .get(&ssid)
+            .cloned()
+            .unwrap_or(Value::Null);
+        presets["ssid"] = Value::String(ssid);
+        presets["identity"] = Value::String("available".into());
+    }
+    Ok(serde_json::json!({ "status": presets.clone(), "presets": presets }))
+}
+
+#[tauri::command]
+async fn reveal_network(app: AppHandle) -> Result<Value, String> {
+    app.run_on_main_thread(wifi_identity::request_permission)
+        .map_err(|e| e.to_string())?;
+    get_network()
+}
+
+#[tauri::command]
+fn set_network_disconnect(state: String) -> Result<Value, String> {
+    if state != "on" && state != "off" {
+        return Err("state must be on or off".into());
+    }
+    let root = controller::router_root();
+    controller::run_controller(&root, &["network-preset", "disconnect", "--state", &state])?;
+    controller::json_command(&root, &["network-preset", "show"])
 }
 
 /// Map the current (or a named) Wi-Fi network to a preset.
@@ -443,7 +473,7 @@ fn set_network_preset(ssid: String, preset: String) -> Result<Value, String> {
     if !valid_slug(&ssid, 255) {
         return Err("network name must be 1-255 characters without control characters".into());
     }
-    if !valid_slug(&preset, 64) {
+    if !valid_slug(&preset, 80) {
         return Err(
             "preset name must be 1-64 characters of letters, digits, dot, dash or underscore"
                 .into(),
@@ -828,6 +858,8 @@ fn main() {
             apply_preset,
             get_config,
             get_network,
+            reveal_network,
+            set_network_disconnect,
             set_network_preset,
             set_network_auto,
             remove_network_preset,
