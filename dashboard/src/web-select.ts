@@ -59,7 +59,14 @@ function focusOption(view: SelectView, index: number): void {
   const choices = options(view);
   const option = choices[(index + choices.length) % choices.length];
   option?.focus({preventScroll: true});
-  option?.scrollIntoView({block: 'nearest'});
+  if (option) {
+    // Scroll only the list; scrollIntoView also scrolls the enclosing dialog.
+    const top = option.getBoundingClientRect().top - view.menu.getBoundingClientRect().top + view.menu.scrollTop;
+    const bottom = top + option.offsetHeight;
+    if (top < view.menu.scrollTop) view.menu.scrollTop = top;
+    else if (bottom > view.menu.scrollTop + view.menu.clientHeight)
+      view.menu.scrollTop = bottom - view.menu.clientHeight;
+  }
 }
 
 function open(view: SelectView, edge?: 'first' | 'last'): void {

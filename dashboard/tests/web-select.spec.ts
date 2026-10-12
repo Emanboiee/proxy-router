@@ -58,6 +58,8 @@ test('long web menus fit viewport and remain inside dialog focus scope', async (
     document.querySelector('#app')!.append(dialog); dialog.showModal();
   });
   const trigger = page.getByRole('combobox', {name:'Edge server',exact:true});
+  await expect(trigger).toBeVisible();
+  const dialogTop = await page.locator('#edge-test').evaluate(element => element.scrollTop);
   await trigger.click();
   const list = page.getByRole('listbox',{name:'Edge server',exact:true});
   await expect(list).not.toHaveAttribute('popover');
@@ -69,6 +71,8 @@ test('long web menus fit viewport and remain inside dialog focus scope', async (
   expect(await list.evaluate(element => element.scrollHeight > element.clientHeight)).toBe(true);
   await page.keyboard.press('End');
   await expect(page.getByRole('option',{name:'Server 22',exact:true})).toBeFocused();
+  expect(await page.locator('#edge-test').evaluate(element => element.scrollTop)).toBe(dialogTop);
+  await expect(trigger).toBeVisible();
   expect((await new AxeBuilder({page}).analyze()).violations).toEqual([]);
   await page.keyboard.press('Escape');
   await expect(trigger).toBeFocused();
