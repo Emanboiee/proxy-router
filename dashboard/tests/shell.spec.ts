@@ -1,3 +1,4 @@
+import {selectWeb} from './select-web';
 import { test, expect } from '@playwright/test';
 import AxeBuilder from '@axe-core/playwright';
 import { mkdirSync, writeFileSync } from 'node:fs';
@@ -82,7 +83,7 @@ for (const [width, height] of [[1440, 900], [390, 844]]) {
         await page.screenshot({ path: `${evidence}/dialog-${width}.png` });
         expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
       }
-      await page.getByLabel('Connection state', { exact: true }).selectOption(value);
+      await selectWeb(page.getByLabel('Connection state', { exact: true }), value);
       await page.getByRole('button', { name: 'Show preview' }).click();
       await expect(page.getByRole('heading', { name: title, exact: true })).toBeVisible();
       await expect(page.getByRole('button', { name: 'Preview states' })).toBeFocused();
@@ -95,7 +96,7 @@ for (const [width, height] of [[1440, 900], [390, 844]]) {
     }
     await expect(page.getByRole('heading', { name: 'Couldn’t read status', exact: true })).toHaveCount(0);
     await page.getByRole('button', { name: 'Preview states' }).click();
-    await page.getByLabel('Connection state', { exact: true }).selectOption('connected');
+    await selectWeb(page.getByLabel('Connection state', { exact: true }), 'connected');
     await page.getByRole('button', { name: 'Show preview' }).click();
     await expect(page.getByRole('heading', { name: 'Connected', exact: true })).toBeVisible();
     await page.getByRole('button', { name: 'Preview states' }).click();

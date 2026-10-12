@@ -1,3 +1,4 @@
+import {selectWeb} from './select-web';
 import { test, expect } from '@playwright/test';
 
 test.beforeEach(async ({ page }) => {
@@ -72,7 +73,7 @@ test('profiles can add WireGuard files and SOCKS5 gateways from the GUI', async 
   await page.getByRole('button', { name: 'Add connection', exact: true }).click();
   const providerForm = page.locator('#provider-form');
   await providerForm.locator('input[name="name"]').fill('Home WireGuard');
-  await providerForm.locator('select[name="kind"]').selectOption('wireguard');
+  await selectWeb(providerForm.locator('select[name="kind"]'), 'wireguard');
   await providerForm.locator('input[name="wireguardConfig"]').setInputFiles({
     name: 'home.conf',
     mimeType: 'text/plain',
@@ -88,7 +89,7 @@ test('profiles can add WireGuard files and SOCKS5 gateways from the GUI', async 
   await page.getByRole('button', { name: 'Add connection', exact: true }).click();
   const customForm = page.locator('#provider-form');
   await customForm.locator('input[name="name"]').fill('Proton config (custom)');
-  await customForm.locator('select[name="kind"]').selectOption('custom');
+  await selectWeb(customForm.locator('select[name="kind"]'), 'custom');
   await customForm.locator('input[name="wireguardConfig"]').setInputFiles({
     name: 'proton-free.conf',
     mimeType: 'text/plain',
@@ -105,7 +106,7 @@ test('profiles can add WireGuard files and SOCKS5 gateways from the GUI', async 
   const socksForm = page.locator('#provider-form');
   await expect(socksForm).toBeVisible();
   await socksForm.locator('input[name="name"]').fill('Windscribe Gateway');
-  await socksForm.locator('select[name="kind"]').selectOption('socks5');
+  await selectWeb(socksForm.locator('select[name="kind"]'), 'socks5');
   await page.waitForTimeout(25);
   await expect(socksForm.locator('input[name="socksHost"]')).toBeVisible();
   await socksForm.locator('input[name="socksHost"]').fill('127.0.0.1');
@@ -120,7 +121,7 @@ test('profiles can add WireGuard files and SOCKS5 gateways from the GUI', async 
   await page.getByRole('button', { name: 'Add connection', exact: true }).click();
   const tailscaleForm = page.locator('#provider-form');
   await tailscaleForm.locator('input[name="name"]').fill('Linux box exit node');
-  await tailscaleForm.locator('select[name="kind"]').selectOption('tailscale');
+  await selectWeb(tailscaleForm.locator('select[name="kind"]'), 'tailscale');
   await expect(tailscaleForm.locator('input[name="tailscaleExitNode"]')).toBeVisible();
   await expect(tailscaleForm.locator('input[name="server"]')).toBeHidden();
   await tailscaleForm.locator('input[name="tailscaleExitNode"]').fill('linux-box');
@@ -135,8 +136,8 @@ test('profiles own routing, fallback, and subdomain preference', async ({ page }
   await page.getByRole('link', { name: 'Profiles', exact: true }).click();
   await page.getByRole('button', { name: 'Create profile', exact: true }).click();
   await page.getByLabel('Name').fill('Routing profile');
-  await page.getByLabel('Routing mode').selectOption('selective');
-  await page.locator('#profile-form select[name="fallback"]').selectOption('retry');
+  await selectWeb(page.getByLabel('Routing mode'), 'selective');
+  await selectWeb(page.locator('#profile-form select[name="fallback"]'), 'retry');
   await page.getByLabel('Domains one per line').fill('media.example');
   await expect(page.getByText('Suggested assets', { exact: true })).toHaveCount(0);
   await page.getByLabel(/Auto-detect subdomains/).check();
@@ -153,17 +154,17 @@ test('profiles own routing, fallback, and subdomain preference', async ({ page }
   await expect(page.locator('#provider-dialog')).toBeVisible();
   await expect(page.getByRole('button', { name: '← Back', exact: true })).toBeVisible();
   await page.getByLabel('Name').fill('Test VPN');
-  await page.getByLabel('Type').selectOption('custom');
+  await selectWeb(page.getByLabel('Type'), 'custom');
   await page.getByLabel('Server or endpoint').fill('nyc.test-vpn.example');
   await page.locator('#provider-form').getByRole('button', { name: 'Add provider', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Test VPN', exact: true })).toBeVisible();
   await expect(page.getByLabel('Simulate Tailscale running')).toHaveCount(0);
-  await page.getByLabel('When a VPN connects').selectOption('keep-running');
+  await selectWeb(page.getByLabel('When a VPN connects'), 'keep-running');
   await expect(page.getByText('Current policy: Keep Tailscale running', { exact: true })).toBeVisible();
   await page.getByRole('link', { name: 'Connectivity', exact: true }).click();
   await page.getByRole('button', { name: 'Use provider', exact: true }).first().click();
   await expect(page.getByRole('status')).toHaveText('Proton VPN selected');
-  await page.getByLabel('Proton VPN server').selectOption('22-SG-FREE-15');
+  await selectWeb(page.getByLabel('Proton VPN server'), '22-SG-FREE-15');
   await expect(page.getByRole('button', { name: 'Simulate outage' })).toHaveCount(0);
 });
 
@@ -181,7 +182,7 @@ test('connection actions, settings, themes, and diagnostics persist', async ({ p
   await tray.setChecked(false);
   await page.getByLabel('Proxy port').fill('2090');
   await page.getByLabel('Proxy port').press('Tab');
-  await page.getByLabel('Switch after TLS errors').selectOption('3');
+  await selectWeb(page.getByLabel('Switch after TLS errors'), '3');
   await page.getByRole('link', { name: 'Appearance', exact: true }).click();
   await expect(page.locator('[data-action="theme-layout"]')).toHaveCount(2);
   await page.getByRole('button', { name: /^Vertical/ }).click();
@@ -197,11 +198,11 @@ test('connection actions, settings, themes, and diagnostics persist', async ({ p
     return { columns: style.gridTemplateColumns.trim().split(/\s+/).length, rows: style.gridTemplateRows.trim().split(/\s+/).length };
   });
   expect(horizontalShell).toEqual({ columns: 1, rows: 2 });
-  await page.getByLabel('Colour scheme').selectOption('light');
-  await page.getByLabel('Accent').selectOption('ocean');
-  await page.getByLabel('Density').selectOption('comfortable');
-  await page.getByLabel('Contrast').selectOption('high');
-  await page.locator('#animation-speed').selectOption('fast');
+  await selectWeb(page.getByLabel('Colour scheme'), 'light');
+  await selectWeb(page.getByLabel('Accent'), 'ocean');
+  await selectWeb(page.getByLabel('Density'), 'comfortable');
+  await selectWeb(page.getByLabel('Contrast'), 'high');
+  await selectWeb(page.locator('#animation-speed'), 'fast');
   await page.getByLabel(/Reduce motion/).check();
   await expect(page.locator('html')).toHaveAttribute('data-scheme', 'light');
   await expect(page.locator('html')).toHaveAttribute('data-accent', 'ocean');
