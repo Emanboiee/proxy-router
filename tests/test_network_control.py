@@ -326,3 +326,10 @@ def test_connection_token_changes_on_new_dhcp_connection(tmp_path):
     assert first["connection_token"] == net.probe(tmp_path, runner=run, platform="darwin")["connection_token"]
     transaction = "0x2"
     assert first["connection_token"] != net.probe(tmp_path, runner=run, platform="darwin")["connection_token"]
+
+
+def test_generic_link_fields_are_not_a_connection_identity(tmp_path):
+    def run(args, **kwargs):
+        text = "Hardware Port: Wi-Fi\nDevice: en0\n" if args[0] == "networksetup" else "SSID : <redacted>\nConnectionID : 1\nSecurity : WPA2_PSK\n"
+        return SimpleNamespace(returncode=0, stdout=text)
+    assert "connection_token" not in net.probe(tmp_path, runner=run, platform="darwin")

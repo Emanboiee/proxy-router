@@ -138,7 +138,7 @@ def probe(root, runner=None, platform=None):
                     r"^\s*source link-address option.*?:\s*(.+)$",
                     out.stdout, re.MULTILINE,
                 )
-                if fields:
+                if fields and re.search(r"^xid = .+$", out.stdout, re.MULTILINE):
                     token = json.dumps([iface, fields], sort_keys=True).encode()
                     result["connection_token"] = hashlib.sha256(token).hexdigest()
                 for line in out.stdout.splitlines():
