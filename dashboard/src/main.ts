@@ -509,6 +509,7 @@ function render(options?: { background?: boolean }): void {
     if (current) link.setAttribute('aria-current', 'page');
     else link.removeAttribute('aria-current');
   });
+  const headingFocused = document.activeElement === main.querySelector('h1');
   const focused = document.activeElement instanceof HTMLElement
     && main.contains(document.activeElement)
     && document.activeElement.matches('input, textarea, select, button, a, [contenteditable="true"], [role="option"]');
@@ -528,6 +529,7 @@ function render(options?: { background?: boolean }): void {
       const openDetails = Array.from(main.querySelectorAll('details')).map(item => item.open);
       main.innerHTML = markup;
       renderedPageMarkup = markup;
+      if (headingFocused) main.querySelector<HTMLElement>('h1')?.focus({ preventScroll: true });
       if (options?.background) {
         main.querySelectorAll('details').forEach((item, index) => { item.open = openDetails[index] ?? false; });
         main.scrollTop = scrollTop;
