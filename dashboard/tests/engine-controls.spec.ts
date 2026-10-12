@@ -481,7 +481,8 @@ test('desktop Network card saves, toggles and removes the mapping', async ({ pag
   await page.addInitScript(desktopMock);
   await page.goto('/#connectivity');
 
-  await page.locator('#network-preset-select').selectOption('profile:opencode');
+  await page.getByRole('combobox', {name:'Profile for this network', exact:true}).click();
+  await page.locator('#network-preset-select-options').getByRole('option', {name:'OpenCode only', exact:true}).click();
   await page.getByRole('button', { name: 'Save mapping', exact: true }).click();
   let saved = await page.evaluate(() => (window as unknown as { __invoke: { command: string; payload?: unknown }[] }).__invoke
     .filter(entry => entry.command === 'set_network_preset')

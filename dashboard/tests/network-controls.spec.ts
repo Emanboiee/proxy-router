@@ -49,7 +49,8 @@ test('reveals and hides all names, maps a recent network, and separates loss pro
   await page.getByRole('button', {name:'Show names', exact:true}).click();
   await expect(page.locator('#network-panel')).toContainText('Home WiFi');
   await expect(page.locator('#network-panel')).toContainText('School WiFi');
-  await page.locator('#recent-network-1').selectOption('profile:preset-school-warp-open');
+  await page.getByRole('combobox', {name:'Profile for recent network 2', exact:true}).click();
+  await page.locator('#recent-network-1-options').getByRole('option', {name:'School WARP + Proton', exact:true}).click();
   await page.locator('.network-history-row').nth(1).getByRole('button', {name:'Save', exact:true}).click();
   await expect.poll(() => page.evaluate(() => (window as any).__calls)).toContainEqual({
     command:'set_network_preset', payload:{ssid:'School WiFi', preset:'profile:preset-school-warp-open'},
@@ -86,7 +87,9 @@ test('permission failure offers recovery and never maps a redaction placeholder'
 test('a background network change preserves the draft and saves the original row network', async ({page}) => {
   await page.clock.install();
   await page.goto('/#connectivity');
-  await page.locator('#recent-network-1').selectOption('profile:preset-school-warp-open');
+  await page.getByRole('combobox', {name:'Profile for recent network 2', exact:true}).click();
+  await page.locator('#recent-network-1-options').getByRole('option', {name:'School WARP + Proton', exact:true}).click();
+  await page.getByRole('link', {name:'Connectivity',exact:true}).focus();
   await page.evaluate(() => {(window as any).__newNetwork = true;});
   await page.clock.fastForward(17000);
   await expect.poll(() => page.evaluate(() => (window as any).__network.recent[0].ssid)).toBe('New WiFi');
@@ -95,4 +98,38 @@ test('a background network change preserves the draft and saves the original row
   await expect.poll(() => page.evaluate(() => (window as any).__calls)).toContainEqual({
     command:'set_network_preset', payload:{ssid:'School WiFi', preset:'profile:preset-school-warp-open'},
   });
+});
+
+
+test('custom network picker supports keyboard drafts and cancellation', async ({page}) => {
+  await page.goto('/#connectivity');
+  const picker = page.getByRole('combobox', {name:'Profile for this network', exact:true});
+  await picker.focus();
+  await picker.press('ArrowDown');
+  await expect(page.getByRole('option', {name:'Keep current profile', exact:true})).toBeFocused();
+  await page.keyboard.press('End');
+  await expect(page.getByRole('option', {name:'School WARP + Proton', exact:true})).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(picker).toBeFocused();
+  await expect(page.locator('#network-preset-select')).toHaveValue('');
+  await picker.press('ArrowDown');
+  await page.keyboard.press('End');
+  await page.keyboard.press('Enter');
+  await expect(picker).toContainText('School WARP + Proton');
+  await expect(page.locator('#network-preset-select')).toHaveValue('profile:preset-school-warp-open');
+  expect((await page.evaluate(() => (window as any).__calls)).filter((call: any) => call.command === 'set_network_preset')).toEqual([]);
+  await page.getByRole('button', {name:'Save mapping', exact:true}).click();
+  await expect.poll(() => page.evaluate(() => (window as any).__calls)).toContainEqual({command:'set_network_preset', payload:{ssid:'Home WiFi',preset:'profile:preset-school-warp-open'}});
+});
+
+test('Home reports confirmed network automation and follows outside changes', async ({page}) => {
+  await page.clock.install();
+  await page.goto('/#home');
+  await expect(page.locator('#home-network-status')).toContainText('Wi-Fi auto-switch: Off');
+  await expect(page.locator('#home-network-status')).toContainText('Network-loss protection: On');
+  await page.evaluate(() => {(window as any).__network.auto = true;});
+  await page.clock.fastForward(17000);
+  await expect(page.locator('#home-network-status')).toContainText('Wi-Fi auto-switch: On');
+  await page.getByRole('link', {name:'Network settings',exact:true}).click();
+  await expect(page.getByRole('button',{name:'Turn auto-switch off',exact:true})).toBeVisible();
 });
