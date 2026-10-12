@@ -115,3 +115,68 @@ def test_mixed_preset_keeps_missing_cloudflare_routes_and_metadata_edit(tmp_path
     assert all(route["available"] for route in school["presetRoutes"])
     assert json.loads((tmp_path / "router.json").read_text())["routes"] == routes
     assert not (tmp_path / "sing-box.json").exists()
+
+
+def test_edit_mixed_routes_preserves_advanced_fields_and_source_preset(tmp_path):
+    config = write_config(tmp_path)
+    config["providers"]["cloudflare"] = {"socks5": {"host": "127.0.0.1", "port": 2181}}
+    (tmp_path / "router.json").write_text(json.dumps(config))
+    source = tmp_path / "presets/opencode-only.json"
+    preset = json.loads(source.read_text())
+    preset["routes"].append({"id": "inactive", "provider": "proton", "domains": ["inactive.example"]})
+    preset["routes"][0]["ip_cidr"] = ["198.51.100.0/24"]
+    source.write_text(json.dumps(preset))
+    original = source.read_bytes()
+    profile = next(p for p in manager.state(tmp_path)["profiles"] if p["id"] == "preset-opencode-only")
+    rules = profile["routeRules"]
+    assert rules[1]["enabled"] is False
+    rules[0]["providerId"] = "cloudflare"
+    rules[0]["domains"] = ["opencode.ai", "new.example"]
+    rules.append({"id": "extra", "providerId": "proton", "domains": ["extra.example"], "autoSubdomains": True, "fallback": "block", "enabled": True})
+    edited = {**profile, "routeRules": rules, "domains": ["opencode.ai", "new.example", "extra.example"]}
+    manager.save_profile(tmp_path, edited, profile["id"])
+    state = manager.apply_profile(tmp_path, profile["id"])
+    actual = json.loads((tmp_path / "router.json").read_text())
+    assert actual["routes"][0]["ip_cidr"] == ["198.51.100.0/24"]
+    assert actual["routes"][0]["provider"] == "cloudflare"
+    assert actual["routing"]["vpn_domains"] == ["opencode.ai", "new.example", "extra.example"]
+    assert source.read_bytes() == original
+    assert state["activeProfileId"] == profile["id"]
+    saved = next(p for p in state["profiles"] if p["id"] == profile["id"])
+    assert saved["routeRules"][0]["providerId"] == "cloudflare"
+    saved["routeRules"] = [row for row in saved["routeRules"] if row["id"] != "extra"]
+    manager.save_profile(tmp_path, saved, profile["id"])
+    manager.apply_profile(tmp_path, profile["id"])
+    assert len(json.loads((tmp_path / "router.json").read_text())["routes"]) == 2
+
+
+def test_invalid_route_edit_keeps_previous_store_and_config(tmp_path):
+    write_config(tmp_path)
+    profile = manager.state(tmp_path)["profiles"][0]
+    manager.save_profile(tmp_path, profile, profile["id"])
+    before = (tmp_path / "state" / manager.STORE_NAME).read_bytes()
+    config_before = (tmp_path / "router.json").read_bytes()
+    profile["routeRules"][0]["domains"] = ["not a domain"]
+    with pytest.raises(manager.DashboardError):
+        manager.save_profile(tmp_path, profile, profile["id"])
+    assert (tmp_path / "state" / manager.STORE_NAME).read_bytes() == before
+    assert (tmp_path / "router.json").read_bytes() == config_before
+
+
+def test_removing_route_removes_only_its_autodetect_source(tmp_path):
+    config = write_config(tmp_path)
+    config["autodetect"] = {"sources": {
+        "youtube": {"route_id": "opencode", "enabled": True},
+    }}
+    (tmp_path / "router.json").write_text(json.dumps(config))
+    profile = manager.state(tmp_path)["profiles"][0]
+    profile["routeRules"] = [{
+        "id": "replacement", "providerId": "proton", "domains": ["replacement.example"],
+        "autoSubdomains": True, "fallback": "direct", "enabled": True,
+    }]
+    profile["domains"] = ["replacement.example"]
+    manager.save_profile(tmp_path, profile, profile["id"])
+    manager.apply_profile(tmp_path, profile["id"])
+    actual = json.loads((tmp_path / "router.json").read_text())
+    assert actual["autodetect"]["sources"] == {}
+    assert actual["routes"][0]["id"] == "replacement"

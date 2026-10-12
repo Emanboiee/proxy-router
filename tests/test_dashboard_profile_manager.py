@@ -455,3 +455,53 @@ def test_same_filename_adds_server_without_overwriting_and_invalid_import_preser
         manager.save_provider(root, {"name": "Primary", "kind": "wireguard"}, provider_id, str(source))
     assert {path.name: path.read_bytes() for path in directory.glob("*.conf")} == before
     assert (root / "router.json").read_bytes() == config_before
+
+
+def test_server_pool_remove_restore_and_safety(tmp_path):
+    root = tmp_path / "router"
+    config_at(root, {"proton": {"directory": "providers/proton"}})
+    pool = root / "providers/proton"
+    pool.mkdir(parents=True)
+    for name in ("a", "b", "c"):
+        (pool / f"{name}.conf").write_text(WIREGUARD)
+    (root / "state").mkdir()
+    (root / "state/proton.active").write_text("a")
+    manager.save_server_preference(root, "proton", "b")
+    removed = manager.manage_server(root, "proton", "b")["providers"][0]
+    assert removed["servers"] == ["a", "c"]
+    assert removed["removedServers"] == ["b"]
+    assert removed["preferredServer"] is None
+    assert (pool / ".removed/b.conf").read_text() == WIREGUARD
+    assert TEST_PRIVATE_KEY not in json.dumps(removed)
+    with pytest.raises(manager.DashboardError, match="current"):
+        manager.manage_server(root, "proton", "a")
+    with pytest.raises(manager.DashboardError):
+        manager.manage_server(root, "proton", "../escape")
+    external = tmp_path / "external.conf"
+    external.write_text(WIREGUARD)
+    (pool / "link.conf").symlink_to(external)
+    with pytest.raises(manager.DashboardError):
+        manager.manage_server(root, "proton", "link")
+    (pool / "link.conf").unlink()
+    manager.manage_server(root, "proton", "c")
+    (root / "state/proton.active").unlink()
+    with pytest.raises(manager.DashboardError, match="at least one"):
+        manager.manage_server(root, "proton", "a")
+    restored = manager.manage_server(root, "proton", "b", restore=True)["providers"][0]
+    assert restored["servers"] == ["a", "b"]
+
+
+def test_server_remove_rolls_back_on_store_failure(tmp_path, monkeypatch):
+    root = tmp_path / "router"
+    config_at(root, {"proton": {"directory": "providers/proton"}})
+    pool = root / "providers/proton"
+    pool.mkdir(parents=True)
+    for name in ("a", "b"):
+        (pool / f"{name}.conf").write_text(WIREGUARD)
+    def fail(*args):
+        raise OSError("disk failure")
+    monkeypatch.setattr(manager, "_save_store", fail)
+    with pytest.raises(OSError):
+        manager.manage_server(root, "proton", "b")
+    assert (pool / "b.conf").read_text() == WIREGUARD
+    assert not (pool / ".removed/b.conf").exists()

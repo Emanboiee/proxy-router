@@ -658,3 +658,5 @@ button.primary:active,
 .preset-route-table th, .preset-route-table td { padding: var(--space-2); vertical-align: top; border-bottom: var(--border); }
 .preset-route-table td:last-child { overflow-wrap: anywhere; }
 .preset-route-table thead th { color: var(--muted); }
+
+.route-rule { margin: 16px 0; padding: 16px; border: 1px solid var(--border); border-radius: 6px; display: grid; gap: 12px; }
