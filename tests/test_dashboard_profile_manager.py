@@ -384,3 +384,21 @@ def test_socks_provider_round_trip_and_invalid_endpoint_rollback(tmp_path):
     state = manager.save_provider(tmp_path, {"name": "WARP", "kind": "warp",
                                             "host": "::1", "port": 40000}, provider["id"])
     assert state["providers"][0]["connection"]["host"] == "::1"
+
+
+def test_command_startup_is_local_metadata_and_saving_never_runs_it(tmp_path, monkeypatch):
+    config_at(tmp_path)
+    import provider_lifecycle
+    monkeypatch.setattr(provider_lifecycle, "ensure", lambda *a, **k: pytest.fail("saving ran startup"))
+    startup = {"mode": "command", "command": "my-proxy --listen 127.0.0.1:9000"}
+    state = manager.save_provider(tmp_path, {"name": "My proxy", "kind": "socks5",
+                                           "host": "127.0.0.1", "port": 9000, "startup": startup})
+    assert state["providers"][0]["startup"] == startup
+    config = json.loads((tmp_path / "router.json").read_text())
+    assert all("startup" not in spec for spec in config["providers"].values())
+    before = (tmp_path / "state" / manager.STORE_NAME).read_bytes()
+    with pytest.raises(manager.DashboardError):
+        manager.save_provider(tmp_path, {"name": "Bad", "kind": "socks5",
+                                        "host": "127.0.0.1", "port": 9001,
+                                        "startup": {"mode": "command", "command": "sudo bad"}})
+    assert (tmp_path / "state" / manager.STORE_NAME).read_bytes() == before
