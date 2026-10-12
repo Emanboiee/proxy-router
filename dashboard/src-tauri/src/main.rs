@@ -430,6 +430,20 @@ fn get_config() -> Result<Value, String> {
 }
 
 /// Live network detection: current Wi-Fi + the SSID -> preset mapping.
+/// Keep authorized Wi-Fi observations fresh while the window is hidden.
+/// The Python worker owns switching; this thread only publishes identity.
+#[cfg(target_os = "macos")]
+fn start_network_identity_observer(root: PathBuf) {
+    std::thread::spawn(move || loop {
+        if let Some(ssid) = wifi_identity::ssid() {
+            let _ = controller::run_controller(
+                &root, &["network-preset", "observe", "--ssid", &ssid],
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_secs(10));
+    });
+}
+
 #[tauri::command]
 fn get_network() -> Result<Value, String> {
     let root = controller::router_root();
@@ -722,6 +736,8 @@ fn main() {
             // Claim before building our status item, so the Python tray can
             // hide itself as soon as this app can serve the menu bar.
             claim_tray_ownership(&owner_root, &setup_owner)?;
+            #[cfg(target_os = "macos")]
+            start_network_identity_observer(owner_root.clone());
 
             let open = MenuItem::with_id(app, "open", "Open Dashboard", true, None::<&str>)?;
             let connect = MenuItem::with_id(app, "connect", "Connect", true, None::<&str>)?;
