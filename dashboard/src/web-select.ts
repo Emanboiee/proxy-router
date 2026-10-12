@@ -68,11 +68,15 @@ function open(view: SelectView, edge?: 'first' | 'last'): void {
   active = view;
   search = '';
   update(view);
-  // Keep menus in the modal's focus scope. Popover lifts them above clipping.
-  (view.source.closest('dialog') ?? document.body).append(view.menu);
+  // Dialogs already occupy the top layer. A nested popover hides their
+  // backdrop/content in WKWebView, so use a fixed sibling of the form there.
+  const dialog = view.source.closest('dialog');
+  if (dialog) view.menu.removeAttribute('popover');
+  else if (typeof view.menu.showPopover === 'function') view.menu.setAttribute('popover', 'manual');
+  (dialog ?? document.body).append(view.menu);
   view.menu.hidden = false;
   position(view);
-  if (typeof view.menu.showPopover === 'function') view.menu.showPopover();
+  if (view.menu.hasAttribute('popover')) view.menu.showPopover();
   view.trigger.setAttribute('aria-expanded', 'true');
   const choices = options(view);
   const selected = choices.findIndex(option => option.getAttribute('aria-selected') === 'true');

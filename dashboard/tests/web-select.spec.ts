@@ -60,6 +60,8 @@ test('long web menus fit viewport and remain inside dialog focus scope', async (
   const trigger = page.getByRole('combobox', {name:'Edge server',exact:true});
   await trigger.click();
   const list = page.getByRole('listbox',{name:'Edge server',exact:true});
+  await expect(list).not.toHaveAttribute('popover');
+  await expect(page.locator('#edge-test .web-select-menu')).toBeVisible();
   const box = await list.boundingBox();
   expect(box).not.toBeNull();
   expect(box!.y).toBeGreaterThanOrEqual(0);
