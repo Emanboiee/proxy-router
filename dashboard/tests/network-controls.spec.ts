@@ -6,11 +6,13 @@ test.beforeEach(async ({page}) => {
     const win = window as any;
     win.__calls = [];
     win.__identityDenied = false;
+    win.__newNetwork = false;
     const network = {
       connected: true, supported: true, ssid: 'Home WiFi', identity: 'available', auto: false,
       disconnect_on_loss: true, mapped_preset: null, presets: {}, last_applied: {},
       recent: ['Home WiFi', 'School WiFi', 'Cafe', 'Phone hotspot', 'Office'].map((ssid, i) => ({ssid, last_seen: 100-i})),
     };
+    win.__network = network;
     Object.defineProperty(window, 'isTauri', {value: true});
     Object.defineProperty(window, '__TAURI_INTERNALS__', {value: {
       invoke: (command: string, payload: any) => {
@@ -21,6 +23,11 @@ test.beforeEach(async ({page}) => {
           {id:'preset-school-warp-open', name:'School WARP + Proton', presetName:'school-warp-open', domains:[], routeMode:'selective', providerId:'cloudflare', fallback:'retry', updatedAt:1},
         ]});
         if (command === 'get_network' || command === 'reveal_network') {
+          if (win.__newNetwork && network.recent[0].ssid !== 'New WiFi') {
+            network.ssid = 'New WiFi';
+            network.recent.unshift({ssid:'New WiFi',last_seen:110});
+            network.recent.pop();
+          }
           return Promise.resolve({status:network, presets:win.__identityDenied ? {...network, ssid:null, identity:'permission', recent:[]} : structuredClone(network)});
         }
         if (command === 'get_config') return Promise.resolve({routes:[], providers:{}});
@@ -74,4 +81,18 @@ test('permission failure offers recovery and never maps a redaction placeholder'
   await expect(page.locator('#network-panel')).not.toContainText('<redacted>');
   await expect(page.locator('#network-preset-select')).toHaveCount(0);
   await expect(page.getByRole('button', {name:'Check network', exact:true})).toBeVisible();
+});
+
+test('a background network change preserves the draft and saves the original row network', async ({page}) => {
+  await page.clock.install();
+  await page.goto('/#connectivity');
+  await page.locator('#recent-network-1').selectOption('profile:preset-school-warp-open');
+  await page.evaluate(() => {(window as any).__newNetwork = true;});
+  await page.clock.fastForward(17000);
+  await expect.poll(() => page.evaluate(() => (window as any).__network.recent[0].ssid)).toBe('New WiFi');
+  await expect(page.locator('#recent-network-1')).toHaveValue('profile:preset-school-warp-open');
+  await page.locator('.network-history-row').nth(1).getByRole('button', {name:'Save',exact:true}).click();
+  await expect.poll(() => page.evaluate(() => (window as any).__calls)).toContainEqual({
+    command:'set_network_preset', payload:{ssid:'School WiFi', preset:'profile:preset-school-warp-open'},
+  });
 });
