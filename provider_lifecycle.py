@@ -190,3 +190,31 @@ def ensure(root: Path, name: str, host: str, port: int, *, timeout: float = 20) 
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=2)
+
+
+def ensure_routed(root: Path, config: dict, providers: dict, endpoint) -> None:
+    """Start managed SOCKS5 providers referenced by generated routing."""
+    for name in referenced_providers(config):
+        if isinstance(providers.get(name, {}).get("socks5"), dict):
+            host, port = endpoint(name)
+            ensure(root, name, host, port)
+
+
+def startup_error(root: Path, config: dict, providers: dict, endpoint) -> str | None:
+    try:
+        ensure_routed(root, config, providers, endpoint)
+    except (OSError, ValueError, TimeoutError) as exc:
+        return f"provider startup failed: {exc}"
+    return None
+
+
+def recover_routed(root: Path, name: str, config_path: Path, endpoint) -> dict | None:
+    """Recover one active proxy; caller checks engine liveness first."""
+    try:
+        config = json.loads(config_path.read_text())
+        if name in referenced_providers(config):
+            host, port = endpoint(name)
+            ensure(root, name, host, port)
+    except (OSError, ValueError, TimeoutError) as exc:
+        return {"detail": f"provider startup failed: {exc}", "dns_ok": None}
+    return None

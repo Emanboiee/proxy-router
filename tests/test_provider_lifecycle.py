@@ -113,10 +113,10 @@ def test_only_routed_providers_start(tmp_path, monkeypatch):
         "unused": {"socks5": {"host": "127.0.0.1", "port": 1235}},
     })
     monkeypatch.setattr(lifecycle, "ensure", lambda root, name, host, port: calls.append(name))
-    router.ensure_managed_proxy_providers({
+    lifecycle.ensure_routed(tmp_path, {
         "outbounds": [{"tag": "used"}, {"tag": "unused"}],
         "route": {"rules": [{"type": "logical", "rules": [{"outbound": "used"}]}], "final": "direct"},
-    })
+    }, router._providers, router.proxy_upstream)
     assert calls == ["used"]
 
 
