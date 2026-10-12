@@ -557,7 +557,8 @@ def state(root: Path) -> dict[str, Any]:
     active_id = store.get("active_profile_id")
     selected = next((item for item in store["profiles"] if item.get("id") == active_id), {})
     selected_snapshot = selected.get("_route_snapshot")
-    override_active = selected_snapshot is not None and _route_snapshot(config) == selected_snapshot
+    override_active = selected_snapshot is not None and all(
+        _route_snapshot(config).get(key) == value for key, value in selected_snapshot.items())
     matching_preset = next((item for item in discovered if item["id"] == preset_id
                             and _preset_is_active(root, config, item)), None)
     if override_active:
