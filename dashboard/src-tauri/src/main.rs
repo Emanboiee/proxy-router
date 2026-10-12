@@ -433,7 +433,7 @@ fn get_config() -> Result<Value, String> {
 /// Keep authorized Wi-Fi observations fresh while the window is hidden.
 /// The Python worker owns switching; this thread only publishes identity.
 #[cfg(target_os = "macos")]
-fn start_network_identity_observer(root: PathBuf) {
+fn start_network_identity_observer(root: std::path::PathBuf) {
     std::thread::spawn(move || loop {
         if let Some(ssid) = wifi_identity::ssid() {
             let _ = controller::run_controller(
