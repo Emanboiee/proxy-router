@@ -27,13 +27,14 @@ export interface Status {
 }
 export interface Profile {
   id: string; name: string; description: string; providerId: string;
+  routeRules?: Array<{ id: string; providerId: string; domains: string[]; autoSubdomains: boolean; fallback: string; enabled?: boolean }>;
   presetName?: string; presetRoutes?: Array<{ id: string; providerId: string; domains: string[]; available: boolean }>;
   fallbackProviderId?: string; routeMode: RouteMode; domains: string[]; autoSubdomains: boolean; fallback: FallbackMode; updatedAt: number;
 }
 export interface Provider {
   id: string; name: string; kind: ProviderKind;
   status: 'healthy' | 'degraded' | 'offline' | 'unknown'; latency: number | null;
-  server: string; servers: string[]; preferredServer?: string | null; capabilities?: { serverSelection: boolean; reconnect: boolean }; connection?: ProviderConnection; startup?: ProviderStartup;
+  server: string; servers: string[]; removedServers?: string[]; preferredServer?: string | null; capabilities?: { serverSelection: boolean; reconnect: boolean }; connection?: ProviderConnection; startup?: ProviderStartup;
 }
 export interface ThemeSettings {
   scheme: Scheme; accent: Accent; density: Density; layout: LayoutPreset; contrast: 'standard' | 'high'; motionSpeed: MotionSpeed; reducedMotion: boolean;
@@ -396,4 +397,8 @@ export async function saveServerPreference(providerId: string, server: string): 
 }
 export async function switchDashboardServer(providerId: string, server: string): Promise<void> {
   await invoke("switch_dashboard_server", { providerId, server });
+}
+
+export async function manageDashboardServer(providerId: string, server: string, restore = false): Promise<DashboardState> {
+  return await invoke<DashboardState>('manage_dashboard_server', { providerId, server, restore });
 }
