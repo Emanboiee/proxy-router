@@ -24,6 +24,8 @@ test('desktop discovers installed servers and separates preference from switchin
   }}});
  });
  await page.goto('/');
+ await expect(page.locator('.server-current')).toBeHidden();
+ await page.locator('.home-more-trigger').click();
  await expect(page.locator('#preferred-server option')).toHaveCount(24);
  await selectWeb(page.locator('#preferred-server'), 'server-22');
  await expect(page.locator('.server-current')).toContainText('server-00');

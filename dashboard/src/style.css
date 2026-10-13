@@ -703,3 +703,24 @@ dialog#profile-dialog[open] .profile-editor {
   opacity: 1;
   transform: none;
 }
+
+.home-more-details { width: min(100%, 42rem); margin: var(--s6) auto 0; }
+.home-more-trigger {
+  display: flex; align-items: center; justify-content: center; gap: var(--s3);
+  width: min(100%, 26rem); margin: 0 auto; padding: var(--s4) var(--s6);
+  min-height: 56px; border: var(--border); border-radius: var(--radius);
+  background: var(--raised); color: var(--ink); font-weight: 600; cursor: pointer;
+  list-style: none;
+}
+.home-more-trigger::-webkit-details-marker { display: none; }
+.home-more-trigger:hover { background: var(--raised-2); }
+.home-more-trigger:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+.home-more-details .less-label { display: none; }
+.home-more-details[open] > summary .more-label { display: none; }
+.home-more-details[open] > summary .less-label { display: inline; }
+.home-more-details[open] > summary .select-chevron { transform: rotate(225deg); }
+.home-route-details > summary { justify-content: center; gap: var(--s2); width: 100%; text-align: center; list-style: none; padding: var(--s3); }
+.home-route-details > summary::-webkit-details-marker { display: none; }
+.home-route-details > summary::after { content: '+'; }
+.home-route-details[open] > summary::after { content: '−'; }
+.home-route-details .route-list { text-align: left; }

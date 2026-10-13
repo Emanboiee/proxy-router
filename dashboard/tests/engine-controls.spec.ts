@@ -6,11 +6,25 @@ test('unchanged background status keeps the page DOM and expanded routing intact
   await page.addInitScript(desktopMock);
   await page.goto('/');
   await expect(page.locator('#active-preset')).toHaveText('opencode');
+  await expect(page.locator('.home-route-details')).toBeHidden();
+  await page.locator('.home-more-trigger').focus();
+  await page.keyboard.press('Enter');
+  await expect(page.locator('.home-route-details')).toBeVisible();
+  const centered = await page.locator('.home-route-details > summary').evaluate(node => {
+    const range = document.createRange();
+    range.selectNodeContents(node);
+    const text = range.getBoundingClientRect();
+    const button = node.getBoundingClientRect();
+    return Math.abs(text.x + text.width / 2 - button.x - button.width / 2);
+  });
+  expect(centered).toBeLessThan(20);
   await page.locator('.home-route-details').evaluate(node => { (node as HTMLDetailsElement).open = true; });
+  await page.locator('h1').focus();
   await page.locator('#main').evaluate(node => {
     (window as unknown as { __originalHero: Element | null }).__originalHero = node.querySelector('.connection-hero');
   });
   await page.clock.runFor(31000);
+  await expect(page.locator('.home-more-details')).toHaveAttribute('open', '');
   await expect(page.locator('.home-route-details')).toHaveAttribute('open', '');
   expect(await page.evaluate(() => document.querySelector('.connection-hero') ===
     (window as unknown as { __originalHero: Element | null }).__originalHero)).toBe(true);
