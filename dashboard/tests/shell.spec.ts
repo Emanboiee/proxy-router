@@ -102,7 +102,7 @@ for (const [width, height] of [[1440, 900], [390, 844]]) {
     await page.getByRole('button', { name: 'Preview states' }).click();
     await page.keyboard.press('Escape');
     await expect(page.getByRole('button', { name: 'Preview states' })).toBeFocused();
-    for (const name of ['Profiles', 'Providers', 'Connectivity', 'Settings', 'About', 'Home']) {
+    for (const name of ['Profiles', 'Providers', 'Connectivity', 'Settings', 'Appearance', 'Home']) {
       if (width === 390) await page.getByRole('button', { name: 'Menu', exact: true }).click();
       const navLink = page.getByRole('navigation').getByRole('link', { name, exact: true });
       await navLink.focus();
@@ -112,7 +112,7 @@ for (const [width, height] of [[1440, 900], [390, 844]]) {
       expect(await page.title()).toContain(name);
     }
     await page.goBack();
-    await expect(page.getByRole('heading', { name: 'About', exact: true })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Appearance', exact: true })).toBeVisible();
     await page.emulateMedia({ reducedMotion: 'reduce' });
     const styles = await page.evaluate(() => ({
       fonts: [...new Set([...document.querySelectorAll('*')].map(e => getComputedStyle(e).fontSize))],
