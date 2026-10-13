@@ -6,9 +6,13 @@ test('unchanged background status keeps the page DOM and expanded routing intact
   await page.addInitScript(desktopMock);
   await page.goto('/');
   await expect(page.locator('#active-preset')).toHaveText('opencode');
+  await expect(page.locator('#prototype-badge')).toHaveText('Live controller');
+  await expect(page.getByRole('button', { name: 'Preview states', exact: true })).toBeHidden();
   await expect(page.locator('.home-route-details')).toBeHidden();
   await page.locator('.home-more-trigger').focus();
   await page.keyboard.press('Enter');
+  await page.clock.runFor(16000);
+  await expect(page.locator('.home-more-trigger')).toBeFocused();
   await expect(page.locator('.home-route-details')).toBeVisible();
   const centered = await page.locator('.home-route-details > summary').evaluate(node => {
     const range = document.createRange();

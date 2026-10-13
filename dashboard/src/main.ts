@@ -532,6 +532,8 @@ function aboutPage(): string {
 }
 
 function render(options?: { background?: boolean }): void {
+  document.querySelector('#prototype-badge')!.textContent = isTauri() ? 'Live controller' : 'Local prototype';
+  document.querySelector<HTMLButtonElement>('#preview')!.hidden = isTauri();
   app.dataset.state = previewState;
   app.dataset.page = page.toLowerCase();
   if (!isTauri() && lastTrayState !== previewState) { lastTrayState = previewState; setTrayStatus(previewState); }
@@ -547,7 +549,7 @@ function render(options?: { background?: boolean }): void {
   const headingFocused = document.activeElement === main.querySelector('h1');
   const focused = document.activeElement instanceof HTMLElement
     && main.contains(document.activeElement)
-    && document.activeElement.matches('input, textarea, select, button, a, [contenteditable="true"], [role="option"]');
+    && document.activeElement.matches('input, textarea, select, button, a, summary, [contenteditable="true"], [role="option"]');
   const draft = Array.from(main.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>('input, textarea, select'))
     .some(field => field instanceof HTMLSelectElement
       ? Array.from(field.options).some(option => option.selected !== option.defaultSelected)
