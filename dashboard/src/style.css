@@ -719,8 +719,8 @@ dialog#profile-dialog[open] .profile-editor {
 .home-more-details[open] > summary .more-label { display: none; }
 .home-more-details[open] > summary .less-label { display: inline; }
 .home-more-details[open] > summary .select-chevron { transform: rotate(225deg); }
-.home-route-details > summary { text-align: center; list-style: none; padding: var(--s3); }
+.home-route-details > summary { justify-content: center; gap: var(--s2); width: 100%; text-align: center; list-style: none; padding: var(--s3); }
 .home-route-details > summary::-webkit-details-marker { display: none; }
-.home-route-details > summary::after { content: ' +'; }
-.home-route-details[open] > summary::after { content: ' −'; }
+.home-route-details > summary::after { content: '+'; }
+.home-route-details[open] > summary::after { content: '−'; }
 .home-route-details .route-list { text-align: left; }
