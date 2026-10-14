@@ -32,6 +32,8 @@ input[type="checkbox"]:checked::after { background: var(--accent-ink); transform
 textarea { resize: vertical; }
 a { color: inherit; }
 :focus-visible { outline: 3px solid var(--focus); outline-offset: 3px; }
+/* The skip-link target is a scrolling landmark, not an interactive control. */
+#main[tabindex="-1"]:focus { outline: none; }
 #app { display: grid; grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); height: 100dvh; }
 .rail { background: var(--surface); border-bottom: var(--border); padding: var(--space-3) clamp(var(--space-3), 4vw, var(--space-5)); display: flex; flex-direction: row; align-items: center; gap: var(--space-4); min-width: 0; }
 .rail header { display: flex; align-items: center; gap: var(--s3); min-height: var(--target); }
@@ -215,6 +217,17 @@ summary { display: flex; align-items: center; cursor: pointer; color: var(--mute
 .provider-fields { display: grid; gap: var(--space-3); }
 .provider-fields [hidden] { display: none; }
 .provider-fields .field-note { margin: 0; }
+#import-feedback:not(:empty), #provider-dialog .provider-feedback {
+  margin: var(--space-3) 0 0;
+  padding: var(--space-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm, 8px);
+  background: var(--surface);
+  color: var(--text);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+#import-feedback:empty { display: none; }
 .provider-card { display: flex; flex-direction: column; min-height: 250px; }
 .provider-controls > label { grid-column: 1; }
 .provider-controls > select { grid-column: 2; min-width: 0; min-height: var(--target); }

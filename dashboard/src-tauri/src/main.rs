@@ -92,6 +92,27 @@ fn get_preview_status() -> Result<serde_json::Value, String> {
         .map_err(|_| "Preview status unavailable".to_string())
 }
 
+/// Explicit, bounded HTTPS timing through the local proxy listener.
+#[tauri::command]
+async fn measure_proxy_latency() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let config = get_config()?;
+        let port = config.get("port").and_then(Value::as_u64).filter(|port| *port > 0 && *port <= 65535)
+            .ok_or_else(|| "Invalid proxy port".to_string())?;
+        let output = std::process::Command::new("curl")
+            .args(["--disable", "--silent", "--show-error", "--fail", "--noproxy", "",
+                "--proxy", &format!("http://127.0.0.1:{port}"), "--connect-timeout", "3",
+                "--max-time", "8", "--output", if cfg!(windows) { "NUL" } else { "/dev/null" },
+                "--write-out", "%{time_total}", "https://1.1.1.1/cdn-cgi/trace"])
+            .output().map_err(|_| "Could not launch curl for latency check".to_string())?;
+        if !output.status.success() { return Err("Latency check failed or timed out; connection was not changed.".to_string()); }
+        let seconds: f64 = String::from_utf8_lossy(&output.stdout).trim().parse()
+            .map_err(|_| "Invalid latency result".to_string())?;
+        if !seconds.is_finite() || seconds < 0.0 { return Err("Invalid latency result".to_string()); }
+        Ok(serde_json::json!({"latency_ms": (seconds * 1000.0).round()}))
+    }).await.map_err(|_| "Latency worker failed".to_string())?
+}
+
 fn show_dashboard<R: Runtime>(app: &AppHandle<R>) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
@@ -868,6 +889,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             get_preview_status,
+            measure_proxy_latency,
             get_live_status,
             cached_live_status,
             run_router_action,

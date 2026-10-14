@@ -1,19 +1,21 @@
 import {installWebSelects, syncWebSelects} from './web-select';
+import {applyDashboardPalette, polishDashboard} from './dashboard-polish';
 import {connectionControls, serverInventory} from './server-controls';
 import './tokens.css';
 import './style.css';
 import { LocalController, manageDashboardServer, saveServerPreference, switchDashboardServer, applyEngineAction, applyDashboardProfile, deleteDashboardProfile, deleteDashboardProvider, getCachedLiveStatus, getDashboardState, getLiveStatus, getPreviewStatus, reportPreviewFrame, saveDashboardProfile, saveDashboardProvider, setTrayStatus, states, type Accent, type Connection, type DashboardState, type Density, type FallbackMode, type LayoutPreset, type MotionSpeed, type PreviewState, type Profile, type Provider, type ProviderKind, type RouteMode, type Scheme, type Snapshot, type Status, type TailscaleMode } from './controller';
 import { open as openNativeFile } from '@tauri-apps/plugin-dialog';
 import { isTauri } from '@tauri-apps/api/core';
+import { parseProfileExport } from './controller';
 import { addRoute, applyPreset, getConfig, getNetwork, revealNetwork, setNetworkDisconnect, getRouting, presetChoices, removeNetworkPreset, removeRoute, runNetworkAction, setNetworkAuto, setNetworkPreset, setRoutingMode, type EngineConfig, type NetworkPresetState, type RoutingState } from './controller';
 
-const pages = ['Home', 'Profiles', 'Providers', 'Connectivity', 'Settings', 'Appearance', 'About'] as const;
+const pages = ['Home', 'Profiles', 'Providers', 'Connectivity', 'Settings', 'Appearance'] as const;
 type Page = typeof pages[number];
 const controller = new LocalController();
 let snapshot = controller.snapshot();
-if (isTauri()) snapshot = { ...snapshot, profiles: [], providers: [], activeProfileId: null };
+if (isTauri()) snapshot = { ...snapshot, profiles: [], providers: [], activeProfileId: null, logs: [], lastAction: '' };
 let status: Status | null = null;
-let previewState: PreviewState = snapshot.connection;
+let previewState: PreviewState = isTauri() ? 'loading' : snapshot.connection;
 let page: Page = 'Home';
 let editingProfileId: string | undefined;
 let editingProviderId: string | undefined;
@@ -93,9 +95,28 @@ function applyTheme(): void {
   const root = document.documentElement;
   root.dataset.scheme = snapshot.theme.scheme; root.dataset.accent = snapshot.theme.accent; root.dataset.density = snapshot.theme.density; root.dataset.layout = snapshot.theme.layout; root.dataset.contrast = snapshot.theme.contrast; root.dataset.motionSpeed = snapshot.theme.motionSpeed; root.dataset.motion = snapshot.theme.reducedMotion ? 'reduced' : 'full';
   root.style.colorScheme = snapshot.theme.scheme === 'system' ? 'light dark' : snapshot.theme.scheme;
+  applyDashboardPalette();
 }
-function sync(next: Snapshot, message = next.lastAction): void { snapshot = next; if (!isTauri() && previewState !== 'loading') previewState = snapshot.connection; applyTheme(); render(); if (message) announce(message); }
-function perform(action: () => Promise<Snapshot>): Promise<void> { actionQueue = actionQueue.then(async () => { busy = true; try { sync(await action()); } catch (error) { announce(error instanceof Error ? error.message : 'Action failed'); } finally { busy = false; render(); } }); return actionQueue; }
+function sync(next: Snapshot, message = next.lastAction): void {
+  snapshot = isTauri()
+    ? { ...snapshot, theme: next.theme, settings: next.settings, lastAction: next.lastAction, logs: message ? [message, ...snapshot.logs].slice(0, 30) : snapshot.logs }
+    : next;
+  if (!isTauri() && previewState !== 'loading') previewState = snapshot.connection;
+  applyTheme(); render(); if (message) announce(message);
+}
+function showActionError(message: string): void {
+  if (providerDialog.open) {
+    let feedback = providerDialog.querySelector<HTMLElement>('.provider-feedback');
+    if (!feedback) {
+      feedback = document.createElement('p'); feedback.className = 'field-note provider-feedback'; feedback.setAttribute('role', 'alert');
+      const actions = providerDialog.querySelector('.dialog-actions, .form-actions');
+      if (actions) actions.before(feedback); else providerDialog.append(feedback);
+    }
+    feedback.textContent = message;
+  }
+  announce(message);
+}
+function perform(action: () => Promise<Snapshot>): Promise<void> { actionQueue = actionQueue.then(async () => { busy = true; try { sync(await action()); } catch (error) { showActionError(error instanceof Error ? error.message : 'Action failed'); } finally { busy = false; render(); } }); return actionQueue; }
 async function performDashboard(action: () => Promise<DashboardState>, message: string): Promise<void> {
   busy = true;
   render();
@@ -103,7 +124,7 @@ async function performDashboard(action: () => Promise<DashboardState>, message: 
     installDashboardState(await action());
     announce(message);
   } catch (error) {
-    announce(error instanceof Error ? error.message : 'Could not save dashboard data');
+    showActionError(error instanceof Error ? error.message : 'Could not save dashboard data');
   } finally {
     busy = false;
     render();
@@ -303,7 +324,7 @@ function profileForm(profile?: Profile): string {
   if (value.routeRules || profile?.presetName) {
     const routes = value.routeRules ?? (profile?.presetRoutes ?? []).map(route => ({ ...route, autoSubdomains: false, fallback: 'direct' }));
     const rows = routes.map((route, index) => routeRuleFields(route, index)).join('');
-    return `<form class="panel editor profile-editor" id="profile-form" data-route-rules><div class="panel-heading"><h2 id="profile-dialog-title">${esc(value.name)}</h2><button type="button" class="quiet" data-action="cancel-profile">← Back</button></div><label>Name<input id="profile-name" name="name" required maxlength="48" value="${esc(value.name)}"></label><label>Description<input name="description" maxlength="120" value="${esc(value.description)}"></label><label>Routing mode<select name="routeMode"><option value="selective" ${value.routeMode === 'selective' ? 'selected' : ''}>Route listed domains</option><option value="full" ${value.routeMode === 'full' ? 'selected' : ''}>Route all other traffic too</option><option value="direct" ${value.routeMode === 'direct' ? 'selected' : ''}>Direct connection</option></select></label><label>Default connection<select name="providerId">${snapshot.providers.some(provider => provider.id === value.providerId) ? providerOptions(value.providerId) : `<option selected value="${esc(value.providerId)}">${esc(value.providerId)} · Not configured</option>${providerOptions('')}`}</select></label><p class="field-note">Rules are evaluated in order. Existing advanced match options stay intact. Saving configures your next Connect.</p><div id="profile-route-rules">${rows}</div><button type="button" class="quiet" data-action="profile-route-add">Add routing rule</button><div class="form-actions"><button type="submit" class="primary">Save changes</button></div></form>`;
+    return `<form class="panel editor profile-editor" id="profile-form" data-route-rules><div class="panel-heading"><h2 id="profile-dialog-title">${esc(value.name || "Create profile")}</h2><button type="button" class="quiet" data-action="cancel-profile">← Back</button></div><label>Name<input id="profile-name" name="name" required maxlength="48" value="${esc(value.name)}"></label><label>Description<input name="description" maxlength="120" value="${esc(value.description)}"></label><label>Routing mode<select name="routeMode"><option value="selective" ${value.routeMode === 'selective' ? 'selected' : ''}>Route listed domains</option><option value="full" ${value.routeMode === 'full' ? 'selected' : ''}>Route all other traffic too</option><option value="direct" ${value.routeMode === 'direct' ? 'selected' : ''}>Direct connection</option></select></label><label>Default connection<select name="providerId">${snapshot.providers.some(provider => provider.id === value.providerId) ? providerOptions(value.providerId) : `<option selected value="${esc(value.providerId)}">${esc(value.providerId)} · Not configured</option>${providerOptions('')}`}</select></label><p class="field-note">Rules are evaluated in order. Existing advanced match options stay intact. Saving configures your next Connect.</p><div id="profile-route-rules">${rows}</div><button type="button" class="quiet" data-action="profile-route-add">Add routing rule</button><div class="form-actions"><button type="submit" class="primary">Save changes</button></div></form>`;
   }
   const selectedProviderId = pendingProviderId ?? value.providerId;
   const fallbackProvider = snapshot.providers.find(provider => provider.id === value.fallbackProviderId)?.id ?? '';
@@ -324,19 +345,19 @@ function providerForm(context: 'providers' | 'profile' = 'providers'): string {
   const fromProfile = context === 'profile';
   const provider = editingProviderId ? snapshot.providers.find(item => item.id === editingProviderId) : undefined;
   const desktop = isTauri();
-  const kind = provider?.connection?.kind === 'socks5' ? (provider.kind === 'warp' ? 'warp' : 'socks5') : 'wireguard';
+  const kind = desktop ? provider?.connection?.kind === 'socks5' ? (provider.kind === 'warp' ? 'warp' : 'socks5') : 'wireguard' : provider?.kind ?? 'wireguard';
   const proxy = provider?.connection?.kind === 'socks5' ? provider.connection : undefined;
   const startup = provider?.startup ?? { mode: 'external' };
   const fileName = provider?.connection?.kind === 'wireguard' ? provider.connection.fileName : '';
   const providerKinds = desktop
     ? `<option value="wireguard" ${kind === 'wireguard' ? 'selected' : ''}>WireGuard</option><option value="warp" ${kind === 'warp' ? 'selected' : ''}>Cloudflare WARP (local proxy)</option><option value="socks5" ${kind === 'socks5' ? 'selected' : ''}>SOCKS5 proxy</option>`
-    : '<option value="custom">Custom VPN</option><option value="warp">Cloudflare WARP</option><option value="proton">Proton VPN</option><option value="wireguard">WireGuard</option><option value="tailscale">Tailscale exit node</option><option value="socks5">SOCKS5 proxy</option>';
+    : [['wireguard', 'WireGuard'], ['proton', 'Proton VPN (WireGuard)'], ['warp', 'Cloudflare WARP'], ['tailscale', 'Tailscale exit node'], ['socks5', 'SOCKS5 proxy']].map(([value, label]) => `<option value="${value}" ${value === (kind === 'custom' ? 'wireguard' : kind) ? 'selected' : ''}>${label}</option>`).join('');
   const configControl = desktop
     ? `<button type="button" class="quiet" data-action="pick-wireguard-config">${selectedProviderPath ? 'Change selected config' : provider ? 'Add WireGuard config'  : 'Choose WireGuard config'}</button><span id="wireguard-file-label" class="field-note">${esc(selectedProviderPath?.split(/[\\/]/).pop() ?? (importingProviderServer ? 'Choose a new config to add.' : fileName) ?? 'Private config stays out of dashboard storage.')}</span>`
-    : '<input name="wireguardConfig" type="file" accept=".conf,text/plain">';
+    : '<label class="config-import-label">Choose WireGuard configs<input name="wireguardConfig" type="file" accept=".conf,text/plain" multiple></label><p class="field-note">Select one or more .conf files. Each becomes a server in this provider.</p>';
   return `<form class="panel editor provider-editor" id="provider-form" data-provider-context="${context}"><div class="panel-heading"><div><span class="label">${provider ? importingProviderServer ? 'Add server' : 'Edit provider' : fromProfile ? 'New profile connection' : 'New provider'}</span><h2 id="provider-dialog-title">${provider ? importingProviderServer ? `Add server to ${esc(provider.name)}` : `Edit ${esc(provider.name)}` : fromProfile ? 'Add a connection to this profile' : 'Add a connection path'}</h2></div><button type="button" class="quiet" data-action="${fromProfile ? 'cancel-provider-profile' : 'cancel-provider'}">← Back</button></div><div class="form-grid"><label>Name<input id="provider-name" name="name" ${importingProviderServer && provider ? 'readonly' : ''} required maxlength="48" placeholder="e.g. Home WireGuard" value="${esc(provider?.name ?? '')}"></label><label>Type<select name="kind" data-provider-kind ${importingProviderServer && provider ? 'disabled' : ''}>${providerKinds}</select>${importingProviderServer && provider ? `<input type="hidden" name="kind" value="${kind}">` : ''}</label>${desktop ? '' : '<label class="wide endpoint-field" data-provider-endpoint>Server or endpoint<input name="server" maxlength="120" placeholder="e.g. us-ny-001.example.net"></label>'}<div class="wide provider-fields" data-provider-fields="config" ${kind === 'warp' || kind === 'socks5' ? 'hidden' : ''}><label>${desktop ? 'VPN configuration' : 'VPN configuration (.conf)'}</label>${configControl}${provider?.connection?.kind === 'wireguard' ? `<p class="field-note">${provider.servers.length} saved server${provider.servers.length === 1 ? '' : 's'} in this provider. Each config adds one server.</p>` : ''}<p class="field-note">Choose a WireGuard-compatible .conf file. Adding a config keeps existing servers and the current connection. Credentials stay in the private provider folder.</p></div>${desktop ? `<div class="wide provider-fields" data-provider-fields="socks5" ${kind === 'warp' || kind === 'socks5' ? '' : 'hidden'}><div class="form-grid"><label>Local SOCKS5 host<input name="socksHost" maxlength="253" value="${esc(proxy?.host ?? '127.0.0.1')}" aria-describedby="proxy-help"></label><label>Port<input name="socksPort" type="number" min="1" max="65535" value="${proxy?.port ?? 40000}" aria-describedby="proxy-help"></label></div><label>Startup<select name="startupMode" data-startup-mode><option value="external" ${startup.mode === 'external' ? 'selected' : ''}>Use an already running connection</option><option value="warp" ${startup.mode === 'warp' ? 'selected' : ''}>Start Cloudflare WARP automatically</option><option value="command" ${startup.mode === 'command' ? 'selected' : ''}>Run my startup command</option></select></label><label data-startup-command ${startup.mode === 'command' ? '' : 'hidden'}>Startup command<textarea name="startupCommand" rows="2" maxlength="4096" aria-describedby="startup-help" placeholder="program --config /path/to/config">${esc(startup.command ?? '')}</textarea><span id="startup-help" class="field-note">One program and its arguments, run as your user when this provider is needed. No shell operators or implicit administrator access. It must provide the local SOCKS5 endpoint above. OpenVPN alone provides a VPN tunnel, not a SOCKS5 listener.</span></label><p id="proxy-help" class="field-note">The proxy program must already be installed and configured. Proxy Router starts it when the selected routing needs this connection and waits for the SOCKS5 endpoint. Saving does not run the command. Automatic WARP requires the official client to be installed and registered.</p><details><summary>WARP setup commands</summary><p class="field-note">After registering the official WARP client, run these commands and use the same port above:</p><pre>warp-cli mode proxy
 warp-cli proxy port 40000
-warp-cli connect</pre><p class="field-note">To see an existing port, run <code>warp-cli settings</code>. A new Cloudflare WARP connection uses the provider ID <code>cloudflare</code> when available, matching school presets.</p></details></div>` : '<div class="wide provider-fields" data-provider-fields="tailscale" hidden><label>Tailscale exit node<input name="tailscaleExitNode" maxlength="255" placeholder="e.g. my-linux-box or 100.x.y.z"></label><p class="field-note">Use the machine name or Tailscale IP of the Linux box advertising the exit node. Tailscale must be running on both devices.</p></div><div class="wide provider-fields" data-provider-fields="socks5" hidden><div class="form-grid"><label>SOCKS5 host<input name="socksHost" maxlength="255" placeholder="127.0.0.1"></label><label>Port<input name="socksPort" type="number" min="1" max="65535" placeholder="10473"></label></div><p class="field-note">For Windscribe, enter the IP and port shown under Proxy Gateway while Windscribe is connected.</p></div>'}</div>${provider?.connection?.kind === 'wireguard' && !importingProviderServer ? providerServerPool(provider) : ''}<div class="form-actions"><button type="submit" class="primary">${provider ? importingProviderServer ? 'Add server' : 'Save connection' : fromProfile ? 'Add connection' : 'Add provider'}</button></div></form>`;
+warp-cli connect</pre><p class="field-note">To see an existing port, run <code>warp-cli settings</code>. A new Cloudflare WARP connection uses the provider ID <code>cloudflare</code> when available, matching school presets.</p></details></div>` : '<div class="wide provider-fields" data-provider-fields="tailscale" hidden><label>Tailscale exit node<input name="tailscaleExitNode" maxlength="255" placeholder="e.g. my-linux-box or 100.x.y.z"></label><p class="field-note">Use the machine name or Tailscale IP of the Linux box advertising the exit node. Tailscale must be running on both devices.</p></div><div class="wide provider-fields" data-provider-fields="socks5" hidden><div class="form-grid"><label>SOCKS5 host<input name="socksHost" maxlength="255" placeholder="127.0.0.1"></label><label>Port<input name="socksPort" type="number" min="1" max="65535" placeholder="10473"></label></div><p class="field-note">For Windscribe, enter the IP and port shown under Proxy Gateway while Windscribe is connected.</p></div>'}</div>${provider && (provider.connection?.kind === 'wireguard' || ['proton', 'wireguard', 'custom'].includes(provider.kind)) && !importingProviderServer ? providerServerPool(provider) : ''}<div class="form-actions"><button type="submit" class="primary">${provider ? importingProviderServer ? 'Add server' : 'Save connection' : fromProfile ? 'Add connection' : 'Add provider'}</button></div></form>`;
 }
 function syncProfileDialog(): void {
   const shouldOpen = page === 'Profiles' && editingProfileId !== undefined && !addingProviderFromProfile;
@@ -386,6 +407,21 @@ function syncProviderDialog(): void {
     providerDialog.dataset.context = context;
     providerDialog.returnValue = '';
     providerDialog.innerHTML = providerForm(context);
+    if (!isTauri() && editingProviderId) {
+      const provider = snapshot.providers.find(item => item.id === editingProviderId);
+      if (provider) {
+        const kindSelect = providerDialog.querySelector<HTMLSelectElement>('[name="kind"]')!;
+        kindSelect.value = provider.kind === 'custom' ? 'wireguard' : provider.kind;
+        const fields: Record<string, string> = {server:provider.server};
+        if (provider.connection?.kind === 'socks5') Object.assign(fields, {socksHost:provider.connection.host, socksPort:String(provider.connection.port)});
+        if (provider.connection?.kind === 'tailscale') fields.tailscaleExitNode = provider.connection.exitNode;
+        Object.entries(fields).forEach(([name, value]) => {
+          const input = providerDialog.querySelector<HTMLInputElement>(`[name="${name}"]`);
+          if (input) input.value = value;
+        });
+        kindSelect.dispatchEvent(new Event('change', {bubbles:true}));
+      }
+    }
     if (!providerDialog.open) providerDialog.showModal();
     providerDialog.querySelector<HTMLInputElement>('#provider-name')?.focus({ preventScroll: true });
   }
@@ -399,14 +435,14 @@ function providersPage(): string {
 
 function dashboardProvidersPage(): string {
   const profile = snapshot.profiles.find(item => item.id === snapshot.activeProfileId);
-  const cards = snapshot.providers.map(provider => `<article class="provider-card provider-managed dashboard-provider"><div class="panel-heading"><div><span class="label">${providerKindLabel(provider.kind)}</span><h2>${esc(provider.name)}</h2></div><span class="health-pill offline">Saved</span></div><div class="provider-meta"><span>Endpoint<strong>${esc(provider.server || 'WireGuard config')}</strong></span><span>${provider.connection?.kind === 'wireguard' ? 'Servers' : 'Credential'}<strong>${provider.connection?.kind === 'wireguard' ? provider.servers.length + ' saved' : 'Stored locally'}</strong></span></div><div class="card-actions">${button('Edit', 'edit-provider', 'quiet', `data-provider="${esc(provider.id)}"`)}${provider.connection?.kind === 'wireguard' ? button('Add server', 'add-provider-server', 'quiet', `data-provider="${esc(provider.id)}"`) : ''}${button('Delete', 'delete-provider', 'quiet danger-text', `data-provider="${esc(provider.id)}"`)}${profile && provider.id === profile.providerId ? '<span class="selected-note">Used by active profile</span>' : profile ? button('Use in active profile', 'choose-provider', 'quiet', `data-provider="${esc(provider.id)}"`) : ''}</div></article>`).join('');
+  const cards = snapshot.providers.map(provider => `<article class="provider-card provider-managed dashboard-provider"><div class="panel-heading"><div><span class="label">${providerKindLabel(provider.kind)}</span><h2>${esc(provider.name)}</h2></div><span class="badge">Saved</span></div><div class="provider-meta"><span>Endpoint<strong>${esc(provider.server || 'WireGuard config')}</strong></span><span>${provider.connection?.kind === 'wireguard' ? 'Servers' : 'Credential'}<strong>${provider.connection?.kind === 'wireguard' ? provider.servers.length + ' saved' : 'Stored locally'}</strong></span></div><div class="card-actions">${button('Edit', 'edit-provider', 'quiet', `data-provider="${esc(provider.id)}"`)}${provider.connection?.kind === 'wireguard' ? button('Add WireGuard config', 'add-provider-server', 'quiet', `data-provider="${esc(provider.id)}"`) : ''}${button('Delete', 'delete-provider', 'quiet danger-text', `data-provider="${esc(provider.id)}"`)}${profile && provider.id === profile.providerId ? '<span class="selected-note">Used by active profile</span>' : profile ? button('Use in active profile', 'choose-provider', 'quiet', `data-provider="${esc(provider.id)}"`) : ''}</div></article>`).join('');
   const error = dashboardStateError ? `<p class="field-note" role="alert">Saved connections could not be loaded: ${esc(dashboardStateError)}</p>` : '';
   const empty = !snapshot.providers.length ? `<p class="muted empty-state">${dashboardStateReady ? 'No connections yet. Add a WireGuard configuration file to use it in a profile.' : 'Loading saved connections…'}</p>` : '';
   return `<section class="page-section"><div class="section-heading"><div><h1 tabindex="-1">Providers</h1><p class="lead">Add WireGuard or local proxy connections, then assign them to profiles.</p></div><div class="section-actions">${button('Add provider', 'new-provider', 'primary')}</div></div>${error}<p class="setting-note">Configuration files are copied into Proxy Router’s private provider folder. Adding or editing a connection never starts the VPN.</p><div class="cards provider-cards provider-management-cards">${cards || empty}</div></section>`;
 }
 
 function connectivityPage(): string {
-  if (isTauri() && (networkState || engineConfig)) return liveConnectivityPage();
+  if (isTauri()) return liveConnectivityPage();
   const cards = snapshot.providers.map(provider => `<article class="provider-card ${provider.id === activeProfile().providerId ? 'selected' : ''}"><div class="panel-heading"><div><span class="label">${provider.kind.toUpperCase()}</span><h2>${esc(provider.name)}</h2></div><span class="health-pill ${provider.status}">${provider.status[0].toUpperCase() + provider.status.slice(1)}</span></div><p><strong>${provider.latency ?? '—'} ms</strong> · ${esc(provider.server)}</p><div class="provider-controls"><select aria-label="${esc(provider.name)} server" data-server-provider="${provider.id}">${provider.servers.map(server => `<option ${server === provider.server ? 'selected' : ''}>${esc(server)}</option>`).join('')}</select>${provider.id === activeProfile().providerId ? '<span class="selected-note">In use by active profile</span>' : button('Use provider', 'choose-provider', 'quiet', `data-provider="${provider.id}"`)}</div><div class="card-actions">${provider.status === 'offline' ? button('Mark recovered', 'recover-provider', 'quiet', `data-provider="${provider.id}"`) : button('Simulate outage', 'outage-provider', 'quiet danger-text', `data-provider="${provider.id}"`)}</div></article>`).join('');
   return `<section class="page-section"><div class="section-heading"><div><h1 tabindex="-1">Connectivity</h1><p class="lead">Pick a provider, check its endpoint, and recover quickly when a path goes unhealthy.</p></div><div class="section-actions">${button('Refresh health', 'refresh-health', 'primary')}${button('Reconnect', 'reconnect', 'quiet')}</div></div><div class="cards provider-cards">${cards}</div><article class="panel info-row"><span class="status-dot" aria-hidden="true"></span><div><strong>Automatic recovery is ${snapshot.settings.autoSwitch ? 'on' : 'off'}.</strong><p class="muted">The router can try another provider after ${snapshot.settings.switchAfterErrors} TLS errors.</p></div><a class="text-link" href="#settings">Tune recovery <span aria-hidden="true">↗</span></a></article></section>`;
 }
@@ -500,17 +536,18 @@ function liveSettingsPage(): string {
   const modes = ['safe-list', 'vpn-list', 'default'].map(name => button(
     name === mode ? `${name} ✓` : name, 'routing-mode', name === mode ? 'quiet' : 'primary',
     `data-mode="${esc(name)}"`)).join('');
+  const currentNetwork = !net ? 'Checking the network…' : net.ssid ? (networkNamesVisible ? net.ssid : 'Hidden network') : net.connected ? 'Connected — Wi-Fi name is unavailable' : 'No Wi-Fi connection';
   const row = (label: string, value: unknown) => `<li><strong>${esc(label)}</strong> <span class="muted">${esc(String(value ?? '—'))}</span></li>`;
   return `<section class="page-section"><div class="section-heading"><div><h1 tabindex="-1">Settings</h1><p class="lead">Values the engine is actually running with.</p></div><span class="badge">from router.json</span></div>
 <article class="panel"><h2>Routing mode</h2><div class="card-actions">${modes}</div><p class="muted">Current mode: <strong>${esc(String(mode))}</strong></p></article>
 <article class="panel"><h2>Engine</h2><ul class="route-list">${row('Proxy port', engineConfig?.port)}${row('Preset', engineConfig?.preset)}${row('VPN default mode', vpn.default_mode)}${row('Capture', vpn.capture)}${row('MTU', vpn.mtu)}${row('DNS transport', vpn.dns_transport)}</ul></article>
-<article class="panel"><h2>Network detection</h2><ul class="route-list">${row('Auto-switch on Wi-Fi change', net?.auto === true ? 'on' : 'off')}${row('Mapped networks', Object.keys(net?.presets ?? {}).length)}${row('Current network', net?.ssid ? (networkNamesVisible ? net.ssid : 'hidden') : 'unavailable')}</ul><div class="card-actions">${net?.auto ? button('Turn auto-switch off', 'network-auto', 'quiet', 'data-network-state="off"') : button('Turn auto-switch on', 'network-auto', 'quiet', 'data-network-state="on"')}<a class="text-link" href="#connectivity">Map a network <span aria-hidden="true">↗</span></a></div></article>
+<article class="panel"><h2>Network detection</h2><ul class="route-list">${row('Auto-switch on Wi-Fi change', net?.auto === true ? 'on' : 'off')}${row('Mapped networks', Object.keys(net?.presets ?? {}).length)}${row('Current network', currentNetwork)}</ul><div class="card-actions">${net?.auto ? button('Turn auto-switch off', 'network-auto', 'quiet', 'data-network-state="off"') : button('Turn auto-switch on', 'network-auto', 'quiet', 'data-network-state="on"')}<a class="text-link" href="#connectivity">Map a network <span aria-hidden="true">↗</span></a></div></article>
 <article class="panel"><h2>Rotation & keepalive</h2><ul class="route-list">${row('Rotate every (s)', (engineConfig?.rotation as Record<string, unknown> | undefined)?.interval_seconds)}${row('Rotation jitter (s)', (engineConfig?.rotation as Record<string, unknown> | undefined)?.jitter_seconds)}${row('Keepalive enabled', (engineConfig?.keepalive as Record<string, unknown> | undefined)?.enabled)}${row('Keepalive interval (s)', (engineConfig?.keepalive as Record<string, unknown> | undefined)?.interval)}</ul></article></section>`;
 }
 
 function toggle(name: string, label: string, checked: boolean, note: string): string { return `<label class="setting-row"><span><strong>${label}</strong><small>${note}</small></span><input type="checkbox" data-setting="${name}" ${checked ? 'checked' : ''}></label>`; }
 function settingsPage(): string {
-  if (isTauri() && engineConfig) return liveSettingsPage();
+  if (isTauri()) return liveSettingsPage();
   return `<section class="page-section"><div class="section-heading"><div><h1 tabindex="-1">Settings</h1><p class="lead">Small defaults that make the local proxy feel like a normal VPN client.</p></div><span class="badge">Saved locally</span></div><div class="two-column"><article class="panel settings-panel"><h2>Window & connection</h2>${toggle('launchAtLogin', 'Launch at login', snapshot.settings.launchAtLogin, 'Start the tray helper when you sign in.')}${toggle('closeToTray', 'Close to tray', snapshot.settings.closeToTray, 'Closing the window hides it; the tray menu can reopen it.')}${toggle('disconnectOnNetworkLoss', 'Disconnect on Wi-Fi loss', snapshot.settings.disconnectOnNetworkLoss, 'Prevent stale routes while moving between networks.')}${toggle('autoSwitch', 'Auto-switch providers', snapshot.settings.autoSwitch, 'Try the healthiest provider after repeated TLS errors.')}${toggle('fullTunnel', 'Full tunnel mode', snapshot.settings.fullTunnel, 'Route all traffic instead of only selected domains.')}</article><article class="panel settings-panel"><h2>Router details</h2><label>Proxy port<input type="number" min="1024" max="65535" data-setting-number="proxyPort" value="${snapshot.settings.proxyPort}"></label><label>Switch after TLS errors<select data-setting-select="switchAfterErrors"><option value="3" ${snapshot.settings.switchAfterErrors === 3 ? 'selected' : ''}>3 errors</option><option value="5" ${snapshot.settings.switchAfterErrors === 5 ? 'selected' : ''}>5 errors</option><option value="8" ${snapshot.settings.switchAfterErrors === 8 ? 'selected' : ''}>8 errors</option></select></label><label>Log detail<select data-setting-select="logLevel"><option value="normal" ${snapshot.settings.logLevel === 'normal' ? 'selected' : ''}>Normal</option><option value="verbose" ${snapshot.settings.logLevel === 'verbose' ? 'selected' : ''}>Verbose</option></select></label><div class="setting-link"><a class="text-link" href="#appearance">Customize appearance <span aria-hidden="true">↗</span></a></div></article></div></section>`;
 }
 
@@ -526,9 +563,9 @@ function appearancePage(): string {
   return `<section class='page-section'><div class='section-heading'><div><h1 tabindex='-1'>Appearance</h1><p class='lead'>Choose a layout preset, then tune colour, density, and motion.</p></div><span class='badge'>Live preview</span></div><article class='panel'><div class='panel-heading'><div><span class='label'>Layout preset</span><h2>Choose how content is arranged</h2></div></div><div class='layout-presets' role='group' aria-label='Layout preset'>${layoutPresets}</div></article><article class='panel'><div class='panel-heading'><div><span class='label'>Theme</span><h2>Colour and scheme</h2></div></div><div class='two-column appearance-fields'><label>Colour scheme<select data-theme-scheme>${schemeOptions}</select></label><label>Accent<select data-theme-accent>${accentOptions}</select></label></div></article><div class='two-column'><article class='panel compact-controls'><h2>Details</h2><label>Density<select data-theme-density><option value='compact' ${snapshot.theme.density === 'compact' ? 'selected' : ''}>Compact</option><option value='comfortable' ${snapshot.theme.density === 'comfortable' ? 'selected' : ''}>Comfortable</option></select></label><label>Contrast<select data-theme-contrast><option value='standard' ${snapshot.theme.contrast === 'standard' ? 'selected' : ''}>Standard</option><option value='high' ${snapshot.theme.contrast === 'high' ? 'selected' : ''}>High</option></select></label><label>Animation speed<select id='animation-speed' data-theme-speed><option value='fast' ${snapshot.theme.motionSpeed === 'fast' ? 'selected' : ''}>Fast</option><option value='normal' ${snapshot.theme.motionSpeed === 'normal' ? 'selected' : ''}>Normal</option><option value='slow' ${snapshot.theme.motionSpeed === 'slow' ? 'selected' : ''}>Slow</option></select></label><label class='setting-row'><span><strong>Reduce motion</strong><small>Respect a calmer interaction style.</small></span><input type='checkbox' data-theme-motion ${snapshot.theme.reducedMotion ? 'checked' : ''}></label></article><article class='panel preview-card'><span class='label'>Preview</span><div class='mini-window'><span class='mini-dot'></span><strong>${esc(activeProfile().name)}</strong><span class='mini-line'></span><button type='button' class='mini-button'>Connected</button></div><p class='muted'>The selected style applies immediately and persists across launches.</p></article></div></section>`;
 }
 
-function aboutPage(): string {
+function diagnosticsSettings(): string {
   const logs = snapshot.logs.slice(0, 8).map(log => `<li><span class="log-dot"></span><span>${esc(log)}</span><time>now</time></li>`).join('');
-  return `<section class="page-section"><div class="section-heading"><div><h1 tabindex="-1">About</h1><p class="lead">A small native shell around the existing Python router. The dashboard is local-first and ready for the live controller contract.</p></div><span class="badge">v0.1 dashboard</span></div><article class="panel"><div class="panel-heading"><div><span class="label">Diagnostics</span><h2>Recent events</h2></div><button type="button" class="quiet" data-action="export-logs">Export</button></div><ul class="logs">${logs}</ul></article><article class="panel danger-zone"><div><h2>Reset local prototype</h2><p class="muted">Remove saved profiles, themes, and settings from this browser only.</p></div>${button('Reset demo data', 'reset-data', 'quiet danger-text')}</article></section>`;
+  return `<section class="page-section diagnostics-settings" aria-label="Diagnostics"><article class="panel"><div class="panel-heading"><div><span class="label">Diagnostics</span><h2>Recent dashboard events</h2></div><button type="button" class="quiet" data-action="export-logs">Export</button></div><ul class="logs">${logs}</ul></article>${isTauri() ? '' : `<article class="panel danger-zone"><div><h2>Reset local prototype</h2><p class="muted">Remove saved profiles, themes, and settings from this browser only.</p></div>${button('Reset demo data', 'reset-data', 'quiet danger-text')}</article>`}</section>`;
 }
 
 function render(options?: { background?: boolean }): void {
@@ -559,7 +596,7 @@ function render(options?: { background?: boolean }): void {
   const editing = options?.background && (focused || draft || main.querySelector('[data-network-draft="true"]') !== null
     || main.querySelector('[aria-expanded="true"][aria-haspopup="listbox"]') !== null);
   if (!editing) {
-    const markup = page === 'Home' ? homePage() : page === 'Profiles' ? profilesPage() : page === 'Providers' ? providersPage() : page === 'Connectivity' ? connectivityPage() : page === 'Settings' ? settingsPage() : page === 'Appearance' ? appearancePage() : aboutPage();
+    const markup = page === 'Home' ? homePage() : page === 'Profiles' ? profilesPage() : page === 'Providers' ? providersPage() : page === 'Connectivity' ? connectivityPage() : page === 'Settings' ? settingsPage() + diagnosticsSettings() : appearancePage();
     if (!options?.background || markup !== renderedPageMarkup) {
       const scrollTop = main.scrollTop;
       const scrollLeft = main.scrollLeft;
@@ -582,6 +619,7 @@ function render(options?: { background?: boolean }): void {
   }
   syncProfileDialog();
   syncProviderDialog();
+  polishDashboard({page, desktop:isTauri(), snapshot, config:engineConfig, configUnavailable:engineConfigUnavailable, status:livePayload});
   syncWebSelects(app);
   applyTheme();
 }
@@ -606,11 +644,21 @@ function applyLive(live: { state: string; status?: Record<string, unknown> | nul
  * immediately and only pays for a controller call once that cache goes stale,
  * so the poller - not the UI - owns the poll cadence.
  */
+let backgroundRefreshRunning = false;
 async function refreshStatus(options?: { silent?: boolean; poll?: boolean }): Promise<void> {
+  if (options?.poll) {
+    if (backgroundRefreshRunning || document.hidden) return;
+    backgroundRefreshRunning = true;
+  }
+  try { await refreshStatusOnce(options); }
+  finally { if (options?.poll) backgroundRefreshRunning = false; }
+}
+
+async function refreshStatusOnce(options?: { silent?: boolean; poll?: boolean }): Promise<void> {
   const generation = ++requestGeneration;
   const previousState = previewState;
   if (!options?.silent) { previewState = 'loading'; render({ background: options?.poll }); }
-  try { status = await getPreviewStatus(); if (generation !== requestGeneration) return; }
+  try { if (!isTauri()) status = await getPreviewStatus(); if (generation !== requestGeneration) return; }
   catch { if (generation !== requestGeneration) return; if (!options?.silent) { previewState = 'failed'; } }
   // In the desktop app the hero and the tray follow the real controller, not
   // the build-time fixture; an unreadable controller is a real failure (#144).
@@ -663,7 +711,7 @@ async function refreshEngineData(): Promise<void> {
   await refreshEngineConfig();
   try { routingState = await getRouting(); } catch { /* keep the last good read */ }
 }
-function navigate(focus: boolean): void { const name = location.hash.slice(1).toLowerCase(); if (name === 'routing') { history.replaceState(null, '', '#profiles'); page = 'Profiles'; } else page = pages.find(item => item.toLowerCase() === name) ?? 'Home'; menu.setAttribute('aria-expanded', 'false'); render(); resetMainScroll(); if (focus) main.querySelector<HTMLElement>('h1')?.focus({ preventScroll: true }); }
+function navigate(focus: boolean): void { const name = location.hash.slice(1).toLowerCase(); if (name === 'routing') { history.replaceState(null, '', '#profiles'); page = 'Profiles'; } else if (name === 'about') { history.replaceState(null, '', '#settings'); page = 'Settings'; } else page = pages.find(item => item.toLowerCase() === name) ?? 'Home'; menu.setAttribute('aria-expanded', 'false'); render(); resetMainScroll(); if (focus) main.querySelector<HTMLElement>('h1')?.focus({ preventScroll: true }); }
 function formInput(form: HTMLFormElement, name: string): string { return (new FormData(form).get(name) as string | null ?? '').trim(); }
 function readProfileDraft(form: HTMLFormElement): Omit<Profile, 'id' | 'updatedAt'> {
   if (form.hasAttribute('data-route-rules')) {
@@ -706,24 +754,41 @@ function saveProfileToDashboard(profile: Omit<Profile, 'id' | 'updatedAt'> | Pro
   }, 'Profile saved for the next explicit Connect');
 }
 
-async function importDashboardProfile(raw: string): Promise<void> {
-  try {
-    const value = JSON.parse(raw) as { proxyRouterProfile?: unknown; profile?: Partial<Profile> };
-    const profile = value.profile;
-    if (value.proxyRouterProfile !== 1 || !profile || typeof profile.name !== 'string') throw new Error('This is not a proxy-router profile export');
-    await saveProfileToDashboard({
-      name: profile.name,
-      description: profile.description ?? '',
-      providerId: profile.providerId ?? '',
-      fallbackProviderId: profile.fallbackProviderId ?? '',
-      routeMode: profile.routeMode ?? 'selective',
-      domains: profile.domains ?? [],
-      autoSubdomains: profile.autoSubdomains === true,
-      fallback: profile.fallback ?? 'direct',
-    });
-  } catch (error) {
-    announce(error instanceof Error ? error.message : 'Could not import profile');
-  }
+async function importProfile(raw: string): Promise<void> {
+  const profile = parseProfileExport(raw);
+  if (isTauri()) {
+    installDashboardState(await saveDashboardProfile(profile));
+    announce('Profile imported. Select it when you are ready.');
+  } else sync(await controller.importProfile(raw));
+}
+
+function confirmAction(title: string, description: string, label = 'Delete'): Promise<boolean> {
+  const opener = document.activeElement as HTMLElement | null;
+  const dialog = document.createElement('dialog');
+  dialog.setAttribute('aria-labelledby', 'confirm-action-title');
+  dialog.setAttribute('aria-describedby', 'confirm-action-description');
+  dialog.innerHTML = `<form method="dialog"><h2 id="confirm-action-title">${esc(title)}</h2><p id="confirm-action-description">${esc(description)}</p><div class="dialog-actions"><button value="cancel" autofocus>Cancel</button><button value="confirm" class="danger-text">${esc(label)}</button></div></form>`;
+  app.append(dialog);
+  return new Promise(resolve => {
+    dialog.addEventListener('close', () => {
+      const confirmed = dialog.returnValue === 'confirm'; dialog.remove();
+      if (opener?.isConnected) {
+        const menu = opener.closest('details');
+        const target = menu && !menu.open ? menu.querySelector('summary') : opener;
+        target?.focus();
+      }
+      resolve(confirmed);
+    }, {once:true});
+    dialog.showModal();
+  });
+}
+
+async function deleteItem(kind: 'profile' | 'provider', id: string): Promise<void> {
+  const item = (kind === 'profile' ? snapshot.profiles : snapshot.providers).find(item => item.id === id);
+  if (!item || !await confirmAction(`Delete ${kind} “${item.name}”?`, 'This removes the saved configuration. This action cannot be undone.')) return;
+  if (isTauri()) await performDashboard(() => kind === 'profile' ? deleteDashboardProfile(id) : deleteDashboardProvider(id), `${kind === 'profile' ? 'Profile' : 'Connection'} deleted`);
+  else if (kind === 'profile') await perform(() => controller.deleteProfile(id));
+  else announce('Deleting providers is available in the desktop app');
 }
 
 async function pickWireGuardConfig(): Promise<void> {
@@ -780,15 +845,21 @@ profileDialog.addEventListener('close', () => {
   profileDialog.returnValue = '';
 });
 previewDialog.addEventListener('close', () => { if (previewDialog.returnValue === 'apply') { ++requestGeneration; previewState = scenario.value as PreviewState; page = 'Home'; history.replaceState(null, '', '#home'); render(); resetMainScroll(); announce(copy[previewState][0]); if (previewState === 'loading') window.setTimeout(() => { if (previewState === 'loading') { previewState = 'failed'; render(); announce(copy.failed[0]); } }, 3000); } previewDialog.returnValue = ''; document.querySelector<HTMLButtonElement>('#preview')?.focus({ preventScroll: true }); });
-importDialog.addEventListener('close', () => {
-  if (importDialog.returnValue === 'import') {
-    const raw = document.querySelector<HTMLTextAreaElement>('#profile-json')!.value;
-    if (isTauri()) void importDashboardProfile(raw);
-    else void perform(() => controller.importProfile(raw));
-  }
-  importDialog.returnValue = '';
+const importFeedback = document.createElement('p');
+importFeedback.id = 'import-feedback'; importFeedback.setAttribute('role', 'alert'); importFeedback.className = 'field-note';
+document.querySelector('#profile-json')!.setAttribute('aria-describedby', importFeedback.id);
+document.querySelector('#profile-json')!.after(importFeedback);
+document.querySelector('#import-form')!.addEventListener('submit', async event => {
+  if ((event as SubmitEvent).submitter && ((event as SubmitEvent).submitter as HTMLButtonElement).value !== 'import') return;
+  event.preventDefault();
+  const submit = document.querySelector<HTMLButtonElement>('#import-form [value="import"]')!;
+  if (submit.disabled) return;
+  submit.disabled = true; importFeedback.textContent = '';
+  const input = document.querySelector<HTMLTextAreaElement>('#profile-json')!;
+  try { await importProfile(input.value); input.removeAttribute('aria-invalid'); importDialog.close(); }
+  catch (error) { importFeedback.textContent = error instanceof Error ? error.message : 'Could not import profile. Try again.'; input.setAttribute('aria-invalid', 'true'); input.focus(); }
+  finally { submit.disabled = false; }
 });
-document.querySelector('#import-form')!.addEventListener('submit', event => { if ((event as SubmitEvent).submitter && ((event as SubmitEvent).submitter as HTMLButtonElement).value !== 'import') return; event.preventDefault(); importDialog.close('import'); });
 
 app.addEventListener('click', event => {
   const element = event.target as HTMLElement;
@@ -829,29 +900,25 @@ app.addEventListener('click', event => {
     else void perform(() => controller.duplicateProfile(profileId));
   }
   else if (action === 'delete-profile' && profileId) {
-    const profile = snapshot.profiles.find(item => item.id === profileId);
-    if (profile && window.confirm(`Delete “${profile.name}”?`)) {
-      if (isTauri()) void performDashboard(() => deleteDashboardProfile(profileId), 'Profile deleted');
-      else void perform(() => controller.deleteProfile(profileId));
-    }
+    void deleteItem('profile', profileId);
   }
   else if (action === 'export-profile' && profileId) {
     const profile = snapshot.profiles.find(item => item.id === profileId);
     if (profile) { download(`${profileId}.proxy-router.json`, JSON.stringify({ proxyRouterProfile: 1, profile }, null, 2)); announce('Profile export ready'); }
   }
-  else if (action === 'import-profile') { document.querySelector<HTMLTextAreaElement>('#profile-json')!.value = ''; importDialog.showModal(); }
+  else if (action === 'import-profile') { importFeedback.textContent = ''; document.querySelector('#profile-json')!.removeAttribute('aria-invalid'); importDialog.showModal(); }
   else if ((action === 'edit-provider' || action === 'add-provider-server') && target.dataset.provider) { providerReturnFocusContext = 'providers'; editingProviderId = target.dataset.provider; selectedProviderPath = undefined; importingProviderServer = action === 'add-provider-server'; render(); }
   else if (action === 'delete-provider' && target.dataset.provider) {
-    const provider = snapshot.providers.find(item => item.id === target.dataset.provider);
-    if (provider && window.confirm(`Delete connection “${provider.name}”?`)) {
-      if (isTauri()) void performDashboard(() => deleteDashboardProvider(provider.id), 'Connection deleted');
-      else announce('Deleting providers is available in the desktop app');
-    }
+    void deleteItem('provider', target.dataset.provider);
   }
   else if ((action === 'remove-pool-server' || action === 'restore-pool-server') && editingProviderId && target.dataset.server) {
     const providerId = editingProviderId;
     const name = providerDialog.querySelector<HTMLInputElement>('[name="name"]')?.value;
-    void performDashboard(() => manageDashboardServer(providerId, target.dataset.server!, action === 'restore-pool-server'), action === 'restore-pool-server' ? 'Server restored' : 'Server removed from pool').then(() => {
+    const restore = action === 'restore-pool-server';
+    const update = isTauri()
+      ? performDashboard(() => manageDashboardServer(providerId, target.dataset.server!, restore), restore ? 'Server restored' : 'Server removed from pool')
+      : perform(() => controller.manageProviderServer(providerId, target.dataset.server!, restore));
+    void update.then(() => {
       if (editingProviderId !== providerId) return;
       providerDialog.innerHTML = providerForm();
       if (name) providerDialog.querySelector<HTMLInputElement>('[name="name"]')!.value = name;
@@ -895,7 +962,7 @@ app.addEventListener('click', event => {
   else if (action === 'theme-scheme' && target.dataset.scheme) void perform(() => controller.updateTheme({ scheme: target.dataset.scheme as Scheme }));
   else if (action === 'theme-accent' && target.dataset.accent) void perform(() => controller.updateTheme({ accent: target.dataset.accent as Accent }));
   else if (action === 'export-logs') { download('proxy-router-logs.json', JSON.stringify({ exportedAt: new Date().toISOString(), logs: snapshot.logs }, null, 2)); announce('Log export ready'); }
-  else if (action === 'reset-data' && window.confirm('Reset local dashboard data?')) { snapshot = controller.reset(); previewState = snapshot.connection; render(); announce('Demo data reset'); }
+  else if (action === 'reset-data' && !isTauri()) void confirmAction('Reset local prototype?', 'This removes profiles and settings saved in this browser. This action cannot be undone.', 'Reset').then(confirmed => { if (confirmed) { snapshot = controller.reset(); previewState = snapshot.connection; render(); announce('Demo data reset'); } });
 });
 app.addEventListener('keydown', event => {
   const element = event.target as HTMLElement;
@@ -957,12 +1024,13 @@ app.addEventListener('change', event => {
     const wireguard = app.querySelector<HTMLElement>('[data-provider-fields="config"]');
     const tailscale = app.querySelector<HTMLElement>('[data-provider-fields="tailscale"]');
     const socks5 = app.querySelector<HTMLElement>('[data-provider-fields="socks5"]');
-    if (endpoint) endpoint.hidden = kind === 'wireguard' || kind === 'socks5' || kind === 'tailscale';
-    if (wireguard) wireguard.hidden = kind !== 'wireguard' && kind !== 'custom';
+    if (endpoint) endpoint.hidden = kind === 'wireguard' || kind === 'proton' || kind === 'socks5' || kind === 'tailscale';
+    if (wireguard) wireguard.hidden = kind !== 'wireguard' && kind !== 'custom' && kind !== 'proton';
     if (tailscale) tailscale.hidden = kind !== 'tailscale';
     if (socks5) socks5.hidden = kind !== 'socks5' && kind !== 'warp';
     const file = app.querySelector<HTMLInputElement>('[name="wireguardConfig"]');
-    if (file) file.required = kind === 'wireguard';
+    // Submit validation announces missing configs; hidden file inputs cannot show browser validation bubbles.
+    if (file) file.required = false;
     const exitNode = app.querySelector<HTMLInputElement>('[name="tailscaleExitNode"]');
     if (exitNode) exitNode.required = kind === 'tailscale';
   }
@@ -1002,7 +1070,7 @@ app.addEventListener('submit', event => {
     const name = formInput(form, 'name'); const kind = formInput(form, 'kind') as ProviderKind; const context = form.dataset.providerContext === 'profile' ? 'profile' : 'providers';
     if (isTauri()) {
       const providerId = editingProviderId;
-      if (kind !== 'warp' && kind !== 'socks5' && (!providerId || importingProviderServer) && !selectedProviderPath) { announce('Choose a WireGuard .conf file'); return; }
+      if (kind !== 'warp' && kind !== 'socks5' && (!providerId || importingProviderServer) && !selectedProviderPath) { showActionError('Choose a WireGuard .conf file'); return; }
       if (kind !== 'wireguard' && kind !== 'custom' && kind !== 'warp' && kind !== 'socks5') { announce('Choose a supported connection type'); return; }
       void performDashboard(async () => {
         const next = await saveDashboardProvider({ name, kind, ...(kind === 'warp' || kind === 'socks5' ? { host: formInput(form, 'socksHost'), port: Number(formInput(form, 'socksPort')), startup: { mode: formInput(form, 'startupMode') as 'external' | 'warp' | 'command', command: formInput(form, 'startupCommand') } } : {}) }, providerId, kind === 'warp' || kind === 'socks5' ? undefined : selectedProviderPath);
@@ -1022,19 +1090,33 @@ app.addEventListener('submit', event => {
     }
     void perform(async () => {
       let next: Snapshot;
+      const providerId = editingProviderId;
+      const existing = snapshot.providers.find(item => item.id === providerId);
       const file = new FormData(form).get('wireguardConfig');
-      if (kind === 'wireguard' || (kind === 'custom' && file instanceof File && file.size > 0)) {
+      const files = new FormData(form).getAll('wireguardConfig').filter((item): item is File => item instanceof File && item.size > 0);
+      if (existing && files.length && ['wireguard', 'proton', 'custom'].includes(kind)) {
+        next = await controller.addProviderConfigs(existing.id, await Promise.all(files.map(async item => ({fileName:item.name, raw:await item.text()}))));
+        if (!importingProviderServer && name !== existing.name) next = await controller.addProvider({name, kind:existing.kind, server:existing.server, connection:existing.connection}, existing.id);
+      } else if (existing && importingProviderServer) {
+        throw new Error('Choose at least one WireGuard .conf file');
+      } else if (existing && (kind === existing.kind || (existing.kind === 'custom' && kind === 'wireguard')) && (!(file instanceof File) || file.size === 0) && kind !== 'tailscale' && kind !== 'socks5') {
+        next = await controller.addProvider({name, kind, server:formInput(form, 'server'), connection:existing.connection}, providerId);
+      } else if (kind === 'wireguard' || kind === 'proton' || (kind === 'custom' && file instanceof File && file.size > 0)) {
         if (!(file instanceof File) || file.size === 0) throw new Error('Choose a VPN .conf file');
-        next = await controller.importProviderConfig({ name, kind, fileName: file.name, raw: await file.text() });
+        next = await controller.importProviderConfig({ name, kind:kind === 'custom' ? 'custom' : 'wireguard', fileName: file.name, raw: await file.text() }, providerId);
+        const saved = next.providers[next.providers.length - 1];
+        if (kind === 'proton') next = await controller.addProvider({name, kind, server:saved.server, connection:saved.connection}, saved.id);
+        if (files.length > 1) next = await controller.addProviderConfigs(saved.id, await Promise.all(files.slice(1).map(async item => ({fileName:item.name, raw:await item.text()}))));
       } else if (kind === 'tailscale') {
-        next = await controller.addTailscaleProvider({ name, exitNode: formInput(form, 'tailscaleExitNode') });
+        next = await controller.addTailscaleProvider({ name, exitNode: formInput(form, 'tailscaleExitNode') }, providerId);
       } else if (kind === 'socks5') {
-        next = await controller.addSocks5Provider({ name, host: formInput(form, 'socksHost'), port: formInput(form, 'socksPort') });
+        next = await controller.addSocks5Provider({ name, host: formInput(form, 'socksHost'), port: formInput(form, 'socksPort') }, providerId);
       } else {
-        next = await controller.addProvider({ name, kind, server: formInput(form, 'server') });
+        next = await controller.addProvider({ name, kind, server: formInput(form, 'server') }, providerId);
       }
       if (context === 'profile') { pendingProviderId = next.providers[next.providers.length - 1]?.id; addingProviderFromProfile = false; }
       else addingProvider = false;
+      editingProviderId = undefined;
       return next;
     });
   }

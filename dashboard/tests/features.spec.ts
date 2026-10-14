@@ -28,6 +28,7 @@ test('announcements stay mounted while the page content rerenders', async ({ pag
 
   await page.getByRole('link', { name: 'Profiles', exact: true }).click();
   await expect(announcement).toHaveText('Profile “OpenCode only” selected');
+  await page.getByRole('article').filter({ hasText: 'OpenCode only' }).locator('.profile-more summary').click();
   await page.getByRole('article').filter({ hasText: 'OpenCode only' }).getByRole('button', { name: 'Export' }).click();
   await expect(announcement).toHaveText('Profile export ready');
 });
@@ -37,13 +38,14 @@ test('profiles support create, edit, duplicate, import, export, select, and dele
   await page.getByRole('link', { name: 'Profiles', exact: true }).click();
   await page.getByRole('button', { name: 'Create profile', exact: true }).click();
   await expect(page.locator('#profile-dialog')).toBeVisible();
-  await expect(page.getByRole('button', { name: '← Back', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Cancel', exact: true })).toBeVisible();
   await page.getByLabel('Name').fill('Launch profile');
   await page.getByLabel('Description').fill('A profile created in the UI');
   await page.getByLabel('Domains one per line').fill('launch.example\ncdn.launch.example');
   await page.locator('#profile-form').getByRole('button', { name: 'Create profile', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Launch profile', exact: true })).toBeVisible();
   const card = page.getByRole('article').filter({ hasText: 'Launch profile' });
+  await card.locator('.profile-more summary').click();
   await card.getByRole('button', { name: 'Export' }).click();
   await expect(page.getByRole('status')).toHaveText('Profile export ready');
   await card.getByRole('button', { name: 'Edit' }).click();
@@ -51,13 +53,16 @@ test('profiles support create, edit, duplicate, import, export, select, and dele
   await page.locator('#profile-form').getByRole('button', { name: 'Save changes' }).click();
   await expect(page.getByRole('heading', { name: 'Launch profile edited', exact: true })).toBeVisible();
   const edited = page.getByRole('article').filter({ hasText: 'Launch profile edited' });
+  await edited.locator('.profile-more summary').click();
   await edited.getByRole('button', { name: 'Duplicate' }).click();
   await expect(page.getByRole('heading', { name: 'Launch profile edited copy', exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Import', exact: true }).click();
   await page.getByLabel('Profile JSON').fill(JSON.stringify({ proxyRouterProfile: 1, profile: { name: 'Imported profile', domains: ['imported.example'] } }));
   await page.getByRole('button', { name: 'Import profile', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Imported profile', exact: true })).toBeVisible();
+  await page.getByRole('article').filter({ hasText: 'Launch profile edited copy' }).locator('.profile-more summary').click();
   await page.getByRole('article').filter({ hasText: 'Launch profile edited copy' }).getByRole('button', { name: 'Delete' }).click();
+  await page.getByRole('dialog').getByRole('button', {name:'Delete', exact:true}).click();
   await expect(page.getByRole('heading', { name: 'Launch profile edited copy', exact: true })).toHaveCount(0);
 });
 
@@ -68,7 +73,7 @@ test('profiles can add WireGuard files and SOCKS5 gateways from the GUI', async 
   await page.getByRole('button', { name: 'Add connection', exact: true }).click();
   await expect(page.locator('#provider-dialog')).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Add a connection to this profile', exact: true })).toBeVisible();
-  await page.getByRole('button', { name: '← Back', exact: true }).click();
+  await page.getByRole('button', { name: 'Cancel', exact: true }).click();
   await expect(page.locator('#provider-dialog')).toBeHidden();
   await page.getByRole('button', { name: 'Add connection', exact: true }).click();
   const providerForm = page.locator('#provider-form');
@@ -89,7 +94,7 @@ test('profiles can add WireGuard files and SOCKS5 gateways from the GUI', async 
   await page.getByRole('button', { name: 'Add connection', exact: true }).click();
   const customForm = page.locator('#provider-form');
   await customForm.locator('input[name="name"]').fill('Proton config (custom)');
-  await selectWeb(customForm.locator('select[name="kind"]'), 'custom');
+  await selectWeb(customForm.locator('select[name="kind"]'), 'proton');
   await customForm.locator('input[name="wireguardConfig"]').setInputFiles({
     name: 'proton-free.conf',
     mimeType: 'text/plain',
@@ -148,15 +153,19 @@ test('profiles own routing, fallback, and subdomain preference', async ({ page }
   await expect(profileCard).toContainText('routed sites');
   await profileCard.getByRole('button', { name: 'Edit', exact: true }).click();
   await expect(page.getByLabel(/Auto-detect subdomains/)).toBeChecked();
-  await page.getByRole('button', { name: '← Back', exact: true }).click();
+  await page.getByRole('button', { name: 'Cancel', exact: true }).click();
   await page.getByRole('link', { name: 'Providers', exact: true }).click();
   await page.getByRole('button', { name: 'Add provider', exact: true }).click();
   await expect(page.locator('#provider-dialog')).toBeVisible();
-  await expect(page.getByRole('button', { name: '← Back', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Cancel', exact: true })).toBeVisible();
   await page.getByLabel('Name').fill('Test VPN');
-  await selectWeb(page.getByLabel('Type'), 'custom');
-  await page.getByLabel('Server or endpoint').fill('nyc.test-vpn.example');
+  await selectWeb(page.getByLabel('Type'), 'wireguard');
+  await page.locator('[name="wireguardConfig"]').setInputFiles({
+    name:'test.conf', mimeType:'text/plain',
+    buffer:Buffer.from('[Interface]\nPrivateKey = private-key\nAddress = 10.0.0.2/32\n[Peer]\nPublicKey = public-key\nEndpoint = nyc.test-vpn.example:51820'),
+  });
   await page.locator('#provider-form').getByRole('button', { name: 'Add provider', exact: true }).click();
+  await page.locator('.provider-instances').getByRole('button', {name:/Test VPN/}).click();
   await expect(page.getByRole('heading', { name: 'Test VPN', exact: true })).toBeVisible();
   await expect(page.getByLabel('Simulate Tailscale running')).toHaveCount(0);
   await selectWeb(page.getByLabel('When a VPN connects'), 'keep-running');
@@ -174,7 +183,7 @@ test('connection actions, settings, themes, and diagnostics persist', async ({ p
   await page.getByRole('button', { name: 'Disconnect', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Disconnected', exact: true })).toBeVisible();
   await expect(page.locator('#app')).toHaveAttribute('data-state', 'disconnected');
-  await expect(page.locator('.rail-status .status-dot')).toHaveCSS('background-color', 'rgb(180, 180, 189)');
+  await expect(page.locator('#rail-status')).toHaveText('Disconnected');
   await page.getByRole('button', { name: 'Connect', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Connected', exact: true })).toBeVisible();
   await page.getByRole('link', { name: 'Settings', exact: true }).click();
@@ -210,7 +219,7 @@ test('connection actions, settings, themes, and diagnostics persist', async ({ p
   await expect(page.locator('html')).toHaveAttribute('data-density', 'comfortable');
   await expect(page.locator('html')).toHaveAttribute('data-contrast', 'high');
   await expect(page.locator('html')).toHaveAttribute('data-motion-speed', 'fast');
-  await page.getByRole('link', { name: 'About', exact: true }).click();
+  await page.getByRole('link', { name: 'Settings', exact: true }).click();
   await expect(page.getByText('Runtime map', { exact: true })).toHaveCount(0);
   await page.getByRole('button', { name: 'Export', exact: true }).click();
   await expect(page.getByRole('status')).toHaveText('Log export ready');

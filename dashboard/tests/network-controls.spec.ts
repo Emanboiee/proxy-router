@@ -1,6 +1,22 @@
 import {test, expect} from '@playwright/test';
 import AxeBuilder from '@axe-core/playwright';
 
+test('Settings distinguishes connected Wi-Fi with hidden identity from no connection', async ({page}) => {
+  await page.goto('/#connectivity');
+  await expect(page.locator('#network-panel')).toContainText('Connected to');
+  await page.evaluate(() => { (window as any).__identityDenied = true; });
+  await page.getByRole('button', {name:'Check network',exact:true}).click();
+  await expect(page.locator('#network-panel')).toContainText('Wi-Fi name is unavailable');
+  await page.getByRole('link', {name:'Settings',exact:true}).click();
+  await expect(page.locator('#main')).toContainText('Connected — Wi-Fi name is unavailable');
+  await page.evaluate(() => { (window as any).__network.connected = false; });
+  await page.getByRole('link', {name:'Connectivity',exact:true}).click();
+  await page.getByRole('button', {name:'Check network',exact:true}).click();
+  await expect(page.locator('#network-panel')).toContainText('No Wi-Fi connection');
+  await page.getByRole('link', {name:'Settings',exact:true}).click();
+  await expect(page.locator('#main')).toContainText('No Wi-Fi connection');
+});
+
 test.beforeEach(async ({page}) => {
   await page.addInitScript(() => {
     const win = window as any;

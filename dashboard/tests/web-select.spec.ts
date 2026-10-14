@@ -9,7 +9,7 @@ test('every page and editor uses visible web dropdowns', async ({page}) => {
   }
   await page.goto('/#providers');
   await page.getByRole('button', {name:'Add provider', exact:true}).click();
-  await expect(page.getByRole('combobox', {name:'Type',exact:true})).toBeVisible();
+  await expect(page.locator('.connection-choices').getByRole('button', {name:'WireGuard',exact:true})).toBeVisible();
   await expect(page.locator('select:visible')).toHaveCount(0);
 });
 
