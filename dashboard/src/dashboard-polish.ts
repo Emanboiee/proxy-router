@@ -1,4 +1,5 @@
 import type {EngineConfig, Snapshot} from './controller';
+import {routeLatency} from './route-latency';
 import './dashboard-polish.css';
 
 interface DashboardPresentation {
@@ -286,6 +287,8 @@ function polishAppearance(): void {
 
 function polishHome(context: DashboardPresentation): void {
   const home = document.querySelector<HTMLElement>('.home-page'); if (!home) return;
+  // Health records can change without changing the underlying Home markup.
+  home.querySelector('.visual-status-strip')?.remove();
   const emblem = home.querySelector('.connection-emblem');
   if (emblem && !emblem.querySelector('svg')) emblem.insertAdjacentHTML('beforeend', '<svg class="connection-ring" viewBox="0 0 160 160" aria-hidden="true"><circle class="ring-track" cx="80" cy="80" r="74"/><circle class="ring-progress" cx="80" cy="80" r="74"/></svg>');
   if (!home.querySelector('.visual-status-strip')) {
@@ -295,18 +298,21 @@ function polishHome(context: DashboardPresentation): void {
     const configKnown = context.config !== null && !context.configUnavailable;
     const routes = configKnown && Array.isArray(context.config?.routes) ? context.config.routes : [];
     const routeProviders = [...new Set(routes.map(route => String(route.provider ?? 'direct')))];
-    const latency = context.status?.latency_ms;
+    const latency = routeLatency(context.status);
+    const sampleAge = latency ? Math.max(0, Math.floor(Date.now() / 1000 - latency.checkedAt)) : 0;
+    const latencyAge = sampleAge < 60 ? 'just now' : sampleAge < 3600 ? `${Math.floor(sampleAge / 60)}m ago` : sampleAge < 86400 ? `${Math.floor(sampleAge / 3600)}h ago` : `${Math.floor(sampleAge / 86400)}d ago`;
     const values = context.desktop ? [
       ['Preset', configKnown ? String(context.config?.preset ?? 'Custom routing') : 'Unknown'],
       ['Providers', configKnown ? routeProviders.join(', ') || 'Direct' : 'Unknown'],
       ['Routing', configKnown ? `${routes.length} routes` : 'Unknown'],
-      ['Latency', typeof latency === 'number' && Number.isFinite(latency) ? `${latency} ms` : 'Not measured'],
+      ['HTTPS latency', latency ? `${latency.ms} ms · ${latencyAge}` : 'Not measured'],
     ] : [
       ['Profile', profile?.name ?? 'Not configured'], ['Provider', provider?.name ?? 'Direct'],
       ['Routing', `${profile?.domains.length ?? 0} sites · sample`],
       ['Latency', provider?.latency == null ? 'Not measured' : `${provider.latency} ms · sample`],
     ];
     values.forEach(([label, value]) => {const item = document.createElement('div'); const caption = document.createElement('span'); caption.textContent = label; const text = document.createElement('strong'); text.textContent = value; item.append(caption, text); strip.append(item);});
+    if (context.desktop && latency) strip.lastElementChild?.setAttribute('title', `${latency.provider}: HTTPS health probe, measured ${new Date(latency.checkedAt * 1000).toLocaleString()}. Includes connection, TLS, and response time; not game ping.`);
     home.querySelector('.connection-status')?.before(strip);
   }
   if (!home.querySelector('.preview-activity')) {
