@@ -1,6 +1,23 @@
 import {selectWeb} from './select-web';
 import { test, expect } from '@playwright/test';
 
+test('Home requests a fresh bounded latency measurement and expires it', async ({ page }) => {
+  await page.clock.install();
+  await page.addInitScript(desktopMock);
+  await page.goto('/');
+  await page.getByRole('button', {name: 'Connect', exact: true}).click();
+  await page.evaluate(() => {
+    const state = window as unknown as {__TAURI_INTERNALS__: {invoke: (...args: unknown[]) => Promise<unknown>}};
+    const original = state.__TAURI_INTERNALS__.invoke;
+    state.__TAURI_INTERNALS__.invoke = (...args) => args[0] === 'measure_proxy_latency'
+      ? Promise.resolve({latency_ms: 123}) : original(...args);
+  });
+  await page.getByRole('button', {name: 'Refresh latency', exact: true}).click();
+  await expect(page.locator('.visual-status-strip')).toContainText('123 ms · just now');
+  await page.clock.runFor(65000);
+  await expect(page.locator('.visual-status-strip')).toContainText('Click Refresh latency');
+});
+
 test('slow background reads do not overlap or request fixture status', async ({ page }) => {
   await page.clock.install();
   await page.addInitScript(desktopMock);

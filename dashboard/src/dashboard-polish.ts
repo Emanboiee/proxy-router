@@ -1,5 +1,5 @@
 import type {EngineConfig, Snapshot} from './controller';
-import {routeLatency} from './route-latency';
+import {invoke} from '@tauri-apps/api/core';
 import './dashboard-polish.css';
 
 interface DashboardPresentation {
@@ -23,6 +23,9 @@ const paths: Record<string, string> = {
 let profileQuery = '';
 let providerQuery = '';
 let selectedProvider = '';
+let latencyCheckRunning = false;
+let measuredLatency: {ms: number; at: number; key: string} | null = null;
+let latencyCheckError = '';
 
 function storageGet(key: string): string | null {
   try { return localStorage.getItem(key); } catch { return null; }
@@ -298,21 +301,37 @@ function polishHome(context: DashboardPresentation): void {
     const configKnown = context.config !== null && !context.configUnavailable;
     const routes = configKnown && Array.isArray(context.config?.routes) ? context.config.routes : [];
     const routeProviders = [...new Set(routes.map(route => String(route.provider ?? 'direct')))];
-    const latency = routeLatency(context.status);
-    const sampleAge = latency ? Math.max(0, Math.floor(Date.now() / 1000 - latency.checkedAt)) : 0;
-    const latencyAge = sampleAge < 60 ? 'just now' : sampleAge < 3600 ? `${Math.floor(sampleAge / 60)}m ago` : sampleAge < 86400 ? `${Math.floor(sampleAge / 3600)}h ago` : `${Math.floor(sampleAge / 86400)}d ago`;
+    const latencyKey = JSON.stringify([context.config?.port, context.config?.preset, context.config?.routes]);
+    const freshMeasurement = measuredLatency?.key === latencyKey && context.status?.up
+      && Date.now() - measuredLatency.at < 60000 ? measuredLatency : null;
     const values = context.desktop ? [
       ['Preset', configKnown ? String(context.config?.preset ?? 'Custom routing') : 'Unknown'],
       ['Providers', configKnown ? routeProviders.join(', ') || 'Direct' : 'Unknown'],
       ['Routing', configKnown ? `${routes.length} routes` : 'Unknown'],
-      ['HTTPS latency', latency ? `${latency.ms} ms · ${latencyAge}` : 'Not measured'],
+      ['Proxy HTTPS check', latencyCheckRunning ? 'Checking…' : freshMeasurement ? `${freshMeasurement.ms} ms · just now` : latencyCheckError || 'Click Refresh latency'],
     ] : [
       ['Profile', profile?.name ?? 'Not configured'], ['Provider', provider?.name ?? 'Direct'],
       ['Routing', `${profile?.domains.length ?? 0} sites · sample`],
       ['Latency', provider?.latency == null ? 'Not measured' : `${provider.latency} ms · sample`],
     ];
     values.forEach(([label, value]) => {const item = document.createElement('div'); const caption = document.createElement('span'); caption.textContent = label; const text = document.createElement('strong'); text.textContent = value; item.append(caption, text); strip.append(item);});
-    if (context.desktop && latency) strip.lastElementChild?.setAttribute('title', `${latency.provider}: HTTPS health probe, measured ${new Date(latency.checkedAt * 1000).toLocaleString()}. Includes connection, TLS, and response time; not game ping.`);
+    if (context.desktop) {
+      const result = strip.lastElementChild!;
+      result.setAttribute('title', 'HTTPS request to 1.1.1.1 through the local proxy. Routing rules choose the path. Includes TLS and response time; not ICMP ping. Expires after 60 seconds.');
+      result.setAttribute('aria-live', 'polite');
+      const refresh = document.createElement('button'); refresh.type = 'button'; refresh.className = 'quiet';
+      refresh.textContent = 'Refresh latency'; refresh.disabled = latencyCheckRunning || !context.status?.up;
+      refresh.addEventListener('click', async () => {
+        if (latencyCheckRunning) return;
+        latencyCheckRunning = true; latencyCheckError = ''; polishHome(context);
+        try {
+          const response = await invoke<{latency_ms: number}>('measure_proxy_latency');
+          measuredLatency = {ms: response.latency_ms, at: Date.now(), key: latencyKey};
+        } catch { measuredLatency = null; latencyCheckError = 'Check failed'; }
+        finally { latencyCheckRunning = false; polishHome(context); }
+      });
+      result.append(refresh);
+    }
     home.querySelector('.connection-status')?.before(strip);
   }
   if (!home.querySelector('.preview-activity')) {
