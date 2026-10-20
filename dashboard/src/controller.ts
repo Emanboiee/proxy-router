@@ -26,6 +26,7 @@ export interface Status {
 }
 export interface Profile {
   id: string; name: string; description: string; providerId: string;
+  presetName?: string; presetRoutes?: Array<{ id: string; providerId: string; domains: string[]; available: boolean }>;
   fallbackProviderId?: string; routeMode: RouteMode; domains: string[]; autoSubdomains: boolean; fallback: FallbackMode; updatedAt: number;
 }
 export interface Provider {
@@ -317,7 +318,7 @@ export async function applyDashboardProfile(profileId: string): Promise<Dashboar
 }
 
 export async function saveDashboardProvider(
-  provider: { name: string; kind: 'wireguard' | 'custom' },
+  provider: { name: string; kind: 'wireguard' | 'custom' | 'warp' | 'socks5'; host?: string; port?: number },
   providerId?: string,
   sourcePath?: string,
 ): Promise<DashboardState> {
