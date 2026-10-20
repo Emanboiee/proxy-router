@@ -1,0 +1,4 @@
+{
+  "bundle": { "targets": ["nsis"] },
+  "app": { "windows": [{ "label": "main", "title": "Proxy Router", "width": 1100, "height": 800, "minWidth": 640, "minHeight": 480, "resizable": true }] }
+}

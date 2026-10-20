@@ -809,6 +809,36 @@ def apply_preset_by_name(root: Path, name: str) -> dict:
     return {"added": added, "mode": mode, "preset": name}
 
 
+def apply_preset_for_activation(root, name, *, validate, write_config, reload=None):
+    """Restore the previous config if validation or engine activation fails."""
+    path = root / "router.json"
+    previous = path.read_text() if path.exists() else None
+
+    def restore():
+        if previous is None:
+            path.unlink(missing_ok=True)
+        else:
+            write_config(path, previous)
+            validate()
+
+    try:
+        result = apply_preset_by_name(root, name)
+        if reload is not None:
+            # The engine builds from loaded globals, not directly from the file.
+            rc = validate()
+            if rc == 0:
+                rc = reload()
+            if rc != 0:
+                restore()
+                return {"applied": False, "reason": "activation failed", "reload_rc": rc}
+            result["reload_rc"] = rc
+        return {**result, "applied": True}
+    except (Exception, SystemExit):
+        restore()
+        raise
+
+
+
 def add_custom_preset(root: Path, name: str, provider: str, domains: list[str],
                       mode: str = "vpn-list", default_provider: str | None = None) -> Path:
     """Create a custom named preset file under ``root/presets/``.
