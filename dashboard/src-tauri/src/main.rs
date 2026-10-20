@@ -8,6 +8,7 @@
 //! (Emanboiee/proxy-router#144).
 
 mod controller;
+mod network_refresh;
 mod tray_owner;
 use crate::tray_owner::TrayOwnerLease;
 
@@ -153,6 +154,21 @@ fn refresh_live_status<R: Runtime>(
     }
     if let Err(error) = apply_tray_state(app, &state) {
         eprintln!("tray: {error}");
+    }
+    if let Some(status) = payload.as_ref() {
+        if let Some(refresh) = app.try_state::<network_refresh::NetworkRefresh>() {
+            if refresh.try_start(status, Instant::now()) {
+                let handle = app.clone();
+                thread::spawn(move || {
+                    let root = controller::router_root();
+                    if let Err(error) = controller::run_controller(&root, &["doctor", "--network"]) {
+                        eprintln!("network check failed: {error}");
+                    }
+                    handle.state::<network_refresh::NetworkRefresh>().finish(Instant::now());
+                    refresh_live_status(&handle, false);
+                });
+            }
+        }
     }
     (state, payload, detail)
 }
@@ -657,6 +673,7 @@ fn main() {
     let run_result = tauri::Builder::default()
         .manage(LaunchTime(Instant::now()))
         .manage(LiveStatus::default())
+        .manage(network_refresh::NetworkRefresh::default())
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             show_dashboard(app);
         }))
