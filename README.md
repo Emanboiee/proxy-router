@@ -758,8 +758,12 @@ examples/install-launchd.sh     # writes the plist with your paths and bootstrap
 launchctl bootout gui/$(id -u)/com.proxy-router.keepalive   # remove
 ```
 
-Linux/Windows: run `examples/keepalive.sh` under a supervisor of your choice
-(systemd service / Task Scheduler / tmux).
+Linux: run `examples/keepalive.sh` under a supervisor of your choice
+(systemd service / tmux).
+
+Windows: use the native `bin\proxy-router-keepalive.ps1` supervisor with Task
+Scheduler (see the Windows install section above); `examples/keepalive.sh`
+requires Bash and is not used on Windows.
 
 The keepalive waits `PROXY_KEEPALIVE_INTERVAL` (default 15s) between checks,
 but while `ensure` keeps failing the wait grows exponentially (15, 30, 60, ...)

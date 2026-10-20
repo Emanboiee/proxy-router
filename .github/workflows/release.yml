@@ -194,6 +194,25 @@ jobs:
           "$PROXY_ROUTER_DIR/current/router.py" --help >/dev/null
           echo "clean-install CLI smoke passed"
 
+      - name: Set up Python for the Windows smoke test
+        if: runner.os == 'Windows'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+
+      - name: Clean-install smoke test (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Install the EXACT published zip into a throwaway LOCALAPPDATA and
+          # run the installed launchers; see issue #67 criterion 6.
+          $archive = Join-Path (Get-Location) "proxy-router-${env:GITHUB_REF_NAME}-${{ matrix.suffix }}.zip"
+          if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
+            throw "release archive not found: $archive"
+          }
+          & "$env:GITHUB_WORKSPACE/.github/scripts/windows-release-smoke.ps1" -Archive $archive
+
       - name: Generate project checksums
         id: checksums
         shell: bash

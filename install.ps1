@@ -61,8 +61,11 @@ $LauncherCmd = Join-Path $Bin 'proxy-router.cmd'
 set "PROXY_ROUTER_ROOT=%~dp0.."
 where py >nul 2>nul
 if not errorlevel 1 (
-  py -3 "%PROXY_ROUTER_ROOT%\router.py" %*
-  exit /b %ERRORLEVEL%
+  py -3 -c "import sys" >nul 2>nul
+  if not errorlevel 1 (
+    py -3 "%PROXY_ROUTER_ROOT%\router.py" %*
+    exit /b %ERRORLEVEL%
+  )
 )
 python "%PROXY_ROUTER_ROOT%\router.py" %*
 exit /b %ERRORLEVEL%
@@ -74,7 +77,12 @@ $LauncherPs1 = Join-Path $Bin 'proxy-router.ps1'
 param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
 $env:PROXY_ROUTER_ROOT = Split-Path -Parent $PSScriptRoot
 $py = Get-Command py -ErrorAction SilentlyContinue
+$pyUsable = $false
 if ($null -ne $py) {
+  & $py.Source -3 -c "import sys" *> $null
+  $pyUsable = ($LASTEXITCODE -eq 0)
+}
+if ($pyUsable) {
   & $py.Source -3 (Join-Path $env:PROXY_ROUTER_ROOT 'router.py') @Arguments
 } else {
   & python (Join-Path $env:PROXY_ROUTER_ROOT 'router.py') @Arguments
