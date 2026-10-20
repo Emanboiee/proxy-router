@@ -92,6 +92,9 @@ def _read_store(root: Path) -> dict[str, Any]:
         raise DashboardError("Saved active profile is invalid")
     if not isinstance(value.get("profiles_initialized", False), bool):
         raise DashboardError("Saved dashboard profile state is invalid")
+    if not isinstance(value.get("hidden_presets", []), list) or any(
+            not isinstance(name, str) for name in value.get("hidden_presets", [])):
+        raise DashboardError("Saved preset visibility is invalid")
     value.setdefault("profiles", [])
     value.setdefault("providers", {})
     value.setdefault("active_profile_id", None)
@@ -358,15 +361,89 @@ def _inferred_profile(config: dict[str, Any], providers: dict[str, Any]) -> dict
     routing = config.get("routing", {})
     mode = routing.get("mode") if isinstance(routing, dict) else "default"
     route_mode = "full" if mode == "safe-list" else "direct" if not routes and mode != "safe-list" else "selective"
-    domains = [domain for route in routes if isinstance(route, dict) for domain in route.get("domains", []) if isinstance(domain, str)]
+    domains = (routing.get("vpn_domains", []) if mode == "vpn-list" else
+               [domain for route in routes if isinstance(route, dict) for domain in route.get("domains", []) if isinstance(domain, str)])
+    if mode == "vpn-list":
+        first = next((route for route in routes if isinstance(route, dict)
+                      and any(domain in domains for domain in route.get("domains", []))), first)
+        provider_id = str(first.get("provider") or provider_id)
     chain = providers.get(provider_id, {}).get("fallback_providers", [])
     fallback_id = chain[0] if isinstance(chain, list) and chain else ""
     return {
-        "id": "current-setup", "name": "Current setup", "description": "Imported from the router’s current routes.",
+        "id": "current-setup", "name": str(config.get("preset") or "Custom routing"), "description": "Read from the router’s active configuration.",
         "providerId": provider_id, "fallbackProviderId": fallback_id if fallback_id in providers else "",
         "routeMode": route_mode, "domains": list(dict.fromkeys(domains)), "autoSubdomains": True,
         "fallback": "retry" if fallback_id in providers else "direct", "updatedAt": 0,
     }
+
+
+def _load_local_preset(root: Path, name: str) -> dict:
+    if not isinstance(name, str) or not _PROVIDER_ID.fullmatch(name):
+        raise DashboardError("Saved preset name is invalid")
+    path = root / "presets" / f"{name}.json"
+    try:
+        path.resolve().relative_to((root / "presets").resolve())
+        preset = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise DashboardError("Saved preset could not be loaded. Refresh and try again.") from exc
+    if not isinstance(preset, dict):
+        raise DashboardError("Saved preset must contain an object")
+    if not isinstance(preset.get("routes", []), list) or any(
+            not isinstance(route, dict) for route in preset.get("routes", [])):
+        raise DashboardError("Saved preset has invalid routes")
+    for field in ("routing", "vpn", "providers"):
+        if field in preset and not isinstance(preset[field], dict):
+            raise DashboardError(f"Saved preset has invalid {field}")
+    return preset
+
+
+def _preset_profiles(root: Path, config: dict, store: dict) -> list[dict]:
+    """Discover existing local presets without writing config or importing keys."""
+    result = []
+    hidden = store.get("hidden_presets", [])
+    for path in sorted((root / "presets").glob("*.json")):
+        name = path.stem
+        profile_id = f"preset-{name}"
+        if not _PROVIDER_ID.fullmatch(profile_id) or name in hidden:
+            continue
+        try:
+            preset = _load_local_preset(root, name)
+            candidate = copy.deepcopy(config)
+            candidate["routes"] = preset.get("routes", [])
+            candidate["routing"] = preset.get("routing", {"mode": "default"})
+            profile = _inferred_profile(candidate, candidate["providers"])
+            if profile is None:
+                continue
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+        profile.update(id=profile_id, name=name, description="Saved routing preset on this computer.",
+                       _preset_name=name)
+        result.append(profile)
+    return result
+
+
+def _find_profile(root: Path, config: dict, store: dict, profile_id: str) -> dict | None:
+    return next((item for item in store["profiles"] + _preset_profiles(root, config, store)
+                 if item.get("id") == profile_id), None)
+
+
+def _preset_is_active(root: Path, config: dict, profile: dict) -> bool:
+    name = profile.get("_preset_name")
+    if config.get("preset") != name:
+        return False
+    try:
+        preset = _load_local_preset(root, name)
+    except DashboardError:
+        return False
+    for field in ("routing", "vpn"):
+        if any(config.get(field, {}).get(key) != value for key, value in preset.get(field, {}).items()):
+            return False
+    configured = {route.get("id"): route for route in config["routes"] if isinstance(route, dict)}
+    for route in preset.get("routes", []):
+        actual = configured.get(route.get("id"), {})
+        if any(actual.get(key) != value for key, value in route.items()):
+            return False
+    return True
 
 
 def state(root: Path) -> dict[str, Any]:
@@ -374,13 +451,29 @@ def state(root: Path) -> dict[str, Any]:
     config = _read_config(root)
     store = _read_store(root)
     providers = _provider_rows(root, config, store)
-    profiles = [{key: value for key, value in item.items() if key != "_route_snapshot"}
+    discovered = _preset_profiles(root, config, store)
+    profiles = [{key: value for key, value in item.items() if not key.startswith("_")}
                 for item in store["profiles"] if isinstance(item, dict)]
+    saved_ids = {item.get("id") for item in profiles}
+    profiles.extend({key: value for key, value in item.items() if not key.startswith("_")}
+                    for item in discovered if item["id"] not in saved_ids)
+    preset_id = f"preset-{config.get('preset', '')}"
     if not profiles and not store.get("profiles_initialized", False):
         inferred = _inferred_profile(config, config["providers"])
         if inferred:
             profiles = [inferred]
     active_id = store.get("active_profile_id")
+    matching_preset = next((item for item in discovered if item["id"] == preset_id
+                            and _preset_is_active(root, config, item)), None)
+    if matching_preset is not None:
+        active_id = preset_id
+    elif discovered and (config.get("preset") or active_id not in saved_ids):
+        inferred = _inferred_profile(config, config["providers"])
+        if inferred:
+            inferred["name"] = "Custom routing"
+            if not any(item["id"] == inferred["id"] for item in profiles):
+                profiles.append(inferred)
+            active_id = inferred["id"]
     if active_id is not None and not isinstance(active_id, str):
         raise DashboardError("Saved active profile is invalid")
     if active_id not in {profile.get("id") for profile in profiles}:
@@ -395,7 +488,7 @@ def save_profile(root: Path, value: Any, profile_id: str | None = None) -> dict[
     config = _read_config(root)
     store = _read_store(root)
     profiles = store["profiles"]
-    old = next((item for item in profiles if isinstance(item, dict) and item.get("id") == profile_id), None) if profile_id else None
+    old = _find_profile(root, config, store, profile_id) if profile_id else None
     if profile_id and old is None:
         inferred = _inferred_profile(config, config["providers"])
         if inferred and inferred["id"] == profile_id:
@@ -403,6 +496,11 @@ def save_profile(root: Path, value: Any, profile_id: str | None = None) -> dict[
         else:
             raise DashboardError("That profile no longer exists. Refresh and try again.")
     profile = _profile_data(value, config["providers"], old)
+    if old and old.get("_preset_name"):
+        fields = ("providerId", "fallbackProviderId", "routeMode", "domains", "autoSubdomains", "fallback")
+        if any(profile.get(field) != old.get(field) for field in fields):
+            raise DashboardError("Create a new profile to change a saved preset’s routing.")
+        profile["_preset_name"] = old["_preset_name"]
     snapshot = (old or {}).get("_route_snapshot")
     if old and old.get("id") == "current-setup" and snapshot is None:
         snapshot = _route_snapshot(config)
@@ -432,6 +530,16 @@ def delete_profile(root: Path, profile_id: str) -> dict[str, Any]:
     store = _read_store(root)
     profiles = store["profiles"]
     config = _read_config(root)
+    discovered = _find_profile(root, config, store, profile_id)
+    if discovered and discovered.get("_preset_name"):
+        if state(root)["activeProfileId"] == profile_id:
+            raise DashboardError("Choose another profile before removing the active preset.")
+        hidden = store.setdefault("hidden_presets", [])
+        if discovered["_preset_name"] not in hidden:
+            hidden.append(discovered["_preset_name"])
+        store["profiles"] = [item for item in profiles if item.get("id") != profile_id]
+        _save_store(root, store)
+        return state(root)
     visible_profiles = list(profiles)
     if not visible_profiles and not store.get("profiles_initialized", False):
         inferred = _inferred_profile(config, config["providers"])
@@ -503,14 +611,28 @@ def apply_profile(root: Path, profile_id: str) -> dict[str, Any]:
     config = _read_config(root)
     store = _read_store(root)
     profiles = store["profiles"]
-    profile = next((item for item in profiles if isinstance(item, dict) and item.get("id") == profile_id), None)
+    profile = _find_profile(root, config, store, profile_id)
     if profile is None:
         profile = _inferred_profile(config, config["providers"])
         if profile:
             profile["_route_snapshot"] = _route_snapshot(config)
     if not profile or profile.get("id") != profile_id:
         raise DashboardError("That profile no longer exists")
-    clean = _apply_profile_config(config, profile)
+    if profile.get("_preset_name"):
+        name = profile["_preset_name"]
+        preset = _load_local_preset(root, name)
+        config["routes"] = copy.deepcopy(preset.get("routes", []))
+        config["routing"] = copy.deepcopy(preset.get("routing", {"mode": "default"}))
+        if isinstance(preset.get("vpn"), dict):
+            config.setdefault("vpn", {}).update(preset["vpn"])
+        for provider_id, spec in preset.get("providers", {}).items():
+            config["providers"].setdefault(provider_id, copy.deepcopy(spec))
+        config["preset"] = name
+        clean = profile
+    else:
+        clean = _apply_profile_config(config, profile)
+        if clean["id"] != "current-setup":
+            config.pop("preset", None)
     store["active_profile_id"] = clean["id"]
     if not any(item.get("id") == clean["id"] for item in profiles if isinstance(item, dict)):
         profiles.append(clean)

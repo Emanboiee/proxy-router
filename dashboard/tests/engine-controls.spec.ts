@@ -1,5 +1,20 @@
 import { test, expect } from '@playwright/test';
 
+test('unchanged background status keeps the page DOM and expanded routing intact', async ({ page }) => {
+  await page.clock.install();
+  await page.addInitScript(desktopMock);
+  await page.goto('/');
+  await expect(page.locator('#active-preset')).toHaveText('opencode');
+  await page.locator('.home-route-details').evaluate(node => { (node as HTMLDetailsElement).open = true; });
+  await page.locator('#main').evaluate(node => {
+    (window as unknown as { __originalHero: Element | null }).__originalHero = node.querySelector('.connection-hero');
+  });
+  await page.clock.runFor(31000);
+  await expect(page.locator('.home-route-details')).toHaveAttribute('open', '');
+  expect(await page.evaluate(() => document.querySelector('.connection-hero') ===
+    (window as unknown as { __originalHero: Element | null }).__originalHero)).toBe(true);
+});
+
 test('background polls preserve navigation focus and open profile pickers', async ({ page }) => {
   await page.clock.install();
   await page.addInitScript(desktopMock);
