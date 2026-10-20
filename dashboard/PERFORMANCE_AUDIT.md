@@ -37,3 +37,27 @@ does not overlap later ticks or request fixture status. Earlier native acceptanc
 verified real configuration and profile inventory. New polling changes have not
 yet been installed or timed in the native webview. Physical Wi-Fi transitions,
 WARP restart, Windows performance, and 24-hour reliability remain unverified.
+
+## Reproducible action-cache benchmark — 2026-10-21
+
+Start a separate development server after `npm ci` and `npx playwright install chromium`:
+
+```sh
+npm run dev -- --port 24327 --strictPort
+# In another terminal, from dashboard/:
+node scripts/benchmark-refresh.mjs http://127.0.0.1:24327
+```
+
+The script installs the existing desktop bridge mock before loading the page.
+It compares the cache change against the same page with only the previous
+`force: !options?.poll` expression restored. A forced status read costs 110ms
+by injection; other controller calls are immediate. Twelve alternating
+Connect/Disconnect actions are timed until both the heading and rail settle;
+DOM clicks exclude Playwright's actionability wait. The script rejects an
+unmatched baseline rewrite or unexpected forced-read counts.
+
+One Chromium run on the PR branch measured median 215.8ms before / 13.5ms after,
+maximum 256.3ms / 28.7ms, and 13 / 0 forced reads including startup. These small,
+sequential samples demonstrate removal of duplicate bridge work under controlled
+delay. They are not native/production latency, a confidence interval, or a
+guarantee for another machine. No native RAM reduction is established.
