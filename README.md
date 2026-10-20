@@ -717,8 +717,8 @@ Menu map:
 
 - **Status header** (`● Connected` / `○ Disconnected` / `! Error`; a fresh
   install shows "No VPN set up yet" with a pointer at Setup).
-- **Open Dashboard** — opens the full terminal wizard in a Terminal window
-  (the bold default action).
+- **Open Dashboard** — opens the installed dashboard, or the terminal wizard
+  when no dashboard is available (the bold default action).
 - **Connect / Reconnect · Disconnect** — `router.py start` / `stop`.
   Disconnect writes the manual-off marker, so the keepalive will NOT
   resurrect the engine until you connect again.
