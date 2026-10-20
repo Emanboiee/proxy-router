@@ -3485,23 +3485,7 @@ def write_sing_box(config: dict) -> None:
         print("router: refusing to write an egress-less sing-box config; keeping existing file",
               file=sys.stderr)
         return
-    SING_BOX_CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            "w", encoding="utf-8", dir=SING_BOX_CONFIG.parent,
-            prefix=f".{SING_BOX_CONFIG.name}.", suffix=".tmp", delete=False,
-        ) as handle:
-            temporary = Path(handle.name)
-            handle.write(json.dumps(config, indent=2) + "\n")
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, SING_BOX_CONFIG)
-        temporary = None
-        os.chmod(SING_BOX_CONFIG, 0o600)
-        _hand_back_ownership(SING_BOX_CONFIG)
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+    _atomic_write(SING_BOX_CONFIG, json.dumps(config, indent=2) + "\n", 0o600)
 
 
 def validate_config() -> bool:
