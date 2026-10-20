@@ -380,7 +380,7 @@ pub fn connection_state(status: &Value) -> &'static str {
     let fresh = network.and_then(|value| value.get("stale")).and_then(Value::as_bool) == Some(false);
     let network_status = network.and_then(|value| value.get("status")).and_then(Value::as_str);
     let proxy_status = status.get("system_proxy").and_then(|value| value.get("status")).and_then(Value::as_str);
-    if !fresh || network_status.is_none() || network_status == Some("unknown")
+    if !fresh || matches!(network_status, None | Some("unknown" | "skipped"))
         || !matches!(proxy_status, Some("ok" | "skipped")) {
         return "stale";
     }
@@ -500,6 +500,14 @@ mod tests {
         assert_eq!(connection_state(&status), "stale");
         status["network"]["stale"] = json!(false);
         assert_eq!(connection_state(&status), "degraded");
+    }
+
+    #[test]
+    fn skipped_check_does_not_claim_routed_connectivity() {
+        let mut status = captured_status();
+        status["network"]["status"] = json!("skipped");
+        status["network"]["stale"] = json!(false);
+        assert_eq!(connection_state(&status), "stale");
     }
 
     #[test]
