@@ -1026,3 +1026,5 @@ uses the installed, registered official client to configure proxy mode, set
 the chosen port, and connect. The WARP GUI need not be open, but its service
 must be installed; this feature does not install software, accept terms,
 register accounts, or silently grant administrator permissions.
+
+Windows desktop setup and build instructions: [Windows dashboard](dashboard/README.windows.md).

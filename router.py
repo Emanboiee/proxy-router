@@ -4655,22 +4655,15 @@ def apply_network_preset(*, reload_engine: bool = True, root: Path | None = None
         current = None
     if current == preset:
         return {"applied": False, "reason": "already active", "preset": preset, "checked_at": now}
-    from setup_tui import apply_preset_by_name
-    result = apply_preset_by_name(root, preset)
-    marker = network_preset_marker(root)
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text(json.dumps({
-        "ssid": current_ssid(),
-        "preset": preset,
-        "applied_at": now,
-    }))
-    os.chmod(marker, 0o600)
-    if reload_engine:
-        if _engine_runs_as_root():
-            result["reload_rc"] = _elevated_reload()
-        else:
-            result["reload_rc"] = engine_reload()
-    return {"applied": True, **result, "preset": preset, "checked_at": now}
+    from setup_tui import apply_preset_for_activation
+    reload = (lambda: _elevated_reload() if _engine_runs_as_root() else engine_reload()) if reload_engine else None
+    result = apply_preset_for_activation(root, preset, validate=load_config,
+                                         write_config=_atomic_write, reload=reload)
+    if result["applied"]:
+        _atomic_write(network_preset_marker(root), json.dumps({
+            "ssid": current_ssid(), "preset": preset, "applied_at": now,
+        }))
+    return {**result, "preset": preset, "checked_at": now}
 
 
 _BUILTIN_NETWORK_PRESETS = ("default", "opencode", "roblox", "school-warp")
