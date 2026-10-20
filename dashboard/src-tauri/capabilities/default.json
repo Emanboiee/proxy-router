@@ -3,5 +3,5 @@
   "identifier": "main-capability",
   "description": "Capabilities for the Proxy Router dashboard window.",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:allow-open"]
+  "permissions": ["core:default", "core:window:allow-set-size", "core:window:allow-set-position", "core:window:allow-unmaximize", "dialog:allow-open"]
 }
