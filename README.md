@@ -998,3 +998,5 @@ python3 -m pytest tests -q --randomly-seed=58
 ## License
 
 [MIT](LICENSE)
+
+Windows desktop setup and build instructions: [Windows dashboard](dashboard/README.windows.md).
