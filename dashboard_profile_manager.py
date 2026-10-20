@@ -6,6 +6,7 @@ returned to the webview.
 """
 from __future__ import annotations
 
+import argparse
 import base64
 import binascii
 import configparser
@@ -317,15 +318,29 @@ def _provider_rows(root: Path, config: dict[str, Any], store: dict[str, Any]) ->
             except ValueError:
                 files = []
         kind = saved.get("kind") or ("wireguard" if spec.get("directory") else "custom")
-        endpoint = str(saved.get("endpoint") or (files[0].stem if files else "Configured connection"))
+        server_ids = [file.stem for file in files if file.is_file()]
+        try:
+            active = (root / "state" / f"{provider_id}.active").read_text().strip()
+        except OSError:
+            active = ""
+        endpoint = active if active in server_ids else "Unknown"
+        proxy = isinstance(spec.get("socks5"), dict)
+        if proxy:
+            endpoint = "Automatic endpoint"
+        preferred = saved.get("preferredServer")
+        if preferred not in server_ids:
+            preferred = None
         result.append({
             "id": provider_id,
             "name": str(saved.get("name") or provider_id),
             "kind": kind if kind in _PROVIDER_KINDS else "custom",
-            "status": "offline",
+            "status": "unknown",
             "latency": None,
             "server": endpoint,
-            "servers": [endpoint],
+            "servers": server_ids if not proxy else [],
+            "preferredServer": preferred,
+            "capabilities": {"serverSelection": bool(server_ids) and not proxy, "reconnect": proxy},
+            "serverCount": len(server_ids),
             "connection": {"kind": "wireguard", "fileName": files[0].name if files else "", "endpoint": endpoint},
             "managed": bool(saved.get("managed", False)),
         })
@@ -598,6 +613,22 @@ def delete_provider(root: Path, provider_id: str) -> dict[str, Any]:
     return state(root)
 
 
+def save_server_preference(root: Path, provider_id: str, server: str | None) -> dict:
+    """Save an inventory-backed choice; never rotate or rewrite active state."""
+    root = Path(root).resolve()
+    config, store = _read_config(root), _read_store(root)
+    provider = next((row for row in _provider_rows(root, config, store)
+                     if row["id"] == provider_id), None)
+    if provider is None or not provider["capabilities"]["serverSelection"]:
+        raise DashboardError("This connection does not offer server selection")
+    if server is not None and server not in provider["servers"]:
+        raise DashboardError("That server is no longer installed. Refresh the server list.")
+    metadata = store["providers"].setdefault(provider_id, {})
+    metadata["preferredServer"] = server
+    _save_store(root, store)
+    return state(root)
+
+
 def run_cli(root: Path, args) -> int:
     try:
         if args.dashboard_action == "state":
@@ -614,6 +645,8 @@ def run_cli(root: Path, args) -> int:
             value = save_provider(
                 root, json.loads(args.json), args.id, args.path,
             )
+        elif args.dashboard_action == "server-preference":
+            value = save_server_preference(root, args.id, args.server or None)
         elif args.dashboard_action == "provider-delete":
             value = delete_provider(root, args.id)
         else:
@@ -623,3 +656,22 @@ def run_cli(root: Path, args) -> int:
         return 1
     print(json.dumps(value, separators=(",", ":")))
     return 0
+
+
+def configure_parser(sub) -> None:
+    dashboard = sub.add_parser("dashboard", help=argparse.SUPPRESS)
+    dashboard_sub = dashboard.add_subparsers(dest="dashboard_action", required=True)
+    dashboard_sub.add_parser("state", help=argparse.SUPPRESS)
+    for action in ("profile-save", "provider-save"):
+        command = dashboard_sub.add_parser(action, help=argparse.SUPPRESS)
+        command.add_argument("--json", required=True, help=argparse.SUPPRESS)
+        command.add_argument("--id", default=None, help=argparse.SUPPRESS)
+        if action == "provider-save":
+            command.add_argument("--path", default=None, help=argparse.SUPPRESS)
+    for action in ("profile-delete", "profile-apply", "provider-delete"):
+        command = dashboard_sub.add_parser(action, help=argparse.SUPPRESS)
+        command.add_argument("--id", required=True, help=argparse.SUPPRESS)
+
+    preference = dashboard_sub.add_parser("server-preference", help=argparse.SUPPRESS)
+    preference.add_argument("--id", required=True)
+    preference.add_argument("--server", default="")
