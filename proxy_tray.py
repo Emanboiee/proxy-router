@@ -797,7 +797,7 @@ def _launch_dashboard_app(app: Path) -> bool:
         return False
 
 
-def open_dashboard(root) -> bool:
+def open_dashboard(root, *, on_tui_fallback: Callable[[], None] | None = None) -> bool:
     """Open the Tauri dashboard from the tray, with a TUI fallback."""
     root = Path(root)
     app = _dashboard_bundle(root)
@@ -819,7 +819,10 @@ def open_dashboard(root) -> bool:
     if not (root / "setup_tui.py").is_file():
         print(f"dashboard: missing {root / 'setup_tui.py'}", file=sys.stderr)
         return False
-    return _launch_terminal(root, [])
+    opened = _launch_terminal(root, [])
+    if opened and on_tui_fallback is not None:
+        on_tui_fallback()
+    return opened
 
 
 def dashboard_app_running() -> bool:
@@ -1706,6 +1709,7 @@ class TrayApp:
             initial_status if initial_status is not None else RouterStatus())
         self.lock = threading.Lock()
         self.last_action_result: str | None = None
+        self._dashboard_fallback_hint_shown = False
         self.quit_flag = threading.Event()
         self.tray = None
         self.dashboard = DashboardController(
@@ -1993,12 +1997,18 @@ class TrayApp:
             print(f"dashboard: unknown action {kind!r}", file=sys.stderr)
 
     def action_dashboard(self):
-        # Preserve the existing right-click menu action: its Dashboard entry
-        # opens the full setup wizard in Terminal. The status-item left-click
-        # uses _show_native_dashboard and never takes this path.
-        ok = open_dashboard(self.client.root)
+        used_tui = False
+
+        def tui_fallback():
+            nonlocal used_tui
+            used_tui = True
+
+        ok = open_dashboard(self.client.root, on_tui_fallback=tui_fallback)
         result = "dashboard opened" if ok else "dashboard: no terminal"
         with self.lock:
+            if used_tui and not self._dashboard_fallback_hint_shown:
+                result = "dashboard: not built — using TUI (set PROXY_ROUTER_DASHBOARD)"
+                self._dashboard_fallback_hint_shown = True
             self.last_action_result = result
         self._dashboard_update_action(result)
         self._refresh_menu()

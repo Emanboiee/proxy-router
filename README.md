@@ -684,6 +684,18 @@ stays resident and hides its icon while that lease is fresh. Clean quit removes
 the lease; after a crash, Python reveals its icon when the 60-second lease expires.
 Installing an app bundle alone does not hide the Python tray.
 
+The tray's **Open Dashboard** action discovers a built app in the repository,
+adjacent dashboard checkout, or installed bundle. Set `PROXY_ROUTER_DASHBOARD`
+to an explicit app path before starting the tray to override discovery:
+
+```sh
+PROXY_ROUTER_DASHBOARD="/Applications/Proxy Router.app" python3 proxy_tray.py
+```
+
+Without a built dashboard or release binary, the action opens the terminal TUI.
+The first successful TUI fallback per tray session shows a menu hint explaining
+how to select the dashboard. This override selects the app; it does not build it.
+
 For installations that explicitly want the native app supervised without a
 Python fallback icon, use:
 
@@ -705,8 +717,8 @@ Menu map:
 
 - **Status header** (`● Connected` / `○ Disconnected` / `! Error`; a fresh
   install shows "No VPN set up yet" with a pointer at Setup).
-- **Open Dashboard** — opens the full terminal wizard in a Terminal window
-  (the bold default action).
+- **Open Dashboard** — opens the installed dashboard, or the terminal wizard
+  when no dashboard is available (the bold default action).
 - **Connect / Reconnect · Disconnect** — `router.py start` / `stop`.
   Disconnect writes the manual-off marker, so the keepalive will NOT
   resurrect the engine until you connect again.
