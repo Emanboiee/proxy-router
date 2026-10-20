@@ -55,6 +55,11 @@ foreach ($Directory in @('examples', 'guides', 'presets', 'rulesets')) {
 # Install a native Windows command entry point instead of adding only the
 # engine directory to PATH.  The launcher resolves router.py relative to the
 # installed prefix, so it remains valid after the source archive is removed.
+#
+# `exit /b` with no argument preserves the current ERRORLEVEL at RUN time.
+# `%ERRORLEVEL%` inside a parenthesised ( ... ) block would be expanded when
+# cmd parses the block -- usually to 0 -- so a failing router.py run looked
+# successful (issue #67 review).
 $LauncherCmd = Join-Path $Bin 'proxy-router.cmd'
 @'
 @echo off
@@ -64,11 +69,11 @@ if not errorlevel 1 (
   py -3 -c "import sys" >nul 2>nul
   if not errorlevel 1 (
     py -3 "%PROXY_ROUTER_ROOT%\router.py" %*
-    exit /b %ERRORLEVEL%
+    exit /b
   )
 )
 python "%PROXY_ROUTER_ROOT%\router.py" %*
-exit /b %ERRORLEVEL%
+exit /b
 '@ | Set-Content -LiteralPath $LauncherCmd -Encoding ASCII
 
 $LauncherPs1 = Join-Path $Bin 'proxy-router.ps1'

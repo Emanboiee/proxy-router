@@ -73,7 +73,20 @@ function Assert-PrivateAcl {
   )
   Assert-True (Test-Path -LiteralPath $Path) "$Label does not exist: $Path"
   $acl = Get-Acl -LiteralPath $Path
-  Assert-True $acl.AreAccessRulesProtected "$Label still inherits its parent DACL: $Path"
+  if ($ExpectInherited) {
+    # Files the engine generates later (sing-box.json, provider profiles) are
+    # created inside the protected install root, so their own DACL stays
+    # UNPROTECTED and every ACE is copied down from the parent. Requiring
+    # protection here would fail every clean install.
+    Assert-True (-not $acl.AreAccessRulesProtected) `
+      "$Label must keep inheriting its parent DACL: $Path"
+  }
+  else {
+    # The install root, providers directory and router.json are locked down
+    # explicitly by install.ps1: the DACL must be protected, and it must have
+    # discarded the broad inherited grants instead of keeping them.
+    Assert-True $acl.AreAccessRulesProtected "$Label still inherits its parent DACL: $Path"
+  }
 
   $current = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
   $allowed = @($current) + $AllowedPrivateSids
@@ -85,6 +98,9 @@ function Assert-PrivateAcl {
     Assert-True ($allowed -contains $sid) "$Label grants access to unexpected SID $sid ($($rule.IdentityReference))"
     if ($ExpectInherited) {
       Assert-True $rule.IsInherited "$Label has an explicit ACE for $sid; generated private files must inherit the installer DACL"
+    }
+    else {
+      Assert-True (-not $rule.IsInherited) "$Label still carries an inherited ACE for $sid; explicit entries must be protected"
     }
   }
   foreach ($required in @($current, 'S-1-5-18')) {
@@ -212,11 +228,13 @@ try {
   $cmdLauncher = Join-Path $dest 'bin\proxy-router.cmd'
   $psLauncher = Join-Path $dest 'bin\proxy-router.ps1'
   $wrapper = Join-Path $shellDir 'fresh-cmd.cmd'
+  # Bare `exit /b` preserves the current ERRORLEVEL; `%ERRORLEVEL%` would be
+  # expanded when cmd parses a line, which is a foot-gun next to `call`.
   @"
 @echo off
 set "PROXY_ROUTER_ROOT="
 call "$cmdLauncher" %*
-exit /b %ERRORLEVEL%
+exit /b
 "@ | Set-Content -LiteralPath $wrapper -Encoding ASCII
 
   Write-Step 'Running installed proxy-router.cmd --help from a fresh shell'
@@ -260,6 +278,81 @@ exit /b %ERRORLEVEL%
     'status --json started the engine (sing-box.pid exists)'
   Assert-True (-not (Test-Path -LiteralPath (Join-Path $dest 'sing-box.json'))) `
     'status --json generated sing-box.json; a status read must stay read-only'
+
+  # Exit-code propagation through cmd.exe. argparse rejects unknown flags with
+  # exit 2; a launcher that swallows it (e.g. `%ERRORLEVEL%` expanded when cmd
+  # parses a parenthesised block, usually to 0) turns every failure green.
+  Write-Step 'Running installed proxy-router.cmd --no-such-flag (exit propagation)'
+  $bad = Invoke-FreshShell -FilePath $wrapper -Arguments @('--no-such-flag') -WorkingDirectory $shellDir
+  Assert-True ($bad.ExitCode -eq 2) `
+    "proxy-router.cmd --no-such-flag must exit 2 through the launcher; got $($bad.ExitCode)`n$($bad.Output)"
+
+  # Force BOTH launcher branches. cmd resolves `py` through PATHEXT, and a
+  # wscript-hosted stub returns to the caller (unlike a .cmd stub, which would
+  # chain and never return), so each wrapper deterministically drives one
+  # branch of the generated launcher and must still hand back exit code 2.
+  $wscript = Join-Path $env:SystemRoot 'System32\wscript.exe'
+  if (Test-Path -LiteralPath $wscript) {
+    Write-Step 'Running both .cmd launcher branches (py branch and python fallback)'
+    $pyOk = Join-Path $work 'py-stub-probe-ok'
+    $pyFail = Join-Path $work 'py-stub-probe-fail'
+    New-Item -ItemType Directory -Force -Path $pyOk, $pyFail | Out-Null
+    # `py -3 <args...>` stub: drop -3, run python with the rest, keep its code.
+    # The marker file proves to the launcher's caller that `where py` really
+    # resolved this stub, i.e. that the intended branch was the one exercised.
+    $stubSource = @'
+Option Explicit
+Dim fso, here, ts, i, rest, shell, rc
+Set fso = CreateObject("Scripting.FileSystemObject")
+here = fso.GetParentFolderName(WScript.ScriptFullName)
+Set ts = fso.CreateTextFile(here & "\invoked.marker", True)
+ts.Close
+If WScript.Arguments.Count = 0 Then WScript.Quit 96
+If WScript.Arguments(0) <> "-3" Then WScript.Quit 96
+rest = ""
+For i = 1 To WScript.Arguments.Count - 1
+  rest = rest & " """ & WScript.Arguments(i) & """"
+Next
+Set shell = CreateObject("WScript.Shell")
+rc = shell.Run("python" & rest, 0, True)
+WScript.Quit rc
+'@
+    Set-Content -LiteralPath (Join-Path $pyOk 'py.vbs') -Value $stubSource -Encoding ASCII
+    # A probe that fails forces the launcher past the parenthesised block.
+    $failSource = @'
+Option Explicit
+Dim fso, ts
+Set fso = CreateObject("Scripting.FileSystemObject")
+Set ts = fso.CreateTextFile(fso.GetParentFolderName(WScript.ScriptFullName) & "\invoked.marker", True)
+ts.Close
+WScript.Quit 1
+'@
+    Set-Content -LiteralPath (Join-Path $pyFail 'py.vbs') -Value $failSource -Encoding ASCII
+
+    foreach ($branch in @(
+        @{ Name = 'py-branch'; Stub = $pyOk; Why = 'probe passed: the parenthesised py branch must return the child exit code' },
+        @{ Name = 'python-fallback'; Stub = $pyFail; Why = 'probe failed: the fallback branch must return the child exit code' }
+      )) {
+      $branchWrapper = Join-Path $shellDir ("fresh-cmd-" + $branch.Name + ".cmd")
+      @"
+@echo off
+set "PROXY_ROUTER_ROOT="
+set "PATH=$($branch.Stub);%PATH%"
+call "$cmdLauncher" %*
+exit /b
+"@ | Set-Content -LiteralPath $branchWrapper -Encoding ASCII
+      $branchResult = Invoke-FreshShell -FilePath $branchWrapper -Arguments @('--no-such-flag') -WorkingDirectory $shellDir
+      $marker = Join-Path $branch.Stub 'invoked.marker'
+      Assert-True (Test-Path -LiteralPath $marker) `
+        "proxy-router.cmd ($($branch.Name)): the stub was never invoked -- cmd did not resolve py through PATHEXT, so this branch was not exercised"
+      Assert-True ($branchResult.ExitCode -eq 2) `
+        "proxy-router.cmd ($($branch.Name)): expected exit 2 propagated; got $($branchResult.ExitCode) -- $($branch.Why)`n$($branchResult.Output)"
+      Write-Host "    exit propagation ok: $($branch.Name)"
+    }
+  }
+  else {
+    Write-Warning 'wscript.exe not found; skipping forced-branch exit propagation checks'
+  }
 
   Write-Host ''
   Write-Host "windows clean-install CLI smoke passed: $dest"
