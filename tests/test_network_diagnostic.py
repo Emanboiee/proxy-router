@@ -7,6 +7,7 @@ import datetime
 from pathlib import Path
 
 import router
+import status_snapshot
 
 
 def test_cached_network_diagnostic_marks_recent_result_fresh(tmp_path: Path, monkeypatch):
@@ -15,6 +16,7 @@ def test_cached_network_diagnostic_marks_recent_result_fresh(tmp_path: Path, mon
     path.write_text(json.dumps({
         "checked_at": "2026-09-09T12:00:00+00:00",
         "status": "ok",
+        "generation": status_snapshot.network_generation(router.PID_FILE, router.SING_BOX_CONFIG),
     }))
     monkeypatch.setattr(router, "NETWORK_DIAGNOSTIC_FILE", path)
 
@@ -32,6 +34,7 @@ def test_cached_network_diagnostic_marks_old_result_stale(tmp_path: Path, monkey
     path.write_text(json.dumps({
         "checked_at": "2026-09-09T12:00:00+00:00",
         "status": "ok",
+        "generation": status_snapshot.network_generation(router.PID_FILE, router.SING_BOX_CONFIG),
     }))
     monkeypatch.setattr(router, "NETWORK_DIAGNOSTIC_FILE", path)
 

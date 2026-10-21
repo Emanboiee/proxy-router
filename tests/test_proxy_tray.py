@@ -334,6 +334,7 @@ class StatusMenuPresentationTests(unittest.TestCase):
             mode="proxy",
             port=2080,
             preset="school-warp",
+            network_status="ok",
         )
         app.last_action_result = (
             "full tunnel on: failed — selective tun: could not resolve route domains"
@@ -405,7 +406,7 @@ class RouterStatusProxyDiagnosticsTests(unittest.TestCase):
         status = tray.RouterStatus.from_cli(0, json.dumps({
             "up": True, "mode": "proxy", "port": 2080,
             "system_proxy": {"status": "system_proxy_mismatch"},
-            "network": {"status": "direct_dns_unavailable"},
+            "network": {"status": "direct_dns_unavailable", "stale": False},
         }))
         self.assertEqual(status.system_proxy_status, "system_proxy_mismatch")
         self.assertEqual(status.network_status, "direct_dns_unavailable")
@@ -683,7 +684,7 @@ class MutationSerializationTests(unittest.TestCase):
         with mock.patch.object(tray, "make_icon", return_value=icon), \
              mock.patch.object(app, "build_menu", return_value=object()):
             app._publish_status(
-                tray.RouterStatus(up=True, mode="proxy", port=2080), 1)
+                tray.RouterStatus(up=True, mode="proxy", port=2080, network_status="ok"), 1)
         self.assertIs(app.tray.icon, icon)
         self.assertEqual(app._icon_sig, "#4caf50")
 
@@ -1522,6 +1523,7 @@ class DashboardViewModelTests(unittest.TestCase):
             mode="proxy",
             port=2080,
             watcher=True,
+            network_status="ok",
             routing_mode="vpn-list",
             providers={
                 "proton": {
