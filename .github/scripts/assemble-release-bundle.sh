@@ -106,7 +106,7 @@ case "$suffix" in
     echo "$file_output" | grep -qiE 'arm64|aarch64' \
       || { echo "error: expected arm64 binary" >&2; exit 1; } ;;
   *amd64*)
-    echo "$file_output" | grep -qiE 'x86_64|amd64' \
+    echo "$file_output" | grep -qiE 'x86[_-]64|amd64' \
       || { echo "error: expected amd64 binary" >&2; exit 1; } ;;
 esac
 version_output=$("$bin" version 2>/dev/null || true)
