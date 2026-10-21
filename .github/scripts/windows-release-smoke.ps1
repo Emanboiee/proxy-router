@@ -365,3 +365,8 @@ finally {
     Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
   }
 }
+
+# The negative probes intentionally leave a nonzero native LASTEXITCODE.
+# Reaching here means every assertion and cleanup succeeded; do not let the
+# Actions PowerShell wrapper mistake the last expected failure for this result.
+exit 0
