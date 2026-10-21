@@ -56,24 +56,21 @@ foreach ($Directory in @('examples', 'guides', 'presets', 'rulesets')) {
 # engine directory to PATH.  The launcher resolves router.py relative to the
 # installed prefix, so it remains valid after the source archive is removed.
 #
-# `exit /b` with no argument preserves the current ERRORLEVEL at RUN time.
-# `%ERRORLEVEL%` inside a parenthesised ( ... ) block would be expanded when
-# cmd parses the block -- usually to 0 -- so a failing router.py run looked
-# successful (issue #67 review).
+# Keep commands and exit-code expansion on separate, ungrouped lines. Inside
+# a parenthesised block cmd expands %ERRORLEVEL% before Python runs.
 $LauncherCmd = Join-Path $Bin 'proxy-router.cmd'
 @'
 @echo off
 set "PROXY_ROUTER_ROOT=%~dp0.."
 where py >nul 2>nul
-if not errorlevel 1 (
-  py -3 -c "import sys" >nul 2>nul
-  if not errorlevel 1 (
-    py -3 "%PROXY_ROUTER_ROOT%\router.py" %*
-    exit /b
-  )
-)
+if errorlevel 1 goto python_fallback
+py -3 -c "import sys" >nul 2>nul
+if errorlevel 1 goto python_fallback
+py -3 "%PROXY_ROUTER_ROOT%\router.py" %*
+exit /b %ERRORLEVEL%
+:python_fallback
 python "%PROXY_ROUTER_ROOT%\router.py" %*
-exit /b
+exit /b %ERRORLEVEL%
 '@ | Set-Content -LiteralPath $LauncherCmd -Encoding ASCII
 
 $LauncherPs1 = Join-Path $Bin 'proxy-router.ps1'

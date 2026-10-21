@@ -58,16 +58,13 @@ if ($launcherNodes.Count -ne 1) {
   throw "install.ps1: expected exactly one embedded .cmd launcher, found $($launcherNodes.Count)"
 }
 $launcher = $launcherNodes[0].Value
-Assert-NotMatch $launcher '%ERRORLEVEL%' `
-  'the .cmd launcher must not expand %ERRORLEVEL% (parse-time inside blocks)'
-Assert-NotMatch $launcher '(?im)exit /b[ \t]+\S' `
-  'the .cmd launcher must use bare `exit /b`, which preserves the runtime code'
-$bareExits = [regex]::Matches($launcher, '(?m)^\s*exit /b\s*$')
-if ($bareExits.Count -lt 2) {
-  throw ('the .cmd launcher must end both branches with bare exit /b (found ' + $bareExits.Count + ')')
+Assert-NotMatch $launcher '(?m)^\s*if .*\(\s*$' `
+  'the .cmd launcher must not expand exit codes inside grouped branches'
+Assert-Match $launcher '(?m)^:python_fallback\s*$' 'missing Python fallback label'
+$exits = [regex]::Matches($launcher, '(?m)^exit /b %ERRORLEVEL%\s*$')
+if ($exits.Count -ne 2) {
+  throw 'both launcher branches must explicitly propagate the child exit code'
 }
-Assert-Match $launcher '(?m)^if not errorlevel 1 \(' `
-  'the .cmd launcher lost its parenthesised py probe; the exit contract is defined for it'
 
 # ---------------------------------------------------------------------------
 # windows-release-smoke.ps1: DACL assertion contract.
@@ -97,7 +94,7 @@ Assert-Match $fn 'Assert-True \(-not \$rule\.IsInherited\)' `
 
 # ---------------------------------------------------------------------------
 # windows-release-smoke.ps1: fresh-shell wrappers + forced-branch stubs.
-# Every cmd wrapper exits with bare `exit /b`, and the nonzero propagation
+# Every cmd wrapper explicitly propagates the child exit code, and the nonzero
 # probe (argparse exit 2 through both launcher branches) is present.
 # ---------------------------------------------------------------------------
 $wrapperNodes = Get-StringAsts $smokeAst '@echo off'
@@ -105,8 +102,8 @@ if ($wrapperNodes.Count -lt 1) {
   throw 'smoke script: expected at least one embedded cmd wrapper'
 }
 foreach ($node in $wrapperNodes) {
-  Assert-NotMatch $node.Value '%ERRORLEVEL%' `
-    "smoke cmd wrapper must not expand %ERRORLEVEL%: $($node.Value)"
+  Assert-Match $node.Value '(?m)^exit /b %ERRORLEVEL%\s*$' `
+    'smoke cmd wrapper must propagate the child exit code on its own line'
 }
 $smokeText = $smokeAst.Extent.Text
 foreach ($needle in @("'--no-such-flag'", 'wscript.exe', 'py.vbs', 'invoked.marker', 'exit propagation')) {

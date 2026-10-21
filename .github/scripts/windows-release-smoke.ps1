@@ -228,13 +228,12 @@ try {
   $cmdLauncher = Join-Path $dest 'bin\proxy-router.cmd'
   $psLauncher = Join-Path $dest 'bin\proxy-router.ps1'
   $wrapper = Join-Path $shellDir 'fresh-cmd.cmd'
-  # Bare `exit /b` preserves the current ERRORLEVEL; `%ERRORLEVEL%` would be
-  # expanded when cmd parses a line, which is a foot-gun next to `call`.
+  # Exit-code expansion is on a separate, ungrouped line after call returns.
   @"
 @echo off
 set "PROXY_ROUTER_ROOT="
 call "$cmdLauncher" %*
-exit /b
+exit /b %ERRORLEVEL%
 "@ | Set-Content -LiteralPath $wrapper -Encoding ASCII
 
   Write-Step 'Running installed proxy-router.cmd --help from a fresh shell'
@@ -330,7 +329,7 @@ WScript.Quit 1
     Set-Content -LiteralPath (Join-Path $pyFail 'py.vbs') -Value $failSource -Encoding ASCII
 
     foreach ($branch in @(
-        @{ Name = 'py-branch'; Stub = $pyOk; Why = 'probe passed: the parenthesised py branch must return the child exit code' },
+        @{ Name = 'py-branch'; Stub = $pyOk; Why = 'probe passed: the py branch must return the child exit code' },
         @{ Name = 'python-fallback'; Stub = $pyFail; Why = 'probe failed: the fallback branch must return the child exit code' }
       )) {
       $branchWrapper = Join-Path $shellDir ("fresh-cmd-" + $branch.Name + ".cmd")
@@ -339,7 +338,7 @@ WScript.Quit 1
 set "PROXY_ROUTER_ROOT="
 set "PATH=$($branch.Stub);%PATH%"
 call "$cmdLauncher" %*
-exit /b
+exit /b %ERRORLEVEL%
 "@ | Set-Content -LiteralPath $branchWrapper -Encoding ASCII
       $branchResult = Invoke-FreshShell -FilePath $branchWrapper -Arguments @('--no-such-flag') -WorkingDirectory $shellDir
       $marker = Join-Path $branch.Stub 'invoked.marker'

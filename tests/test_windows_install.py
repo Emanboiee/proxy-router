@@ -132,11 +132,11 @@ def test_cmd_launcher_propagates_runtime_exit_codes():
     script = (ROOT / "install.ps1").read_text(encoding="utf-8")
     smoke = SMOKE.read_text(encoding="utf-8")
 
-    assert "exit /b %ERRORLEVEL%" not in script
-    assert "exit /b %ERRORLEVEL%" not in smoke
-    # Bare `exit /b` (no argument) preserves the current code at run time.
-    assert script.count("exit /b") >= 2
-    assert 'exit /b\n' in script or 'exit /b\r\n' in script
+    launcher = script.split("@echo off", 1)[1].split("'@", 1)[0]
+    assert "if not errorlevel 1 (" not in launcher
+    assert "goto python_fallback" in launcher
+    assert launcher.count("exit /b %ERRORLEVEL%") == 2
+    assert "exit /b %ERRORLEVEL%" in smoke
 
 
 def test_windows_smoke_probes_nonzero_exit_propagation_on_both_branches():
@@ -144,7 +144,7 @@ def test_windows_smoke_probes_nonzero_exit_propagation_on_both_branches():
 
     The smoke runs the installed launcher with an unknown flag (argparse exit
     2) three ways: naturally, through a py stub that passes the launcher's
-    probe (the parenthesised branch), and through a stub that fails it (the
+    probe (the py branch), and through a stub that fails it (the
     python fallback branch). Each must hand exit 2 back to the caller.
     """
     smoke = SMOKE.read_text(encoding="utf-8")
