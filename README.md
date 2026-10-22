@@ -1039,4 +1039,19 @@ the chosen port, and connect. The WARP GUI need not be open, but its service
 must be installed; this feature does not install software, accept terms,
 register accounts, or silently grant administrator permissions.
 
+
+### Add servers to one WireGuard provider
+
+In **Providers**, create a WireGuard provider named, for example, Proton.
+Use **Add server → Add WireGuard config → Save connection** to import
+another `.conf` into that same provider. The provider card shows its saved
+server count; Home's preferred-server selector and server browser include
+the imported servers.
+
+Imports preserve the provider's configured folder, current server,
+preferences, and routing. Re-importing identical content adds no duplicate.
+Different configs with the same filename receive a suffix rather than
+overwriting an existing server. Saving an import does not connect or switch
+the engine. Legacy Custom VPN entries are displayed as WireGuard.
+
 Windows desktop setup and build instructions: [Windows dashboard](dashboard/README.windows.md).

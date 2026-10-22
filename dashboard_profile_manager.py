@@ -24,6 +24,7 @@ import tempfile
 import time
 import uuid
 import provider_lifecycle
+import worker_lock
 from pathlib import Path
 from typing import Any
 
@@ -329,6 +330,10 @@ def _provider_rows(root: Path, config: dict[str, Any], store: dict[str, Any]) ->
             active = ""
         endpoint = active if active in server_ids else "Unknown"
         proxy = isinstance(spec.get("socks5"), dict)
+        if not proxy:
+            kind = "wireguard"
+        elif kind not in {"socks5", "warp"}:
+            kind = "socks5"
         if proxy:
             endpoint = f"{spec['socks5'].get('host', '')}:{spec['socks5'].get('port', '')}"
         preferred = saved.get("preferredServer")
@@ -337,7 +342,7 @@ def _provider_rows(root: Path, config: dict[str, Any], store: dict[str, Any]) ->
         result.append({
             "id": provider_id,
             "name": str(saved.get("name") or provider_id),
-            "kind": kind if kind in _PROVIDER_KINDS else "custom",
+            "kind": kind,
             "status": "unknown",
             "latency": None,
             "server": endpoint,
@@ -667,12 +672,42 @@ def previous_startup(store: dict, identifier: str) -> dict:
 
 def save_provider(root: Path, value: Any, provider_id: str | None = None, source_path: str | None = None) -> dict[str, Any]:
     root = Path(root).resolve()
+    with worker_lock.exclusive(root / "state" / "dashboard-provider-save.lock"):
+        return _save_provider(root, value, provider_id, source_path)
+
+
+def _wireguard_destination(root: Path, spec: dict, identifier: str, source: Path, raw: str, existing: bool) -> Path:
+    directory = (root / spec.get("directory", f"providers/{identifier}")).resolve()
+    try:
+        directory.relative_to(root)
+    except ValueError as exc:
+        raise DashboardError("Provider folder must be inside the Proxy Router runtime") from exc
+    if directory == root:
+        raise DashboardError("Choose a separate folder for this provider")
+    for path in directory.glob("*.conf"):
+        if path.is_file() and path.read_bytes() == raw.encode():
+            return path
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "-", source.stem).strip(".-")[:80] or "wireguard"
+    if not existing:
+        stem = "wireguard"
+    destination = directory / f"{stem}.conf"
+    suffix = 2
+    while destination.exists() or destination.is_symlink():
+        destination = directory / f"{stem}-{suffix}.conf"
+        suffix += 1
+    return destination
+
+
+def _save_provider(root: Path, value: Any, provider_id: str | None = None, source_path: str | None = None) -> dict[str, Any]:
+    root = Path(root).resolve()
     if not isinstance(value, dict):
         raise DashboardError("Connection data is invalid")
     name = _text(value.get("name"), "Connection name", 48, required=True)
     kind = value.get("kind", "custom")
     if not isinstance(kind, str) or kind not in _PROVIDER_KINDS:
-        raise DashboardError("Choose WireGuard, Custom VPN, Cloudflare WARP, or SOCKS5")
+        raise DashboardError("Choose WireGuard, Cloudflare WARP, or SOCKS5")
+    if kind == "custom":
+        kind = "wireguard"
     if provider_id is not None and (not isinstance(provider_id, str) or not _PROVIDER_ID.fullmatch(provider_id)):
         raise DashboardError("Connection ID is invalid")
     config = _read_config(root)
@@ -713,19 +748,24 @@ def save_provider(root: Path, value: Any, provider_id: str | None = None, source
     elif source_path:
         source = Path(source_path).expanduser().resolve()
         endpoint, raw = _wireguard_summary(source)
-        relative = Path("providers") / identifier
-        destination_dir = root / relative
-        destination_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(destination_dir, 0o700)
-        destination = destination_dir / "wireguard.conf"
-        pending_files[destination] = raw.encode()
-        spec = config["providers"].get(identifier, {})
-        if not isinstance(spec, dict):
-            spec = {}
-        spec.pop("socks5", None)
-        spec["directory"] = str(relative)
+        spec = dict(config["providers"].get(identifier, {}))
+        converting = isinstance(spec.get("socks5"), dict)
+        if converting:
+            spec.pop("socks5")
+            spec["directory"] = f"providers/{identifier}"
+        spec.setdefault("directory", f"providers/{identifier}")
+        destination = _wireguard_destination(root, spec, identifier, source, raw, bool(provider_id))
+        _validate_config(root, config)
+        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(destination.parent, 0o700)
+        if not destination.exists():
+            pending_files[destination] = raw.encode()
         config["providers"][identifier] = spec
-        saved = {"name": name, "kind": kind, "endpoint": endpoint, "managed": True}
+        previous = store["providers"].get(identifier, {})
+        saved = {**previous, "name": name, "kind": kind, "endpoint": endpoint,
+                 "managed": bool(previous.get("managed", False)) if provider_id and not converting else True}
+        if converting:
+            saved.pop("startup", None)
     else:
         if not provider_id:
             raise DashboardError("Choose a WireGuard configuration file")

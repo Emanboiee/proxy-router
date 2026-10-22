@@ -430,7 +430,7 @@ test('desktop provider GUI picks a local config, edits metadata, and deletes a s
   await page.getByRole('button', { name: 'Add provider', exact: true }).click();
   const dialog = page.locator('#provider-dialog');
   await dialog.locator('[name="name"]').fill('Proton home');
-  await dialog.locator('[name="kind"]').selectOption('custom');
+  await dialog.locator('[name="kind"]').selectOption('wireguard');
   await dialog.getByRole('button', { name: 'Choose WireGuard config', exact: true }).click();
   await expect(dialog.locator('#wireguard-file-label')).toHaveText('proton-home.conf');
   await dialog.getByRole('button', { name: 'Add provider', exact: true }).click();
@@ -440,7 +440,7 @@ test('desktop provider GUI picks a local config, edits metadata, and deletes a s
   const saves = await page.evaluate(() => (window as unknown as { __invoke: { command: string; payload?: unknown }[] }).__invoke
     .filter(entry => entry.command === 'save_dashboard_provider')
     .map(entry => entry.payload as { provider: { name: string; kind: string }; providerId: string | null; sourcePath: string | null }));
-  expect(saves[0]).toMatchObject({ provider: { name: 'Proton home', kind: 'custom' }, providerId: null, sourcePath: '/tmp/proton-home.conf' });
+  expect(saves[0]).toMatchObject({ provider: { name: 'Proton home', kind: 'wireguard' }, providerId: null, sourcePath: '/tmp/proton-home.conf' });
   expect(JSON.stringify(saves)).not.toContain('PRIVATE-KEY');
 
   page.on('dialog', dialogEvent => dialogEvent.accept());
@@ -601,4 +601,26 @@ test('generic command provider saves command and port without executing on save'
       startup: { mode: 'command', command: 'my-proxy --listen 127.0.0.1:9000' } },
   });
   expect(calls.some(call => call.command === 'run_router_action')).toBe(false);
+});
+
+
+test('existing WireGuard provider accepts another server without creating a provider or connecting', async ({ page }) => {
+  await page.addInitScript(desktopMock);
+  await page.goto('/#providers');
+  const card = page.locator('.provider-card').filter({ hasText: 'Proton custom VPN' });
+  await card.getByRole('button', { name: 'Add server', exact: true }).click();
+  const dialog = page.locator('#provider-dialog');
+  await expect(dialog.locator('[name="kind"] option[value="custom"]')).toHaveCount(0);
+  await expect(dialog.locator('[name="kind"]')).toHaveValue('wireguard');
+  await expect(dialog).toContainText('1 saved server in this provider');
+  await dialog.getByRole('button', { name: 'Add WireGuard config', exact: true }).click();
+  await expect(dialog.locator('#wireguard-file-label')).toHaveText('proton-home.conf');
+  await dialog.getByRole('button', { name: 'Save connection', exact: true }).click();
+  await expect(dialog).not.toBeVisible();
+  const calls = await page.evaluate(() => (window as unknown as { __invoke: { command: string; payload?: unknown }[] }).__invoke);
+  expect(calls.filter(call => call.command === 'save_dashboard_provider').at(-1)?.payload).toMatchObject({
+    providerId: 'proton', provider: { name: 'Proton custom VPN', kind: 'wireguard' }, sourcePath: '/tmp/proton-home.conf',
+  });
+  expect(calls.some(call => call.command === 'run_router_action')).toBe(false);
+  await expect(page.locator('.provider-card')).toHaveCount(2);
 });
