@@ -23,6 +23,7 @@ import sys
 import tempfile
 import time
 import uuid
+import provider_lifecycle
 from pathlib import Path
 from typing import Any
 
@@ -346,6 +347,7 @@ def _provider_rows(root: Path, config: dict[str, Any], store: dict[str, Any]) ->
             "serverCount": len(server_ids),
             "connection": ({"kind": "socks5", "host": spec["socks5"].get("host", ""), "port": spec["socks5"].get("port")} if proxy else
                            {"kind": "wireguard", "fileName": files[0].name if files else "", "endpoint": endpoint}),
+            "startup": saved.get("startup", {"mode": "external"}),
             "managed": bool(saved.get("managed", False)),
         })
     return result
@@ -659,6 +661,10 @@ def apply_profile(root: Path, profile_id: str) -> dict[str, Any]:
     return state(root)
 
 
+def previous_startup(store: dict, identifier: str) -> dict:
+    return store.get("providers", {}).get(identifier, {}).get("startup", {"mode": "external"})
+
+
 def save_provider(root: Path, value: Any, provider_id: str | None = None, source_path: str | None = None) -> dict[str, Any]:
     root = Path(root).resolve()
     if not isinstance(value, dict):
@@ -697,7 +703,13 @@ def save_provider(root: Path, value: Any, provider_id: str | None = None, source
         if provider_id and not isinstance(previous.get("socks5"), dict):
             raise DashboardError("Add a new connection to change its transport")
         config["providers"][identifier] = {**previous, "socks5": {"host": host, "port": port}}
-        saved = {"name": name, "kind": kind, "managed": False}
+        try:
+            startup = provider_lifecycle.startup_data(value.get("startup", previous_startup(store, identifier)))
+        except provider_lifecycle.StartupError as exc:
+            raise DashboardError(str(exc)) from exc
+        if startup["mode"] == "warp" and host != "127.0.0.1":
+            raise DashboardError("Automatic WARP uses 127.0.0.1")
+        saved = {"name": name, "kind": kind, "managed": False, "startup": startup}
     elif source_path:
         source = Path(source_path).expanduser().resolve()
         endpoint, raw = _wireguard_summary(source)

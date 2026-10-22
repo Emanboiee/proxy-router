@@ -212,6 +212,9 @@ summary { display: flex; align-items: center; cursor: pointer; color: var(--mute
 .profile-meta { display: flex; justify-content: space-between; gap: var(--s3); color: var(--muted); font-size: var(--text-sm); padding: var(--s4) 0; border-top: var(--border); border-bottom: var(--border); margin: var(--s4) 0; }
 .tip, .info-row { display: flex; align-items: center; gap: var(--s4); margin-top: var(--s4); }.tip span { color: var(--muted); }.tip strong { white-space: nowrap; }
 .editor { max-width: 54rem; }.form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-3); }.form-grid label, .settings-panel label, .compact-controls label { display: grid; gap: var(--space-2); color: var(--muted); }.form-grid .wide { grid-column: 1 / -1; }.form-actions { justify-content: flex-end; margin-top: var(--space-4); }.field-with-action { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: var(--space-2); }.field-with-action > label { min-width: 0; }.provider-fields[hidden], .endpoint-field[hidden] { display: none; }.field-note { margin: calc(var(--space-2) * -1) 0 0; color: var(--muted); font-size: var(--text-sm); }
+.provider-fields { display: grid; gap: var(--space-3); }
+.provider-fields [hidden] { display: none; }
+.provider-fields .field-note { margin: 0; }
 .provider-card { display: flex; flex-direction: column; min-height: 250px; }
 .provider-controls > label { grid-column: 1; }
 .provider-controls > select { grid-column: 2; min-width: 0; min-height: var(--target); }

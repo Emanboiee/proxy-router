@@ -11,6 +11,7 @@ export type Accent = 'signal' | 'ocean' | 'moss' | 'iris';
 export type Density = 'compact' | 'comfortable';
 export type LayoutPreset = 'vertical' | 'horizontal';
 export type MotionSpeed = 'slow' | 'normal' | 'fast';
+export type ProviderStartup = { mode: 'external' | 'warp' | 'command'; command?: string };
 export type ProviderKind = 'warp' | 'proton' | 'wireguard' | 'socks5' | 'tailscale' | 'custom';
 export type TailscaleMode = 'pause-tailscale' | 'keep-running' | 'prefer-tailscale';
 
@@ -32,7 +33,7 @@ export interface Profile {
 export interface Provider {
   id: string; name: string; kind: ProviderKind;
   status: 'healthy' | 'degraded' | 'offline' | 'unknown'; latency: number | null;
-  server: string; servers: string[]; preferredServer?: string | null; capabilities?: { serverSelection: boolean; reconnect: boolean }; connection?: ProviderConnection;
+  server: string; servers: string[]; preferredServer?: string | null; capabilities?: { serverSelection: boolean; reconnect: boolean }; connection?: ProviderConnection; startup?: ProviderStartup;
 }
 export interface ThemeSettings {
   scheme: Scheme; accent: Accent; density: Density; layout: LayoutPreset; contrast: 'standard' | 'high'; motionSpeed: MotionSpeed; reducedMotion: boolean;
@@ -318,7 +319,7 @@ export async function applyDashboardProfile(profileId: string): Promise<Dashboar
 }
 
 export async function saveDashboardProvider(
-  provider: { name: string; kind: 'wireguard' | 'custom' | 'warp' | 'socks5'; host?: string; port?: number },
+  provider: { name: string; kind: 'wireguard' | 'custom' | 'warp' | 'socks5'; host?: string; port?: number; startup?: ProviderStartup },
   providerId?: string,
   sourcePath?: string,
 ): Promise<DashboardState> {

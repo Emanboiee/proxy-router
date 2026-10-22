@@ -1011,4 +1011,32 @@ python3 -m pytest tests -q --randomly-seed=58
 
 [MIT](LICENSE)
 
+
+### Managed local proxy startup
+
+In the desktop app, choose **Add provider → SOCKS5 proxy**, enter the local
+host and port, then choose **Run my startup command** and paste one executable
+with its arguments. The program must expose that SOCKS5 endpoint; OpenVPN
+alone exposes a VPN tunnel, so it needs a local proxy bridge rather than an
+OpenVPN management port. Install the program and configure its credentials
+first. Use explicit paths; shell pipes, redirection, and implicit elevation
+are not supported.
+
+Startup is local metadata saved by the provider editor. Saving or viewing
+status never runs a command. Routing presets cannot grant startup permission.
+On Connect/reload, only local proxy providers referenced by generated routing
+rules start. The engine waits up to 20 seconds for a SOCKS5 handshake; failed
+startup does not claim readiness. Active egress health checks can recover a
+missing managed provider, with a short delay after failed launches.
+Concurrent starts are serialized and an already ready proxy is reused.
+Commands run as the runtime directory owner, including when the router is
+invoked with root permissions. Programs remain running after router
+disconnect; they can be shared by other apps.
+
+For WARP, choose **Start Cloudflare WARP automatically** instead. Proxy Router
+uses the installed, registered official client to configure proxy mode, set
+the chosen port, and connect. The WARP GUI need not be open, but its service
+must be installed; this feature does not install software, accept terms,
+register accounts, or silently grant administrator permissions.
+
 Windows desktop setup and build instructions: [Windows dashboard](dashboard/README.windows.md).
