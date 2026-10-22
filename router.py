@@ -49,6 +49,7 @@ import egress
 import net_safety
 import provider_lifecycle
 import state
+import status_snapshot
 from providers_check import provider_config_errors as _provider_config_errors
 from config_schema import (
     DEFAULT_DIRECT_PROBE_URL,
@@ -3491,23 +3492,7 @@ def write_sing_box(config: dict) -> None:
         print("router: refusing to write an egress-less sing-box config; keeping existing file",
               file=sys.stderr)
         return
-    SING_BOX_CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            "w", encoding="utf-8", dir=SING_BOX_CONFIG.parent,
-            prefix=f".{SING_BOX_CONFIG.name}.", suffix=".tmp", delete=False,
-        ) as handle:
-            temporary = Path(handle.name)
-            handle.write(json.dumps(config, indent=2) + "\n")
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, SING_BOX_CONFIG)
-        temporary = None
-        os.chmod(SING_BOX_CONFIG, 0o600)
-        _hand_back_ownership(SING_BOX_CONFIG)
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+    _atomic_write(SING_BOX_CONFIG, json.dumps(config, indent=2) + "\n", 0o600)
 
 
 def validate_config() -> bool:
@@ -4609,7 +4594,6 @@ def apply_network_preset(*, reload_engine: bool = True, root: Path | None = None
     import network_control
     return network_control.apply_mapping(SimpleNamespace(**globals()), root or ROOT, reload_engine)
 
-
 _BUILTIN_NETWORK_PRESETS = ("default", "opencode", "roblox", "school-warp")
 _PRESET_SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
@@ -5703,6 +5687,7 @@ def _network_diagnostic(*, runner=subprocess.run, opener=None,
     All subprocess/network dependencies are injectable for hermetic tests.
     """
     checked_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    generation = status_snapshot.network_generation(PID_FILE, SING_BOX_CONFIG)
     proxy = _effective_proxy_state(runner)
     proxy_status = "unknown"
     if proxy.get("known"):
@@ -5710,7 +5695,7 @@ def _network_diagnostic(*, runner=subprocess.run, opener=None,
     direct_url = _diagnostic_direct_url()
     if direct_url is None:
         return {
-            "checked_at": checked_at, "status": "direct_probe_skipped",
+            "checked_at": checked_at, "generation": generation, "status": "direct_probe_skipped",
             "proxy": proxy, "proxy_status": proxy_status,
             "direct_dns": {"status": "skipped", "reason": "no unrouted HTTPS target"},
             "direct": {"status": "skipped", "reason": "no unrouted HTTPS target"},
@@ -5758,6 +5743,8 @@ def _network_diagnostic(*, runner=subprocess.run, opener=None,
         overall = "direct_connection_failed"
     elif routed.get("status") == "routed_path_failed":
         overall = "routed_path_failed"
+    elif routed.get("status") not in {"ok", "reachable_http_error"}:
+        overall = "routed_probe_skipped"
     elif proxy_status == "unknown":
         overall = "system_proxy_unknown"
     else:
@@ -5766,7 +5753,7 @@ def _network_diagnostic(*, runner=subprocess.run, opener=None,
     if overall == "direct_dns_unavailable":
         recovery = "inspect configured/DHCP DNS, restore automatic DHCP DNS, run 'router.py reload', then rerun 'router.py doctor --network'"
     return {
-        "checked_at": checked_at, "status": overall, "proxy": proxy,
+        "checked_at": checked_at, "generation": generation, "status": overall, "proxy": proxy,
         "proxy_status": proxy_status, "direct_dns": direct_dns,
         "direct": direct, "routed": routed, "routed_url": routed_url,
         "dns": _macos_dns_snapshot(runner) if sys.platform == "darwin" or runner is not subprocess.run else {},
@@ -5781,28 +5768,9 @@ def _cached_network_diagnostic(*, now: float | None = None) -> dict | None:
     presenting an old successful probe as current connectivity evidence.
     Malformed or missing timestamps are stale by definition.
     """
-    try:
-        data = json.loads(NETWORK_DIAGNOSTIC_FILE.read_text())
-        if not isinstance(data, dict):
-            return None
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        return None
-    checked_at = data.get("checked_at")
-    age: float | None = None
-    try:
-        if isinstance(checked_at, (int, float)):
-            checked_epoch = float(checked_at)
-        else:
-            checked_epoch = datetime.datetime.fromisoformat(
-                str(checked_at)
-            ).timestamp()
-        age = max(0.0, (time.time() if now is None else float(now)) - checked_epoch)
-    except (TypeError, ValueError, OverflowError):
-        pass
-    enriched = dict(data)
-    enriched["age_seconds"] = round(age, 1) if age is not None else None
-    enriched["stale"] = age is None or age > NETWORK_DIAGNOSTIC_MAX_AGE_SECONDS
-    return enriched
+    return status_snapshot.cached_network_diagnostic(
+        NETWORK_DIAGNOSTIC_FILE, status_snapshot.network_generation(PID_FILE, SING_BOX_CONFIG),
+        NETWORK_DIAGNOSTIC_MAX_AGE_SECONDS, now=now)
 
 
 def doctor(network: bool = False) -> int:

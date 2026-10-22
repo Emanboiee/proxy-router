@@ -22,7 +22,7 @@ impl NetworkRefresh {
         let network = payload.get("network");
         let fresh = network.and_then(|value| value.get("stale")).and_then(Value::as_bool) == Some(false);
         let status = network.and_then(|value| value.get("status")).and_then(Value::as_str);
-        if fresh && matches!(status, Some(value) if value != "unknown") {
+        if fresh && matches!(status, Some(value) if !matches!(value, "unknown" | "skipped")) {
             return false;
         }
         let Ok(mut state) = self.0.lock() else { return false; };
@@ -76,5 +76,12 @@ mod tests {
         assert!(refresh.try_start(&json!({"up":true}), now));
         refresh.finish(now);
         assert!(!refresh.try_start(&json!({"up":true,"network":{"stale":false,"status":"ok"}}), now + Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn skipped_check_is_retried_without_claiming_fresh_health() {
+        let refresh = NetworkRefresh::default();
+        let payload = json!({"up":true,"network":{"stale":false,"status":"skipped"}});
+        assert!(refresh.try_start(&payload, Instant::now()));
     }
 }
