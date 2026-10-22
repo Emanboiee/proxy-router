@@ -615,6 +615,12 @@ fn delete_dashboard_provider(provider_id: String) -> Result<Value, String> {
 }
 
 #[tauri::command]
+fn manage_dashboard_server(provider_id: String, server: String, restore: bool) -> Result<Value, String> {
+    dashboard_json(&["dashboard", if restore { "server-restore" } else { "server-remove" },
+                     "--id", &provider_id, "--server", &server])
+}
+
+#[tauri::command]
 fn save_server_preference(provider_id: String, server: String) -> Result<Value, String> {
     dashboard_json(&["dashboard", "server-preference", "--id", &provider_id, "--server", &server])
 }
@@ -835,6 +841,7 @@ fn main() {
             apply_dashboard_profile,
             save_dashboard_provider,
             delete_dashboard_provider,
+            manage_dashboard_server,
             save_server_preference,
             switch_dashboard_server,
             set_tray_status,

@@ -204,6 +204,15 @@ const desktopMock = (seedCurrentSetup = false) => {
         return Promise.resolve(copyDashboard());
       }
       if (name === 'plugin:dialog|open') return Promise.resolve('/tmp/proton-home.conf');
+      if (name === 'manage_dashboard_server') {
+        const request = payload as { providerId: string; server: string; restore: boolean };
+        const provider = dashboard.providers.find(item => item.id === request.providerId)!;
+        const servers = provider.servers as string[];
+        const removed = (provider.removedServers ?? []) as string[];
+        provider.servers = request.restore ? [...servers, request.server] : servers.filter(server => server !== request.server);
+        provider.removedServers = request.restore ? removed.filter(server => server !== request.server) : [...removed, request.server];
+        return Promise.resolve(copyDashboard());
+      }
       if (name === 'save_dashboard_provider') {
         const request = payload as { provider: { name: string; kind: string }; providerId?: string | null; sourcePath?: string | null };
         if (request.providerId) {
@@ -519,7 +528,7 @@ test('desktop Settings shows engine values and switches routing mode', async ({ 
 });
 
 
-test('mixed preset editor shows route connections and missing WARP without a false single-provider selector', async ({ page }) => {
+test('mixed preset editor edits each route and preserves missing connection choices', async ({ page }) => {
   await page.addInitScript(desktopMock);
   await page.addInitScript(() => {
     const state = window as unknown as { __dashboard: { profiles: unknown[]; providers: unknown[] } };
@@ -536,10 +545,11 @@ test('mixed preset editor shows route connections and missing WARP without a fal
   await page.goto('/#profiles');
   await page.getByRole('button', { name: 'Edit', exact: true }).click();
   const dialog = page.locator('#profile-dialog');
-  await expect(dialog.getByRole('row', { name: 'school cloudflare · Not configured discord.com' })).toBeVisible();
-  await expect(dialog.getByRole('row', { name: 'opencode proton opencode.ai' })).toBeVisible();
-  await expect(dialog.locator('[name="providerId"]')).toHaveCount(0);
-  await expect(dialog).toContainText('Missing connections: cloudflare');
+  await expect(dialog.locator('[data-route-rule]')).toHaveCount(2);
+  await expect(dialog.locator('[name="route-provider"]').first()).toHaveValue('cloudflare');
+  await expect(dialog.locator('[name="route-provider"]').nth(1)).toHaveValue('proton');
+  await expect(dialog.locator('[name="route-domains"]').first()).toHaveValue('discord.com');
+  await expect(dialog).toContainText('cloudflare · Not configured');
   for (const width of [1440, 390]) {
     await page.setViewportSize({ width, height: 900 });
     await page.screenshot({ path: `test-results/mixed-preset-${width}.png` });
@@ -611,11 +621,11 @@ test('existing WireGuard provider accepts another server without creating a prov
   await card.getByRole('button', { name: 'Add server', exact: true }).click();
   const dialog = page.locator('#provider-dialog');
   await expect(dialog.locator('[name="kind"] option[value="custom"]')).toHaveCount(0);
-  await expect(dialog.locator('[name="kind"]')).toHaveValue('wireguard');
+  await expect(dialog.locator('select[name="kind"]')).toHaveValue('wireguard');
   await expect(dialog).toContainText('1 saved server in this provider');
   await dialog.getByRole('button', { name: 'Add WireGuard config', exact: true }).click();
   await expect(dialog.locator('#wireguard-file-label')).toHaveText('proton-home.conf');
-  await dialog.getByRole('button', { name: 'Save connection', exact: true }).click();
+  await dialog.getByRole('button', { name: 'Add server', exact: true }).click();
   await expect(dialog).not.toBeVisible();
   const calls = await page.evaluate(() => (window as unknown as { __invoke: { command: string; payload?: unknown }[] }).__invoke);
   expect(calls.filter(call => call.command === 'save_dashboard_provider').at(-1)?.payload).toMatchObject({
@@ -623,4 +633,57 @@ test('existing WireGuard provider accepts another server without creating a prov
   });
   expect(calls.some(call => call.command === 'run_router_action')).toBe(false);
   await expect(page.locator('.provider-card')).toHaveCount(2);
+});
+
+
+test('provider edit removes and restores pool servers without changing the connection', async ({ page }) => {
+  await page.addInitScript(desktopMock);
+  await page.addInitScript(() => {
+    const state = window as unknown as { __dashboard: { providers: Record<string, unknown>[] } };
+    Object.assign(state.__dashboard.providers[1], { server: 'current', servers: ['current', 'unused', 'backup'], removedServers: [] });
+  });
+  await page.goto('/#providers');
+  await page.locator('.provider-card').filter({ hasText: 'Proton custom VPN' }).getByRole('button', { name: 'Edit', exact: true }).click();
+  const dialog = page.locator('#provider-dialog');
+  await expect(dialog.getByRole('row', { name: 'current Current Remove' }).getByRole('button')).toBeDisabled();
+  await dialog.getByRole('row', { name: 'unused Available Remove' }).getByRole('button').click();
+  await expect(dialog.getByRole('row', { name: 'unused Removed Restore' })).toBeVisible();
+  await dialog.locator('[data-pool-search]').fill('backup');
+  await expect(dialog.getByRole('row', { name: 'backup Available Remove' })).toBeVisible();
+  await expect(dialog.getByRole('row', { name: 'current Current Remove' })).toBeHidden();
+  await dialog.locator('[data-pool-search]').fill('nothing');
+  await expect(dialog.locator('[data-pool-empty]')).toBeVisible();
+  await dialog.locator('[data-pool-search]').fill('');
+  await dialog.getByRole('row', { name: 'unused Removed Restore' }).getByRole('button').click();
+  await expect(dialog.getByRole('row', { name: 'unused Available Remove' })).toBeVisible();
+  const calls = await page.evaluate(() => (window as unknown as { __invoke: { command: string }[] }).__invoke);
+  expect(calls.filter(call => call.command === 'manage_dashboard_server')).toHaveLength(2);
+  expect(calls.some(call => call.command === 'run_router_action')).toBe(false);
+});
+
+test('profile editor adds changes and removes routing rules before saving', async ({ page }) => {
+  await page.addInitScript(desktopMock);
+  await page.goto('/#profiles');
+  await page.locator('.profile-card').filter({ hasText: 'OpenCode only' }).getByRole('button', { name: 'Edit', exact: true }).click();
+  const dialog = page.locator('#profile-dialog');
+  await dialog.getByRole('button', { name: 'Add more routing rules' }).click();
+  await dialog.getByRole('button', { name: 'Add routing rule', exact: true }).click();
+  const rules = dialog.locator('[data-route-rule]');
+  await expect(rules).toHaveCount(2);
+  await rules.nth(1).locator('[name="route-id"]').fill('discord');
+  await rules.nth(1).locator('[name="route-provider"]').selectOption('warp');
+  await rules.nth(1).locator('[name="route-domains"]').fill('discord.com');
+  await rules.nth(1).locator('[name="route-fallback"]').selectOption('block');
+  await dialog.getByRole('button', { name: 'Add routing rule', exact: true }).click();
+  await rules.nth(2).getByRole('button', { name: 'Remove routing rule' }).click();
+  await expect(rules).toHaveCount(2);
+  await dialog.getByRole('button', { name: 'Save changes' }).click();
+  await expect(dialog).toBeHidden();
+  const calls = await page.evaluate(() => (window as unknown as { __invoke: { command: string; payload?: unknown }[] }).__invoke);
+  expect(calls.filter(call => call.command === 'save_dashboard_profile').at(-1)?.payload).toMatchObject({
+    profileId: 'opencode', profile: { routeRules: [
+      { id: 'route-1', providerId: 'proton', domains: ['opencode.ai'] },
+      { id: 'discord', providerId: 'warp', domains: ['discord.com'], fallback: 'block' },
+    ] },
+  });
 });
