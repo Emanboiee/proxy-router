@@ -397,6 +397,11 @@ def _load_local_preset(root: Path, name: str) -> dict:
     if not isinstance(preset.get("routes", []), list) or any(
             not isinstance(route, dict) for route in preset.get("routes", [])):
         raise DashboardError("Saved preset has invalid routes")
+    for route in preset.get("routes", []):
+        if not isinstance(route.get("domains", []), list):
+            raise DashboardError("Saved preset has invalid route domains")
+        if any(not isinstance(domain, str) for domain in route.get("domains", [])):
+            raise DashboardError("Saved preset has invalid route domains")
     for field in ("routing", "vpn", "providers"):
         if field in preset and not isinstance(preset[field], dict):
             raise DashboardError(f"Saved preset has invalid {field}")

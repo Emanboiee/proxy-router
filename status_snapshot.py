@@ -1,9 +1,49 @@
 """Read-only status assembly shared by controller pollers."""
 
 import json
+import datetime
+import math
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
+
+
+def network_generation(pid_file: Path, config_file: Path) -> dict:
+    """Bind a probe to the local engine/config artifacts, without reading secrets."""
+    generation = {}
+    for name, path in (("engine", pid_file), ("config", config_file)):
+        try:
+            metadata = path.stat()
+            generation[name] = [metadata.st_ino, metadata.st_mtime_ns, metadata.st_size]
+        except OSError:
+            generation[name] = None
+    return generation
+
+
+def cached_network_diagnostic(path: Path, generation: dict, max_age: float,
+                              *, now: float | None = None) -> dict | None:
+    """Read-only freshness check; legacy or different-generation checks are stale."""
+    try:
+        data = json.loads(path.read_text())
+        if not isinstance(data, dict):
+            return None
+    except (OSError, ValueError, TypeError):
+        return None
+    age = None
+    checked_at = data.get("checked_at")
+    try:
+        if isinstance(checked_at, bool):
+            raise ValueError("boolean timestamp")
+        checked = (float(checked_at) if isinstance(checked_at, (int, float)) else
+                   datetime.datetime.fromisoformat(str(checked_at)).timestamp())
+        elapsed = (time.time() if now is None else now) - checked
+        if math.isfinite(elapsed) and elapsed >= 0:
+            age = elapsed
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return {**data, "age_seconds": round(age, 1) if age is not None else None,
+            "stale": age is None or age > max_age or data.get("generation") != generation}
 
 
 def build_status_snapshot(namespace: dict, *, fast: bool = False) -> dict:

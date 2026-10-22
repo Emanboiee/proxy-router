@@ -418,3 +418,112 @@ def test_cli_dispatch_remove_and_auto(tmp_path):
         assert router.main() == 0
     saved = json.loads((tmp_path / "router.json").read_text())
     assert saved["vpn"]["network_auto"] is False
+
+
+def test_network_preset_reload_uses_new_config(tmp_path):
+    router = load_router(tmp_path)
+    _write_config(tmp_path, preset="default")
+    assert router.load_config() == 0
+    observed = []
+
+    def apply(root, name):
+        path = root / "router.json"
+        data = json.loads(path.read_text())
+        data["preset"] = name
+        data.setdefault("routing", {})["vpn_domains"] = ["new.example"]
+        path.write_text(json.dumps(data))
+        return {"preset": name}
+
+    def reload():
+        observed.append(router._routing["vpn_domains"])
+        return 0
+
+    with (
+        mock.patch.object(router, "preset_for_current_network", return_value="school-warp"),
+        mock.patch.object(router, "_engine_runs_as_root", return_value=False),
+        mock.patch.object(router, "current_ssid", return_value="SchoolWiFi"),
+        mock.patch.object(router, "engine_reload", side_effect=reload),
+        mock.patch("setup_tui.apply_preset_by_name", side_effect=apply),
+    ):
+        result = router.apply_network_preset()
+    assert result["applied"] is True
+    assert observed == [["new.example"]]
+
+
+def test_failed_network_preset_restores_config_and_remains_retryable(tmp_path):
+    router = load_router(tmp_path)
+    _write_config(tmp_path, preset="default")
+    original = (tmp_path / "router.json").read_text()
+
+    def apply(root, name):
+        path = root / "router.json"
+        data = json.loads(path.read_text())
+        data["preset"] = name
+        path.write_text(json.dumps(data))
+        return {"preset": name}
+
+    with (
+        mock.patch.object(router, "preset_for_current_network", return_value="school-warp"),
+        mock.patch.object(router, "_engine_runs_as_root", return_value=False),
+        mock.patch.object(router, "current_ssid", return_value="SchoolWiFi"),
+        mock.patch.object(router, "engine_reload", side_effect=[1, 0]),
+        mock.patch("setup_tui.apply_preset_by_name", side_effect=apply) as apply_mock,
+    ):
+        failed = router.apply_network_preset()
+        assert failed["applied"] is False
+        assert failed["reload_rc"] == 1
+        assert (tmp_path / "router.json").read_text() == original
+        assert not router.network_preset_marker(tmp_path).exists()
+        recovered = router.apply_network_preset()
+    assert recovered["applied"] is True
+    assert apply_mock.call_count == 2
+
+
+def test_invalid_network_preset_rolls_back_before_engine_reload(tmp_path):
+    router = load_router(tmp_path)
+    _write_config(tmp_path, preset="default")
+    original = (tmp_path / "router.json").read_text()
+
+    def apply(root, name):
+        path = root / "router.json"
+        data = json.loads(path.read_text())
+        data["preset"] = name
+        data["routes"][0]["provider"] = "missing-provider"
+        path.write_text(json.dumps(data))
+        return {"preset": name}
+
+    with (
+        mock.patch.object(router, "preset_for_current_network", return_value="school-warp"),
+        mock.patch.object(router, "engine_reload") as reload_mock,
+        mock.patch("setup_tui.apply_preset_by_name", side_effect=apply),
+    ):
+        result = router.apply_network_preset()
+    assert result["applied"] is False
+    assert (tmp_path / "router.json").read_text() == original
+    reload_mock.assert_not_called()
+
+
+def test_network_preset_exception_restores_config_and_previous_marker(tmp_path):
+    router = load_router(tmp_path)
+    _write_config(tmp_path, preset="default")
+    original = (tmp_path / "router.json").read_text()
+    marker = router.network_preset_marker(tmp_path)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text('{"preset":"default"}')
+
+    def apply(root, name):
+        (root / "router.json").write_text('{"preset":"broken"}')
+        raise ValueError("broken profile")
+
+    with (
+        mock.patch.object(router, "preset_for_current_network", return_value="school-warp"),
+        mock.patch("setup_tui.apply_preset_by_name", side_effect=apply),
+    ):
+        try:
+            router.apply_network_preset()
+        except ValueError as error:
+            assert str(error) == "broken profile"
+        else:
+            raise AssertionError("Expected profile application to fail")
+    assert (tmp_path / "router.json").read_text() == original
+    assert json.loads(marker.read_text()) == {"preset": "default"}

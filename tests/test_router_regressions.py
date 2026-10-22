@@ -1846,6 +1846,32 @@ def test_tray_vpn_off_uses_user_controller_on_darwin(tmp_path, monkeypatch):
     assert "osascript" not in argv and "sudo" not in argv
 
 
+def test_fast_status_never_probes_the_privileged_helper(tmp_path, monkeypatch):
+    """`--fast` exists so a 15s poll does not pay a `sudo -n` round trip.
+
+    The probe is the expensive part of a status read (measured 120-190ms), and
+    engine_alive() historically probed it before consulting the pid file, so a
+    refactor can silently reintroduce the cost. Pin both directions: skip_helper
+    must not probe, the full check must.
+    """
+    router = load_router(tmp_path)
+    monkeypatch.setattr(router.sys, "platform", "darwin")
+    monkeypatch.setattr(router, "_effective_uid", lambda: 501)
+    probes = []
+
+    def fake_probe():
+        probes.append(1)
+        return {"installed": True, "running": True, "mode": "proxy"}
+
+    monkeypatch.setattr(router, "_probe_helper_status", fake_probe)
+
+    assert router.engine_alive(skip_helper=True) is False
+    assert probes == [], "skip_helper re-introduced the privileged helper probe"
+
+    assert router.engine_alive() is True
+    assert probes, "the full check must still consult the privileged helper"
+
+
 def test_tray_vpn_uses_plain_cli_off_macos(tmp_path, monkeypatch):
     """Non-macOS has no osascript dialog; the toggle falls back to the plain
     CLI, whose clear error tells the user to run it with sudo."""

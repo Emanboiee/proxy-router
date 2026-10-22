@@ -318,7 +318,7 @@ class RouterStatus:
             preset=d.get("preset") or None,
             system_proxy_status=str(system_proxy.get("status") or (
                 "unknown" if d.get("up") and d.get("mode") == "proxy" else "skipped")),
-            network_status=("stale" if network.get("stale") is True
+            network_status=("stale" if network.get("stale") is not False
                             else str(network.get("status") or "unknown")),
             degraded_lanes=[str(lane) for lane in (d.get("degraded_lanes") or [])
                             if isinstance(lane, str) and lane],
@@ -394,13 +394,23 @@ class RouterStatus:
             return f"router: proxy{port}"
         return f"router: {self.mode}"
 
+    def connection_state(self) -> str:
+        """A green connection requires an explicitly fresh successful check."""
+        if self.error:
+            return "failed"
+        if not self.up:
+            return "disconnected"
+        if self.degraded_lanes or self.system_proxy_status not in {"ok", "skipped", "unknown"}:
+            return "degraded"
+        if (self.network_status in {"unknown", "skipped", "stale"}
+                or self.system_proxy_status not in {"ok", "skipped"}):
+            return "stale"
+        return "connected" if self.network_status == "ok" else "degraded"
+
     def headline(self) -> str:
         if self.error:
             return f"proxy-router: error ({self.error})"
-        degraded = self.up and self.mode == "proxy" and (
-            self.system_proxy_status not in {"ok", "skipped"}
-            or self.network_status not in {"ok", "unknown", "skipped"}
-            or bool(self.degraded_lanes))
+        degraded = self.connection_state() in {"degraded", "stale"}
         state = "degraded" if degraded else ("connected" if self.up else "disconnected")
         detail = self.engine_label().removeprefix("router: ") if self.up else self.mode
         if degraded:
@@ -425,7 +435,7 @@ def _dashboard_indicator(status: RouterStatus) -> tuple[str, tuple[int, int, int
     """Return a truthful symbol and color for the native dashboard state."""
     if status.error:
         return "!", (242, 157, 76)
-    if status.up and status.degraded_lanes:
+    if status.connection_state() in {"degraded", "stale"}:
         return "▲", (242, 157, 76)
     if status.up:
         return "●", (77, 205, 139)
@@ -457,9 +467,13 @@ class DashboardViewModel:
         if status.error:
             title = "Router unavailable"
             explanation = "The dashboard could not read proxy-router status. Try Connect again or open Setup."
-        elif status.up and status.degraded_lanes:
+        elif status.connection_state() == "degraded":
             title = "Degraded"
-            explanation = f"Some routed connections need attention: {', '.join(status.degraded_lanes)}."
+            reason = ", ".join(status.degraded_lanes) or status.network_status
+            explanation = f"Some routed connections need attention: {reason}."
+        elif status.connection_state() == "stale":
+            title = "Health unverified"
+            explanation = "The engine is running. Run router.py doctor --network to check the routed path."
         elif not providers:
             title = "No VPN profile yet"
             explanation = "Add a provider profile from Setup, then Connect to start routing traffic."
@@ -501,7 +515,7 @@ class DashboardViewModel:
             provider_summary = "No provider"
         if status.error:
             route_health = "Unavailable"
-        elif status.up and status.degraded_lanes:
+        elif status.connection_state() in {"degraded", "stale"}:
             route_health = "Needs attention"
         elif not providers:
             route_health = "Not configured"
@@ -797,7 +811,7 @@ def _launch_dashboard_app(app: Path) -> bool:
         return False
 
 
-def open_dashboard(root) -> bool:
+def open_dashboard(root, *, on_tui_fallback: Callable[[], None] | None = None) -> bool:
     """Open the Tauri dashboard from the tray, with a TUI fallback."""
     root = Path(root)
     app = _dashboard_bundle(root)
@@ -819,7 +833,10 @@ def open_dashboard(root) -> bool:
     if not (root / "setup_tui.py").is_file():
         print(f"dashboard: missing {root / 'setup_tui.py'}", file=sys.stderr)
         return False
-    return _launch_terminal(root, [])
+    opened = _launch_terminal(root, [])
+    if opened and on_tui_fallback is not None:
+        on_tui_fallback()
+    return opened
 
 
 def dashboard_app_running() -> bool:
@@ -1085,10 +1102,7 @@ class RouterClient:
 def _status_icon_color(st: RouterStatus, action_result: str | None = None) -> str:
     """Choose green/red/orange from current state plus the latest action."""
     action_failed = bool(action_result and ": failed" in action_result.lower())
-    if action_failed or st.error or (st.up and (
-            st.degraded_lanes or (st.mode == "proxy" and (
-                st.system_proxy_status not in {"ok", "skipped"}
-                or st.network_status not in {"ok", "unknown", "skipped"})))):
+    if action_failed or st.connection_state() in {"failed", "degraded", "stale"}:
         return "#ff9800"
     return "#4caf50" if st.up else "#e53935"
 
@@ -1706,6 +1720,7 @@ class TrayApp:
             initial_status if initial_status is not None else RouterStatus())
         self.lock = threading.Lock()
         self.last_action_result: str | None = None
+        self._dashboard_fallback_hint_shown = False
         self.quit_flag = threading.Event()
         self.tray = None
         self.dashboard = DashboardController(
@@ -1993,12 +2008,18 @@ class TrayApp:
             print(f"dashboard: unknown action {kind!r}", file=sys.stderr)
 
     def action_dashboard(self):
-        # Preserve the existing right-click menu action: its Dashboard entry
-        # opens the full setup wizard in Terminal. The status-item left-click
-        # uses _show_native_dashboard and never takes this path.
-        ok = open_dashboard(self.client.root)
+        used_tui = False
+
+        def tui_fallback():
+            nonlocal used_tui
+            used_tui = True
+
+        ok = open_dashboard(self.client.root, on_tui_fallback=tui_fallback)
         result = "dashboard opened" if ok else "dashboard: no terminal"
         with self.lock:
+            if used_tui and not self._dashboard_fallback_hint_shown:
+                result = "dashboard: not built — using TUI (set PROXY_ROUTER_DASHBOARD)"
+                self._dashboard_fallback_hint_shown = True
             self.last_action_result = result
         self._dashboard_update_action(result)
         self._refresh_menu()
@@ -2265,10 +2286,7 @@ class TrayApp:
         first_run = not st.providers and not st.up and not st.error
         if first_run:
             state = "● No VPN set up yet"
-        elif st.up and (st.mode != "proxy" or (
-                st.system_proxy_status in {"ok", "skipped"}
-                and st.network_status in {"ok", "unknown", "skipped"}
-                and not st.degraded_lanes)):
+        elif st.connection_state() == "connected":
             state = "● Connected"
         elif st.up:
             reason = (", ".join(st.degraded_lanes) if st.degraded_lanes
@@ -2281,6 +2299,9 @@ class TrayApp:
         else:
             state = "○ Disconnected"
         items.append(pystray.MenuItem(state, None))
+        if st.connection_state() == "stale":
+            items.append(pystray.MenuItem(
+                "Check connectivity: router.py doctor --network", None, enabled=False))
         if st.network_status == "direct_dns_unavailable":
             items.append(pystray.MenuItem(
                 "Recovery: restore DHCP DNS → reload → doctor --network", None,
