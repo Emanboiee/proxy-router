@@ -1,3 +1,4 @@
+import {selectWeb} from './select-web';
 import { test, expect } from '@playwright/test';
 
 test('unchanged background status keeps the page DOM and expanded routing intact', async ({ page }) => {
@@ -333,8 +334,8 @@ test('desktop profile GUI creates, edits, duplicates and deletes saved profiles'
   await page.getByRole('button', { name: 'Create profile', exact: true }).click();
   const dialog = page.locator('#profile-dialog');
   await dialog.locator('[name="name"]').fill('Home setup');
-  await dialog.locator('[name="providerId"]').selectOption('warp');
-  await dialog.locator('[name="routeMode"]').selectOption('selective');
+  await selectWeb(dialog.locator('[name="providerId"]'), 'warp');
+  await selectWeb(dialog.locator('[name="routeMode"]'), 'selective');
   await dialog.locator('[name="domains"]').fill('example.com\napi.example.com');
   await dialog.locator('[name="autoSubdomains"]').check();
   await dialog.getByRole('button', { name: 'Create profile', exact: true }).click();
@@ -358,9 +359,9 @@ test('desktop profile GUI creates, edits, duplicates and deletes saved profiles'
   await page.clock.runFor(16500);
   await expect(dialog.locator('[name="description"]')).toHaveValue('A profile edited in the GUI');
   await expect(dialog.locator('[name="name"]')).toHaveValue('Home setup');
-  await dialog.locator('[name="fallback"]').selectOption('retry');
-  await dialog.locator('[name="fallbackProviderId"]').selectOption('proton');
-  await dialog.locator('[name="providerId"]').selectOption('proton');
+  await selectWeb(dialog.locator('[name="fallback"]'), 'retry');
+  await selectWeb(dialog.locator('[name="fallbackProviderId"]'), 'proton');
+  await selectWeb(dialog.locator('[name="providerId"]'), 'proton');
   await expect(dialog.locator('[name="fallbackProviderId"]')).toHaveValue('warp');
   await dialog.getByRole('button', { name: 'Save changes', exact: true }).click();
   await expect(card).toContainText('Retry another provider');
@@ -395,7 +396,7 @@ test('desktop profile apply failure leaves the previous selection intact', async
   await page.getByRole('button', { name: 'Create profile', exact: true }).click();
   const dialog = page.locator('#profile-dialog');
   await dialog.locator('[name="name"]').fill('Needs review');
-  await dialog.locator('[name="providerId"]').selectOption('warp');
+  await selectWeb(dialog.locator('[name="providerId"]'), 'warp');
   await dialog.locator('[name="domains"]').fill('example.com');
   await dialog.getByRole('button', { name: 'Create profile', exact: true }).click();
 
@@ -439,7 +440,7 @@ test('desktop provider GUI picks a local config, edits metadata, and deletes a s
   await page.getByRole('button', { name: 'Add provider', exact: true }).click();
   const dialog = page.locator('#provider-dialog');
   await dialog.locator('[name="name"]').fill('Proton home');
-  await dialog.locator('[name="kind"]').selectOption('wireguard');
+  await selectWeb(dialog.locator('[name="kind"]'), 'wireguard');
   await dialog.getByRole('button', { name: 'Choose WireGuard config', exact: true }).click();
   await expect(dialog.locator('#wireguard-file-label')).toHaveText('proton-home.conf');
   await dialog.getByRole('button', { name: 'Add provider', exact: true }).click();
@@ -572,11 +573,11 @@ test('desktop adds WARP proxy using its configured port without requiring a Wire
   await page.getByRole('button', { name: 'Add provider', exact: true }).click();
   const dialog = page.locator('#provider-dialog');
   await dialog.locator('[name="name"]').fill('Cloudflare WARP');
-  await dialog.locator('[name="kind"]').selectOption('warp');
+  await selectWeb(dialog.locator('[name="kind"]'), 'warp');
   await expect(dialog.locator('[data-provider-fields="config"]')).not.toBeVisible();
   await expect(dialog.locator('[name="socksHost"]')).toBeVisible();
   await dialog.locator('[name="socksPort"]').fill('2181');
-  await dialog.locator('[name="startupMode"]').selectOption('warp');
+  await selectWeb(dialog.locator('[name="startupMode"]'), 'warp');
   await dialog.getByRole('button', { name: 'Add provider', exact: true }).click();
   await expect(dialog).not.toBeVisible();
   const calls = await page.evaluate(() => (window as unknown as { __invoke: { command: string; payload?: unknown }[] }).__invoke);
@@ -593,16 +594,16 @@ test('generic command provider saves command and port without executing on save'
   await page.getByRole('button', { name: 'Add provider', exact: true }).click();
   const dialog = page.locator('#provider-dialog');
   await dialog.locator('[name="name"]').fill('My proxy');
-  await dialog.locator('[name="kind"]').selectOption('socks5');
+  await selectWeb(dialog.locator('[name="kind"]'), 'socks5');
   await expect(dialog.locator('[name="startupCommand"]')).not.toBeVisible();
-  await dialog.locator('[name="startupMode"]').selectOption('command');
+  await selectWeb(dialog.locator('[name="startupMode"]'), 'command');
   await expect(dialog.locator('[name="startupCommand"]')).toBeVisible();
   const help = await dialog.locator('#startup-help').boundingBox();
   const endpointHelp = await dialog.locator('#proxy-help').boundingBox();
   expect(help && endpointHelp && help.y + help.height <= endpointHelp.y).toBeTruthy();
-  await dialog.locator('[name="startupMode"]').selectOption('external');
+  await selectWeb(dialog.locator('[name="startupMode"]'), 'external');
   await expect(dialog.locator('[name="startupCommand"]')).not.toBeVisible();
-  await dialog.locator('[name="startupMode"]').selectOption('command');
+  await selectWeb(dialog.locator('[name="startupMode"]'), 'command');
   await dialog.locator('[name="startupCommand"]').fill('my-proxy --listen 127.0.0.1:9000');
   await dialog.locator('[name="socksPort"]').fill('9000');
   await dialog.getByRole('button', { name: 'Add provider', exact: true }).click();
@@ -673,9 +674,9 @@ test('profile editor adds changes and removes routing rules before saving', asyn
   const rules = dialog.locator('[data-route-rule]');
   await expect(rules).toHaveCount(2);
   await rules.nth(1).locator('[name="route-id"]').fill('discord');
-  await rules.nth(1).locator('[name="route-provider"]').selectOption('warp');
+  await selectWeb(rules.nth(1).locator('[name="route-provider"]'), 'warp');
   await rules.nth(1).locator('[name="route-domains"]').fill('discord.com');
-  await rules.nth(1).locator('[name="route-fallback"]').selectOption('block');
+  await selectWeb(rules.nth(1).locator('[name="route-fallback"]'), 'block');
   await dialog.getByRole('button', { name: 'Add routing rule', exact: true }).click();
   await rules.nth(2).getByRole('button', { name: 'Remove routing rule' }).click();
   await expect(rules).toHaveCount(2);

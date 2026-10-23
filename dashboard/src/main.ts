@@ -1,3 +1,4 @@
+import {installWebSelects, syncWebSelects} from './web-select';
 import {connectionControls, serverInventory} from './server-controls';
 import './tokens.css';
 import './style.css';
@@ -68,6 +69,7 @@ const importDialog = document.querySelector<HTMLDialogElement>('#import-dialog')
 const profileDialog = document.querySelector<HTMLDialogElement>('#profile-dialog')!;
 const providerDialog = document.querySelector<HTMLDialogElement>('#provider-dialog')!;
 const scenario = document.querySelector<HTMLSelectElement>('#scenario')!;
+installWebSelects(app);
 const menu = document.querySelector<HTMLButtonElement>('#menu')!;
 app.querySelector('#toast')?.removeAttribute('role');
 app.querySelector('#toast')?.removeAttribute('aria-live');
@@ -569,6 +571,7 @@ function render(options?: { background?: boolean }): void {
   }
   syncProfileDialog();
   syncProviderDialog();
+  syncWebSelects(app);
   applyTheme();
 }
 
