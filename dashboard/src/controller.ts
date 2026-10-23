@@ -52,6 +52,27 @@ export interface Snapshot {
 }
 
 const STORAGE_KEY = 'proxy-router.dashboard.state.v2';
+export function parseProfileExport(raw: string): Omit<Profile, 'id' | 'updatedAt'> {
+  let value: { proxyRouterProfile?: unknown; profile?: Partial<Profile> };
+  try { value = JSON.parse(raw); }
+  catch { throw new Error('Invalid JSON. Check the pasted export and try again.'); }
+  const profile = value?.profile;
+  if (value?.proxyRouterProfile !== 1 || !profile || typeof profile.name !== 'string' || !profile.name.trim()) throw new Error('Paste a proxy-router profile export with a profile name.');
+  const fallback = profile.fallback ?? 'direct';
+  const routeMode = profile.routeMode ?? 'selective';
+  const domains = profile.domains ?? [];
+  const autoSubdomains = profile.autoSubdomains ?? false;
+  const domainList = (items: unknown): items is string[] => Array.isArray(items) && items.every(item => typeof item === 'string');
+  if (!['direct', 'retry', 'block'].includes(fallback)) throw new Error('Imported profile has an unknown fallback mode');
+  if (!['selective', 'direct', 'full'].includes(routeMode)) throw new Error('Imported profile has an unknown routing mode');
+  if (!domainList(domains)) throw new Error('Imported profile has an invalid domain list');
+  if (typeof autoSubdomains !== 'boolean') throw new Error('Imported profile has an invalid subdomain flag');
+  if (profile.routeRules !== undefined) {
+    if (!Array.isArray(profile.routeRules) || profile.routeRules.some(rule => !rule || typeof rule.id !== 'string' || !rule.id.trim() || typeof rule.providerId !== 'string' || !domainList(rule.domains) || typeof rule.autoSubdomains !== 'boolean' || !['direct', 'block'].includes(rule.fallback) || (rule.enabled !== undefined && typeof rule.enabled !== 'boolean'))) throw new Error('Imported profile has invalid routing rules');
+    if (new Set(profile.routeRules.map(rule => rule.id)).size !== profile.routeRules.length) throw new Error('Imported routing rule names must be unique');
+  }
+  return { name: profile.name, description: typeof profile.description === 'string' ? profile.description : '', providerId: typeof profile.providerId === 'string' ? profile.providerId : '', fallbackProviderId: typeof profile.fallbackProviderId === 'string' ? profile.fallbackProviderId : '', fallback, routeMode, domains, autoSubdomains, ...(profile.routeRules ? { routeRules: profile.routeRules } : {}) };
+}
 const now = () => Date.now();
 const id = (prefix: string) => `${prefix}-${Math.random().toString(36).slice(2, 9)}`;
 const defaultState: Snapshot = {
@@ -139,27 +160,60 @@ export class LocalController {
   async applyPreset(mode: RouteMode, domains: string[] = []): Promise<Snapshot> { const profile = this.activeProfile(); profile.routeMode = mode; if (domains.length) profile.domains = [...new Set(domains)]; profile.updatedAt = now(); return this.settle(`${mode === 'selective' ? 'Selective routing' : mode === 'full' ? 'Full tunnel' : 'Direct connection'} preset applied`); }
   async setFallback(fallback: FallbackMode): Promise<Snapshot> { const profile = this.activeProfile(); profile.fallback = fallback; profile.updatedAt = now(); return this.settle(`Fallback set to ${fallback}`); }
   async setProvider(providerId: string): Promise<Snapshot> { const profile = this.activeProfile(); const provider = this.data.providers.find(item => item.id === providerId); if (!provider) throw new Error('Provider not found'); profile.providerId = providerId; profile.updatedAt = now(); return this.settle(`${provider.name} selected`); }
-  async addProvider(input: { name: string; kind: ProviderKind; server: string; connection?: ProviderConnection }): Promise<Snapshot> {
+  async addProvider(input: { name: string; kind: ProviderKind; server: string; connection?: ProviderConnection }, providerId?: string): Promise<Snapshot> {
     const name = input.name.trim(); const server = input.server.trim(); if (!name) throw new Error('Give this provider a name'); if (!server) throw new Error('Add a server or endpoint');
+    if (providerId) {
+      const provider = this.data.providers.find(item => item.id === providerId);
+      if (!provider) throw new Error('Provider not found');
+      if (!provider.servers.includes(server)) provider.servers.push(server);
+      Object.assign(provider, input, {name, server});
+      return this.settle(`${name} updated`);
+    }
     const provider: Provider = { id: id('provider'), name, kind: input.kind, status: 'healthy', latency: null, server, servers: [server], ...(input.connection ? { connection: input.connection } : {}) }; this.data.providers.push(provider); return this.settle(`${name} added`);
   }
-  async importProviderConfig(input: { name: string; kind: 'wireguard' | 'custom'; fileName: string; raw: string }): Promise<Snapshot> {
+  async importProviderConfig(input: { name: string; kind: 'wireguard' | 'custom'; fileName: string; raw: string }, providerId?: string): Promise<Snapshot> {
     const connection = parseWireGuardConfig(input.raw, input.fileName);
-    return this.addProvider({ name: input.name, kind: input.kind, server: connection.endpoint, connection });
+    return this.addProvider({ name: input.name, kind: input.kind, server: connection.endpoint, connection }, providerId);
   }
-  async addSocks5Provider(input: { name: string; host: string; port: string | number }): Promise<Snapshot> {
+  async addProviderConfigs(providerId: string, files: Array<{fileName: string; raw: string}>): Promise<Snapshot> {
+    const provider = this.data.providers.find(item => item.id === providerId);
+    if (!provider) throw new Error('Provider not found');
+    if (!files.length) throw new Error('Choose at least one WireGuard .conf file');
+    const connections = files.map(file => parseWireGuardConfig(file.raw, file.fileName));
+    const endpoints = connections.map(connection => connection.endpoint);
+    provider.servers = [...new Set([...provider.servers, ...endpoints])];
+    provider.removedServers = (provider.removedServers ?? []).filter(server => !endpoints.includes(server));
+    provider.connection ??= connections[0];
+    return this.settle(`${files.length} WireGuard config${files.length === 1 ? '' : 's'} added to ${provider.name}`);
+  }
+  async manageProviderServer(providerId: string, server: string, restore: boolean): Promise<Snapshot> {
+    const provider = this.data.providers.find(item => item.id === providerId);
+    if (!provider) throw new Error('Provider not found');
+    if (restore) {
+      if (!provider.removedServers?.includes(server)) throw new Error('Removed server not found');
+      provider.servers.push(server);
+      provider.removedServers = provider.removedServers.filter(item => item !== server);
+    } else {
+      if (server === provider.server || provider.servers.length <= 1) throw new Error('Switch servers before removing the current one');
+      if (!provider.servers.includes(server)) throw new Error('Server not found');
+      provider.servers = provider.servers.filter(item => item !== server);
+      provider.removedServers = [...(provider.removedServers ?? []), server];
+    }
+    return this.settle(restore ? 'Server restored' : 'Server removed from pool');
+  }
+  async addSocks5Provider(input: { name: string; host: string; port: string | number }, providerId?: string): Promise<Snapshot> {
     const host = input.host.trim(); const port = Number(input.port);
     if (!host) throw new Error('Add the SOCKS5 host');
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Use a SOCKS5 port from 1 to 65535');
     const connection: ProviderConnection = { kind: 'socks5', host, port };
-    return this.addProvider({ name: input.name, kind: 'socks5', server: `${host}:${port}`, connection });
+    return this.addProvider({ name: input.name, kind: 'socks5', server: `${host}:${port}`, connection }, providerId);
   }
-  async addTailscaleProvider(input: { name: string; exitNode: string }): Promise<Snapshot> {
+  async addTailscaleProvider(input: { name: string; exitNode: string }, providerId?: string): Promise<Snapshot> {
     const exitNode = input.exitNode.trim();
     if (!exitNode) throw new Error('Add a Tailscale exit node name or address');
     if (exitNode.length > 255) throw new Error('Use a Tailscale exit node under 255 characters');
     const connection: ProviderConnection = { kind: 'tailscale', exitNode };
-    return this.addProvider({ name: input.name, kind: 'tailscale', server: exitNode, connection });
+    return this.addProvider({ name: input.name, kind: 'tailscale', server: exitNode, connection }, providerId);
   }
   async setServer(providerId: string, server: string): Promise<Snapshot> { const provider = this.data.providers.find(item => item.id === providerId); if (!provider || !provider.servers.includes(server)) throw new Error('Server not found'); provider.server = server; return this.settle(`${provider.name} server changed to ${server}`); }
   async refreshHealth(): Promise<Snapshot> { this.data.providers = this.data.providers.map(provider => ({ ...provider, status: 'healthy', latency: provider.id === 'warp' ? 42 : provider.id === 'proton' ? 68 : 96 })); return this.settle('Provider health refreshed'); }
@@ -170,18 +224,7 @@ export class LocalController {
   activeProfile(): Profile { return this.data.profiles.find(profile => profile.id === this.data.activeProfileId) ?? this.data.profiles[0]; }
   exportProfile(profileId = this.data.activeProfileId): string { const profile = this.data.profiles.find(item => item.id === profileId); if (!profile) throw new Error('Profile not found'); return JSON.stringify({ proxyRouterProfile: 1, profile }, null, 2); }
   async importProfile(raw: string): Promise<Snapshot> {
-    const value = JSON.parse(raw) as { proxyRouterProfile?: number; profile?: Partial<Omit<Profile, 'id' | 'updatedAt'>> };
-    const profile = value.profile; const name = profile?.name;
-    if (value.proxyRouterProfile !== 1 || !profile || typeof name !== 'string') throw new Error('This is not a proxy-router profile export');
-    const fallback = profile.fallback ?? 'direct';
-    const routeMode = profile.routeMode ?? 'selective';
-    const domains = profile.domains ?? [];
-    const autoSubdomains = profile.autoSubdomains ?? false;
-    if (fallback !== 'direct' && fallback !== 'retry' && fallback !== 'block') throw new Error('Imported profile has an unknown fallback mode');
-    if (routeMode !== 'selective' && routeMode !== 'direct' && routeMode !== 'full') throw new Error('Imported profile has an unknown routing mode');
-    if (!Array.isArray(domains) || domains.some(domain => typeof domain !== 'string')) throw new Error('Imported profile has an invalid domain list');
-    if (typeof autoSubdomains !== 'boolean') throw new Error('Imported profile has an invalid subdomain flag');
-    return this.saveProfile({ name, description: typeof profile.description === 'string' ? profile.description : '', fallback, routeMode, domains, autoSubdomains, providerId: typeof profile.providerId === 'string' ? profile.providerId : 'warp' });
+    return this.saveProfile(parseProfileExport(raw));
   }
   reset(): Snapshot { this.data = clone(defaultState); writeStored(STORAGE_KEY, JSON.stringify(this.data)); return this.snapshot(); }
 }
