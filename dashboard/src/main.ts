@@ -682,7 +682,10 @@ async function refreshStatusOnce(options?: { silent?: boolean; poll?: boolean })
       } catch { /* fall through to a real fetch */ }
     }
     try {
-      const live = await getLiveStatus({ force: !options?.poll });
+      // Actions refresh the snapshot in Rust before returning (run_router_action
+      // and apply_preset), and a startup read has no cache to bypass. Forcing
+      // here only repeats a 110-330ms CLI spawn the poller just paid for.
+      const live = await getLiveStatus({ force: false });
       if (generation !== requestGeneration) return;
       applyLive(live);
     } catch {
