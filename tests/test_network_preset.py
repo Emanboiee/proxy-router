@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
+import network_control
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -45,25 +46,31 @@ class _FakeComplete:
 
 def test_current_ssid_parses_ipconfig_output(tmp_path):
     router = load_router(tmp_path)
-    fake = _FakeComplete(stdout="\n  SSID : SchoolWiFi\n  BSSID : aa:bb\n")
-    with mock.patch.object(router.subprocess, "run", return_value=fake):
+    def run(cmd, **kwargs):
+        return _FakeComplete(stdout="Hardware Port: Wi-Fi\nDevice: en7\n" if cmd[0] == "networksetup" else "\n  SSID : SchoolWiFi\n  BSSID : aa:bb\n")
+    with mock.patch.object(router.subprocess, "run", side_effect=run), mock.patch.object(network_control, "native_ssid", return_value=None), mock.patch.object(router.sys, "platform", "darwin"):
         assert router.current_ssid() == "SchoolWiFi"
 
 
 def test_current_ssid_none_when_unconnected(tmp_path):
     router = load_router(tmp_path)
-    fake = _FakeComplete(stdout="\n  BSSID : aa:bb\n")
-    with mock.patch.object(router.subprocess, "run", return_value=fake):
+    def run(cmd, **kwargs):
+        return _FakeComplete(stdout="Hardware Port: Wi-Fi\nDevice: en7\n" if cmd[0] == "networksetup" else "\n  BSSID : aa:bb\n")
+    with mock.patch.object(router.subprocess, "run", side_effect=run), mock.patch.object(network_control, "native_ssid", return_value=None), mock.patch.object(router.sys, "platform", "darwin"):
         assert router.current_ssid() is None
 
 
 def test_current_ssid_skips_failed_interface(tmp_path):
     router = load_router(tmp_path)
     def _run(cmd, **kwargs):
+        if cmd[0] == "networksetup":
+            return _FakeComplete(stdout="Hardware Port: Wi-Fi\nDevice: en0\nHardware Port: Wi-Fi\nDevice: en1\n")
+        if cmd[0] == "ifconfig":
+            return _FakeComplete(stdout="", returncode=1)
         if cmd[2] == "en0":
             return _FakeComplete(stdout="", returncode=1)
         return _FakeComplete(stdout="  SSID : OtherNet\n")
-    with mock.patch.object(router.subprocess, "run", side_effect=_run):
+    with mock.patch.object(router.subprocess, "run", side_effect=_run), mock.patch.object(network_control, "native_ssid", return_value=None), mock.patch.object(router.sys, "platform", "darwin"):
         assert router.current_ssid() == "OtherNet"
 
 
@@ -104,6 +111,8 @@ def test_apply_network_preset_applies_and_reloads_when_changed(tmp_path):
         mock.patch.object(router, "preset_for_current_network", return_value="school-warp"),
         mock.patch.object(router, "_engine_runs_as_root", return_value=False),
         mock.patch.object(router, "engine_reload", return_value=0),
+        mock.patch.object(router, "engine_alive", return_value=True),
+        mock.patch.object(router, "load_config", return_value=0),
         mock.patch("setup_tui.apply_preset_by_name", side_effect=fake_apply),
     ):
         result = router.apply_network_preset()
@@ -145,6 +154,8 @@ def test_cmd_network_check_returns_zero_on_apply(tmp_path, capsys):
     with (
         mock.patch.object(router, "preset_for_current_network", return_value="school-warp"),
         mock.patch.object(router, "engine_reload", return_value=0),
+        mock.patch.object(router, "engine_alive", return_value=True),
+        mock.patch.object(router, "load_config", return_value=0),
         mock.patch.object(router, "_engine_runs_as_root", return_value=False),
         mock.patch("setup_tui.apply_preset_by_name", return_value={"added": [], "mode": "vpn-list", "preset": "school-warp"}),
     ):
@@ -155,14 +166,12 @@ def test_cmd_network_check_returns_zero_on_apply(tmp_path, capsys):
 
 def test_network_status_reports_wifi_state(tmp_path):
     router = load_router(tmp_path)
-    with mock.patch.object(router.sys, "platform", "darwin"), \
-         mock.patch.object(router, "current_ssid", return_value="SchoolWiFi"):
-        assert router.network_status()["connected"] is True
-    with mock.patch.object(router.sys, "platform", "darwin"), \
-         mock.patch.object(router, "current_ssid", return_value=None):
-        result = router.network_status()
-    assert result["connected"] is False
-    assert result["supported"] is True
+    for connected, ssid in [(True, "SchoolWiFi"), (True, None), (False, None)]:
+        with mock.patch.object(network_control, "probe", return_value={"connected": connected, "ssid": ssid, "supported": True}), mock.patch.object(network_control, "native_ssid", return_value=None):
+            result = router.network_status()
+        assert result["connected"] is connected
+        assert result["supported"] is True
+        assert result["ssid"] == ssid
 
 
 def test_network_disconnect_latches_and_tears_down_without_manual_off(tmp_path):
@@ -358,7 +367,7 @@ def test_network_presets_state_reports_mapping_and_last_applied(tmp_path):
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(json.dumps({"ssid": "SchoolWiFi", "preset": "school-warp", "at": 123}))
 
-    with mock.patch.object(router, "current_ssid", return_value="SchoolWiFi"):
+    with mock.patch.object(router, "network_status", return_value={"connected": True, "ssid": "SchoolWiFi"}):
         state = router.network_presets_state()
 
     assert state["ssid"] == "SchoolWiFi"
@@ -374,7 +383,7 @@ def test_network_presets_state_handles_no_wifi_and_missing_marker(tmp_path):
     _write_config(tmp_path, mappings={"SchoolWiFi": "school-warp"})
     router._vpn = {"network_auto": True, "network_presets": {"SchoolWiFi": "school-warp"}}
 
-    with mock.patch.object(router, "current_ssid", return_value=None):
+    with mock.patch.object(router, "network_status", return_value={"connected": False, "ssid": None}):
         state = router.network_presets_state()
 
     assert state["connected"] is False
@@ -442,6 +451,7 @@ def test_network_preset_reload_uses_new_config(tmp_path):
         mock.patch.object(router, "preset_for_current_network", return_value="school-warp"),
         mock.patch.object(router, "_engine_runs_as_root", return_value=False),
         mock.patch.object(router, "current_ssid", return_value="SchoolWiFi"),
+        mock.patch.object(router, "engine_alive", return_value=True),
         mock.patch.object(router, "engine_reload", side_effect=reload),
         mock.patch("setup_tui.apply_preset_by_name", side_effect=apply),
     ):
@@ -466,6 +476,7 @@ def test_failed_network_preset_restores_config_and_remains_retryable(tmp_path):
         mock.patch.object(router, "preset_for_current_network", return_value="school-warp"),
         mock.patch.object(router, "_engine_runs_as_root", return_value=False),
         mock.patch.object(router, "current_ssid", return_value="SchoolWiFi"),
+        mock.patch.object(router, "engine_alive", return_value=True),
         mock.patch.object(router, "engine_reload", side_effect=[1, 0]),
         mock.patch("setup_tui.apply_preset_by_name", side_effect=apply) as apply_mock,
     ):

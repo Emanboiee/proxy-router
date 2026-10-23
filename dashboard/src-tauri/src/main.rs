@@ -8,6 +8,7 @@
 //! (Emanboiee/proxy-router#144).
 
 mod controller;
+mod wifi_identity;
 mod network_refresh;
 mod tray_owner;
 use crate::tray_owner::TrayOwnerLease;
@@ -89,6 +90,27 @@ fn preview_rendered(start: tauri::State<LaunchTime>) {
 fn get_preview_status() -> Result<serde_json::Value, String> {
     serde_json::from_str(include_str!("../../src/status.json"))
         .map_err(|_| "Preview status unavailable".to_string())
+}
+
+/// Explicit, bounded HTTPS timing through the local proxy listener.
+#[tauri::command]
+async fn measure_proxy_latency() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let config = get_config()?;
+        let port = config.get("port").and_then(Value::as_u64).filter(|port| *port > 0 && *port <= 65535)
+            .ok_or_else(|| "Invalid proxy port".to_string())?;
+        let output = std::process::Command::new("curl")
+            .args(["--disable", "--silent", "--show-error", "--fail", "--noproxy", "",
+                "--proxy", &format!("http://127.0.0.1:{port}"), "--connect-timeout", "3",
+                "--max-time", "8", "--output", if cfg!(windows) { "NUL" } else { "/dev/null" },
+                "--write-out", "%{time_total}", "https://1.1.1.1/cdn-cgi/trace"])
+            .output().map_err(|_| "Could not launch curl for latency check".to_string())?;
+        if !output.status.success() { return Err("Latency check failed or timed out; connection was not changed.".to_string()); }
+        let seconds: f64 = String::from_utf8_lossy(&output.stdout).trim().parse()
+            .map_err(|_| "Invalid latency result".to_string())?;
+        if !seconds.is_finite() || seconds < 0.0 { return Err("Invalid latency result".to_string()); }
+        Ok(serde_json::json!({"latency_ms": (seconds * 1000.0).round()}))
+    }).await.map_err(|_| "Latency worker failed".to_string())?
 }
 
 fn show_dashboard<R: Runtime>(app: &AppHandle<R>) {
@@ -429,12 +451,55 @@ fn get_config() -> Result<Value, String> {
 }
 
 /// Live network detection: current Wi-Fi + the SSID -> preset mapping.
+/// Keep authorized Wi-Fi observations fresh while the window is hidden.
+/// The Python worker owns switching; this thread only publishes identity.
+#[cfg(target_os = "macos")]
+fn start_network_identity_observer(root: std::path::PathBuf) {
+    std::thread::spawn(move || loop {
+        if let Some(ssid) = wifi_identity::ssid() {
+            let _ = controller::run_controller(
+                &root, &["network-preset", "observe", "--ssid", &ssid],
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_secs(10));
+    });
+}
+
 #[tauri::command]
 fn get_network() -> Result<Value, String> {
     let root = controller::router_root();
-    let status = controller::json_command(&root, &["network-status", "--json"])?;
-    let presets = controller::json_command(&root, &["network-preset", "show"])?;
-    Ok(serde_json::json!({ "status": status, "presets": presets }))
+    let native_ssid = wifi_identity::ssid();
+    let mut presets = if let Some(ref ssid) = native_ssid {
+        controller::json_command(&root, &["network-preset", "observe", "--ssid", ssid])?
+    } else {
+        controller::json_command(&root, &["network-preset", "show"])?
+    };
+    if let Some(ssid) = native_ssid {
+        presets["mapped_preset"] = presets["presets"]
+            .get(&ssid)
+            .cloned()
+            .unwrap_or(Value::Null);
+        presets["ssid"] = Value::String(ssid);
+        presets["identity"] = Value::String("available".into());
+    }
+    Ok(serde_json::json!({ "status": presets.clone(), "presets": presets }))
+}
+
+#[tauri::command]
+async fn reveal_network(app: AppHandle) -> Result<Value, String> {
+    app.run_on_main_thread(wifi_identity::request_permission)
+        .map_err(|e| e.to_string())?;
+    get_network()
+}
+
+#[tauri::command]
+fn set_network_disconnect(state: String) -> Result<Value, String> {
+    if state != "on" && state != "off" {
+        return Err("state must be on or off".into());
+    }
+    let root = controller::router_root();
+    controller::run_controller(&root, &["network-preset", "disconnect", "--state", &state])?;
+    controller::json_command(&root, &["network-preset", "show"])
 }
 
 /// Map the current (or a named) Wi-Fi network to a preset.
@@ -443,7 +508,7 @@ fn set_network_preset(ssid: String, preset: String) -> Result<Value, String> {
     if !valid_slug(&ssid, 255) {
         return Err("network name must be 1-255 characters without control characters".into());
     }
-    if !valid_slug(&preset, 64) {
+    if !valid_slug(&preset, 80) {
         return Err(
             "preset name must be 1-64 characters of letters, digits, dot, dash or underscore"
                 .into(),
@@ -615,6 +680,12 @@ fn delete_dashboard_provider(provider_id: String) -> Result<Value, String> {
 }
 
 #[tauri::command]
+fn manage_dashboard_server(provider_id: String, server: String, restore: bool) -> Result<Value, String> {
+    dashboard_json(&["dashboard", if restore { "server-restore" } else { "server-remove" },
+                     "--id", &provider_id, "--server", &server])
+}
+
+#[tauri::command]
 fn save_server_preference(provider_id: String, server: String) -> Result<Value, String> {
     dashboard_json(&["dashboard", "server-preference", "--id", &provider_id, "--server", &server])
 }
@@ -686,6 +757,8 @@ fn main() {
             // Claim before building our status item, so the Python tray can
             // hide itself as soon as this app can serve the menu bar.
             claim_tray_ownership(&owner_root, &setup_owner)?;
+            #[cfg(target_os = "macos")]
+            start_network_identity_observer(owner_root.clone());
 
             let open = MenuItem::with_id(app, "open", "Open Dashboard", true, None::<&str>)?;
             let connect = MenuItem::with_id(app, "connect", "Connect", true, None::<&str>)?;
@@ -816,12 +889,15 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             get_preview_status,
+            measure_proxy_latency,
             get_live_status,
             cached_live_status,
             run_router_action,
             apply_preset,
             get_config,
             get_network,
+            reveal_network,
+            set_network_disconnect,
             set_network_preset,
             set_network_auto,
             remove_network_preset,
@@ -835,6 +911,7 @@ fn main() {
             apply_dashboard_profile,
             save_dashboard_provider,
             delete_dashboard_provider,
+            manage_dashboard_server,
             save_server_preference,
             switch_dashboard_server,
             set_tray_status,

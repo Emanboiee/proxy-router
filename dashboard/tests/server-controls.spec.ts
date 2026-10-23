@@ -1,3 +1,4 @@
+import {selectWeb} from './select-web';
 import {test,expect} from '@playwright/test';
 import AxeBuilder from '@axe-core/playwright';
 
@@ -23,8 +24,10 @@ test('desktop discovers installed servers and separates preference from switchin
   }}});
  });
  await page.goto('/');
+ await expect(page.locator('.server-current')).toBeHidden();
+ await page.locator('.home-more-trigger').click();
  await expect(page.locator('#preferred-server option')).toHaveCount(24);
- await page.locator('#preferred-server').selectOption('server-22');
+ await selectWeb(page.locator('#preferred-server'), 'server-22');
  await expect(page.locator('.server-current')).toContainText('server-00');
  await page.getByRole('button',{name:'Switch now',exact:true}).click();
  await expect(page.locator('#announcement')).toContainText('previous connection restored');
@@ -47,7 +50,7 @@ test('desktop discovers installed servers and separates preference from switchin
  await page.keyboard.press('Escape');
  await expect(page.getByRole('button',{name:'Browse 23 installed servers →'})).toBeFocused();
  await expect(page.locator('#preferred-server')).toHaveValue('server-17');
- await page.locator('#server-provider').selectOption('warp');
+ await selectWeb(page.locator('#server-provider'), 'warp');
  await expect(page.locator('#preferred-server')).toHaveCount(0);
  await expect(page.locator('#main')).toContainText('chooses its endpoint automatically');
  await expect(page.locator('#main')).not.toContainText('DEMO-');
