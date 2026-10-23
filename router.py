@@ -7871,7 +7871,7 @@ def main() -> int:
             import network_control
             if not network_control.valid_ssid(args.ssid):
                 return fail("unreadable network name")
-            network_control.remember(ROOT, args.ssid)
+            network_control.observe(ROOT, args.ssid)
             return cmd_network_preset_show(as_json=True)
         if args.action == "disconnect":
             import network_control

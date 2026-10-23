@@ -285,3 +285,51 @@ def test_wifi_off_can_be_confirmed_without_ipconfig_summary(tmp_path):
     state = net.probe(tmp_path, runner=run, platform="darwin")
     assert state["supported"] is True
     assert state["connected"] is False
+
+
+def test_authorized_observation_only_matches_fresh_same_connection(tmp_path):
+    status = {"supported": True, "connected": True, "ssid": None,
+              "connection_token": "home-token"}
+    with mock.patch.object(net, "probe", return_value=status), mock.patch.object(net.time, "time", return_value=100):
+        assert net.observe(tmp_path, "Home")
+        assert net.observed_ssid(tmp_path, status) == "Home"
+        assert net.observed_ssid(tmp_path, dict(status, connection_token="school-token")) is None
+        assert net.observed_ssid(tmp_path, dict(status, connected=False)) is None
+    with mock.patch.object(net.time, "time", return_value=131):
+        assert net.observed_ssid(tmp_path, status) is None
+    with mock.patch.object(net.time, "time", return_value=99):
+        assert net.observed_ssid(tmp_path, status) is None
+
+
+def test_redacted_worker_uses_authorized_current_observation(tmp_path):
+    status = {"supported": True, "connected": True, "ssid": None,
+              "connection_token": "home-token"}
+    with mock.patch.object(net, "probe", return_value=status), mock.patch.object(net, "native_ssid", return_value=None), mock.patch.object(net.sys, "platform", "darwin"):
+        assert net.observe(tmp_path, "Home")
+        assert net.view(tmp_path, status)["ssid"] == "Home"
+        assert net.view(tmp_path, dict(status, connection_token="new-token"))["ssid"] is None
+
+
+def test_observation_rejects_unknown_link_and_redaction(tmp_path):
+    with mock.patch.object(net, "probe", return_value={"connected": True, "supported": False}):
+        assert not net.observe(tmp_path, "Home")
+        assert not net.observe(tmp_path, "<redacted>")
+    assert not (tmp_path / "state/native-network.json").exists()
+
+
+def test_connection_token_changes_on_new_dhcp_connection(tmp_path):
+    transaction = "0x1"
+    def run(args, **kwargs):
+        text = "Hardware Port: Wi-Fi\nDevice: en0\n" if args[0] == "networksetup" else f"SSID : <redacted>\nConnectionID : 1\nxid = {transaction}\nchaddr = aa:bb\n"
+        return SimpleNamespace(returncode=0, stdout=text)
+    first = net.probe(tmp_path, runner=run, platform="darwin")
+    assert first["connection_token"] == net.probe(tmp_path, runner=run, platform="darwin")["connection_token"]
+    transaction = "0x2"
+    assert first["connection_token"] != net.probe(tmp_path, runner=run, platform="darwin")["connection_token"]
+
+
+def test_generic_link_fields_are_not_a_connection_identity(tmp_path):
+    def run(args, **kwargs):
+        text = "Hardware Port: Wi-Fi\nDevice: en0\n" if args[0] == "networksetup" else "SSID : <redacted>\nConnectionID : 1\nSecurity : WPA2_PSK\n"
+        return SimpleNamespace(returncode=0, stdout=text)
+    assert "connection_token" not in net.probe(tmp_path, runner=run, platform="darwin")

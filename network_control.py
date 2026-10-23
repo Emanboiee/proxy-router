@@ -6,6 +6,8 @@ mapping keys, and an unavailable probe never disconnects a working engine.
 
 from __future__ import annotations
 import json
+import hashlib
+import re
 import os
 import subprocess
 import sys
@@ -127,6 +129,18 @@ def probe(root, runner=None, platform=None):
                         return result
                     continue
                 successful = True
+                # Private connection token, not an SSID guess. DHCP transaction
+                # and gateway identity change when roaming, including networks
+                # that happen to use the same private address range.
+                fields = re.findall(
+                    r"^\s*(?:ConnectionID|LeaseStartTime|Security)\s*:\s*(.+)$|"
+                    r"^(?:xid|chaddr) = (.+)$|"
+                    r"^\s*source link-address option.*?:\s*(.+)$",
+                    out.stdout, re.MULTILINE,
+                )
+                if fields and re.search(r"^xid = .+$", out.stdout, re.MULTILINE):
+                    token = json.dumps([iface, fields], sort_keys=True).encode()
+                    result["connection_token"] = hashlib.sha256(token).hexdigest()
                 for line in out.stdout.splitlines():
                     if line.strip().startswith("SSID :") or line.strip().startswith(
                         "SSID:"
@@ -239,9 +253,38 @@ def native_ssid():
         return None
 
 
+def observe(root, ssid):
+    """Bridge an authorized dashboard reading to the unprivileged worker."""
+    if not valid_ssid(ssid):
+        return False
+    status = probe(root)
+    token = status.get("connection_token")
+    if not status.get("supported") or not status.get("connected") or not token:
+        return False
+    write_json(Path(root) / "state" / "native-network.json", {
+        "ssid": ssid, "connection_token": token, "checked_at": int(time.time()),
+    })
+    remember(root, ssid)
+    return True
+
+
+def observed_ssid(root, status):
+    if not status.get("supported") or not status.get("connected"):
+        return None
+    observation = read_json(Path(root) / "state" / "native-network.json")
+    checked = observation.get("checked_at")
+    if not isinstance(checked, (int, float)) or not 0 <= time.time() - checked <= 30:
+        return None
+    token = status.get("connection_token")
+    if not token or token != observation.get("connection_token"):
+        return None
+    ssid = observation.get("ssid")
+    return ssid if valid_ssid(ssid) else None
+
+
 def view(root, status):
     if status.get("connected") and sys.platform == "darwin":
-        ssid = native_ssid()
+        ssid = native_ssid() or observed_ssid(root, status)
         if ssid:
             status = dict(status, ssid=ssid, identity="available")
     ssid = status.get("ssid")
@@ -439,12 +482,18 @@ def worker(root):
                             },
                         )
                     elif status.get("connected") and time.monotonic() - last_check > 15:
-                        subprocess.run(
+                        checked = subprocess.run(
                             [sys.executable, str(root / "router.py"), "network-check"],
-                            timeout=45,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
+                            timeout=45, capture_output=True, text=True,
                         )
+                        try:
+                            result = json.loads(getattr(checked, "stdout", ""))
+                        except (ValueError, TypeError):
+                            result = {"error": "network-check returned no result"}
+                        write_json(root / "state" / "network-auto.json", {
+                            "result": result, "returncode": checked.returncode,
+                            "checked_at": int(time.time()),
+                        })
                         last_check = time.monotonic()
                 except (OSError, subprocess.SubprocessError):
                     guard.completed(action, 1)
