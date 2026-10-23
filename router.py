@@ -40,6 +40,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Any
 
@@ -3875,8 +3876,8 @@ def ensure_tray_started() -> None:
 def route_watcher_start() -> None:
     """Start the independent routed-connection watcher best-effort."""
     try:
-        import route_watcher
-
+        import route_watcher, network_control
+        network_control.start(ROOT)
         result = route_watcher.start(ROOT)
         if result.get("error"):
             print(f"router: route watcher unavailable: {result['error']}", file=sys.stderr)
@@ -4472,44 +4473,12 @@ def _elevated_reload() -> int:
 # ---------------------------------------------------------------------------
 
 def current_ssid() -> str | None:
-    """Active Wi-Fi SSID via `ipconfig getsummary` (macOS, read-only).
-
-    Returns None when Wi-Fi is off or no interface answers. Pure getter;
-    tests inject synthetic output through subprocess mocks.
-    """
-    for iface in ("en0", "en1"):
-        try:
-            probe = subprocess.run(
-                ["ipconfig", "getsummary", iface],
-                capture_output=True, text=True, timeout=5,
-            )
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if probe.returncode != 0:
-            continue
-        for line in probe.stdout.splitlines():
-            if line.strip().startswith("SSID"):
-                _, _, value = line.partition(":")
-                ssid = value.strip()
-                return ssid or None
-    return None
+    return network_status().get("ssid")
 
 
 def network_status() -> dict:
-    """Return the current physical Wi-Fi state without touching the engine.
-
-    The guard is implemented for macOS, where ``ipconfig getsummary`` is the
-    same read-only source already used by network-aware presets. Other
-    platforms report ``supported: false`` and stay connected so keepalive
-    cannot tear down a VPN based on an unavailable platform probe.
-    """
-    checked_at = int(time.time())
-    if sys.platform != "darwin":
-        return {"connected": True, "ssid": None, "supported": False,
-                "checked_at": checked_at}
-    ssid = current_ssid()
-    return {"connected": bool(ssid), "ssid": ssid, "supported": True,
-            "checked_at": checked_at}
+    import network_control
+    return network_control.view(ROOT, network_control.probe(ROOT))
 
 
 def network_off_marker(root: Path | None = None) -> Path:
@@ -4575,7 +4544,7 @@ def cmd_network_reconnect() -> int:
         return 3
     if not network_off_marker().is_file():
         return 0
-    if sys.platform == "darwin" and not current_ssid():
+    if network_status().get("supported") and not network_status().get("connected"):
         return 2
     if load_config() != 0:
         return 1
@@ -4622,34 +4591,8 @@ def network_preset_marker(root: Path | None = None) -> Path:
 
 
 def apply_network_preset(*, reload_engine: bool = True, root: Path | None = None) -> dict:
-    """Auto-switch the routing preset for the current network; no-op when unchanged.
-
-    Applies the mapped preset with ``setup_tui.apply_preset_by_name`` (lossless
-    merge: routes/providers are added, nothing removed) and, when the preset
-    changed, reloads the engine so the change goes live. Writes the
-    ``state/network-preset.json`` marker for the status/tray surface.
-    """
-    root = Path(root) if root is not None else ROOT
-    preset = preset_for_current_network()
-    now = int(time.time())
-    if preset is None:
-        return {"applied": False, "reason": "no network mapping", "checked_at": now}
-    try:
-        current = json.loads((root / "router.json").read_text()).get("preset")
-    except (OSError, json.JSONDecodeError):
-        current = None
-    if current == preset:
-        return {"applied": False, "reason": "already active", "preset": preset, "checked_at": now}
-    from setup_tui import apply_preset_for_activation
-    reload = (lambda: _elevated_reload() if _engine_runs_as_root() else engine_reload()) if reload_engine else None
-    result = apply_preset_for_activation(root, preset, validate=load_config,
-                                         write_config=_atomic_write, reload=reload)
-    if result["applied"]:
-        _atomic_write(network_preset_marker(root), json.dumps({
-            "ssid": current_ssid(), "preset": preset, "applied_at": now,
-        }))
-    return {**result, "preset": preset, "checked_at": now}
-
+    import network_control
+    return network_control.apply_mapping(SimpleNamespace(**globals()), root or ROOT, reload_engine)
 
 _BUILTIN_NETWORK_PRESETS = ("default", "opencode", "roblox", "school-warp")
 _PRESET_SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
@@ -4661,6 +4604,9 @@ def _valid_preset_name(name: str) -> str | None:
     Mirrors setup_tui's built-ins (the tray keeps the same mirrored list) and
     accepts any custom preset that exists as ``presets/<name>.json``.
     """
+    if isinstance(name, str) and name.startswith("profile:"):
+        import network_control
+        return network_control.profile_error(ROOT, name)
     if not isinstance(name, str) or not _PRESET_SLUG_RE.fullmatch(name):
         return "preset name must be 1-64 characters of [A-Za-z0-9._-]"
     if name in _BUILTIN_NETWORK_PRESETS:
@@ -4710,11 +4656,12 @@ def network_presets_state() -> dict:
             marker = loaded
     except (OSError, json.JSONDecodeError):
         marker = {}
-    ssid = current_ssid()
+    status = network_status()
+    ssid = status.get("ssid")
     mapping = network_preset_map()
     return {
         "ssid": ssid,
-        "connected": bool(ssid),
+        **status,
         "auto": network_auto_enabled(),
         "mapped_preset": mapping.get(ssid) if ssid else None,
         "presets": dict(sorted(mapping.items())),
@@ -4738,8 +4685,9 @@ def cmd_network_preset_show(as_json: bool = False) -> int:
 def cmd_network_preset_set(ssid: str, preset: str) -> int:
     """Map one Wi-Fi network to a preset (idempotent)."""
     ssid = (ssid or "").strip()
-    if not ssid:
-        return fail("--ssid must name the Wi-Fi network")
+    import network_control
+    if not network_control.valid_ssid(ssid):
+        return fail("--ssid must name a readable Wi-Fi network, not a redacted placeholder")
     if any(ch in ssid for ch in "\n\r\t"):
         return fail("--ssid must not contain control characters")
     if len(ssid) > 255:
@@ -7886,7 +7834,7 @@ def main() -> int:
         "network-preset",
         help="show or map a Wi-Fi network (SSID) to a routing preset")
     network_preset_parser.add_argument(
-        "action", nargs="?", default="show", choices=["show", "set", "remove", "auto"],
+        "action", nargs="?", default="show", choices=["show", "set", "remove", "auto", "disconnect", "observe"],
         help="show mappings (default), map a network, drop a mapping, or toggle auto")
     network_preset_parser.add_argument("--ssid", default=None, help="Wi-Fi network name")
     network_preset_parser.add_argument("--preset", default=None, help="preset to apply on that network")
@@ -7919,6 +7867,18 @@ def main() -> int:
             return cmd_network_preset_set(args.ssid or "", args.preset or "")
         if args.action == "remove":
             return cmd_network_preset_remove(args.ssid or "")
+        if args.action == "observe":
+            import network_control
+            if not network_control.valid_ssid(args.ssid):
+                return fail("unreadable network name")
+            network_control.remember(ROOT, args.ssid)
+            return cmd_network_preset_show(as_json=True)
+        if args.action == "disconnect":
+            import network_control
+            if args.state not in ("on", "off"):
+                return fail("--state must be on or off")
+            network_control.set_disconnect(ROOT, args.state == "on")
+            return cmd_network_preset_show(as_json=True)
         if args.action == "auto":
             return cmd_network_preset_auto(args.state or "")
         return cmd_network_preset_show(as_json=bool(getattr(args, "json", False)))

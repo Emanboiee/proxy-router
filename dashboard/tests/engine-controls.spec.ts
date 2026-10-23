@@ -469,7 +469,8 @@ test('desktop Connectivity shows the detected network and its preset', async ({ 
   await page.goto('/#connectivity');
 
   await expect(page.locator('#network-panel')).toBeVisible();
-  await expect(page.locator('#network-panel')).toContainText('SchoolWiFi');
+  await expect(page.locator('#network-panel')).toContainText('Hidden network');
+  await expect(page.locator('#network-panel')).not.toContainText('SchoolWiFi');
   await expect(page.locator('#network-panel')).toContainText('school-warp');
   // Real engine routes/providers, not the fixture's demo profiles.
   await expect(page.locator('#engine-routes')).toContainText('opencode-zen');
@@ -480,12 +481,12 @@ test('desktop Network card saves, toggles and removes the mapping', async ({ pag
   await page.addInitScript(desktopMock);
   await page.goto('/#connectivity');
 
-  await page.locator('#network-preset-select').selectOption('opencode');
+  await page.locator('#network-preset-select').selectOption('profile:opencode');
   await page.getByRole('button', { name: 'Save mapping', exact: true }).click();
   let saved = await page.evaluate(() => (window as unknown as { __invoke: { command: string; payload?: unknown }[] }).__invoke
     .filter(entry => entry.command === 'set_network_preset')
     .map(entry => entry.payload));
-  expect(saved).toContainEqual({ ssid: 'SchoolWiFi', preset: 'opencode' });
+  expect(saved).toContainEqual({ ssid: 'SchoolWiFi', preset: 'profile:opencode' });
 
   await page.getByRole('button', { name: 'Turn auto-switch off', exact: true }).click();
   const toggles = await page.evaluate(() => (window as unknown as { __invoke: { command: string; payload?: unknown }[] }).__invoke

@@ -662,3 +662,15 @@ button.primary:active,
 .route-rule { margin: 16px 0; padding: 16px; border: var(--border); border-radius: 6px; display: grid; gap: 12px; }
 
 .server-pool-scroll { max-height: 320px; overflow: auto; }
+
+.route-list .network-history-row { display:flex; align-items:center; gap:12px; }
+.network-history-row > div { flex:1; min-width:0; }
+.network-history-row small { display:block; }
+.network-history-row select { max-width:280px; }
+.network-history-row button { flex:0 0 auto; }
+
+@media (max-width: 600px) {
+  .route-list .network-history-row { display:grid; grid-template-columns:minmax(0, 1fr) auto; }
+  .network-history-row > div { grid-column:1 / -1; }
+  .network-history-row select { min-width:0; width:100%; max-width:none; }
+}
