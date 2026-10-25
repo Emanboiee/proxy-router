@@ -32,6 +32,8 @@ input[type="checkbox"]:checked::after { background: var(--accent-ink); transform
 textarea { resize: vertical; }
 a { color: inherit; }
 :focus-visible { outline: 3px solid var(--focus); outline-offset: 3px; }
+/* The skip-link target is a scrolling landmark, not an interactive control. */
+#main[tabindex="-1"]:focus { outline: none; }
 #app { display: grid; grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); height: 100dvh; }
 .rail { background: var(--surface); border-bottom: var(--border); padding: var(--space-3) clamp(var(--space-3), 4vw, var(--space-5)); display: flex; flex-direction: row; align-items: center; gap: var(--space-4); min-width: 0; }
 .rail header { display: flex; align-items: center; gap: var(--s3); min-height: var(--target); }
@@ -212,6 +214,20 @@ summary { display: flex; align-items: center; cursor: pointer; color: var(--mute
 .profile-meta { display: flex; justify-content: space-between; gap: var(--s3); color: var(--muted); font-size: var(--text-sm); padding: var(--s4) 0; border-top: var(--border); border-bottom: var(--border); margin: var(--s4) 0; }
 .tip, .info-row { display: flex; align-items: center; gap: var(--s4); margin-top: var(--s4); }.tip span { color: var(--muted); }.tip strong { white-space: nowrap; }
 .editor { max-width: 54rem; }.form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-3); }.form-grid label, .settings-panel label, .compact-controls label { display: grid; gap: var(--space-2); color: var(--muted); }.form-grid .wide { grid-column: 1 / -1; }.form-actions { justify-content: flex-end; margin-top: var(--space-4); }.field-with-action { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: var(--space-2); }.field-with-action > label { min-width: 0; }.provider-fields[hidden], .endpoint-field[hidden] { display: none; }.field-note { margin: calc(var(--space-2) * -1) 0 0; color: var(--muted); font-size: var(--text-sm); }
+.provider-fields { display: grid; gap: var(--space-3); }
+.provider-fields [hidden] { display: none; }
+.provider-fields .field-note { margin: 0; }
+#import-feedback:not(:empty), #provider-dialog .provider-feedback {
+  margin: var(--space-3) 0 0;
+  padding: var(--space-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm, 8px);
+  background: var(--surface);
+  color: var(--text);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+#import-feedback:empty { display: none; }
 .provider-card { display: flex; flex-direction: column; min-height: 250px; }
 .provider-controls > label { grid-column: 1; }
 .provider-controls > select { grid-column: 2; min-width: 0; min-height: var(--target); }
@@ -655,3 +671,69 @@ button.primary:active,
 .preset-route-table th, .preset-route-table td { padding: var(--space-2); vertical-align: top; border-bottom: var(--border); }
 .preset-route-table td:last-child { overflow-wrap: anywhere; }
 .preset-route-table thead th { color: var(--muted); }
+
+.route-rule { margin: 16px 0; padding: 16px; border: var(--border); border-radius: 6px; display: grid; gap: 12px; }
+
+.server-pool-scroll { max-height: 320px; overflow: auto; }
+
+.route-list .network-history-row { display:flex; align-items:center; gap:12px; }
+.network-history-row > div { flex:1; min-width:0; }
+.network-history-row small { display:block; }
+.network-history-row select { max-width:280px; }
+.network-history-row button { flex:0 0 auto; }
+
+@media (max-width: 600px) {
+  .route-list .network-history-row { display:grid; grid-template-columns:minmax(0, 1fr) auto; }
+  .network-history-row > div { grid-column:1 / -1; }
+  .network-history-row select { min-width:0; width:100%; max-width:none; }
+}
+
+.network-profile-picker { position: relative; display: block; min-width: 0; flex: 1; }
+@media (max-width: 650px) { .provider-controls > .network-profile-picker { flex-basis: 100%; } }
+
+.web-select { position: relative; display: block; min-width: 0; width: 100%; }
+.web-select > select { display: none !important; }
+.web-select-menu { position: fixed; inset: auto; margin: 0; }
+.web-select-menu [role="option"]:disabled { opacity: .5; cursor: not-allowed; }
+.provider-controls > .web-select { flex: 1; min-width: 0; }
+.select-trigger[aria-invalid="true"] { border-color: var(--danger); }
+input[type="number"] { appearance: textfield; -moz-appearance: textfield; }
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+
+.web-select-error:empty { display: none; }
+
+/* Keep modal surfaces in one WKWebView paint layer; animated translucent
+   backdrops can leave the form invisible while accessibility still sees it. */
+dialog#provider-dialog::backdrop, dialog#profile-dialog::backdrop {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  animation: none;
+}
+dialog#provider-dialog[open] .provider-editor,
+dialog#profile-dialog[open] .profile-editor {
+  animation: none;
+  opacity: 1;
+  transform: none;
+}
+
+.home-more-details { width: min(100%, 42rem); margin: var(--s6) auto 0; }
+.home-more-trigger {
+  display: flex; align-items: center; justify-content: center; gap: var(--s3);
+  width: min(100%, 26rem); margin: 0 auto; padding: var(--s4) var(--s6);
+  min-height: 56px; border: var(--border); border-radius: var(--radius);
+  background: var(--raised); color: var(--ink); font-weight: 600; cursor: pointer;
+  list-style: none;
+}
+.home-more-trigger::-webkit-details-marker { display: none; }
+.home-more-trigger:hover { background: var(--raised-2); }
+.home-more-trigger:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+.home-more-details .less-label { display: none; }
+.home-more-details[open] > summary .more-label { display: none; }
+.home-more-details[open] > summary .less-label { display: inline; }
+.home-more-details[open] > summary .select-chevron { transform: rotate(225deg); }
+.home-route-details > summary { justify-content: center; gap: var(--s2); width: 100%; text-align: center; list-style: none; padding: var(--s3); }
+.home-route-details > summary::-webkit-details-marker { display: none; }
+.home-route-details > summary::after { content: '+'; }
+.home-route-details[open] > summary::after { content: '−'; }
+.home-route-details .route-list { text-align: left; }

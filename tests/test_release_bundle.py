@@ -82,6 +82,7 @@ class ReleaseBundleSourceTests(unittest.TestCase):
             "install.sh": (ROOT / "install.sh").read_text(),
             "install.ps1": (ROOT / "install.ps1").read_text(),
             "assemble-release-bundle.sh": ASSEMBLY_HELPER.read_text(),
+            "release source archive": (ROOT / ".github/workflows/release.yml").read_text(),
         }
         for name in sorted(modules):
             skip_windows = name in _MACOS_ONLY_MODULES

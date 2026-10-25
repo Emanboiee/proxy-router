@@ -40,13 +40,16 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Any
 
 import domain_autodetect
 import egress
 import net_safety
+import provider_lifecycle
 import state
+import status_snapshot
 from providers_check import provider_config_errors as _provider_config_errors
 from config_schema import (
     DEFAULT_DIRECT_PROBE_URL,
@@ -104,10 +107,21 @@ _rotation: dict = {}
 # Rotate logs/sing-box.log once it outgrows this (mirrors monitor.py sample
 # rotation); the live log grows a line per connection and is unbounded.
 LOG_MAX_BYTES = 10_000_000
-# Confirmed direct fallbacks are retried on a slow cadence to avoid flapping.
+# Confirmed fallbacks are retried on a slow cadence to avoid flapping.
 RECOVERY_COOLDOWN_SECONDS = 120.0
-RESTORE_COOLDOWN_SECONDS = 300.0
+# Primary restoration checks run every minute; two wins are still required.
+RESTORE_COOLDOWN_SECONDS = 60.0
 RESTORE_SUCCESS_THRESHOLD = 2
+
+
+class _RouterView:
+    """Late-bound view of this module's globals for ``egress`` policy calls."""
+
+    def __getattr__(self, name):
+        return globals()[name]
+
+
+_ROUTER_VIEW = _RouterView()
 
 _sing_box_cache: str | None = None
 _sing_box_resolved = False
@@ -1319,6 +1333,14 @@ def egress_is_blocked(name: str, profile: Path, now: int | None = None) -> bool:
     return (now if now is not None else int(time.time())) < int(until)
 
 
+def egress_is_exhausted(name: str, profile: Path, now: int | None = None) -> bool:
+    """True while this exit carries an unexpired quota-exhaustion marker."""
+    return egress.quota_active(
+        read_egress(name, profile),
+        int(time.time()) if now is None else int(now),
+    )
+
+
 def _is_block_reason(reason: str) -> bool:
     """True when an upstream failure reason describes an egress-IP reputation
     block (Cloudflare 1010/403) rather than a transient error."""
@@ -1464,6 +1486,11 @@ def activate_fallback(name: str, *, target: str | None = None, reason: str = "tr
     return fail(f"provider '{name}': {last_error}")
 
 
+def _recover_primary_route(name: str, reachable) -> int:
+    """Delegate primary-exit recovery to the egress transport policy."""
+    return egress.recover_primary_route(_ROUTER_VIEW, name, reachable)
+
+
 def recover_route(name: str, host: str) -> int:
     """Confirm a stalled route, then try configured alternatives and opt-in direct."""
     if MANUAL_OFF_FILE.exists() or not _automatic_proxy_mode():
@@ -1500,12 +1527,14 @@ def recover_route(name: str, host: str) -> int:
     original = _fallback_state_path(name)
     previous = original.read_text() if original.is_file() else None
     active = active_fallback(name)
-    # Try at most two VPN alternatives per attempt, keeping direct last.
+    primary_rc = _recover_primary_route(name, reachable)
+    if primary_rc in (0, 3):
+        return primary_rc
+    if primary_rc == 2:
+        return fail("primary recovery rollback failed; deferring fallback")
+    # Exhaust eligible primary exits before trying other providers; direct stays last.
     configured = configured_fallbacks(name)
     candidates = [item for item in configured if item != "direct" and item != active][:2]
-    if not configured:
-        rc = rotate(name, reason="timeout", automatic=True)
-        return 0 if rc == 0 and reachable() else 1
     if "direct" in configured and active != "direct":
         candidates.append("direct")
     for candidate in candidates:
@@ -1529,13 +1558,18 @@ def recover_route(name: str, host: str) -> int:
     return fail(f"no working fallback for '{name}'")
 
 
-def restore_fallback(name: str, host: str) -> int:
-    """Probe a primary provider and remove a direct fallback after two wins.
+def restore_fallback(name: str, host: str, *, automatic: bool = False) -> int:
+    """Probe a primary provider and clear its fallback after two wins.
 
-    Direct fallback remains the serving path while the primary is checked. A
-    failed check immediately reinstates direct routing; a single successful
-    check is retained as evidence and the second consecutive success commits
-    the return to the VPN. Attempts are cooldown-limited to prevent flapping.
+    The serving fallback stays in place while the primary is checked. A failed
+    check immediately reinstates that SAME fallback; a single successful check
+    is retained as evidence and the second consecutive success commits the
+    return to the primary. Attempts are cooldown-limited to prevent flapping.
+
+    ``automatic`` marks a supervisor-driven call. It may only clear fallbacks
+    owned by automatic transport recovery, including a ``confirmed-stall`` park
+    that landed on another provider; a deliberate caller keeps the legacy
+    contract and may restore any direct fallback.
     """
     if MANUAL_OFF_FILE.exists() or not _automatic_proxy_mode():
         return 3
@@ -1550,7 +1584,9 @@ def restore_fallback(name: str, host: str) -> int:
     url = f"https://{host}/"
     if urllib.parse.urlsplit(url).hostname != host or unsafe_probe_target(url):
         return fail("unsafe restore target")
-    if active_fallback(name) != "direct":
+    serving = egress.restorable_fallback(
+        _ROUTER_VIEW, name, automatic=automatic)
+    if serving is None:
         return 3
     marker = ROOT / "state" / "recovery" / f"{name}-restore.json"
     now = time.time()
@@ -1568,7 +1604,7 @@ def restore_fallback(name: str, host: str) -> int:
     except (TypeError, ValueError):
         successes = 0
     # Temporarily restore the primary so this probe cannot accidentally measure
-    # the already-selected direct path.
+    # the already-selected fallback path.
     rc = deactivate_fallback(name, automatic=True)
     if rc != 0:
         return rc
@@ -1584,17 +1620,22 @@ def restore_fallback(name: str, host: str) -> int:
         _atomic_write(marker, json.dumps({
             "attempted_at": now, "host": host, "successes": successes,
         }, sort_keys=True) + "\n", 0o600)
-        if activate_fallback(name, target="direct", reason="restore-pending", automatic=True) == 0:
+        reason = "restore-pending" if serving == "direct" else "confirmed-stall"
+        if activate_fallback(name, target=serving, reason=reason,
+                             automatic=True) == 0:
             print(f"primary check passed for {name}; awaiting one more check")
             return 1
-        return fail(f"provider '{name}' restore pending but direct fallback could not be reinstated")
-    # Keep service available through direct while the VPN is still unhealthy.
+        return fail(f"provider '{name}' restore pending but fallback '{serving}' could not be reinstated")
+    # Keep service available through the original fallback while the primary is
+    # still unhealthy.
     _atomic_write(marker, json.dumps({
         "attempted_at": now, "host": host, "successes": 0,
     }, sort_keys=True) + "\n", 0o600)
-    if activate_fallback(name, target="direct", reason="primary-unhealthy", automatic=True) != 0:
-        return fail(f"provider '{name}' primary is still unhealthy and direct fallback failed")
-    print(f"primary still unhealthy: {name}; direct fallback retained", file=sys.stderr)
+    reason = "primary-unhealthy" if serving == "direct" else "confirmed-stall"
+    if activate_fallback(name, target=serving, reason=reason,
+                         automatic=True) != 0:
+        return fail(f"provider '{name}' primary is still unhealthy and fallback '{serving}' failed")
+    print(f"primary still unhealthy: {name}; fallback '{serving}' retained", file=sys.stderr)
     return 1
 
 
@@ -2214,6 +2255,10 @@ def check_egress_live(name: str, profile: Path, *, port: int | None = None,
     ``dns_ok`` when determined) and reputation-block reasons still raise a
     blocked marker, exactly like probe_profile.
     """
+    if is_proxy_provider(name) and SING_BOX_CONFIG.is_file() and engine_alive():
+        record = provider_lifecycle.recover_routed(ROOT, name, SING_BOX_CONFIG, proxy_upstream)
+        if record is not None:
+            return "dead", record
     url = url or probe_url_for(name)
     if url is None:
         return "alive", None
@@ -3485,23 +3530,7 @@ def write_sing_box(config: dict) -> None:
         print("router: refusing to write an egress-less sing-box config; keeping existing file",
               file=sys.stderr)
         return
-    SING_BOX_CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            "w", encoding="utf-8", dir=SING_BOX_CONFIG.parent,
-            prefix=f".{SING_BOX_CONFIG.name}.", suffix=".tmp", delete=False,
-        ) as handle:
-            temporary = Path(handle.name)
-            handle.write(json.dumps(config, indent=2) + "\n")
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, SING_BOX_CONFIG)
-        temporary = None
-        os.chmod(SING_BOX_CONFIG, 0o600)
-        _hand_back_ownership(SING_BOX_CONFIG)
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+    _atomic_write(SING_BOX_CONFIG, json.dumps(config, indent=2) + "\n", 0o600)
 
 
 def validate_config() -> bool:
@@ -3885,8 +3914,8 @@ def ensure_tray_started() -> None:
 def route_watcher_start() -> None:
     """Start the independent routed-connection watcher best-effort."""
     try:
-        import route_watcher
-
+        import route_watcher, network_control
+        network_control.start(ROOT)
         result = route_watcher.start(ROOT)
         if result.get("error"):
             print(f"router: route watcher unavailable: {result['error']}", file=sys.stderr)
@@ -4000,6 +4029,8 @@ def engine_start(use_existing_config: bool = False, *, recover: bool = True) -> 
                 print("router: generated config failed validation; restoring last-good", file=sys.stderr)
                 return restore_last_good()
             return fail("sing-box config check failed")
+    if error := provider_lifecycle.startup_error(ROOT, json.loads(SING_BOX_CONFIG.read_text()) if use_existing_config else config, _providers, proxy_upstream):
+        return fail(error)
     try:
         prepare_log_directory()
     except OSError as exc:
@@ -4480,44 +4511,12 @@ def _elevated_reload() -> int:
 # ---------------------------------------------------------------------------
 
 def current_ssid() -> str | None:
-    """Active Wi-Fi SSID via `ipconfig getsummary` (macOS, read-only).
-
-    Returns None when Wi-Fi is off or no interface answers. Pure getter;
-    tests inject synthetic output through subprocess mocks.
-    """
-    for iface in ("en0", "en1"):
-        try:
-            probe = subprocess.run(
-                ["ipconfig", "getsummary", iface],
-                capture_output=True, text=True, timeout=5,
-            )
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if probe.returncode != 0:
-            continue
-        for line in probe.stdout.splitlines():
-            if line.strip().startswith("SSID"):
-                _, _, value = line.partition(":")
-                ssid = value.strip()
-                return ssid or None
-    return None
+    return network_status().get("ssid")
 
 
 def network_status() -> dict:
-    """Return the current physical Wi-Fi state without touching the engine.
-
-    The guard is implemented for macOS, where ``ipconfig getsummary`` is the
-    same read-only source already used by network-aware presets. Other
-    platforms report ``supported: false`` and stay connected so keepalive
-    cannot tear down a VPN based on an unavailable platform probe.
-    """
-    checked_at = int(time.time())
-    if sys.platform != "darwin":
-        return {"connected": True, "ssid": None, "supported": False,
-                "checked_at": checked_at}
-    ssid = current_ssid()
-    return {"connected": bool(ssid), "ssid": ssid, "supported": True,
-            "checked_at": checked_at}
+    import network_control
+    return network_control.view(ROOT, network_control.probe(ROOT))
 
 
 def network_off_marker(root: Path | None = None) -> Path:
@@ -4583,7 +4582,7 @@ def cmd_network_reconnect() -> int:
         return 3
     if not network_off_marker().is_file():
         return 0
-    if sys.platform == "darwin" and not current_ssid():
+    if network_status().get("supported") and not network_status().get("connected"):
         return 2
     if load_config() != 0:
         return 1
@@ -4630,34 +4629,8 @@ def network_preset_marker(root: Path | None = None) -> Path:
 
 
 def apply_network_preset(*, reload_engine: bool = True, root: Path | None = None) -> dict:
-    """Auto-switch the routing preset for the current network; no-op when unchanged.
-
-    Applies the mapped preset with ``setup_tui.apply_preset_by_name`` (lossless
-    merge: routes/providers are added, nothing removed) and, when the preset
-    changed, reloads the engine so the change goes live. Writes the
-    ``state/network-preset.json`` marker for the status/tray surface.
-    """
-    root = Path(root) if root is not None else ROOT
-    preset = preset_for_current_network()
-    now = int(time.time())
-    if preset is None:
-        return {"applied": False, "reason": "no network mapping", "checked_at": now}
-    try:
-        current = json.loads((root / "router.json").read_text()).get("preset")
-    except (OSError, json.JSONDecodeError):
-        current = None
-    if current == preset:
-        return {"applied": False, "reason": "already active", "preset": preset, "checked_at": now}
-    from setup_tui import apply_preset_for_activation
-    reload = (lambda: _elevated_reload() if _engine_runs_as_root() else engine_reload()) if reload_engine else None
-    result = apply_preset_for_activation(root, preset, validate=load_config,
-                                         write_config=_atomic_write, reload=reload)
-    if result["applied"]:
-        _atomic_write(network_preset_marker(root), json.dumps({
-            "ssid": current_ssid(), "preset": preset, "applied_at": now,
-        }))
-    return {**result, "preset": preset, "checked_at": now}
-
+    import network_control
+    return network_control.apply_mapping(SimpleNamespace(**globals()), root or ROOT, reload_engine)
 
 _BUILTIN_NETWORK_PRESETS = ("default", "opencode", "roblox", "school-warp")
 _PRESET_SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
@@ -4669,6 +4642,9 @@ def _valid_preset_name(name: str) -> str | None:
     Mirrors setup_tui's built-ins (the tray keeps the same mirrored list) and
     accepts any custom preset that exists as ``presets/<name>.json``.
     """
+    if isinstance(name, str) and name.startswith("profile:"):
+        import network_control
+        return network_control.profile_error(ROOT, name)
     if not isinstance(name, str) or not _PRESET_SLUG_RE.fullmatch(name):
         return "preset name must be 1-64 characters of [A-Za-z0-9._-]"
     if name in _BUILTIN_NETWORK_PRESETS:
@@ -4718,11 +4694,12 @@ def network_presets_state() -> dict:
             marker = loaded
     except (OSError, json.JSONDecodeError):
         marker = {}
-    ssid = current_ssid()
+    status = network_status()
+    ssid = status.get("ssid")
     mapping = network_preset_map()
     return {
         "ssid": ssid,
-        "connected": bool(ssid),
+        **status,
         "auto": network_auto_enabled(),
         "mapped_preset": mapping.get(ssid) if ssid else None,
         "presets": dict(sorted(mapping.items())),
@@ -4746,8 +4723,9 @@ def cmd_network_preset_show(as_json: bool = False) -> int:
 def cmd_network_preset_set(ssid: str, preset: str) -> int:
     """Map one Wi-Fi network to a preset (idempotent)."""
     ssid = (ssid or "").strip()
-    if not ssid:
-        return fail("--ssid must name the Wi-Fi network")
+    import network_control
+    if not network_control.valid_ssid(ssid):
+        return fail("--ssid must name a readable Wi-Fi network, not a redacted placeholder")
     if any(ch in ssid for ch in "\n\r\t"):
         return fail("--ssid must not contain control characters")
     if len(ssid) > 255:
@@ -4853,6 +4831,8 @@ def engine_reload(active_overrides: dict[str, Path] | None = None) -> int:
         # not leave the proxy dead while a known-good config exists).
         print("router: new sing-box config failed validation; restoring last-good", file=sys.stderr)
         return _rejected_change_after_restore(restore_last_good())
+    if error := provider_lifecycle.startup_error(ROOT, config, _providers, proxy_upstream):
+        return fail(error)
     if sys.platform == "darwin" and _effective_uid() != 0:
         helper = _helper_status()
         if helper and helper.get("installed") and helper.get("running"):
@@ -5745,6 +5725,7 @@ def _network_diagnostic(*, runner=subprocess.run, opener=None,
     All subprocess/network dependencies are injectable for hermetic tests.
     """
     checked_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    generation = status_snapshot.network_generation(PID_FILE, SING_BOX_CONFIG)
     proxy = _effective_proxy_state(runner)
     proxy_status = "unknown"
     if proxy.get("known"):
@@ -5752,7 +5733,7 @@ def _network_diagnostic(*, runner=subprocess.run, opener=None,
     direct_url = _diagnostic_direct_url()
     if direct_url is None:
         return {
-            "checked_at": checked_at, "status": "direct_probe_skipped",
+            "checked_at": checked_at, "generation": generation, "status": "direct_probe_skipped",
             "proxy": proxy, "proxy_status": proxy_status,
             "direct_dns": {"status": "skipped", "reason": "no unrouted HTTPS target"},
             "direct": {"status": "skipped", "reason": "no unrouted HTTPS target"},
@@ -5800,6 +5781,8 @@ def _network_diagnostic(*, runner=subprocess.run, opener=None,
         overall = "direct_connection_failed"
     elif routed.get("status") == "routed_path_failed":
         overall = "routed_path_failed"
+    elif routed.get("status") not in {"ok", "reachable_http_error"}:
+        overall = "routed_probe_skipped"
     elif proxy_status == "unknown":
         overall = "system_proxy_unknown"
     else:
@@ -5808,7 +5791,7 @@ def _network_diagnostic(*, runner=subprocess.run, opener=None,
     if overall == "direct_dns_unavailable":
         recovery = "inspect configured/DHCP DNS, restore automatic DHCP DNS, run 'router.py reload', then rerun 'router.py doctor --network'"
     return {
-        "checked_at": checked_at, "status": overall, "proxy": proxy,
+        "checked_at": checked_at, "generation": generation, "status": overall, "proxy": proxy,
         "proxy_status": proxy_status, "direct_dns": direct_dns,
         "direct": direct, "routed": routed, "routed_url": routed_url,
         "dns": _macos_dns_snapshot(runner) if sys.platform == "darwin" or runner is not subprocess.run else {},
@@ -5823,28 +5806,9 @@ def _cached_network_diagnostic(*, now: float | None = None) -> dict | None:
     presenting an old successful probe as current connectivity evidence.
     Malformed or missing timestamps are stale by definition.
     """
-    try:
-        data = json.loads(NETWORK_DIAGNOSTIC_FILE.read_text())
-        if not isinstance(data, dict):
-            return None
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        return None
-    checked_at = data.get("checked_at")
-    age: float | None = None
-    try:
-        if isinstance(checked_at, (int, float)):
-            checked_epoch = float(checked_at)
-        else:
-            checked_epoch = datetime.datetime.fromisoformat(
-                str(checked_at)
-            ).timestamp()
-        age = max(0.0, (time.time() if now is None else float(now)) - checked_epoch)
-    except (TypeError, ValueError, OverflowError):
-        pass
-    enriched = dict(data)
-    enriched["age_seconds"] = round(age, 1) if age is not None else None
-    enriched["stale"] = age is None or age > NETWORK_DIAGNOSTIC_MAX_AGE_SECONDS
-    return enriched
+    return status_snapshot.cached_network_diagnostic(
+        NETWORK_DIAGNOSTIC_FILE, status_snapshot.network_generation(PID_FILE, SING_BOX_CONFIG),
+        NETWORK_DIAGNOSTIC_MAX_AGE_SECONDS, now=now)
 
 
 def doctor(network: bool = False) -> int:
@@ -7913,7 +7877,7 @@ def main() -> int:
         "network-preset",
         help="show or map a Wi-Fi network (SSID) to a routing preset")
     network_preset_parser.add_argument(
-        "action", nargs="?", default="show", choices=["show", "set", "remove", "auto"],
+        "action", nargs="?", default="show", choices=["show", "set", "remove", "auto", "disconnect", "observe"],
         help="show mappings (default), map a network, drop a mapping, or toggle auto")
     network_preset_parser.add_argument("--ssid", default=None, help="Wi-Fi network name")
     network_preset_parser.add_argument("--preset", default=None, help="preset to apply on that network")
@@ -7946,6 +7910,18 @@ def main() -> int:
             return cmd_network_preset_set(args.ssid or "", args.preset or "")
         if args.action == "remove":
             return cmd_network_preset_remove(args.ssid or "")
+        if args.action == "observe":
+            import network_control
+            if not network_control.valid_ssid(args.ssid):
+                return fail("unreadable network name")
+            network_control.observe(ROOT, args.ssid)
+            return cmd_network_preset_show(as_json=True)
+        if args.action == "disconnect":
+            import network_control
+            if args.state not in ("on", "off"):
+                return fail("--state must be on or off")
+            network_control.set_disconnect(ROOT, args.state == "on")
+            return cmd_network_preset_show(as_json=True)
         if args.action == "auto":
             return cmd_network_preset_auto(args.state or "")
         return cmd_network_preset_show(as_json=bool(getattr(args, "json", False)))
@@ -8210,8 +8186,10 @@ def main() -> int:
         if args.action in ("recover", "restore"):
             if not args.host:
                 parser.error(f"failover {args.action} requires --host")
-            handler = recover_route if args.action == "recover" else restore_fallback
-            return _with_lock(lambda: handler(args.provider, args.host))
+            if args.action == "recover":
+                return _with_lock(lambda: recover_route(args.provider, args.host))
+            return _with_lock(lambda: restore_fallback(
+                args.provider, args.host, automatic=args.automatic))
         if args.action == "on":
             return _with_lock(lambda: activate_fallback(
                 args.provider, target=args.to, reason=args.reason,

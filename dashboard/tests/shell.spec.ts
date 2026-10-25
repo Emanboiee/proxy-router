@@ -1,3 +1,4 @@
+import {selectWeb} from './select-web';
 import { test, expect } from '@playwright/test';
 import AxeBuilder from '@axe-core/playwright';
 import { mkdirSync, writeFileSync } from 'node:fs';
@@ -82,7 +83,7 @@ for (const [width, height] of [[1440, 900], [390, 844]]) {
         await page.screenshot({ path: `${evidence}/dialog-${width}.png` });
         expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
       }
-      await page.getByLabel('Connection state', { exact: true }).selectOption(value);
+      await selectWeb(page.getByLabel('Connection state', { exact: true }), value);
       await page.getByRole('button', { name: 'Show preview' }).click();
       await expect(page.getByRole('heading', { name: title, exact: true })).toBeVisible();
       await expect(page.getByRole('button', { name: 'Preview states' })).toBeFocused();
@@ -95,13 +96,13 @@ for (const [width, height] of [[1440, 900], [390, 844]]) {
     }
     await expect(page.getByRole('heading', { name: 'Couldn’t read status', exact: true })).toHaveCount(0);
     await page.getByRole('button', { name: 'Preview states' }).click();
-    await page.getByLabel('Connection state', { exact: true }).selectOption('connected');
+    await selectWeb(page.getByLabel('Connection state', { exact: true }), 'connected');
     await page.getByRole('button', { name: 'Show preview' }).click();
     await expect(page.getByRole('heading', { name: 'Connected', exact: true })).toBeVisible();
     await page.getByRole('button', { name: 'Preview states' }).click();
     await page.keyboard.press('Escape');
     await expect(page.getByRole('button', { name: 'Preview states' })).toBeFocused();
-    for (const name of ['Profiles', 'Providers', 'Connectivity', 'Settings', 'About', 'Home']) {
+    for (const name of ['Profiles', 'Providers', 'Connectivity', 'Settings', 'Appearance', 'Home']) {
       if (width === 390) await page.getByRole('button', { name: 'Menu', exact: true }).click();
       const navLink = page.getByRole('navigation').getByRole('link', { name, exact: true });
       await navLink.focus();
@@ -111,7 +112,7 @@ for (const [width, height] of [[1440, 900], [390, 844]]) {
       expect(await page.title()).toContain(name);
     }
     await page.goBack();
-    await expect(page.getByRole('heading', { name: 'About', exact: true })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Appearance', exact: true })).toBeVisible();
     await page.emulateMedia({ reducedMotion: 'reduce' });
     const styles = await page.evaluate(() => ({
       fonts: [...new Set([...document.querySelectorAll('*')].map(e => getComputedStyle(e).fontSize))],

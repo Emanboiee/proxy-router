@@ -1,15 +1,75 @@
+import {selectWeb} from './select-web';
 import { test, expect } from '@playwright/test';
+
+test('Home requests a fresh bounded latency measurement and expires it', async ({ page }) => {
+  await page.clock.install();
+  await page.addInitScript(desktopMock);
+  await page.goto('/');
+  await page.getByRole('button', {name: 'Connect', exact: true}).click();
+  await page.evaluate(() => {
+    const state = window as unknown as {__TAURI_INTERNALS__: {invoke: (...args: unknown[]) => Promise<unknown>}};
+    const original = state.__TAURI_INTERNALS__.invoke;
+    state.__TAURI_INTERNALS__.invoke = (...args) => args[0] === 'measure_proxy_latency'
+      ? Promise.resolve({latency_ms: 123}) : original(...args);
+  });
+  await page.getByRole('button', {name: 'Refresh latency', exact: true}).click();
+  await expect(page.locator('.visual-status-strip')).toContainText('123 ms · just now');
+  await page.clock.runFor(65000);
+  await expect(page.locator('.visual-status-strip')).toContainText('Click Refresh latency');
+});
+
+test('slow background reads do not overlap or request fixture status', async ({ page }) => {
+  await page.clock.install();
+  await page.addInitScript(desktopMock);
+  await page.goto('/');
+  await expect(page.locator('#active-preset')).toHaveText('opencode');
+  await page.evaluate(() => {
+    const state = window as unknown as { __TAURI_INTERNALS__: { invoke: (...args: unknown[]) => Promise<unknown> }; __pollReads?: number };
+    const invoke = state.__TAURI_INTERNALS__.invoke;
+    state.__pollReads = 0;
+    state.__TAURI_INTERNALS__.invoke = (...args) => {
+      if (args[0] === 'cached_live_status') {
+        state.__pollReads!++;
+        return new Promise(resolve => setTimeout(() => resolve(invoke(...args)), 12000));
+      }
+      return invoke(...args);
+    };
+  });
+  await page.clock.runFor(16000);
+  expect(await page.evaluate(() => (window as unknown as { __pollReads: number }).__pollReads)).toBe(1);
+  expect(await page.evaluate(() => (window as unknown as { __invoke: { command: string }[] }).__invoke.some(call => call.command === 'get_preview_status'))).toBe(false);
+  await page.clock.runFor(5000);
+  expect(await page.evaluate(() => (window as unknown as { __pollReads: number }).__pollReads)).toBe(2);
+});
 
 test('unchanged background status keeps the page DOM and expanded routing intact', async ({ page }) => {
   await page.clock.install();
   await page.addInitScript(desktopMock);
   await page.goto('/');
   await expect(page.locator('#active-preset')).toHaveText('opencode');
+  await expect(page.locator('#prototype-badge')).toHaveText('Live controller');
+  await expect(page.getByRole('button', { name: 'Preview states', exact: true })).toBeHidden();
+  await expect(page.locator('.home-route-details')).toBeHidden();
+  await page.locator('.home-more-trigger').focus();
+  await page.keyboard.press('Enter');
+  await page.clock.runFor(16000);
+  await expect(page.locator('.home-more-trigger')).toBeFocused();
+  await expect(page.locator('.home-route-details')).toBeVisible();
+  const centered = await page.locator('.home-route-details > summary').evaluate(node => {
+    const range = document.createRange();
+    range.selectNodeContents(node);
+    const text = range.getBoundingClientRect();
+    const button = node.getBoundingClientRect();
+    return Math.abs(text.x + text.width / 2 - button.x - button.width / 2);
+  });
+  expect(centered).toBeLessThan(20);
   await page.locator('.home-route-details').evaluate(node => { (node as HTMLDetailsElement).open = true; });
+  await page.locator('h1').focus();
   await page.locator('#main').evaluate(node => {
     (window as unknown as { __originalHero: Element | null }).__originalHero = node.querySelector('.connection-hero');
   });
   await page.clock.runFor(31000);
+  await expect(page.locator('.home-more-details')).toHaveAttribute('open', '');
   await expect(page.locator('.home-route-details')).toHaveAttribute('open', '');
   expect(await page.evaluate(() => document.querySelector('.connection-hero') ===
     (window as unknown as { __originalHero: Element | null }).__originalHero)).toBe(true);
@@ -204,6 +264,15 @@ const desktopMock = (seedCurrentSetup = false) => {
         return Promise.resolve(copyDashboard());
       }
       if (name === 'plugin:dialog|open') return Promise.resolve('/tmp/proton-home.conf');
+      if (name === 'manage_dashboard_server') {
+        const request = payload as { providerId: string; server: string; restore: boolean };
+        const provider = dashboard.providers.find(item => item.id === request.providerId)!;
+        const servers = provider.servers as string[];
+        const removed = (provider.removedServers ?? []) as string[];
+        provider.servers = request.restore ? [...servers, request.server] : servers.filter(server => server !== request.server);
+        provider.removedServers = request.restore ? removed.filter(server => server !== request.server) : [...removed, request.server];
+        return Promise.resolve(copyDashboard());
+      }
       if (name === 'save_dashboard_provider') {
         const request = payload as { provider: { name: string; kind: string }; providerId?: string | null; sourcePath?: string | null };
         if (request.providerId) {
@@ -324,8 +393,8 @@ test('desktop profile GUI creates, edits, duplicates and deletes saved profiles'
   await page.getByRole('button', { name: 'Create profile', exact: true }).click();
   const dialog = page.locator('#profile-dialog');
   await dialog.locator('[name="name"]').fill('Home setup');
-  await dialog.locator('[name="providerId"]').selectOption('warp');
-  await dialog.locator('[name="routeMode"]').selectOption('selective');
+  await selectWeb(dialog.locator('[name="providerId"]'), 'warp');
+  await selectWeb(dialog.locator('[name="routeMode"]'), 'selective');
   await dialog.locator('[name="domains"]').fill('example.com\napi.example.com');
   await dialog.locator('[name="autoSubdomains"]').check();
   await dialog.getByRole('button', { name: 'Create profile', exact: true }).click();
@@ -349,9 +418,9 @@ test('desktop profile GUI creates, edits, duplicates and deletes saved profiles'
   await page.clock.runFor(16500);
   await expect(dialog.locator('[name="description"]')).toHaveValue('A profile edited in the GUI');
   await expect(dialog.locator('[name="name"]')).toHaveValue('Home setup');
-  await dialog.locator('[name="fallback"]').selectOption('retry');
-  await dialog.locator('[name="fallbackProviderId"]').selectOption('proton');
-  await dialog.locator('[name="providerId"]').selectOption('proton');
+  await selectWeb(dialog.locator('[name="fallback"]'), 'retry');
+  await selectWeb(dialog.locator('[name="fallbackProviderId"]'), 'proton');
+  await selectWeb(dialog.locator('[name="providerId"]'), 'proton');
   await expect(dialog.locator('[name="fallbackProviderId"]')).toHaveValue('warp');
   await dialog.getByRole('button', { name: 'Save changes', exact: true }).click();
   await expect(card).toContainText('Retry another provider');
@@ -362,11 +431,14 @@ test('desktop profile GUI creates, edits, duplicates and deletes saved profiles'
   expect(edited.at(-1)?.profile).toMatchObject({ description: 'A profile edited in the GUI', providerId: 'proton', fallback: 'retry', fallbackProviderId: 'warp' });
   expect(edited.at(-1)?.profileId).toMatch(/^created-/);
 
+  await card.locator('.profile-more summary').click();
   await card.getByRole('button', { name: 'Duplicate', exact: true }).click();
   await expect(page.locator('.profile-card').filter({ hasText: 'Home setup copy' })).toBeVisible();
   const duplicate = page.locator('.profile-card').filter({ hasText: 'Home setup copy' });
   page.on('dialog', dialogEvent => dialogEvent.accept());
+  await duplicate.locator('.profile-more summary').click();
   await duplicate.getByRole('button', { name: 'Delete', exact: true }).click();
+  await page.getByRole('dialog').getByRole('button', {name:'Delete', exact:true}).click();
   await expect(page.locator('.profile-card').filter({ hasText: 'Home setup copy' })).toHaveCount(0);
   const deletions = await page.evaluate(() => (window as unknown as { __invoke: { command: string; payload?: unknown }[] }).__invoke
     .filter(entry => entry.command === 'delete_dashboard_profile'));
@@ -386,7 +458,7 @@ test('desktop profile apply failure leaves the previous selection intact', async
   await page.getByRole('button', { name: 'Create profile', exact: true }).click();
   const dialog = page.locator('#profile-dialog');
   await dialog.locator('[name="name"]').fill('Needs review');
-  await dialog.locator('[name="providerId"]').selectOption('warp');
+  await selectWeb(dialog.locator('[name="providerId"]'), 'warp');
   await dialog.locator('[name="domains"]').fill('example.com');
   await dialog.getByRole('button', { name: 'Create profile', exact: true }).click();
 
@@ -430,25 +502,28 @@ test('desktop provider GUI picks a local config, edits metadata, and deletes a s
   await page.getByRole('button', { name: 'Add provider', exact: true }).click();
   const dialog = page.locator('#provider-dialog');
   await dialog.locator('[name="name"]').fill('Proton home');
-  await dialog.locator('[name="kind"]').selectOption('custom');
+  await selectWeb(dialog.locator('[name="kind"]'), 'wireguard');
   await dialog.getByRole('button', { name: 'Choose WireGuard config', exact: true }).click();
   await expect(dialog.locator('#wireguard-file-label')).toHaveText('proton-home.conf');
   await dialog.getByRole('button', { name: 'Add provider', exact: true }).click();
   const providerCard = page.locator('.provider-card').filter({ hasText: 'Proton home' });
+  await page.locator('.provider-instances').getByRole('button', {name:/Proton home/}).click();
   await expect(providerCard).toBeVisible();
 
   const saves = await page.evaluate(() => (window as unknown as { __invoke: { command: string; payload?: unknown }[] }).__invoke
     .filter(entry => entry.command === 'save_dashboard_provider')
     .map(entry => entry.payload as { provider: { name: string; kind: string }; providerId: string | null; sourcePath: string | null }));
-  expect(saves[0]).toMatchObject({ provider: { name: 'Proton home', kind: 'custom' }, providerId: null, sourcePath: '/tmp/proton-home.conf' });
+  expect(saves[0]).toMatchObject({ provider: { name: 'Proton home', kind: 'wireguard' }, providerId: null, sourcePath: '/tmp/proton-home.conf' });
   expect(JSON.stringify(saves)).not.toContain('PRIVATE-KEY');
 
   page.on('dialog', dialogEvent => dialogEvent.accept());
+  await page.locator('.provider-instances').getByRole('button', {name:/Proton home/}).click();
   await providerCard.getByRole('button', { name: 'Edit', exact: true }).click();
   await dialog.locator('[name="name"]').fill('Proton personal');
   await dialog.getByRole('button', { name: 'Save connection', exact: true }).click();
   await expect(page.locator('.provider-card').filter({ hasText: 'Proton personal' })).toBeVisible();
   await page.locator('.provider-card').filter({ hasText: 'Proton personal' }).getByRole('button', { name: 'Delete', exact: true }).click();
+  await page.getByRole('dialog').getByRole('button', {name:'Delete', exact:true}).click();
   await expect(page.locator('.provider-card').filter({ hasText: 'Proton personal' })).toHaveCount(0);
   const deletes = await page.evaluate(() => (window as unknown as { __invoke: { command: string; payload?: unknown }[] }).__invoke
     .filter(entry => entry.command === 'delete_dashboard_provider'));
@@ -460,7 +535,8 @@ test('desktop Connectivity shows the detected network and its preset', async ({ 
   await page.goto('/#connectivity');
 
   await expect(page.locator('#network-panel')).toBeVisible();
-  await expect(page.locator('#network-panel')).toContainText('SchoolWiFi');
+  await expect(page.locator('#network-panel')).toContainText('Hidden network');
+  await expect(page.locator('#network-panel')).not.toContainText('SchoolWiFi');
   await expect(page.locator('#network-panel')).toContainText('school-warp');
   // Real engine routes/providers, not the fixture's demo profiles.
   await expect(page.locator('#engine-routes')).toContainText('opencode-zen');
@@ -471,12 +547,13 @@ test('desktop Network card saves, toggles and removes the mapping', async ({ pag
   await page.addInitScript(desktopMock);
   await page.goto('/#connectivity');
 
-  await page.locator('#network-preset-select').selectOption('opencode');
+  await page.getByRole('combobox', {name:'Profile for this network', exact:true}).click();
+  await page.locator('#network-preset-select-options').getByRole('option', {name:'OpenCode only', exact:true}).click();
   await page.getByRole('button', { name: 'Save mapping', exact: true }).click();
   let saved = await page.evaluate(() => (window as unknown as { __invoke: { command: string; payload?: unknown }[] }).__invoke
     .filter(entry => entry.command === 'set_network_preset')
     .map(entry => entry.payload));
-  expect(saved).toContainEqual({ ssid: 'SchoolWiFi', preset: 'opencode' });
+  expect(saved).toContainEqual({ ssid: 'SchoolWiFi', preset: 'profile:opencode' });
 
   await page.getByRole('button', { name: 'Turn auto-switch off', exact: true }).click();
   const toggles = await page.evaluate(() => (window as unknown as { __invoke: { command: string; payload?: unknown }[] }).__invoke
@@ -519,7 +596,7 @@ test('desktop Settings shows engine values and switches routing mode', async ({ 
 });
 
 
-test('mixed preset editor shows route connections and missing WARP without a false single-provider selector', async ({ page }) => {
+test('mixed preset editor edits each route and preserves missing connection choices', async ({ page }) => {
   await page.addInitScript(desktopMock);
   await page.addInitScript(() => {
     const state = window as unknown as { __dashboard: { profiles: unknown[]; providers: unknown[] } };
@@ -536,10 +613,11 @@ test('mixed preset editor shows route connections and missing WARP without a fal
   await page.goto('/#profiles');
   await page.getByRole('button', { name: 'Edit', exact: true }).click();
   const dialog = page.locator('#profile-dialog');
-  await expect(dialog.getByRole('row', { name: 'school cloudflare · Not configured discord.com' })).toBeVisible();
-  await expect(dialog.getByRole('row', { name: 'opencode proton opencode.ai' })).toBeVisible();
-  await expect(dialog.locator('[name="providerId"]')).toHaveCount(0);
-  await expect(dialog).toContainText('Missing connections: cloudflare');
+  await expect(dialog.locator('[data-route-rule]')).toHaveCount(2);
+  await expect(dialog.locator('[name="route-provider"]').first()).toHaveValue('cloudflare');
+  await expect(dialog.locator('[name="route-provider"]').nth(1)).toHaveValue('proton');
+  await expect(dialog.locator('[name="route-domains"]').first()).toHaveValue('discord.com');
+  await expect(dialog).toContainText('cloudflare · Not configured');
   for (const width of [1440, 390]) {
     await page.setViewportSize({ width, height: 900 });
     await page.screenshot({ path: `test-results/mixed-preset-${width}.png` });
@@ -560,15 +638,123 @@ test('desktop adds WARP proxy using its configured port without requiring a Wire
   await page.getByRole('button', { name: 'Add provider', exact: true }).click();
   const dialog = page.locator('#provider-dialog');
   await dialog.locator('[name="name"]').fill('Cloudflare WARP');
-  await dialog.locator('[name="kind"]').selectOption('warp');
+  await selectWeb(dialog.locator('[name="kind"]'), 'warp');
   await expect(dialog.locator('[data-provider-fields="config"]')).not.toBeVisible();
   await expect(dialog.locator('[name="socksHost"]')).toBeVisible();
   await dialog.locator('[name="socksPort"]').fill('2181');
+  await selectWeb(dialog.locator('[name="startupMode"]'), 'warp');
   await dialog.getByRole('button', { name: 'Add provider', exact: true }).click();
   await expect(dialog).not.toBeVisible();
   const calls = await page.evaluate(() => (window as unknown as { __invoke: { command: string; payload?: unknown }[] }).__invoke);
   expect(calls.filter(call => call.command === 'save_dashboard_provider').at(-1)?.payload).toMatchObject({
-    provider: { name: 'Cloudflare WARP', kind: 'warp', host: '127.0.0.1', port: 2181 }, sourcePath: null,
+    provider: { name: 'Cloudflare WARP', kind: 'warp', host: '127.0.0.1', port: 2181, startup: { mode: 'warp' } }, sourcePath: null,
   });
   expect(calls.some(call => call.command === 'run_router_action')).toBe(false);
+});
+
+
+test('generic command provider saves command and port without executing on save', async ({ page }) => {
+  await page.addInitScript(desktopMock);
+  await page.goto('/#providers');
+  await page.getByRole('button', { name: 'Add provider', exact: true }).click();
+  const dialog = page.locator('#provider-dialog');
+  await dialog.locator('[name="name"]').fill('My proxy');
+  await selectWeb(dialog.locator('[name="kind"]'), 'socks5');
+  await expect(dialog.locator('[name="startupCommand"]')).not.toBeVisible();
+  await selectWeb(dialog.locator('[name="startupMode"]'), 'command');
+  await expect(dialog.locator('[name="startupCommand"]')).toBeVisible();
+  const help = await dialog.locator('#startup-help').boundingBox();
+  const endpointHelp = await dialog.locator('#proxy-help').boundingBox();
+  expect(help && endpointHelp && help.y + help.height <= endpointHelp.y).toBeTruthy();
+  await selectWeb(dialog.locator('[name="startupMode"]'), 'external');
+  await expect(dialog.locator('[name="startupCommand"]')).not.toBeVisible();
+  await selectWeb(dialog.locator('[name="startupMode"]'), 'command');
+  await dialog.locator('[name="startupCommand"]').fill('my-proxy --listen 127.0.0.1:9000');
+  await dialog.locator('[name="socksPort"]').fill('9000');
+  await dialog.getByRole('button', { name: 'Add provider', exact: true }).click();
+  await expect(dialog).not.toBeVisible();
+  const calls = await page.evaluate(() => (window as unknown as { __invoke: { command: string; payload?: unknown }[] }).__invoke);
+  expect(calls.filter(call => call.command === 'save_dashboard_provider').at(-1)?.payload).toMatchObject({
+    provider: { name: 'My proxy', kind: 'socks5', host: '127.0.0.1', port: 9000,
+      startup: { mode: 'command', command: 'my-proxy --listen 127.0.0.1:9000' } },
+  });
+  expect(calls.some(call => call.command === 'run_router_action')).toBe(false);
+});
+
+
+test('existing WireGuard provider accepts another server without creating a provider or connecting', async ({ page }) => {
+  await page.addInitScript(desktopMock);
+  await page.goto('/#providers');
+  await page.locator('.provider-instances').getByRole('button', {name:/Proton custom VPN/}).click();
+  const card = page.locator('.provider-card').filter({ hasText: 'Proton custom VPN' });
+  await card.getByRole('button', { name: 'Add WireGuard config', exact: true }).click();
+  const dialog = page.locator('#provider-dialog');
+  await expect(dialog.locator('[name="kind"] option[value="custom"]')).toHaveCount(0);
+  await expect(dialog.locator('select[name="kind"]')).toHaveValue('wireguard');
+  await expect(dialog).toContainText('1 saved server in this provider');
+  await dialog.getByRole('button', { name: 'Add WireGuard config', exact: true }).click();
+  await expect(dialog.locator('#wireguard-file-label')).toHaveText('proton-home.conf');
+  await dialog.getByRole('button', { name: 'Add server', exact: true }).click();
+  await expect(dialog).not.toBeVisible();
+  const calls = await page.evaluate(() => (window as unknown as { __invoke: { command: string; payload?: unknown }[] }).__invoke);
+  expect(calls.filter(call => call.command === 'save_dashboard_provider').at(-1)?.payload).toMatchObject({
+    providerId: 'proton', provider: { name: 'Proton custom VPN', kind: 'wireguard' }, sourcePath: '/tmp/proton-home.conf',
+  });
+  expect(calls.some(call => call.command === 'run_router_action')).toBe(false);
+  await expect(page.locator('.provider-card')).toHaveCount(2);
+});
+
+
+test('provider edit removes and restores pool servers without changing the connection', async ({ page }) => {
+  await page.addInitScript(desktopMock);
+  await page.addInitScript(() => {
+    const state = window as unknown as { __dashboard: { providers: Record<string, unknown>[] } };
+    Object.assign(state.__dashboard.providers[1], { server: 'current', servers: ['current', 'unused', 'backup'], removedServers: [] });
+  });
+  await page.goto('/#providers');
+  await page.locator('.provider-instances').getByRole('button', {name:/Proton custom VPN/}).click();
+  await page.locator('.provider-card').filter({ hasText: 'Proton custom VPN' }).getByRole('button', { name: 'Edit', exact: true }).click();
+  const dialog = page.locator('#provider-dialog');
+  await expect(dialog.getByRole('row', { name: 'current Current Remove' }).getByRole('button')).toBeDisabled();
+  await dialog.getByRole('row', { name: 'unused Available Remove' }).getByRole('button').click();
+  await expect(dialog.getByRole('row', { name: 'unused Removed Restore' })).toBeVisible();
+  await dialog.locator('[data-pool-search]').fill('backup');
+  await expect(dialog.getByRole('row', { name: 'backup Available Remove' })).toBeVisible();
+  await expect(dialog.getByRole('row', { name: 'current Current Remove' })).toBeHidden();
+  await dialog.locator('[data-pool-search]').fill('nothing');
+  await expect(dialog.locator('[data-pool-empty]')).toBeVisible();
+  await dialog.locator('[data-pool-search]').fill('');
+  await dialog.getByRole('row', { name: 'unused Removed Restore' }).getByRole('button').click();
+  await expect(dialog.getByRole('row', { name: 'unused Available Remove' })).toBeVisible();
+  const calls = await page.evaluate(() => (window as unknown as { __invoke: { command: string }[] }).__invoke);
+  expect(calls.filter(call => call.command === 'manage_dashboard_server')).toHaveLength(2);
+  expect(calls.some(call => call.command === 'run_router_action')).toBe(false);
+});
+
+test('profile editor adds changes and removes routing rules before saving', async ({ page }) => {
+  await page.addInitScript(desktopMock);
+  await page.goto('/#profiles');
+  await page.locator('.profile-card').filter({ hasText: 'OpenCode only' }).getByRole('button', { name: 'Edit', exact: true }).click();
+  const dialog = page.locator('#profile-dialog');
+  await dialog.locator('.editor-advanced summary').click();
+  await dialog.getByRole('button', { name: 'Add more routing rules' }).click();
+  await dialog.getByRole('button', { name: 'Add routing rule', exact: true }).click();
+  const rules = dialog.locator('[data-route-rule]');
+  await expect(rules).toHaveCount(2);
+  await rules.nth(1).locator('[name="route-id"]').fill('discord');
+  await selectWeb(rules.nth(1).locator('[name="route-provider"]'), 'warp');
+  await rules.nth(1).locator('[name="route-domains"]').fill('discord.com');
+  await selectWeb(rules.nth(1).locator('[name="route-fallback"]'), 'block');
+  await dialog.getByRole('button', { name: 'Add routing rule', exact: true }).click();
+  await rules.nth(2).getByRole('button', { name: 'Remove routing rule' }).click();
+  await expect(rules).toHaveCount(2);
+  await dialog.getByRole('button', { name: 'Save changes' }).click();
+  await expect(dialog).toBeHidden();
+  const calls = await page.evaluate(() => (window as unknown as { __invoke: { command: string; payload?: unknown }[] }).__invoke);
+  expect(calls.filter(call => call.command === 'save_dashboard_profile').at(-1)?.payload).toMatchObject({
+    profileId: 'opencode', profile: { routeRules: [
+      { id: 'route-1', providerId: 'proton', domains: ['opencode.ai'] },
+      { id: 'discord', providerId: 'warp', domains: ['discord.com'], fallback: 'block' },
+    ] },
+  });
 });

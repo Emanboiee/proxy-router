@@ -684,6 +684,18 @@ stays resident and hides its icon while that lease is fresh. Clean quit removes
 the lease; after a crash, Python reveals its icon when the 60-second lease expires.
 Installing an app bundle alone does not hide the Python tray.
 
+The tray's **Open Dashboard** action discovers a built app in the repository,
+adjacent dashboard checkout, or installed bundle. Set `PROXY_ROUTER_DASHBOARD`
+to an explicit app path before starting the tray to override discovery:
+
+```sh
+PROXY_ROUTER_DASHBOARD="/Applications/Proxy Router.app" python3 proxy_tray.py
+```
+
+Without a built dashboard or release binary, the action opens the terminal TUI.
+The first successful TUI fallback per tray session shows a menu hint explaining
+how to select the dashboard. This override selects the app; it does not build it.
+
 For installations that explicitly want the native app supervised without a
 Python fallback icon, use:
 
@@ -705,8 +717,8 @@ Menu map:
 
 - **Status header** (`● Connected` / `○ Disconnected` / `! Error`; a fresh
   install shows "No VPN set up yet" with a pointer at Setup).
-- **Open Dashboard** — opens the full terminal wizard in a Terminal window
-  (the bold default action).
+- **Open Dashboard** — opens the installed dashboard, or the terminal wizard
+  when no dashboard is available (the bold default action).
 - **Connect / Reconnect · Disconnect** — `router.py start` / `stop`.
   Disconnect writes the manual-off marker, so the keepalive will NOT
   resurrect the engine until you connect again.
@@ -1003,4 +1015,71 @@ python3 -m pytest tests -q --randomly-seed=58
 
 [MIT](LICENSE)
 
+
+### Managed local proxy startup
+
+In the desktop app, choose **Add provider → SOCKS5 proxy**, enter the local
+host and port, then choose **Run my startup command** and paste one executable
+with its arguments. The program must expose that SOCKS5 endpoint; OpenVPN
+alone exposes a VPN tunnel, so it needs a local proxy bridge rather than an
+OpenVPN management port. Install the program and configure its credentials
+first. Use explicit paths; shell pipes, redirection, and implicit elevation
+are not supported.
+
+Startup is local metadata saved by the provider editor. Saving or viewing
+status never runs a command. Routing presets cannot grant startup permission.
+On Connect/reload, only local proxy providers referenced by generated routing
+rules start. The engine waits up to 20 seconds for a SOCKS5 handshake; failed
+startup does not claim readiness. Active egress health checks can recover a
+missing managed provider, with a short delay after failed launches.
+Concurrent starts are serialized and an already ready proxy is reused.
+Commands run as the runtime directory owner, including when the router is
+invoked with root permissions. Programs remain running after router
+disconnect; they can be shared by other apps.
+
+For WARP, choose **Start Cloudflare WARP automatically** instead. Proxy Router
+uses the installed, registered official client to configure proxy mode, set
+the chosen port, and connect. The WARP GUI need not be open, but its service
+must be installed; this feature does not install software, accept terms,
+register accounts, or silently grant administrator permissions.
+
+
+### Add servers to one WireGuard provider
+
+In **Providers**, create a WireGuard provider named, for example, Proton.
+Use **Add server → Add WireGuard config → Save connection** to import
+another `.conf` into that same provider. The provider card shows its saved
+server count; Home's preferred-server selector and server browser include
+the imported servers.
+
+Imports preserve the provider's configured folder, current server,
+preferences, and routing. Re-importing identical content adds no duplicate.
+Different configs with the same filename receive a suffix rather than
+overwriting an existing server. Saving an import does not connect or switch
+the engine. Legacy Custom VPN entries are displayed as WireGuard.
+
+### Wi-Fi mappings and network-loss protection
+
+Connectivity remembers up to five distinct Wi-Fi networks after their names
+become readable. Show names reveals them for this app session. macOS requires
+Location Services authorization to read an SSID; Proxy Router requests it only
+when you click Show names. Hidden or redacted names are never mapping keys.
+
+Choose a saved profile for each current or recent network, then enable Wi-Fi
+auto-switch. These mappings use the same profile application path as Profiles,
+including mixed WARP and WireGuard routes. A network check never starts a stopped
+router. Existing SSID-to-preset mappings remain supported.
+
+Network-loss protection is enabled by default and independent of auto-switch.
+The built-in network guard starts with Connect, waits for two lost-link readings,
+disables the owned proxy and stops the engine, then stays alive to reconnect after
+two connected readings. It applies a readable network's mapping before reconnect.
+Manual Disconnect stays off. Probe failures and missing permissions never count
+as link loss; unsupported platforms leave the connection alone. macOS discovers
+Wi-Fi interfaces, Windows checks physical adapters, and Linux uses NetworkManager
+when available. This protects against lost links, not every upstream outage.
+
+Network history and the disconnect setting are local private files in state/.
+CLI: `network-preset disconnect --state on|off` changes protection;
+`network-preset set --ssid NAME --preset profile:ID` maps a saved profile.
 Windows desktop setup and build instructions: [Windows dashboard](dashboard/README.windows.md).

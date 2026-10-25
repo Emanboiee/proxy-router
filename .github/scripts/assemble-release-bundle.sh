@@ -116,7 +116,7 @@ echo "$version_output" | grep -q "${SING_BOX_VERSION}" \
 
 # Runtime file manifest. Every file install.sh / install.ps1 need at runtime,
 # kept in one place for both the release and the pull request smoke job.
-cp router.py setup_tui.py monitor.py route_watcher.py proxy_tray.py domain_autodetect.py egress.py state.py config_schema.py worker_lock.py providers_check.py net_safety.py model_relay.py status_snapshot.py dashboard_profile_manager.py README.md LICENSE .gitignore router.example.json dist/proxy-router/
+cp router.py setup_tui.py monitor.py network_control.py route_watcher.py proxy_tray.py domain_autodetect.py egress.py state.py config_schema.py worker_lock.py providers_check.py net_safety.py model_relay.py status_snapshot.py dashboard_profile_manager.py provider_lifecycle.py README.md LICENSE .gitignore router.example.json dist/proxy-router/
 cp -R guides rulesets dist/proxy-router/
 cp privileged_helper.py privileged_installer.py sing-box-release.json dist/proxy-router/
 if [ "$archive_type" = "tar.gz" ]; then

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>NSLocationWhenInUseUsageDescription</key><string>Proxy Router reads your Wi-Fi name to show connected networks and apply your network profile mappings. It does not track your location.</string>
+<key>NSLocationUsageDescription</key><string>Read Wi-Fi names for network profile mappings.</string>
+</dict></plist>

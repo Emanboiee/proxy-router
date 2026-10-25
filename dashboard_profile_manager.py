@@ -23,6 +23,8 @@ import sys
 import tempfile
 import time
 import uuid
+import provider_lifecycle
+import worker_lock
 from pathlib import Path
 from typing import Any
 
@@ -177,7 +179,74 @@ def _route_snapshot(config: dict) -> dict:
     return {
         "routes": copy.deepcopy(config.get("routes", [])),
         "routing": copy.deepcopy(config.get("routing")),
+        "autodetect": copy.deepcopy(config.get("autodetect")),
     }
+
+
+def _editable_routes(routes: list, routing: dict | None = None) -> list:
+    return [{"id": str(route.get("id", "")), "providerId": str(route.get("provider", "")),
+             "domains": route.get("domains", []), "autoSubdomains": route.get("auto_subdomains", False),
+             "fallback": route.get("on_unavailable", "direct"),
+             "enabled": not routing or routing.get("mode") != "vpn-list" or any(
+                 domain in routing.get("vpn_domains", []) for domain in route.get("domains", []))}
+            for route in routes]
+
+
+def _edit_route_snapshot(root: Path, config: dict, snapshot: dict, rows: Any, mode: str, provider: str) -> dict:
+    if not isinstance(rows, list) or len(rows) > 200:
+        raise DashboardError("Routing rules must be a list of at most 200 routes")
+    if any(not isinstance(row, dict) or not isinstance(row.get("enabled", True), bool) for row in rows):
+        raise DashboardError("Routing rule availability must be on or off")
+    original = {route.get("id"): route for route in snapshot["routes"]}
+    routes, ids = [], set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise DashboardError("Routing rule is invalid")
+        identifier = _text(row.get("id"), "Route ID", 64, required=True)
+        if not _PROVIDER_ID.fullmatch(identifier) or identifier in ids:
+            raise DashboardError("Route names must be unique and contain only letters, numbers, dots, dashes or underscores")
+        ids.add(identifier)
+        previous = original.get(identifier, {})
+        clean = _profile_data({"name": identifier, "providerId": row.get("providerId"),
+                              "domains": row.get("domains", []), "autoSubdomains": row.get("autoSubdomains", False),
+                              "routeMode": "selective" if row.get("domains") else "full",
+                              "fallback": row.get("fallback", "direct")}, {**config["providers"], "direct": {}})
+        route = copy.deepcopy(previous)
+        route.update(id=identifier, provider=clean["providerId"], domains=clean["domains"],
+                     auto_subdomains=clean["autoSubdomains"], on_unavailable=clean["fallback"])
+        if not clean["domains"] and not previous:
+            raise DashboardError("Add at least one domain to a new route")
+        routes.append(route)
+    routing = copy.deepcopy(snapshot.get("routing") or {"mode": "default"})
+    if mode == "direct":
+        routes, routing = [], {"mode": "default"}
+    elif mode == "full":
+        routing.update(mode="safe-list", default_provider=provider)
+    elif routing.get("mode") in {"vpn-list", "safe-list"} or any(not row.get("enabled", True) for row in rows):
+        old_routing = snapshot.get("routing") or {}
+        old_domains = old_routing.get("vpn_domains", [])
+        domains = []
+        for route, row in zip(routes, rows):
+            if not row.get("enabled", True):
+                continue
+            preserve_scope = (old_routing.get("mode") == "vpn-list"
+                              and row.get("domains") == original.get(row["id"], {}).get("domains")
+                              and any(domain in old_domains for domain in row.get("domains", [])))
+            domains.extend(domain for domain in route.get("domains", [])
+                           if not preserve_scope or domain in old_domains)
+        routing.update(mode="vpn-list", vpn_domains=list(dict.fromkeys(domains)))
+    autodetect = copy.deepcopy(snapshot.get("autodetect", config.get("autodetect")))
+    if isinstance(autodetect, dict) and isinstance(autodetect.get("sources"), dict):
+        removed_ids = set(original) - {route["id"] for route in routes}
+        autodetect["sources"] = {key: source for key, source in autodetect["sources"].items()
+                                if not isinstance(source, dict) or source.get("route_id") not in removed_ids}
+    result = {"routes": routes, "routing": routing, "autodetect": autodetect}
+    candidate = copy.deepcopy(config)
+    candidate.update({key: value for key, value in result.items() if value is not None})
+    if autodetect is None:
+        candidate.pop("autodetect", None)
+    _validate_config(root, candidate)
+    return result
 
 
 def _text(value: Any, field: str, limit: int, *, required: bool = False) -> str:
@@ -328,6 +397,10 @@ def _provider_rows(root: Path, config: dict[str, Any], store: dict[str, Any]) ->
             active = ""
         endpoint = active if active in server_ids else "Unknown"
         proxy = isinstance(spec.get("socks5"), dict)
+        if not proxy:
+            kind = "wireguard"
+        elif kind not in {"socks5", "warp"}:
+            kind = "socks5"
         if proxy:
             endpoint = f"{spec['socks5'].get('host', '')}:{spec['socks5'].get('port', '')}"
         preferred = saved.get("preferredServer")
@@ -336,16 +409,18 @@ def _provider_rows(root: Path, config: dict[str, Any], store: dict[str, Any]) ->
         result.append({
             "id": provider_id,
             "name": str(saved.get("name") or provider_id),
-            "kind": kind if kind in _PROVIDER_KINDS else "custom",
+            "kind": kind,
             "status": "unknown",
             "latency": None,
             "server": endpoint,
             "servers": server_ids if not proxy else [],
+            "removedServers": sorted(file.stem for file in (provider_path / ".removed").glob("*.conf") if file.is_file()) if not proxy and files else [],
             "preferredServer": preferred,
             "capabilities": {"serverSelection": bool(server_ids) and not proxy, "reconnect": proxy},
             "serverCount": len(server_ids),
             "connection": ({"kind": "socks5", "host": spec["socks5"].get("host", ""), "port": spec["socks5"].get("port")} if proxy else
                            {"kind": "wireguard", "fileName": files[0].name if files else "", "endpoint": endpoint}),
+            "startup": saved.get("startup", {"mode": "external"}),
             "managed": bool(saved.get("managed", False)),
         })
     return result
@@ -429,6 +504,8 @@ def _preset_profiles(root: Path, config: dict, store: dict) -> list[dict]:
                                       "available": route.get("provider") in candidate["providers"]}
                                      for route in candidate["routes"]
                                      if any(d in profile["domains"] for d in route.get("domains", []))])
+        profile["_route_snapshot"] = _route_snapshot(candidate)
+        profile["routeRules"] = _editable_routes(candidate["routes"], candidate.get("routing"))
         result.append(profile)
     return result
 
@@ -466,9 +543,13 @@ def state(root: Path) -> dict[str, Any]:
     profiles = [{key: value for key, value in item.items() if not key.startswith("_")}
                 for item in store["profiles"] if isinstance(item, dict)]
     by_id = {item["id"]: item for item in discovered}
-    profiles = [{**by_id[item["id"]], "name": item["name"], "description": item["description"]}
+    profiles = [{**by_id[item["id"]], **item}
                 if item.get("id") in by_id else item for item in profiles]
     profiles = [{key: value for key, value in item.items() if not key.startswith("_")} for item in profiles]
+    for profile in profiles:
+        if profile.get("routeRules"):
+            profile["presetRoutes"] = [{**row, "available": row["providerId"] == "direct" or row["providerId"] in config["providers"]}
+                                      for row in profile["routeRules"]]
     saved_ids = {item.get("id") for item in profiles}
     profiles.extend({key: value for key, value in item.items() if not key.startswith("_")}
                     for item in discovered if item["id"] not in saved_ids)
@@ -476,16 +557,24 @@ def state(root: Path) -> dict[str, Any]:
     if not profiles and not store.get("profiles_initialized", False):
         inferred = _inferred_profile(config, config["providers"])
         if inferred:
+            inferred["routeRules"] = _editable_routes(config["routes"], config.get("routing"))
             profiles = [inferred]
     active_id = store.get("active_profile_id")
+    selected = next((item for item in store["profiles"] if item.get("id") == active_id), {})
+    selected_snapshot = selected.get("_route_snapshot")
+    override_active = selected_snapshot is not None and all(
+        _route_snapshot(config).get(key) == value for key, value in selected_snapshot.items())
     matching_preset = next((item for item in discovered if item["id"] == preset_id
                             and _preset_is_active(root, config, item)), None)
-    if matching_preset is not None:
+    if override_active:
+        pass
+    elif matching_preset is not None:
         active_id = preset_id
     elif discovered and (config.get("preset") or active_id not in saved_ids):
         inferred = _inferred_profile(config, config["providers"])
         if inferred:
             inferred["name"] = "Custom routing"
+            inferred["routeRules"] = _editable_routes(config["routes"], config.get("routing"))
             if not any(item["id"] == inferred["id"] for item in profiles):
                 profiles.append(inferred)
             active_id = inferred["id"]
@@ -497,6 +586,11 @@ def state(root: Path) -> dict[str, Any]:
 
 
 def save_profile(root: Path, value: Any, profile_id: str | None = None) -> dict[str, Any]:
+    with worker_lock.exclusive(Path(root) / "state" / "dashboard-provider-save.lock"):
+        return _save_profile(root, value, profile_id)
+
+
+def _save_profile(root: Path, value: Any, profile_id: str | None = None) -> dict[str, Any]:
     root = Path(root).resolve()
     if profile_id is not None and (not isinstance(profile_id, str) or not _PROVIDER_ID.fullmatch(profile_id)):
         raise DashboardError("Profile ID is invalid")
@@ -515,20 +609,27 @@ def save_profile(root: Path, value: Any, profile_id: str | None = None) -> dict[
         validation_providers.setdefault(old["providerId"], {})
     profile = _profile_data(value, validation_providers, old)
     if old and old.get("_preset_name"):
-        fields = ("providerId", "fallbackProviderId", "routeMode", "domains", "autoSubdomains", "fallback")
-        if any(profile.get(field) != old.get(field) for field in fields):
-            raise DashboardError("Create a new profile to change a saved preset’s routing.")
         profile.update({key: old[key] for key in ("_preset_name", "presetName", "presetRoutes")})
     snapshot = (old or {}).get("_route_snapshot")
     if old and old.get("id") == "current-setup" and snapshot is None:
         snapshot = _route_snapshot(config)
-    if snapshot is not None:
+    if "routeRules" in value:
+        if snapshot is None:
+            snapshot = {"routes": [], "routing": {"mode": "default"}}
+        if value["routeRules"] != _editable_routes(snapshot["routes"], snapshot.get("routing")) or profile["routeMode"] != (old or {}).get("routeMode") or (profile["routeMode"] == "full" and profile["providerId"] != (old or {}).get("providerId")):
+            snapshot = _edit_route_snapshot(root, config, snapshot, value["routeRules"], profile["routeMode"], profile["providerId"])
+        profile["_route_snapshot"] = snapshot
+        profile["routeRules"] = _editable_routes(snapshot["routes"], snapshot.get("routing"))
+        if profile["routeMode"] == "selective":
+            routing = snapshot.get("routing") or {}
+            profile["domains"] = (routing.get("vpn_domains", []) if routing.get("mode") == "vpn-list" else
+                                  list(dict.fromkeys(d for route in snapshot["routes"] for d in route.get("domains", []))))
+    elif snapshot is not None:
         fields = ("providerId", "fallbackProviderId", "routeMode", "domains", "autoSubdomains", "fallback")
-        changed = any(profile.get(field) != old.get(field) for field in fields)
-        if changed and len(snapshot["routes"]) > 1:
-            raise DashboardError("Current setup has multiple route rules. Create a new profile to replace them.")
-        if not changed:
-            profile["_route_snapshot"] = snapshot
+        if any(profile.get(field) != old.get(field) for field in fields):
+            raise DashboardError("Edit the individual routing rules for this profile")
+        profile["_route_snapshot"] = snapshot
+        profile["routeRules"] = _editable_routes(snapshot["routes"], snapshot.get("routing"))
     if old:
         profiles[:] = [profile if item.get("id") == profile_id else item for item in profiles]
         if not any(item.get("id") == profile_id for item in profiles):
@@ -599,6 +700,11 @@ def _apply_profile_config(config: dict, profile: dict) -> dict:
             config.pop("routing", None)
         else:
             config["routing"] = copy.deepcopy(snapshot["routing"])
+        if "autodetect" in snapshot:
+            if snapshot["autodetect"] is None:
+                config.pop("autodetect", None)
+            else:
+                config["autodetect"] = copy.deepcopy(snapshot["autodetect"])
         return clean
     spec = config["providers"].get(provider_id)
     if isinstance(spec, dict) and clean["routeMode"] != "direct":
@@ -646,6 +752,8 @@ def apply_profile(root: Path, profile_id: str) -> dict[str, Any]:
         for provider_id, spec in preset.get("providers", {}).items():
             config["providers"].setdefault(provider_id, copy.deepcopy(spec))
         config["preset"] = name
+        if profile.get("_route_snapshot"):
+            _apply_profile_config(config, profile)
         clean = profile
     else:
         clean = _apply_profile_config(config, profile)
@@ -659,14 +767,48 @@ def apply_profile(root: Path, profile_id: str) -> dict[str, Any]:
     return state(root)
 
 
+def previous_startup(store: dict, identifier: str) -> dict:
+    return store.get("providers", {}).get(identifier, {}).get("startup", {"mode": "external"})
+
+
 def save_provider(root: Path, value: Any, provider_id: str | None = None, source_path: str | None = None) -> dict[str, Any]:
+    root = Path(root).resolve()
+    with worker_lock.exclusive(root / "state" / "dashboard-provider-save.lock"):
+        return _save_provider(root, value, provider_id, source_path)
+
+
+def _wireguard_destination(root: Path, spec: dict, identifier: str, source: Path, raw: str, existing: bool) -> Path:
+    directory = (root / spec.get("directory", f"providers/{identifier}")).resolve()
+    try:
+        directory.relative_to(root)
+    except ValueError as exc:
+        raise DashboardError("Provider folder must be inside the Proxy Router runtime") from exc
+    if directory == root:
+        raise DashboardError("Choose a separate folder for this provider")
+    for path in directory.glob("*.conf"):
+        if path.is_file() and path.read_bytes() == raw.encode():
+            return path
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "-", source.stem).strip(".-")[:80] or "wireguard"
+    if not existing:
+        stem = "wireguard"
+    destination = directory / f"{stem}.conf"
+    suffix = 2
+    while destination.exists() or destination.is_symlink():
+        destination = directory / f"{stem}-{suffix}.conf"
+        suffix += 1
+    return destination
+
+
+def _save_provider(root: Path, value: Any, provider_id: str | None = None, source_path: str | None = None) -> dict[str, Any]:
     root = Path(root).resolve()
     if not isinstance(value, dict):
         raise DashboardError("Connection data is invalid")
     name = _text(value.get("name"), "Connection name", 48, required=True)
     kind = value.get("kind", "custom")
     if not isinstance(kind, str) or kind not in _PROVIDER_KINDS:
-        raise DashboardError("Choose WireGuard, Custom VPN, Cloudflare WARP, or SOCKS5")
+        raise DashboardError("Choose WireGuard, Cloudflare WARP, or SOCKS5")
+    if kind == "custom":
+        kind = "wireguard"
     if provider_id is not None and (not isinstance(provider_id, str) or not _PROVIDER_ID.fullmatch(provider_id)):
         raise DashboardError("Connection ID is invalid")
     config = _read_config(root)
@@ -697,23 +839,34 @@ def save_provider(root: Path, value: Any, provider_id: str | None = None, source
         if provider_id and not isinstance(previous.get("socks5"), dict):
             raise DashboardError("Add a new connection to change its transport")
         config["providers"][identifier] = {**previous, "socks5": {"host": host, "port": port}}
-        saved = {"name": name, "kind": kind, "managed": False}
+        try:
+            startup = provider_lifecycle.startup_data(value.get("startup", previous_startup(store, identifier)))
+        except provider_lifecycle.StartupError as exc:
+            raise DashboardError(str(exc)) from exc
+        if startup["mode"] == "warp" and host != "127.0.0.1":
+            raise DashboardError("Automatic WARP uses 127.0.0.1")
+        saved = {"name": name, "kind": kind, "managed": False, "startup": startup}
     elif source_path:
         source = Path(source_path).expanduser().resolve()
         endpoint, raw = _wireguard_summary(source)
-        relative = Path("providers") / identifier
-        destination_dir = root / relative
-        destination_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(destination_dir, 0o700)
-        destination = destination_dir / "wireguard.conf"
-        pending_files[destination] = raw.encode()
-        spec = config["providers"].get(identifier, {})
-        if not isinstance(spec, dict):
-            spec = {}
-        spec.pop("socks5", None)
-        spec["directory"] = str(relative)
+        spec = dict(config["providers"].get(identifier, {}))
+        converting = isinstance(spec.get("socks5"), dict)
+        if converting:
+            spec.pop("socks5")
+            spec["directory"] = f"providers/{identifier}"
+        spec.setdefault("directory", f"providers/{identifier}")
+        destination = _wireguard_destination(root, spec, identifier, source, raw, bool(provider_id))
+        _validate_config(root, config)
+        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(destination.parent, 0o700)
+        if not destination.exists():
+            pending_files[destination] = raw.encode()
         config["providers"][identifier] = spec
-        saved = {"name": name, "kind": kind, "endpoint": endpoint, "managed": True}
+        previous = store["providers"].get(identifier, {})
+        saved = {**previous, "name": name, "kind": kind, "endpoint": endpoint,
+                 "managed": bool(previous.get("managed", False)) if provider_id and not converting else True}
+        if converting:
+            saved.pop("startup", None)
     else:
         if not provider_id:
             raise DashboardError("Choose a WireGuard configuration file")
@@ -786,6 +939,48 @@ def save_server_preference(root: Path, provider_id: str, server: str | None) -> 
     return state(root)
 
 
+def manage_server(root: Path, provider_id: str, server: str, *, restore: bool = False) -> dict:
+    root = Path(root).resolve()
+    with worker_lock.exclusive(root / "state" / "dashboard-provider-save.lock"):
+        config, store = _read_config(root), _read_store(root)
+        spec = config["providers"].get(provider_id)
+        if not isinstance(spec, dict) or not spec.get("directory") or spec.get("socks5"):
+            raise DashboardError("Choose a WireGuard provider")
+        if not isinstance(server, str) or not server or Path(server).name != server or server in {".", ".."} or "/" in server or "\\" in server:
+            raise DashboardError("Choose a server from this provider")
+        directory = (root / spec["directory"]).resolve()
+        try:
+            directory.relative_to(root)
+        except ValueError:
+            raise DashboardError("Provider folder is outside the router installation")
+        if directory == root:
+            raise DashboardError("Provider folder cannot be the router installation")
+        source = directory / (".removed/" if restore else "") / f"{server}.conf"
+        destination = directory / ("" if restore else ".removed/") / f"{server}.conf"
+        if source.is_symlink() or not source.is_file() or destination.exists() or destination.is_symlink():
+            raise DashboardError("That server is unavailable; refresh the list")
+        if not restore:
+            active_file = root / "state" / f"{provider_id}.active"
+            if active_file.exists() and active_file.read_text().strip() == server:
+                raise DashboardError("Switch to another server before removing the current server")
+            if len(list(directory.glob("*.conf"))) <= 1:
+                raise DashboardError("Keep at least one server in this provider")
+        archive = directory / ".removed"
+        if archive.is_symlink():
+            raise DashboardError("Server archive must be a local folder")
+        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        source.rename(destination)
+        try:
+            metadata = store["providers"].setdefault(provider_id, {})
+            if not restore and metadata.get("preferredServer") == server:
+                metadata.pop("preferredServer", None)
+            _save_store(root, store)
+        except Exception:
+            destination.rename(source)
+            raise
+        return state(root)
+
+
 def run_cli(root: Path, args) -> int:
     try:
         if args.dashboard_action == "state":
@@ -802,6 +997,8 @@ def run_cli(root: Path, args) -> int:
             value = save_provider(
                 root, json.loads(args.json), args.id, args.path,
             )
+        elif args.dashboard_action in {"server-remove", "server-restore"}:
+            value = manage_server(root, args.id, args.server, restore=args.dashboard_action == "server-restore")
         elif args.dashboard_action == "server-preference":
             value = save_server_preference(root, args.id, args.server or None)
         elif args.dashboard_action == "provider-delete":
@@ -832,3 +1029,8 @@ def configure_parser(sub) -> None:
     preference = dashboard_sub.add_parser("server-preference", help=argparse.SUPPRESS)
     preference.add_argument("--id", required=True)
     preference.add_argument("--server", default="")
+
+    for action in ("server-remove", "server-restore"):
+        command = dashboard_sub.add_parser(action, help=argparse.SUPPRESS)
+        command.add_argument("--id", required=True)
+        command.add_argument("--server", required=True)

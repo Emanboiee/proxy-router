@@ -334,6 +334,7 @@ class StatusMenuPresentationTests(unittest.TestCase):
             mode="proxy",
             port=2080,
             preset="school-warp",
+            network_status="ok",
         )
         app.last_action_result = (
             "full tunnel on: failed — selective tun: could not resolve route domains"
@@ -405,7 +406,7 @@ class RouterStatusProxyDiagnosticsTests(unittest.TestCase):
         status = tray.RouterStatus.from_cli(0, json.dumps({
             "up": True, "mode": "proxy", "port": 2080,
             "system_proxy": {"status": "system_proxy_mismatch"},
-            "network": {"status": "direct_dns_unavailable"},
+            "network": {"status": "direct_dns_unavailable", "stale": False},
         }))
         self.assertEqual(status.system_proxy_status, "system_proxy_mismatch")
         self.assertEqual(status.network_status, "direct_dns_unavailable")
@@ -683,7 +684,7 @@ class MutationSerializationTests(unittest.TestCase):
         with mock.patch.object(tray, "make_icon", return_value=icon), \
              mock.patch.object(app, "build_menu", return_value=object()):
             app._publish_status(
-                tray.RouterStatus(up=True, mode="proxy", port=2080), 1)
+                tray.RouterStatus(up=True, mode="proxy", port=2080, network_status="ok"), 1)
         self.assertIs(app.tray.icon, icon)
         self.assertEqual(app._icon_sig, "#4caf50")
 
@@ -1360,11 +1361,38 @@ class DashboardActionTests(unittest.TestCase):
     def test_callback_passes_client_root_and_records_success(self):
         roots = []
         with mock.patch.object(
-            tray, "open_dashboard", side_effect=lambda root: roots.append(root) or True
+            tray, "open_dashboard", side_effect=lambda root, **kwargs: roots.append(root) or True
         ):
             self.app.action_dashboard()
         self.assertEqual(roots, [str(self.root)])
         self.assertEqual(self.app.last_action_result, "dashboard opened")
+
+    def test_successful_tui_fallback_shows_hint_only_once_per_tray(self):
+        (self.root / "setup_tui.py").write_text("# tui")
+        with mock.patch.object(tray, "_dashboard_bundle", return_value=None), \
+             mock.patch.object(tray, "_launch_terminal", return_value=True):
+            self.app.action_dashboard()
+            labels = [item.text for item in self.app.build_menu()]
+            self.assertTrue(any("not built — using TUI" in text and
+                                "PROXY_ROUTER_DASHBOARD" in text for text in labels))
+            self.app.action_dashboard()
+        self.assertEqual(self.app.last_action_result, "dashboard opened")
+
+    def test_failed_terminal_does_not_consume_fallback_hint(self):
+        (self.root / "setup_tui.py").write_text("# tui")
+        with mock.patch.object(tray, "_dashboard_bundle", return_value=None), \
+             mock.patch.object(tray, "_launch_terminal", side_effect=[False, True]):
+            self.app.action_dashboard()
+            self.assertEqual(self.app.last_action_result, "dashboard: no terminal")
+            self.app.action_dashboard()
+        self.assertIn("not built — using TUI", self.app.last_action_result)
+
+    def test_native_bundle_does_not_show_tui_hint(self):
+        with mock.patch.object(tray, "_dashboard_bundle", return_value=self.root / "app"), \
+             mock.patch.object(tray, "_launch_dashboard_app", return_value=True):
+            self.app.action_dashboard()
+        self.assertEqual(self.app.last_action_result, "dashboard opened")
+        self.assertFalse(self.app._dashboard_fallback_hint_shown)
 
     def test_callback_records_visible_failure_without_raising(self):
         with mock.patch.object(tray, "open_dashboard", return_value=False):
@@ -1495,6 +1523,7 @@ class DashboardViewModelTests(unittest.TestCase):
             mode="proxy",
             port=2080,
             watcher=True,
+            network_status="ok",
             routing_mode="vpn-list",
             providers={
                 "proton": {
@@ -1851,7 +1880,7 @@ class DashboardTrayIntegrationTests(unittest.TestCase):
         app.dashboard = mock.Mock()
         with mock.patch.object(tray, "open_dashboard", return_value=True) as legacy:
             app.action_dashboard()
-        legacy.assert_called_once_with("/tmp")
+        legacy.assert_called_once_with("/tmp", on_tui_fallback=mock.ANY)
 
         app.dashboard.show.reset_mock()
         app._show_native_dashboard()
