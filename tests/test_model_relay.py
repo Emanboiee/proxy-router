@@ -68,17 +68,20 @@ def relay_path():
     for t in threads:
         t.start()
 
-    def request(model='test-free'):
+    def request(model='test-free', *, stream=True, kind=None):
         payload = json.dumps({'model': model, 'messages': [{'role': 'user', 'content': 'unchanged'}],
-                              'stream': True}).encode()
+                              'stream': stream}).encode()
+        headers = {'Content-Type': 'application/json', 'Authorization': 'Bearer test-only'}
+        if kind is not None:
+            headers['X-Proxy-Router-Request-Kind'] = kind
         conn = http.client.HTTPConnection(*relay.server_address, timeout=5)
-        conn.request('POST', '/v1/chat/completions', payload,
-                     {'Content-Type': 'application/json', 'Authorization': 'Bearer test-only'})
+        conn.request('POST', '/v1/chat/completions', payload, headers)
         response = conn.getresponse()
         result = response.status, response.read(), response.getheader('X-Proxy-Router-Retries')
         conn.close()
         return result
 
+    request.relay = relay
     yield request, statuses, attempts, recovery, body
     for s in (relay, upstream):
         s.shutdown()
