@@ -55,15 +55,20 @@ foreach ($Directory in @('examples', 'guides', 'presets', 'rulesets')) {
 # Install a native Windows command entry point instead of adding only the
 # engine directory to PATH.  The launcher resolves router.py relative to the
 # installed prefix, so it remains valid after the source archive is removed.
+#
+# Keep commands and exit-code expansion on separate, ungrouped lines. Inside
+# a parenthesised block cmd expands %ERRORLEVEL% before Python runs.
 $LauncherCmd = Join-Path $Bin 'proxy-router.cmd'
 @'
 @echo off
 set "PROXY_ROUTER_ROOT=%~dp0.."
 where py >nul 2>nul
-if not errorlevel 1 (
-  py -3 "%PROXY_ROUTER_ROOT%\router.py" %*
-  exit /b %ERRORLEVEL%
-)
+if errorlevel 1 goto python_fallback
+py -3 -c "import sys" >nul 2>nul
+if errorlevel 1 goto python_fallback
+py -3 "%PROXY_ROUTER_ROOT%\router.py" %*
+exit /b %ERRORLEVEL%
+:python_fallback
 python "%PROXY_ROUTER_ROOT%\router.py" %*
 exit /b %ERRORLEVEL%
 '@ | Set-Content -LiteralPath $LauncherCmd -Encoding ASCII
@@ -74,7 +79,12 @@ $LauncherPs1 = Join-Path $Bin 'proxy-router.ps1'
 param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
 $env:PROXY_ROUTER_ROOT = Split-Path -Parent $PSScriptRoot
 $py = Get-Command py -ErrorAction SilentlyContinue
+$pyUsable = $false
 if ($null -ne $py) {
+  & $py.Source -3 -c "import sys" *> $null
+  $pyUsable = ($LASTEXITCODE -eq 0)
+}
+if ($pyUsable) {
   & $py.Source -3 (Join-Path $env:PROXY_ROUTER_ROOT 'router.py') @Arguments
 } else {
   & python (Join-Path $env:PROXY_ROUTER_ROOT 'router.py') @Arguments
