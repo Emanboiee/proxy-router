@@ -1,7 +1,6 @@
 import json
 import os
 import shlex
-import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -36,9 +35,23 @@ def test_command_validation(command):
 
 @pytest.mark.enable_socket
 @pytest.mark.allow_hosts(["127.0.0.1"])
-def test_foreground_proxy_starts_once_and_recovers_after_exit(tmp_path):
+def test_foreground_proxy_starts_once_and_recovers_after_exit(tmp_path, monkeypatch):
     import socket
     from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+
+    processes = []
+    real_popen = subprocess.Popen
+
+    def spawn(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    # Retain handles for this test's children only; do not replace the global
+    # subprocess module used by the host-safety fixtures.
+    monkeypatch.setattr(lifecycle, "subprocess", SimpleNamespace(**{
+        **vars(subprocess), "Popen": spawn}))
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
@@ -68,20 +81,21 @@ with socket.socket() as server:
         pids.append(pid)
         assert lifecycle.ensure(tmp_path, "test", "127.0.0.1", port, timeout=3)
         assert int(pidfile.read_text()) == pid
-        os.kill(pid, signal.SIGTERM)
-        import time
-        deadline = time.monotonic() + 2
-        while lifecycle.socks_ready("127.0.0.1", port) and time.monotonic() < deadline:
-            time.sleep(.02)
+        first = next(process for process in processes if process.pid == pid)
+        first.terminate()
+        first.wait(timeout=2)
         assert lifecycle.ensure(tmp_path, "test", "127.0.0.1", port, timeout=3)
         pids.append(int(pidfile.read_text()))
         assert pids[-1] != pid
     finally:
-        for pid in pids:
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
             try:
-                os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
 
 
 def test_warp_connects_in_proxy_mode_and_does_not_reconnect_ready_client(tmp_path, monkeypatch):
