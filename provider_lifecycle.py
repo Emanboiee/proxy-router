@@ -6,6 +6,7 @@ presets. Executables run without a shell or inherited root privileges.
 from __future__ import annotations
 
 import json
+import math
 import contextlib
 import tempfile
 import os
@@ -51,13 +52,24 @@ def command_args(command: str) -> list[str]:
     return [arg[1:-1] if os.name == "nt" and len(arg) > 1 and arg[0] == arg[-1] == '"' else arg for arg in args]
 
 
-def socks_ready(host: str, port: int) -> bool:
+def socks_ready(host: str, port: int, *, timeout: float = 0.4) -> bool:
+    """Check the SOCKS handshake within one connect/write/read budget."""
+    deadline = time.monotonic() + timeout
     try:
-        with socket.create_connection((host, port), timeout=0.4) as connection:
+        with socket.create_connection((host, port), timeout=_remaining(deadline)) as connection:
+            connection.settimeout(_remaining(deadline))
             connection.sendall(b"\x05\x01\x00")
+            connection.settimeout(_remaining(deadline))
             return connection.recv(2) == b"\x05\x00"
-    except OSError:
+    except (OSError, StartupError):
         return False
+
+
+def _remaining(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise StartupError("Provider did not become ready within the startup timeout")
+    return remaining
 
 
 def referenced_providers(config: dict) -> set[str]:
@@ -108,17 +120,20 @@ def _warp_binary(env: dict) -> str | None:
     return str(installed) if installed.is_file() else None
 
 
-def _warp_status(binary: str, options: dict) -> str:
+def _warp_status(binary: str, options: dict, *, timeout: float = 3) -> str:
     try:
         result = subprocess.run([binary, "--json", "status"], **{
-            **options, "stdout": subprocess.PIPE}, timeout=3)
+            **options, "stdout": subprocess.PIPE}, timeout=timeout)
         return str(json.loads(result.stdout).get("status", "")) if result.returncode == 0 else ""
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return ""
 
 
 def ensure(root: Path, name: str, host: str, port: int, *, timeout: float = 20) -> bool:
-    """Start only an explicitly managed provider; saving/status never calls this."""
+    """Bound lock, probes and startup by one deadline; failed-child cleanup adds at most 4s."""
+    if not math.isfinite(timeout) or timeout < 0:
+        raise StartupError("Provider startup timeout must be finite and nonnegative")
+    deadline = time.monotonic() + timeout
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", name):
         raise StartupError("Invalid provider ID")
     try:
@@ -132,7 +147,7 @@ def ensure(root: Path, name: str, host: str, port: int, *, timeout: float = 20) 
         return False
     if host not in {"127.0.0.1", "::1"} or not 1 <= port <= 65535:
         raise StartupError("Managed startup requires a local SOCKS5 endpoint")
-    with worker_lock.exclusive(root / "state" / f"provider-startup-{name}.lock", timeout=timeout + 2) as lock:
+    with worker_lock.exclusive(root / "state" / f"provider-startup-{name}.lock", timeout=_remaining(deadline)) as lock:
         if os.name != "nt" and os.geteuid() == 0:
             os.fchown(lock.fileno(), root.stat().st_uid, root.stat().st_gid)
         options = _launch_options(root)
@@ -140,7 +155,13 @@ def ensure(root: Path, name: str, host: str, port: int, *, timeout: float = 20) 
         binary = _warp_binary(options["env"]) if warp else None
         if warp and not binary:
             raise StartupError("Install and register the official WARP client before using automatic startup")
-        if socks_ready(host, port) and (not warp or _warp_status(binary, options) == "Connected"):
+        def ready() -> bool:
+            listening = socks_ready(host, port, timeout=min(0.4, _remaining(deadline)))
+            return listening and (not warp or _warp_status(
+                binary, options, timeout=min(3, _remaining(deadline))) == "Connected")
+
+        if ready():
+            _remaining(deadline)
             return True
         failure = root / "state" / f"provider-startup-{name}.failure"
         try:
@@ -149,26 +170,29 @@ def ensure(root: Path, name: str, host: str, port: int, *, timeout: float = 20) 
             failed_at = 0
         if time.time() - failed_at < 5:
             raise StartupError("Provider startup recently failed; retry in a few seconds")
-        deadline = time.monotonic() + timeout
         process = None
+        became_ready = False
         try:
             if warp:
                 if host != "127.0.0.1":
                     raise StartupError("WARP local proxy uses 127.0.0.1")
                 for args in ([binary, "mode", "proxy"], [binary, "proxy", "port", str(port)], [binary, "connect"]):
-                    result = subprocess.run(args, **options, timeout=max(0.1, deadline-time.monotonic()))
+                    result = subprocess.run(args, **options, timeout=_remaining(deadline))
                     if result.returncode != 0:
                         raise StartupError("WARP startup failed; check registration and client permissions")
             else:
                 args = command_args(startup["command"])
+                _remaining(deadline)
                 process = subprocess.Popen(args, **options)
             while time.monotonic() < deadline:
-                if socks_ready(host, port) and (not warp or _warp_status(binary, options) == "Connected"):
+                if ready():
+                    _remaining(deadline)
                     failure.unlink(missing_ok=True)
+                    became_ready = True
                     return True
                 if process is not None and process.poll() not in {None, 0}:
                     raise StartupError(f"Provider startup exited with code {process.returncode}")
-                time.sleep(0.15)
+                time.sleep(min(0.15, _remaining(deadline)))
             raise StartupError("Provider did not become ready within the startup timeout")
         except (StartupError, OSError, subprocess.TimeoutExpired) as exc:
             with contextlib.suppress(OSError):
@@ -183,7 +207,7 @@ def ensure(root: Path, name: str, host: str, port: int, *, timeout: float = 20) 
             raise StartupError("Could not start provider; check executable, arguments, and permissions") from exc
         finally:
             # Failed foreground launches must not leave an unmanaged orphan.
-            if process is not None and not socks_ready(host, port) and process.poll() is None:
+            if process is not None and not became_ready and process.poll() is None:
                 process.terminate()
                 try:
                     process.wait(timeout=2)

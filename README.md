@@ -1025,8 +1025,13 @@ are not supported.
 Startup is local metadata saved by the provider editor. Saving or viewing
 status never runs a command. Routing presets cannot grant startup permission.
 On Connect/reload, only local proxy providers referenced by generated routing
-rules start. The engine waits up to 20 seconds for a SOCKS5 handshake; failed
-startup does not claim readiness. Active egress health checks can recover a
+rules start. Each provider has one 20-second monotonic startup budget shared
+by lock acquisition, WARP commands/status, SOCKS5 handshakes, and polling sleeps.
+The budget is not restarted after waiting for another launch. OS scheduling and
+process creation can add latency; terminating a failed foreground child has a
+separate cleanup allowance of up to four seconds. No final readiness probe runs
+after the deadline, and failed startup does not claim readiness.
+Active egress health checks can recover a
 missing managed provider, with a short delay after failed launches.
 Concurrent starts are serialized and an already ready proxy is reused.
 Commands run as the runtime directory owner, including when the router is
