@@ -100,7 +100,12 @@ def test_hanging_headers_rotate_before_retry_window_without_replaying_output(hea
 
 def test_delayed_headers_restore_longer_stream_idle_timeout(header_path):
     request, delays, attempts, recovery, relay, result, _ = header_path
-    delays.append((0.01, 0.15))
+    # Leave room for CI scheduling/TCP latency while still making the body
+    # arrive after the header budget and before the stream idle timeout.
+    relay.header_timeout = 0.5
+    relay.retry_window = 2
+    relay.timeout = 2
+    delays.append((0.02, 0.7))
     assert request() == (200, result, "0")
     assert len(attempts) == 1
     recovery.recover_transport.assert_not_called()
