@@ -200,39 +200,6 @@ PY
 }
 
 
-# Return every explicit and generated autodetection source for periodic refresh.
-autodetect_sources() {
-  python_runner - "$ROOT/router.json" <<'PY' 2>/dev/null
-import json
-import pathlib
-import sys
-
-try:
-    config_path = pathlib.Path(sys.argv[1]).resolve()
-    data = json.loads(config_path.read_text(encoding="utf-8"))
-    autodetect = data.get("autodetect") or {}
-    if not autodetect.get("enabled", False):
-        raise SystemExit(0)
-    try:
-        sys.path.insert(0, str(config_path.parent))
-        import router
-
-        routes = data.get("routes") or []
-        providers = data.get("providers") or {}
-        settings = router._load_autodetect(data, routes, providers)
-        for source in sorted(settings["sources"]):
-            print(source)
-    except (OSError, TypeError, ValueError, ImportError, AttributeError):
-        sources = autodetect.get("sources") or {}
-        if not isinstance(sources, dict):
-            raise
-        for source in sorted(source for source in sources if isinstance(source, str) and source):
-            print(source)
-except (OSError, TypeError, ValueError, json.JSONDecodeError, ImportError, AttributeError):
-    raise SystemExit(1)
-PY
-}
-
 ENABLED="${PROXY_KEEPALIVE_ENABLED:-$(config_setting enabled 1)}"
 case "$ENABLED" in
   0|false|False|off|OFF)
@@ -777,15 +744,11 @@ while true; do
     autodetect_now=$(date +%s)
     if [ "$AUTODETECT_ENABLED" != "0" ] && ! is_tun_mode \
        && { [ "$last_autodetect" -eq 0 ] || [ $((autodetect_now - last_autodetect)) -ge "$AUTODETECT_INTERVAL" ]; }; then
-      sources=$(autodetect_sources 2>/dev/null || true)
-      while IFS= read -r source; do
-        [ -n "$source" ] || continue
-        if controller autodetect "$source" --quiet; then
-          :
-        else
-          echo "router: autodetect $source failed; keeping existing learned routes" >&2
-        fi
-      done <<< "$sources"
+      # The controller refreshes every source under one lock, then compares
+      # effective routing and performs at most one shared-engine reload.
+      if ! controller autodetect --all --quiet; then
+        echo "router: autodetect batch failed or was partial; retaining available learned routes" >&2
+      fi
       last_autodetect="$autodetect_now"
     fi
     # Time-based full-pool sweep: on the first successful ensure, and every
