@@ -1,3 +1,4 @@
+import {resizeNativeWindow} from './window-layout';
 import {installWebSelects, syncWebSelects} from './web-select';
 import {applyDashboardPalette, polishDashboard} from './dashboard-polish';
 import {connectionControls, serverInventory} from './server-controls';
@@ -91,10 +92,18 @@ async function refreshDashboardState(): Promise<DashboardState> {
   return next;
 }
 function announce(message: string): void { const toast = document.querySelector('#toast')!; toast.textContent = message; window.setTimeout(() => { if (toast.textContent === message) toast.textContent = ''; }, 2600); const region = document.querySelector('#announcement')!; region.textContent = message; }
+let nativeLayout: LayoutPreset | undefined;
 function applyTheme(): void {
   const root = document.documentElement;
   root.dataset.scheme = snapshot.theme.scheme; root.dataset.accent = snapshot.theme.accent; root.dataset.density = snapshot.theme.density; root.dataset.layout = snapshot.theme.layout; root.dataset.contrast = snapshot.theme.contrast; root.dataset.motionSpeed = snapshot.theme.motionSpeed; root.dataset.motion = snapshot.theme.reducedMotion ? 'reduced' : 'full';
   root.style.colorScheme = snapshot.theme.scheme === 'system' ? 'light dark' : snapshot.theme.scheme;
+  if (isTauri() && nativeLayout !== snapshot.theme.layout) {
+    const startup = nativeLayout === undefined;
+    nativeLayout = snapshot.theme.layout;
+    void resizeNativeWindow(nativeLayout).catch(() => {
+      if (!startup) announce('Window size could not be updated. Try the other layout preset.');
+    });
+  }
   applyDashboardPalette();
 }
 function sync(next: Snapshot, message = next.lastAction): void {
