@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Any
 
 import domain_autodetect
+import autodetect_refresh
 import egress
 import net_safety
 import provider_lifecycle
@@ -7683,6 +7684,7 @@ def main() -> int:
     autodetect = sub.add_parser("autodetect", help="discover routed web-app dependency hostnames")
     autodetect.add_argument("source", nargs="?", default="twitch",
                             help="configured discovery source (default: twitch)")
+    autodetect.add_argument("--all", action="store_true", help="refresh all sources with at most one proxy-mode reload")
     autodetect.add_argument("--no-reload", action="store_true",
                             help="persist discoveries without reloading sing-box")
     autodetect.add_argument("--quiet", action="store_true",
@@ -8166,6 +8168,9 @@ def main() -> int:
         except (ValueError, OSError) as exc:
             return fail(f"model-relay: {exc}")
     if args.cmd == "autodetect":
+        if args.all:
+            return _with_lock(lambda: autodetect_refresh.refresh(
+                _ROUTER_VIEW, reload=not args.no_reload, quiet=args.quiet))
         return _with_lock(lambda: autodetect_source(
             args.source, reload=not args.no_reload, quiet=args.quiet
         ))
