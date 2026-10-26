@@ -103,7 +103,7 @@ def test_warp_connects_in_proxy_mode_and_does_not_reconnect_ready_client(tmp_pat
     commands = []
     ready = False
     monkeypatch.setattr(lifecycle.shutil, "which", lambda *a, **k: "/usr/local/bin/warp-cli")
-    monkeypatch.setattr(lifecycle, "socks_ready", lambda *a: ready)
+    monkeypatch.setattr(lifecycle, "socks_ready", lambda *a, **k: ready)
     def run(args, **kwargs):
         nonlocal ready
         commands.append(args[1:])
@@ -136,14 +136,14 @@ def test_only_routed_providers_start(tmp_path, monkeypatch):
 
 def test_failed_command_is_bounded_and_does_not_claim_ready(tmp_path, monkeypatch):
     managed(tmp_path, {"mode": "command", "command": shlex.join([sys.executable, "-c", "raise SystemExit(7)"])})
-    monkeypatch.setattr(lifecycle, "socks_ready", lambda *a: False)
+    monkeypatch.setattr(lifecycle, "socks_ready", lambda *a, **k: False)
     with pytest.raises(lifecycle.StartupError, match="exited with code 7"):
         lifecycle.ensure(tmp_path, "test", "127.0.0.1", 12345, timeout=2)
 
 
 def test_failed_startup_has_short_cooldown(tmp_path, monkeypatch):
     managed(tmp_path, {"mode": "command", "command": "missing-proxy"})
-    monkeypatch.setattr(lifecycle, "socks_ready", lambda *a: False)
+    monkeypatch.setattr(lifecycle, "socks_ready", lambda *a, **k: False)
     calls = []
     def spawn(*a, **k):
         calls.append(a)
