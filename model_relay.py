@@ -5,6 +5,9 @@ import http.client
 import ipaddress
 import json
 import logging
+import math
+import select
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -90,6 +93,26 @@ class RouterRecovery:
         with self.lock:
             return self._snapshot()
 
+    def recover_transport(self, expected, *, timeout=45):
+        """Rotate a stalled primary without charging it a quota failure."""
+        if timeout <= 0:
+            return False
+        with self.lock:
+            def apply():
+                current = self._snapshot()
+                if not expected or not current:
+                    return False
+                if current != expected:
+                    return True
+                _, effective, _ = current
+                r = self.router
+                if effective == "direct" or r.is_proxy_provider(effective):
+                    return False
+                if r.rotate(effective, reason="timeout", automatic=True, probe=False) != 0:
+                    return False
+                return self._snapshot() not in (None, current)
+            return self.router._with_lock(apply, timeout=min(45, timeout)) is True
+
     def recover(self, expected):
         with self.lock:
             def apply():
@@ -128,32 +151,61 @@ class RouterRecovery:
             return self.router._with_lock(apply, timeout=45) is True
 
 
+class UpstreamHeaderTimeout(TimeoutError):
+    """An upstream accepted the request but did not return response headers."""
+
+
 class ModelRelay(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, address, upstream, proxy_port, recovery, *, max_retries=32,
-                 timeout=180, retry_window=180, free_models=()):
+                 timeout=180, header_timeout=25, retry_window=180, free_models=()):
         parsed = urlsplit(upstream)
         if (parsed.scheme != "https" or not parsed.hostname or parsed.username
                 or parsed.password or parsed.query or parsed.fragment):
             raise ValueError("upstream must be an HTTPS API base URL")
         if address[0] != "127.0.0.1":
             raise ValueError("model relay must listen on 127.0.0.1")
+        if not math.isfinite(header_timeout) or header_timeout <= 0:
+            raise ValueError("header timeout must be finite and positive")
         self.upstream = parsed
+        self.header_timeout = header_timeout
         self.proxy_port = proxy_port
         self.recovery = recovery
         self.max_retries, self.timeout, self.retry_window = max_retries, timeout, retry_window
         self.free_models = set(free_models)
         super().__init__(address, RelayHandler)
 
-    def open_upstream(self, method, path, body, headers):
+    def open_upstream(self, method, path, body, headers, *, remaining=None):
         # Explicit CONNECT ignores ambient proxy/no_proxy settings. TLS verifies
         # the upstream hostname; this relay needs no interception certificate.
-        conn = http.client.HTTPSConnection("127.0.0.1", self.proxy_port, timeout=self.timeout)
+        budget = min(self.timeout, self.header_timeout,
+                     remaining if remaining is not None else self.header_timeout)
+        if budget <= 0:
+            raise TimeoutError("recovery window expired")
+        deadline = time.monotonic() + budget
+        conn = http.client.HTTPSConnection("127.0.0.1", self.proxy_port, timeout=budget)
         conn.set_tunnel(self.upstream.hostname, self.upstream.port or 443)
         try:
+            conn.connect()
+            upstream_socket = conn.sock
+            wait = deadline - time.monotonic()
+            if wait <= 0:
+                raise TimeoutError("connection exhausted attempt budget")
+            upstream_socket.settimeout(wait)
             conn.request(method, self.upstream.path.rstrip("/") + path, body, headers)
-            return conn, conn.getresponse()
+            wait = deadline - time.monotonic()
+            if wait <= 0:
+                raise TimeoutError("request exhausted attempt budget")
+            upstream_socket.settimeout(wait)
+            try:
+                response = conn.getresponse()
+            except TimeoutError as exc:
+                raise UpstreamHeaderTimeout("upstream response headers timed out") from exc
+            # Generations that have sent headers keep the normal stream idle
+            # timeout; the short header budget must not truncate slow output.
+            upstream_socket.settimeout(self.timeout)
+            return conn, response
         except Exception:
             conn.close()
             raise
@@ -173,6 +225,13 @@ class RelayHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self._relay()
+
+    def _client_disconnected(self):
+        try:
+            readable, _, _ = select.select([self.connection], [], [], 0)
+            return bool(readable) and not self.connection.recv(1, socket.MSG_PEEK)
+        except OSError:
+            return True
 
     def _json(self, status, value):
         body = json.dumps(value).encode()
@@ -216,8 +275,27 @@ class RelayHandler(BaseHTTPRequestHandler):
         headers_sent = False
         try:
             while True:
+                if self._client_disconnected():
+                    return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise UpstreamHeaderTimeout("recovery window expired")
                 exit_before = server.recovery.snapshot()
-                conn, response = server.open_upstream(self.command, path.path[3:], body, headers)
+                try:
+                    conn, response = server.open_upstream(
+                        self.command, path.path[3:], body, headers,
+                        remaining=deadline - time.monotonic())
+                except UpstreamHeaderTimeout:
+                    # Transport stalls are not quota evidence. Do not mark an
+                    # exit exhausted or replay any output already delivered.
+                    if (self._client_disconnected() or self.command != "POST" or not free
+                            or retries >= server.max_retries or time.monotonic() >= deadline):
+                        raise
+                    if not server.recovery.recover_transport(
+                            exit_before, timeout=deadline - time.monotonic()):
+                        raise
+                    retries += 1
+                    continue
                 try:
                     prefix = b""
                     failed_body = response.read(MAX_BODY + 1) if response.status == 429 else None
@@ -285,8 +363,12 @@ class RelayHandler(BaseHTTPRequestHandler):
                     conn.close()
         except (OSError, http.client.HTTPException) as exc:
             log.warning("model upstream connection failed (%s)", type(exc).__name__)
-            if not headers_sent:
-                self._json(502, {"error": {"message": "Model upstream connection failed"}})
+            if not headers_sent and not self._client_disconnected():
+                if isinstance(exc, UpstreamHeaderTimeout):
+                    self._json(504, {"error": {"message": "Model upstream response headers timed out",
+                                               "type": "upstream_error", "code": "upstream_header_timeout"}})
+                else:
+                    self._json(502, {"error": {"message": "Model upstream connection failed"}})
 
 
 def serve(router, args):
@@ -295,7 +377,8 @@ def serve(router, args):
     recovery = RouterRecovery(router, host)
     with ModelRelay(("127.0.0.1", args.port), args.upstream, router._port, recovery,
                     max_retries=args.max_retries, free_models=args.free_model,
-                    timeout=args.timeout, retry_window=args.retry_window) as server:
+                    timeout=args.timeout, header_timeout=args.header_timeout,
+                    retry_window=args.retry_window) as server:
         log.info("listening on 127.0.0.1:%d; upstream %s", args.port, host)
         try:
             server.serve_forever()

@@ -58,7 +58,7 @@ def relay_path():
     recovery = Recovery()
     relay = ModelRelay(('127.0.0.1', 0), 'https://example.test/zen/v1', 1, recovery, max_retries=3)
 
-    def open_upstream(method, path, data, headers):
+    def open_upstream(method, path, data, headers, *, remaining=None):
         conn = http.client.HTTPConnection(*upstream.server_address, timeout=3)
         conn.request(method, '/zen/v1' + path, data, headers)
         return conn, conn.getresponse()

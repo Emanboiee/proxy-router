@@ -945,8 +945,18 @@ Models ending in `-free` or `:free`, explicit `--free-model` IDs, and semantic
 `FreeUsageLimitError` responses qualify. Raw JSON limit errors returned with
 HTTP 200 are recognized before success headers are sent. Paid-model generic
 429s pass through.
-The relay never replays a partially delivered successful stream. It listens
-only on loopback, verifies upstream TLS, and logs no prompts or credentials.
+Each upstream attempt has a separate `--header-timeout` budget (default 25
+seconds), capped by the remaining recovery window. After headers arrive,
+`--timeout` remains the stream idle timeout (default 180 seconds), so slow
+streaming output is not cut off by the shorter header wait. A free-model
+header stall may rotate a WireGuard primary and retry before any output is
+sent, sharing the existing retry count/window. It records a transport timeout,
+not quota exhaustion; paid requests and unrotatable paths return an explicit
+504 instead. This does not make engine reloads deadline-preemptible: an
+already-started reload may still finish after the recovery window.
+Client disconnects suppress subsequent retries once the active header wait
+returns. The relay never replays a partially delivered successful stream. It
+listens only on loopback, verifies upstream TLS, and logs no prompts or credentials.
 The engine must be running; manual-off does not restart it.
 
 Hermes's error hooks are observer-only in the inspected version: a plugin's
