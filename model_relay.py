@@ -6,6 +6,7 @@ import ipaddress
 import json
 import logging
 import math
+import re
 import select
 import socket
 import threading
@@ -151,6 +152,48 @@ class RouterRecovery:
             return self.router._with_lock(apply, timeout=45) is True
 
 
+class RelayEvidence:
+    """Keep bounded, request-separated failure metadata, never payloads or headers."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.last_failure = None
+        self.failures_by_kind = {}
+
+    @staticmethod
+    def exit_fields(snapshot):
+        if not isinstance(snapshot, tuple) or len(snapshot) != 3:
+            return None
+        if not all(isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", value)
+                   for value in snapshot):
+            return None
+        return dict(zip(("primary", "provider", "profile"), snapshot))
+
+    def failure(self, snapshot, **fields):
+        allowed = {"failure_class", "phase", "request_kind", "attempt", "elapsed_seconds",
+                   "remaining_seconds", "quota_retries", "transport_retries", "upstream_status"}
+        event = {key: value for key, value in fields.items() if key in allowed}
+        if event.get("request_kind") not in {"stream", "nonstream", "models", "chat", "auxiliary"}:
+            event["request_kind"] = "unknown"
+        event["exit"] = self.exit_fields(snapshot)
+        with self.lock:
+            self.last_failure = (time.monotonic(), event)
+            self.failures_by_kind[event["request_kind"]] = self.last_failure
+        log.warning("model upstream failure: %s", json.dumps(event, sort_keys=True))
+
+    def view(self):
+        with self.lock:
+            now = time.monotonic()
+
+            def recent(record):
+                if record is None:
+                    return None
+                when, event = record
+                return {**event, "seconds_ago": round(max(0, now - when), 1)}
+
+            return {"last_failure": recent(self.last_failure),
+                    "failures_by_kind": {kind: recent(record) for kind, record in self.failures_by_kind.items()}}
+
+
 class UpstreamHeaderTimeout(TimeoutError):
     """An upstream accepted the request but did not return response headers."""
 
@@ -174,6 +217,7 @@ class ModelRelay(ThreadingHTTPServer):
         self.recovery = recovery
         self.max_retries, self.timeout, self.retry_window = max_retries, timeout, retry_window
         self.free_models = set(free_models)
+        self.evidence = RelayEvidence()
         super().__init__(address, RelayHandler)
 
     def open_upstream(self, method, path, body, headers, *, remaining=None):
@@ -220,7 +264,8 @@ class RelayHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            return self._json(200, {"service": "proxy-router-model-relay", "ok": True})
+            return self._json(200, {"service": "proxy-router-model-relay", "ok": True,
+                                    **self.server.evidence.view()})
         self._relay()
 
     def do_POST(self):
@@ -258,24 +303,44 @@ class RelayHandler(BaseHTTPRequestHandler):
         self.connection.settimeout(server.timeout)
         body = self.rfile.read(length) if length else None
         model = ""
+        request_kind = "models"
         if self.command == "POST":
             try:
                 payload = json.loads(body or b"")
                 model = payload.get("model", "")
+                request_kind = "stream" if payload.get("stream") is True else "nonstream"
                 if not isinstance(model, str):
                     raise ValueError("model must be a string")
             except (ValueError, AttributeError):
                 return self._json(400, {"error": {"message": "Invalid model request"}})
+        declared_kind = self.headers.get("X-Proxy-Router-Request-Kind")
+        if declared_kind in {"chat", "auxiliary"}:
+            request_kind = declared_kind
         free = model.endswith(("-free", ":free")) or model in server.free_models
         blocked = HOP_HEADERS | {h.strip().lower() for h in self.headers.get("Connection", "").split(",")}
+        blocked.add("x-proxy-router-request-kind")
         headers = {k: v for k, v in self.headers.items() if k.lower() not in blocked}
         headers["Accept-Encoding"] = "identity"
-        deadline = time.monotonic() + server.retry_window
-        retries = 0
+        started = time.monotonic()
+        deadline = started + server.retry_window
+        retries = quota_retries = transport_retries = 0
         headers_sent = False
+        exit_before = None
+
+        def record(failure_class, phase, status=None):
+            now = time.monotonic()
+            server.evidence.failure(
+                exit_before, failure_class=failure_class, phase=phase,
+                request_kind=request_kind, attempt=retries + 1,
+                elapsed_seconds=round(now - started, 3),
+                remaining_seconds=round(max(0, deadline - now), 3),
+                quota_retries=quota_retries, transport_retries=transport_retries,
+                upstream_status=status)
+
         try:
             while True:
                 if self._client_disconnected():
+                    record("client_cancelled", "before_attempt")
                     return
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -286,6 +351,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                         self.command, path.path[3:], body, headers,
                         remaining=deadline - time.monotonic())
                 except UpstreamHeaderTimeout:
+                    record("upstream_header_timeout", "response_headers")
                     # Transport stalls are not quota evidence. Do not mark an
                     # exit exhausted or replay any output already delivered.
                     if (self._client_disconnected() or self.command != "POST" or not free
@@ -295,6 +361,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                             exit_before, timeout=deadline - time.monotonic()):
                         raise
                     retries += 1
+                    transport_retries += 1
                     continue
                 try:
                     prefix = b""
@@ -326,6 +393,9 @@ class RelayHandler(BaseHTTPRequestHandler):
                                 status, failed_body = 429, prefix
                                 prefix = b""
                     semantic_free = failed_body is not None and b"freeusagelimiterror" in failed_body.lower()
+                    if status >= 400:
+                        record("quota_unavailable" if status == 429 else "upstream_rejected",
+                               "response_headers", status)
                     if (status == 429 and (free or semantic_free)
                             and retries < server.max_retries and time.monotonic() < deadline):
                         # Close rejected sockets before reloading the network engine.
@@ -333,6 +403,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                         conn.close()
                         if server.recovery.recover(exit_before):
                             retries += 1
+                            quota_retries += 1
                             log.info("free-model 429: exit changed; retry %d", retries)
                             if time.monotonic() < deadline:
                                 continue
@@ -362,8 +433,16 @@ class RelayHandler(BaseHTTPRequestHandler):
                     response.close()
                     conn.close()
         except (OSError, http.client.HTTPException) as exc:
-            log.warning("model upstream connection failed (%s)", type(exc).__name__)
-            if not headers_sent and not self._client_disconnected():
+            cancelled = self._client_disconnected()
+            failure_class = "transport_failed"
+            phase = "stream" if headers_sent else "connect_or_response"
+            if isinstance(exc, UpstreamHeaderTimeout):
+                failure_class = "upstream_header_timeout"
+                phase = "response_headers"
+            if cancelled:
+                failure_class = "client_cancelled"
+            record(failure_class, phase)
+            if not headers_sent and not cancelled:
                 if isinstance(exc, UpstreamHeaderTimeout):
                     self._json(504, {"error": {"message": "Model upstream response headers timed out",
                                                "type": "upstream_error", "code": "upstream_header_timeout"}})

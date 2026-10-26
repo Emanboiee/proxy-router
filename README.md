@@ -959,6 +959,20 @@ returns. The relay never replays a partially delivered successful stream. It
 listens only on loopback, verifies upstream TLS, and logs no prompts or credentials.
 The engine must be running; manual-off does not restart it.
 
+Relay failure logs are structured: failure class, phase, attempt, elapsed and
+remaining seconds, transport/quota retry counts, upstream status, and the
+observed exit identifiers. `/health` keeps the latest failure and a bounded
+`failures_by_kind` view with ages. `ok` still means the relay is serving, not
+that the upstream or its quota is healthy; old failure evidence is historical,
+not a claim that the current path is down. No extra probe runs on health reads.
+By default, streaming and non-streaming failures are separate. Callers can set
+`X-Proxy-Router-Request-Kind: chat` or `auxiliary` to separate main chat from
+background/title work explicitly; the relay strips this diagnostic header
+before forwarding. It does not infer title requests from prompt contents.
+Logs and health never include request bodies, authorization, session IDs, or
+upstream error text. Exit identifiers are restricted to short plain IDs;
+paths and unexpected snapshot shapes are omitted.
+
 Hermes's error hooks are observer-only in the inspected version: a plugin's
 `retry_primary` return is discarded before eager rate-limit fallback. Keeping
 the recovery below Hermes avoids depending on that hook or patching its core.
