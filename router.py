@@ -7400,6 +7400,11 @@ _HELPER_STATUS_PENDING = object()
 
 def _probe_helper_status() -> dict | None:
     """Return canonical helper status, or None when exact NOPASSWD is absent."""
+    if os.name == "nt":
+        # The root helper is a macOS sudo/launchd mechanism. Windows has no
+        # POSIX uid or sudo, so probing it would crash status --json before the
+        # elevation block can report the (correct) not-installed state.
+        return None
     try:
         result = subprocess.run(
             _helper_command("status"),
