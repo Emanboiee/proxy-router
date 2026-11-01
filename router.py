@@ -51,6 +51,7 @@ import net_safety
 import provider_lifecycle
 import state
 import status_snapshot
+from engine_identity import EngineIdentityError
 from providers_check import provider_config_errors as _provider_config_errors
 from config_schema import (
     DEFAULT_DIRECT_PROBE_URL,
@@ -3454,6 +3455,10 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
             # captured domains still select their configured provider.
             rules.insert(0, {"action": "sniff"})
         exclude_cidr = _vpn.get("exclude_cidr") or []
+        if os.name == "nt" and "route_address_set" not in tun:
+            # Windows otherwise sends multihomed DNS queries outside the
+            # full tunnel, bypassing the DNS hijack and keeping ISP blocks.
+            tun["strict_route"] = True
         if exclude_cidr:
             # Destinations pinned outside the engine entirely: sing-box
             # excludes these routes from the TUN, so they always ride the
@@ -3479,6 +3484,8 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
         # in sing-box 1.12 (confirmed against the 1.12 binary), so the tun
         # config needs the same 1.12 minimum as proxy mode.
         rules.insert(0, {"protocol": "dns", "action": "hijack-dns"})
+        if os.name == "nt" and "route_address_set" not in tun:
+            rules.insert(0, {"inbound": ["tun-in"], "port": 53, "action": "hijack-dns"})
     else:
         inbounds = [{"type": "mixed", "tag": "local-proxy", "listen": "127.0.0.1", "listen_port": _port}]
         route_final = "direct"
@@ -3667,12 +3674,12 @@ def _pid_matches(pid: int) -> bool:
         return False
     try:
         if os.name == "nt":
-            # Windows helper lifecycle is authoritative; this fallback remains
-            # conservative and requires the configured path in the command line.
+            # Require the exact CreateProcess command line, including config.
             out = subprocess.run(
                 ["powershell", "-NoProfile", "-Command",
+                 "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new(); "
                  f"(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, encoding="utf-8", timeout=5,
             ).stdout.strip()
             return bool(out) and _command_is_our_engine(out)
         result = subprocess.run(
@@ -4315,8 +4322,6 @@ def engine_ensure(*, allow_network_off: bool = False) -> int:
     return rc
 
 
-class EngineIdentityError(RuntimeError):
-    """The process table could not prove engine identity safely."""
 
 
 def _expected_engine_command() -> str | None:
@@ -4334,6 +4339,9 @@ _expected_engine_argv_source: str | None = None
 def _expected_engine_argv() -> list[str] | None:
     """``_expected_engine_command()`` split once, not per process-table row."""
     global _expected_engine_argv_cache, _expected_engine_argv_source
+    if os.name == "nt":
+        binary = resolve_sing_box()
+        return [str(binary), "run", "-c", str(SING_BOX_CONFIG)] if binary else None
     expected = _expected_engine_command()
     if expected is None:
         return None
@@ -4351,6 +4359,10 @@ def _command_is_our_engine(cmd: str) -> bool:
     expected_argv = _expected_engine_argv()
     if not expected_argv:
         return False
+    if os.name == "nt":
+        # Popen uses list2cmdline for CreateProcess. POSIX shlex strips
+        # Windows path separators and misparses paths containing spaces.
+        return str(cmd).strip() == subprocess.list2cmdline(expected_argv)
     try:
         return shlex.split(str(cmd).strip()) == expected_argv
     except ValueError:
@@ -4369,9 +4381,10 @@ def _find_our_engine_pids() -> list[int]:
         raise EngineIdentityError("sing-box binary is unavailable; engine identity is unknown")
     engine_binary = expected_argv[0]
     if os.name == "nt":
-        # The privileged helper owns Windows lifecycle in supported installs;
-        # retain a conservative no-result path for the cross-platform CLI.
-        raise EngineIdentityError("exact orphan scan is unavailable on Windows")
+        from engine_identity import find_windows_engine_pids
+        return find_windows_engine_pids(
+            engine_binary, matches=_command_is_our_engine, runner=subprocess.run,
+        )
     try:
         result = subprocess.run(
             ["ps", "-axo", "pid=,uid=,command="],

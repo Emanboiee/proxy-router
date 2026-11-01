@@ -22,6 +22,7 @@ LEAF_MODULES = (
     "worker_lock.py",
     "providers_check.py",
     "net_safety.py",
+    "engine_identity.py",
 )
 TOP_LEVEL_MODULES = (
     "router",

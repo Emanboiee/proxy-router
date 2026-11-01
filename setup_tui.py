@@ -165,6 +165,15 @@ _PRESET_ROUTES = {
         "domains": ["reddit.com", "redd.it", "redditstatic.com", "redditmedia.com"],
         "provider": "cloudflare",
     },
+    "steam": {
+        "id": "steam",
+        "domains": [
+            "steampowered.com", "steamcommunity.com", "steamgames.com",
+            "steamcontent.com", "steamstatic.com", "steamusercontent.com",
+            "steamserver.net", "steam-chat.com", "s.team", "valvesoftware.com",
+        ],
+        "provider": "cloudflare",
+    },
 }
 
 # Built-in preset definitions: name -> {"routes": [..], "routing": {...}}.
@@ -178,6 +187,20 @@ _PRESET_ROUTES = {
 _PRESET_AUTODETECT = {"enabled": True, "auto_sources": True}
 
 _BUILTIN_PRESETS: dict = {
+    "gaming": {
+        "routes": [_PRESET_ROUTES["steam"], _PRESET_ROUTES["roblox"],
+                   _PRESET_ROUTES["reddit"]],
+        # Games use raw-IP UDP servers beyond the web/CDN domain lists.
+        # Capture the full tunnel and route unmatched traffic through WARP.
+        "routing": {"mode": "safe-list", "default_provider": "cloudflare",
+                    "direct_domains": []},
+        "vpn": {"default_mode": "tun", "capture": "ruleset", "selective": None, "mtu": 1280,
+                "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
+                "public_dns": {"server": "1.1.1.1", "transport": "https"},
+                "dns_transport": "https", "dns_resolver": "provider",
+                "network_auto": False, "tailscale_bypass": True},
+        "autodetect": dict(_PRESET_AUTODETECT),
+    },
     "opencode": {
         "routes": [_PRESET_ROUTES["opencode-zen"], _PRESET_ROUTES["reddit"]],
         "routing": {"mode": "default"},

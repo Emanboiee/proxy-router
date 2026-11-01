@@ -94,9 +94,12 @@ generic providers `primary-vpn` / `fallback-vpn` (with a
 `fallback_providers` chain) and a conservative route table. The validated,
 provider-specific presets are applied explicitly by name via
 `setup --preset <name>` — built-ins: `default` (OpenCode → Proton + Roblox →
-WARP combo), `opencode`, `roblox`, `school-warp` (VPN-list routing plus DoH
+WARP combo), `opencode`, `roblox`, `gaming` (Steam, Roblox and Reddit with a
+full TUN through a WireGuard WARP profile), `school-warp` (VPN-list routing plus DoH
 DNS for filtered/captive networks). List them any time with
 `proxy-router setup --preset-list`.
+
+For Windows games, use the [gaming setup guide](guides/windows-gaming.md).
 
 `proxy-router setup` with no flags opens the custom terminal wizard. It never
 enables TUN mode or starts monitoring unless you explicitly choose those
