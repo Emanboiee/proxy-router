@@ -1342,6 +1342,25 @@ def egress_is_exhausted(name: str, profile: Path, now: int | None = None) -> boo
     )
 
 
+def provider_quota_exhausted(name: str, now: int | None = None) -> bool:
+    """True when ``name`` has no exit that may carry traffic because of quota.
+
+    A candidate the operator can never use is worse than the stall it replaces:
+    activation would consume the recovery window and leave the route parked.
+    Proxy-backed providers keep one egress record per SOCKS5 host, and a
+    WireGuard pool keeps one per profile; in both cases the provider is
+    unusable only when *every* known exit carries an unexpired marker. A
+    provider with no egress records at all is not blocked here.
+    """
+    try:
+        profiles = provider_files(name)
+    except ValueError:
+        return False
+    if not profiles:
+        return False
+    return all(egress_is_exhausted(name, profile, now) for profile in profiles)
+
+
 def _is_block_reason(reason: str) -> bool:
     """True when an upstream failure reason describes an egress-IP reputation
     block (Cloudflare 1010/403) rather than a transient error."""
@@ -1469,6 +1488,14 @@ def activate_fallback(name: str, *, target: str | None = None, reason: str = "tr
         if candidate != "direct" and not provider_has_valid_exit(candidate):
             print(f"router: skipping fallback '{candidate}': no valid exit "
                   "(no parseable profile or bad socks5 upstream)", file=sys.stderr)
+            continue
+        # A static exit check says the profile parses, not that the exit can
+        # serve traffic. Parking a route on a provider whose last egress record
+        # is quota-exhausted trades one outage for another (#219).
+        if candidate != "direct" and provider_quota_exhausted(candidate):
+            print(f"router: skipping fallback '{candidate}': exit quota is "
+                  "exhausted (last egress record carries an unexpired marker)",
+                  file=sys.stderr)
             continue
         _atomic_write(path, json.dumps({
             "provider": candidate,
