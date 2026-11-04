@@ -1345,20 +1345,20 @@ def egress_is_exhausted(name: str, profile: Path, now: int | None = None) -> boo
 def provider_quota_exhausted(name: str, now: int | None = None) -> bool:
     """True when ``name`` has no exit that may carry traffic because of quota.
 
-    A candidate the operator can never use is worse than the stall it replaces:
-    activation would consume the recovery window and leave the route parked.
-    Proxy-backed providers keep one egress record per SOCKS5 host, and a
-    WireGuard pool keeps one per profile; in both cases the provider is
-    unusable only when *every* known exit carries an unexpired marker. A
-    provider with no egress records at all is not blocked here.
+    A proxy-backed provider has no ``*.conf`` profiles; its health records key
+    off the synthetic ``proxy_profile_key()`` stem, so the record to read is
+    ``state/egress/<name>/socks.json``. Enumerating profiles here would raise
+    or return [] and read as "not exhausted" for the very provider #219 is
+    about. A WireGuard pool is unusable only when every profile is exhausted.
+    No records at all reads eligible: absence of evidence is not exhaustion.
     """
     try:
-        profiles = provider_files(name)
+        profiles = ([proxy_profile_key(name)] if is_proxy_provider(name)
+                    else provider_files(name))
     except ValueError:
         return False
-    if not profiles:
-        return False
-    return all(egress_is_exhausted(name, profile, now) for profile in profiles)
+    return bool(profiles) and all(
+        egress_is_exhausted(name, profile, now) for profile in profiles)
 
 
 def _is_block_reason(reason: str) -> bool:
@@ -1489,9 +1489,11 @@ def activate_fallback(name: str, *, target: str | None = None, reason: str = "tr
             print(f"router: skipping fallback '{candidate}': no valid exit "
                   "(no parseable profile or bad socks5 upstream)", file=sys.stderr)
             continue
-        # A static exit check says the profile parses, not that the exit can
-        # serve traffic. Parking a route on a provider whose last egress record
-        # is quota-exhausted trades one outage for another (#219).
+        # A static exit check says the profile parses, not that it can serve
+        # traffic. Parking on a quota-exhausted exit trades one outage for
+        # another (#219). Fail-closed on purpose, like rotation: a marker with
+        # no parsable deadline blocks until a passing probe rewrites it, and a
+        # skipped candidate is never probed, so it may need an operator.
         if candidate != "direct" and provider_quota_exhausted(candidate):
             print(f"router: skipping fallback '{candidate}': exit quota is "
                   "exhausted (last egress record carries an unexpired marker)",
