@@ -1345,18 +1345,18 @@ def egress_is_exhausted(name: str, profile: Path, now: int | None = None) -> boo
 def provider_quota_exhausted(name: str, now: int | None = None) -> bool:
     """True when ``name`` has no exit that may carry traffic because of quota.
 
-    A proxy-backed provider has no ``*.conf`` profiles; its health records key
-    off the synthetic ``proxy_profile_key()`` stem, so the record to read is
-    ``state/egress/<name>/socks.json``. Enumerating profiles here would raise
-    or return [] and read as "not exhausted" for the very provider #219 is
-    about. A WireGuard pool is unusable only when every profile is exhausted.
-    No records at all reads eligible: absence of evidence is not exhaustion.
+    Proxy providers have no ``*.conf``; the record keys off the synthetic
+    ``proxy_profile_key()`` stem (``state/egress/<name>/socks.json``). Reading
+    profiles would read "not exhausted" for the provider #219 names. A pool is
+    unusable only when every profile is exhausted; no records reads eligible.
     """
-    try:
-        profiles = ([proxy_profile_key(name)] if is_proxy_provider(name)
-                    else provider_files(name))
-    except ValueError:
-        return False
+    if is_proxy_provider(name):
+        profiles = [proxy_profile_key(name)]
+    else:
+        try:
+            profiles = provider_files(name)
+        except ValueError:
+            return False
     return bool(profiles) and all(
         egress_is_exhausted(name, profile, now) for profile in profiles)
 
@@ -1489,14 +1489,14 @@ def activate_fallback(name: str, *, target: str | None = None, reason: str = "tr
             print(f"router: skipping fallback '{candidate}': no valid exit "
                   "(no parseable profile or bad socks5 upstream)", file=sys.stderr)
             continue
-        # A static exit check says the profile parses, not that it can serve
-        # traffic. Parking on a quota-exhausted exit trades one outage for
-        # another (#219). Fail-closed on purpose, like rotation: a marker with
-        # no parsable deadline blocks until a passing probe rewrites it, and a
-        # skipped candidate is never probed, so it may need an operator.
+        # Parsable != able to serve traffic. Stale-but-clean records still pass
+        # (issue #219). Fail-closed like rotation: a marker without a parsable
+        # deadline blocks until a probe rewrites it, and a skipped candidate is
+        # never probed, so clearing one may need an operator.
         if candidate != "direct" and provider_quota_exhausted(candidate):
+            last_error = "all fallback candidates are quota-exhausted" 
             print(f"router: skipping fallback '{candidate}': exit quota is "
-                  "exhausted (last egress record carries an unexpired marker)",
+                  "exhausted (record carries an unexpired marker)",
                   file=sys.stderr)
             continue
         _atomic_write(path, json.dumps({

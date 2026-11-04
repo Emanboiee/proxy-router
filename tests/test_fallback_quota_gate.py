@@ -5,6 +5,8 @@ proxy-backed provider that is a static ``proxy_upstream()`` parse, so a provider
 whose egress record was quota-exhausted still counted as a viable candidate. The
 route then parked on an exit that could not serve traffic.
 """
+import contextlib
+import io
 import json
 import time
 from unittest import mock
@@ -186,3 +188,21 @@ def test_proxy_marker_without_deadline_stays_blocking(proxy_controller):
     assert r.provider_quota_exhausted("cloudflare")
     assert r.activate_fallback("warp") != 0
     assert r.active_fallback("warp") is None
+
+
+def test_exhausted_only_candidate_reports_quota_not_bad_profile(proxy_controller):
+    """The failure message must name the real reason.
+
+    A candidate with a valid socks5 upstream that was rejected for quota is not
+    a "no valid profile" case; reporting it as one sends operators to the wrong
+    config.
+    """
+    r = proxy_controller
+    r._providers["warp"]["fallback_providers"] = ["cloudflare"]
+    _mark_exhausted(r, "cloudflare", r.proxy_profile_key("cloudflare"), until=_FUTURE)
+
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        assert r.activate_fallback("warp") != 0
+    assert "no fallback candidate has a valid profile" not in err.getvalue()
+    assert "quota-exhausted" in err.getvalue()
