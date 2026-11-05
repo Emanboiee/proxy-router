@@ -314,3 +314,33 @@ def test_proxy_gate_works_without_stubbing_profile_error(tmp_path):
     assert r.provider_quota_exhausted("cloudflare") is True
     assert r.activate_fallback("warp") != 0
     assert r.active_fallback("warp") is None
+
+
+def test_nested_chain_ending_in_direct_is_not_quota_gated(tmp_path):
+    """A leaf resolving to "direct" has no egress record to exhaust.
+
+    "direct" is a sentinel, not a provider with quota. A config may also
+    legitimately name a provider "direct"; either way the leaf must not be
+    gated, or a healthy chain can never fail over.
+    """
+    r = load_router(tmp_path)
+    conf = tmp_path / "proton.conf"
+    conf.write_text("x")
+    direct_conf = tmp_path / "direct.conf"
+    r._providers = {
+        "warp": {"fallback_providers": ["proton"]},
+        "proton": {"fallback_providers": ["direct"]},
+        "direct": {},
+    }
+    r.current_mode = lambda: "proxy"
+    r.engine_reload = mock.Mock(return_value=0)
+    r._profile_error = lambda p: None
+    r.provider_files = lambda n: ([conf] if n == "proton" else
+                                  [direct_conf] if n == "direct" else [])
+    assert r.activate_fallback("proton", target="direct") == 0
+    assert r._effective_route_provider("proton") == "direct"
+
+    _mark_exhausted(r, "direct", direct_conf, until=_FUTURE)
+    assert r.provider_quota_exhausted("direct") is True
+    assert r.activate_fallback("warp", target="proton") == 0
+    assert r.active_fallback("warp") == "proton"

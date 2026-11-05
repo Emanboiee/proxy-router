@@ -1493,7 +1493,7 @@ def activate_fallback(name: str, *, target: str | None = None, reason: str = "tr
         # probe to clear. Reinstating a just-deactivated fallback is not a fresh
         # choice; gate a nested chain by its leaf.
         leaf = candidate if candidate == "direct" else _effective_route_provider(candidate)
-        if not reinstating and candidate != "direct" and provider_quota_exhausted(leaf):
+        if not reinstating and leaf != "direct" and provider_quota_exhausted(leaf):
             last_error = "fallback candidate(s) are quota-exhausted"
             print(f"router: skipping fallback '{candidate}': exit quota is "
                   "exhausted (record carries an unexpired marker)",

@@ -286,12 +286,14 @@ Rotation is then egress-aware instead of blind round-robin:
   provider name or an **ordered list** forming a fallback chain, e.g.
   `"fallback_providers": ["cloudflare", "mullvad"]` — entries are validated at
   load (must name another configured provider, no self/duplicates) and the
-  chain is walked in order, so the first entry with valid profiles wins. When
+  chain is walked in order, so the first entry with a valid, non-exhausted
+  exit wins. When
   rotation exhausts the primary pool, the wrapper, keepalive, or Hermes
   rotation bridge writes a private runtime marker and reloads once with the
   primary endpoint removed; matching routes and DNS then use the chosen
   fallback. `failover <name> on [--to <provider>]` activates the first valid
-  chain entry (or a specific member); `failover <name> status --json` reports
+  chain entry with a valid, non-exhausted exit (or a specific member);
+  `failover <name> status --json` reports
   both `configured` (the full chain) and `active`. `egress check`/`sweep`
   report `fallback` instead of probing Proton through WARP. Clear it
   explicitly with `failover proton off` after Proton has been validated again.
