@@ -655,3 +655,30 @@ class ProviderForHostTests(unittest.TestCase):
                         "provider": "../../outside"}],
         }))
         assert w.provider_for_host(root, "discord.com") is None
+
+    def test_underlay_check_reads_connected_flag(self):
+        def fake_runner(*args, **kwargs):
+            return SimpleNamespace(returncode=0, stdout='{"connected": true}', stderr="")
+        self.assertTrue(w._underlay_healthy(Path("/tmp"), runner=fake_runner))
+
+    def test_underlay_check_defers_when_disconnected(self):
+        def fake_runner(*args, **kwargs):
+            return SimpleNamespace(returncode=1, stdout='{"connected": false}', stderr="")
+        self.assertFalse(w._underlay_healthy(Path("/tmp"), runner=fake_runner))
+
+    def test_underlay_check_defers_on_unavailable_or_malformed(self):
+        def boom(*args, **kwargs):
+            raise OSError("no controller")
+        self.assertFalse(w._underlay_healthy(Path("/tmp"), runner=boom))
+        def malformed(*args, **kwargs):
+            return SimpleNamespace(returncode=0, stdout="not json", stderr="")
+        self.assertFalse(w._underlay_healthy(Path("/tmp"), runner=malformed))
+
+    def test_rotation_deferred_preserves_failure_evidence(self):
+        """#176: an underlay flap must not consume the two-failure counter."""
+        guard = w.RotationGuard()
+        self.assertFalse(guard.record_transport_failure(100.0, "opencode.ai"))
+        # Deferral path (as in watch_worker) does not call the guard at all.
+        self.assertFalse(w._underlay_healthy(Path("/tmp"),
+                         runner=lambda *a, **k: SimpleNamespace(returncode=1, stdout="{}", stderr="")))
+        self.assertTrue(guard.record_transport_failure(101.0, "opencode.ai"))

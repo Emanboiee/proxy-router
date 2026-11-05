@@ -34,10 +34,11 @@ def controller(tmp_path):
     return r, files
 
 
-def _mark_exhausted(r, name, profile, *, until=None):
+def _mark_exhausted(r, name, profile, *, until=None, checked_at=None):
     path = r.egress_record_path(name, profile)
     path.parent.mkdir(parents=True, exist_ok=True)
-    record = {"exhausted": True}
+    record = {"exhausted": True,
+              "checked_at": int(time.time()) if checked_at is None else checked_at}
     if until is not None:
         record["exhausted_until"] = r._iso_ts(until)
     path.write_text(json.dumps(record))
@@ -344,3 +345,39 @@ def test_nested_chain_ending_in_direct_is_not_quota_gated(tmp_path):
     assert r.provider_quota_exhausted("direct") is True
     assert r.activate_fallback("warp", target="proton") == 0
     assert r.active_fallback("warp") == "proton"
+
+
+def test_stale_clean_record_does_not_certify_a_fallback(proxy_controller):
+    """#219's incident: exhausted=false, ok=true, checked_at weeks old.
+
+    quota_active() returns False for this shape, so the original gate could
+    not reject it. A record outside ok_window is unknown, not healthy.
+    """
+    r = proxy_controller
+    key = r.proxy_profile_key("cloudflare")
+    path = r.egress_record_path("cloudflare", key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stale = int(time.time()) - 29 * 86400
+    path.write_text(json.dumps({
+        "ok": True, "exhausted": False, "checked_at": stale,
+        "last_ok_at": stale, "status": 200, "fails": 0,
+    }))
+    assert not r.egress_is_exhausted("cloudflare", key)  # clean, but stale
+    assert r.provider_quota_exhausted("cloudflare") is True
+    assert r.activate_fallback("warp") != 0
+    assert r.active_fallback("warp") is None
+
+
+def test_fresh_clean_record_stays_eligible(proxy_controller):
+    """A current clean probe is real evidence and must still allow failover."""
+    r = proxy_controller
+    key = r.proxy_profile_key("cloudflare")
+    path = r.egress_record_path("cloudflare", key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    now = int(time.time())
+    path.write_text(json.dumps({
+        "ok": True, "exhausted": False, "checked_at": now,
+        "last_ok_at": now, "status": 200,
+    }))
+    assert r.provider_quota_exhausted("cloudflare") is False
+    assert r.activate_fallback("warp", target="cloudflare") == 0
