@@ -99,8 +99,12 @@ def test_every_profile_exhausted_blocks_a_wireguard_pool(controller, tmp_path):
 def test_direct_candidate_is_never_quota_gated(controller):
     r, _files = controller
     r._providers["warp"]["fail_open_direct"] = True
-    for name in ("proton", "cloudflare"):
-        r.provider_files = lambda n: _files.get(n, [])
+    # Register "direct" WITH an exhausted record: without the != "direct"
+    # exclusion this would activate nothing instead of going direct.
+    r._providers["direct"] = {}
+    direct_profile = _files["proton"][0].parent / "direct.conf"
+    r.provider_files = lambda n: _files.get(n, [direct_profile] if n == "direct" else [])
+    _mark_exhausted(r, "direct", direct_profile, until=_FUTURE)
     _mark_exhausted(r, "proton", _files["proton"][0], until=_FUTURE)
     _mark_exhausted(r, "cloudflare", _files["cloudflare"][0], until=_FUTURE)
 
@@ -129,12 +133,6 @@ def proxy_controller(tmp_path):
     r.engine_reload = mock.Mock(return_value=0)
     r._profile_error = lambda profile: None
     return r
-
-
-def _mark_proxy_exhausted(r, name, *, until=None):
-    del r._providers[name]["socks5"]  # keep the provider looking proxy-backed
-    _mark_exhausted(r, name, r.proxy_profile_key(name), until=until)
-    r._providers[name]["socks5"] = {"host": "127.0.0.1", "port": 2181}
 
 
 def test_proxy_provider_has_no_real_conf_profiles(proxy_controller):
@@ -206,3 +204,90 @@ def test_exhausted_only_candidate_reports_quota_not_bad_profile(proxy_controller
         assert r.activate_fallback("warp") != 0
     assert "no fallback candidate has a valid profile" not in err.getvalue()
     assert "quota-exhausted" in err.getvalue()
+
+
+def test_unparseable_profile_does_not_disable_the_gate(controller):
+    """One malformed *.conf must not make an exhausted provider look eligible.
+
+    provider_has_valid_exit() uses any() over parseable profiles, so the
+    provider still has a valid exit. If all() also counted the bad profile
+    (which has no egress record), the whole gate would be skipped.
+    """
+    r, files = controller
+    bad = files["proton"][0].parent / "proton-b.conf"
+    files["proton"] = [files["proton"][0], bad]
+    r._profile_error = lambda p: "bad config" if p == bad else None
+    _mark_exhausted(r, "proton", files["proton"][0], until=_FUTURE)
+
+    assert r.provider_has_valid_exit("proton")
+    assert r.provider_quota_exhausted("proton")
+    assert r.activate_fallback("warp") == 0
+    assert r.active_fallback("warp") == "cloudflare"
+
+
+def test_invalid_stem_does_not_raise_from_activation(controller):
+    """A *.conf whose stem cannot form a record path must not crash recovery.
+
+    WireGuard exports are commonly named "US East.conf"; README:124 tells
+    users to drop *.conf files into the provider directory. This worked before
+    the gate was added.
+    """
+    r, files = controller
+    weird = files["proton"][0].parent / "bad name.conf"
+    files["proton"] = [weird]
+    r._profile_error = lambda p: None
+
+    assert r.provider_quota_exhausted("proton") is False
+    assert r.activate_fallback("warp", target="proton") == 0
+
+
+def test_nested_chain_is_gated_by_its_effective_leaf(tmp_path):
+    """warp -> proton -> proton2: the exhausted leaf must reject activation."""
+    r = load_router(tmp_path)
+    conf = tmp_path / "proton.conf"
+    conf.write_text("x")
+    r._providers = {
+        "warp": {"fallback_providers": ["proton"]},
+        "proton": {"fallback_providers": ["proton2"]},
+        "proton2": {"socks5": {"host": "127.0.0.1", "port": 2181}},
+    }
+    r.current_mode = lambda: "proxy"
+    r.engine_reload = mock.Mock(return_value=0)
+    r._profile_error = lambda p: None
+    r.provider_files = lambda n: [conf] if n == "proton" else []
+    assert r.activate_fallback("proton", target="proton2") == 0
+    assert r._effective_route_provider("proton") == "proton2"
+
+    _mark_exhausted(r, "proton2", r.proxy_profile_key("proton2"), until=_FUTURE)
+    assert r.activate_fallback("warp") != 0
+    assert r.active_fallback("warp") is None
+
+
+def test_restore_reinstates_fallback_without_being_quota_gated(tmp_path):
+    """restore_fallback() deactivates before probing, then re-activates the
+    SAME serving fallback. That reinstatement is not a fresh candidate choice;
+    gating it would strand the route on a dead primary with the marker gone.
+    """
+    r = load_router(tmp_path)
+    r._providers = {"warp": {"fallback_providers": ["proton"], "fail_open_direct": True},
+                    "proton": {}}
+    r._routes = [{"id": "school", "domains": ["discord.com"], "provider": "warp"}]
+    r._routing = {}
+    r._vpn = {}
+    r._port = 2080
+    r.current_mode = lambda: "proxy"
+    r._automatic_proxy_mode = lambda: True
+    r.probe_egress = mock.Mock(return_value={"status": 200})
+    r.egress_dns_probe = mock.Mock(return_value=True)
+    r.engine_reload = mock.Mock(return_value=0)
+    profile = tmp_path / "test.conf"
+    r.provider_files = lambda name: [profile]
+    r._profile_error = lambda p: None
+    r.RESTORE_COOLDOWN_SECONDS = 0
+
+    assert r.activate_fallback("warp", target="proton", reason="confirmed-stall") == 0
+    assert r.active_fallback("warp") == "proton"
+    _mark_exhausted(r, "proton", profile, until=_FUTURE)
+
+    assert r.restore_fallback("warp", "discord.com", automatic=True) == 1
+    assert r.active_fallback("warp") == "proton"

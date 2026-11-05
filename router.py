@@ -1342,13 +1342,11 @@ def egress_is_exhausted(name: str, profile: Path, now: int | None = None) -> boo
     )
 
 
-def provider_quota_exhausted(name: str, now: int | None = None) -> bool:
+def provider_quota_exhausted(name: str) -> bool:
     """True when ``name`` has no exit that may carry traffic because of quota.
-
-    Proxy providers have no ``*.conf``; the record keys off the synthetic
-    ``proxy_profile_key()`` stem (``state/egress/<name>/socks.json``). Reading
-    profiles would read "not exhausted" for the provider #219 names. A pool is
-    unusable only when every profile is exhausted; no records reads eligible.
+    Proxy providers have no ``*.conf``; their record keys off the synthetic
+    ``proxy_profile_key()`` stem (``state/egress/<name>/socks.json``). A pool
+    needs every usable exit exhausted; no records reads eligible.
     """
     if is_proxy_provider(name):
         profiles = [proxy_profile_key(name)]
@@ -1357,8 +1355,11 @@ def provider_quota_exhausted(name: str, now: int | None = None) -> bool:
             profiles = provider_files(name)
         except ValueError:
             return False
-    return bool(profiles) and all(
-        egress_is_exhausted(name, profile, now) for profile in profiles)
+    # Only exits provider_has_valid_exit() accepts may vote; a bad stem or an
+    # unparseable .conf has no record and must not flip all() false or raise.
+    usable = [p for p in profiles if _PROVIDER_NAME.fullmatch(p.stem)
+              and _profile_error(p) is None]
+    return bool(usable) and all(egress_is_exhausted(name, p) for p in usable)
 
 
 def _is_block_reason(reason: str) -> bool:
@@ -1453,9 +1454,8 @@ def _effective_route_provider(name: str) -> str:
 
 
 def activate_fallback(name: str, *, target: str | None = None, reason: str = "transport",
-                      automatic: bool = False) -> int:
+                      automatic: bool = False, reinstating: bool = False) -> int:
     """Activate one provider from ``name``'s ordered fallback chain.
-
     With no explicit target, candidates are attempted in configured order. A
     candidate with no valid profiles is skipped; a failed hard switch rolls its
     marker/configuration back before the next candidate is tried.
@@ -1489,12 +1489,12 @@ def activate_fallback(name: str, *, target: str | None = None, reason: str = "tr
             print(f"router: skipping fallback '{candidate}': no valid exit "
                   "(no parseable profile or bad socks5 upstream)", file=sys.stderr)
             continue
-        # Parsable != able to serve traffic. Stale-but-clean records still pass
-        # (issue #219). Fail-closed like rotation: a marker without a parsable
-        # deadline blocks until a probe rewrites it, and a skipped candidate is
-        # never probed, so clearing one may need an operator.
-        if candidate != "direct" and provider_quota_exhausted(candidate):
-            last_error = "all fallback candidates are quota-exhausted" 
+        # Stale-but-clean records still pass (#219). Fail-closed: a deadline-less
+        # marker needs a keepalive probe to clear. Reinstating a just-deactivated
+        # fallback is not a fresh choice; gate a nested chain by its leaf.
+        leaf = candidate if candidate == "direct" else _effective_route_provider(candidate)
+        if not reinstating and candidate != "direct" and provider_quota_exhausted(leaf):
+            last_error = "fallback candidate(s) are quota-exhausted"
             print(f"router: skipping fallback '{candidate}': exit quota is "
                   "exhausted (record carries an unexpired marker)",
                   file=sys.stderr)
@@ -1652,7 +1652,7 @@ def restore_fallback(name: str, host: str, *, automatic: bool = False) -> int:
         }, sort_keys=True) + "\n", 0o600)
         reason = "restore-pending" if serving == "direct" else "confirmed-stall"
         if activate_fallback(name, target=serving, reason=reason,
-                             automatic=True) == 0:
+                             automatic=True, reinstating=True) == 0:
             print(f"primary check passed for {name}; awaiting one more check")
             return 1
         return fail(f"provider '{name}' restore pending but fallback '{serving}' could not be reinstated")
@@ -1663,7 +1663,7 @@ def restore_fallback(name: str, host: str, *, automatic: bool = False) -> int:
     }, sort_keys=True) + "\n", 0o600)
     reason = "primary-unhealthy" if serving == "direct" else "confirmed-stall"
     if activate_fallback(name, target=serving, reason=reason,
-                         automatic=True) != 0:
+                         automatic=True, reinstating=True) != 0:
         return fail(f"provider '{name}' primary is still unhealthy and fallback '{serving}' failed")
     print(f"primary still unhealthy: {name}; fallback '{serving}' retained", file=sys.stderr)
     return 1
