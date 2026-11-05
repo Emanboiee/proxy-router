@@ -291,3 +291,26 @@ def test_restore_reinstates_fallback_without_being_quota_gated(tmp_path):
 
     assert r.restore_fallback("warp", "discord.com", automatic=True) == 1
     assert r.active_fallback("warp") == "proton"
+
+
+def test_proxy_gate_works_without_stubbing_profile_error(tmp_path):
+    """Regression for the round-3 fix that reintroduced the round-1 blocker.
+
+    proxy_profile_key() is a synthetic Path("socks.conf") with no file on
+    disk, so the real _profile_error() rejects it. Filtering proxy keys
+    through _profile_error made the gate a no-op for EVERY proxy provider.
+    Every other proxy test stubs _profile_error, which is what hid this.
+    """
+    r = load_router(tmp_path)
+    r._providers = {"warp": {"fallback_providers": ["cloudflare"]},
+                    "cloudflare": {"socks5": {"host": "127.0.0.1", "port": 2181}}}
+    r.current_mode = lambda: "proxy"
+    r.engine_reload = mock.Mock(return_value=0)
+    # Deliberately no r._profile_error stub: use the real implementation.
+    key = r.proxy_profile_key("cloudflare")
+    assert r._profile_error(key) is not None  # synthetic key has no file
+    _mark_exhausted(r, "cloudflare", key, until=_FUTURE)
+
+    assert r.provider_quota_exhausted("cloudflare") is True
+    assert r.activate_fallback("warp") != 0
+    assert r.active_fallback("warp") is None
