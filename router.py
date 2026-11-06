@@ -5546,11 +5546,13 @@ def vpn_capture(scope: str) -> int:
 
 
 def _degraded_lanes() -> list[str]:
-    """Routes whose provider is parked on fail-open direct.
+    """Routes whose provider cannot currently serve traffic.
 
-    Read-only view over the persisted fallback markers (the same state the
-    generated config was built from), so `status` reports what traffic is
-    actually doing without probing the network.
+    Read-only view over persisted state (fallback markers + egress records),
+    so `status` reports what traffic is actually doing without probing the
+    network. #225: a proxy provider whose egress record is exhausted or too
+    old to certify health is reported even while its SOCKS listener accepts
+    TCP — an open port is not a usable exit.
     """
     lanes = []
     for route in _routes:
@@ -5558,12 +5560,23 @@ def _degraded_lanes() -> list[str]:
         route_id = route.get("id") or provider
         if not provider or provider == "direct" or provider not in _providers:
             continue
-        if _effective_route_provider(provider) != "direct":
-            continue
         if active_fallback(provider) == "direct":
             lanes.append(f"{route_id} ({provider} down, failing open to direct)")
-        else:
-            lanes.append(f"{route_id} ({provider} has no live exit)")
+            continue
+        if is_proxy_provider(provider):
+            record = read_egress(provider, proxy_profile_key(provider))
+            now, window = int(time.time()), int(egress_settings()["ok_window"])
+            # Status reports UNKNOWN when there is no record at all (#225:
+            # missing evidence must not read healthy). The fallback gate
+            # stays fail-open (#219): absence of evidence is not exhaustion.
+            if not record or egress.exit_unusable(record, now, window):
+                detail = ("quota exhausted" if egress.quota_active(record, now)
+                          else "egress health stale or unknown")
+                lanes.append(f"{route_id} ({provider} {detail})")
+            continue
+        if _effective_route_provider(provider) != "direct":
+            continue
+        lanes.append(f"{route_id} ({provider} has no live exit)")
     return lanes
 
 
