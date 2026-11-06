@@ -450,9 +450,7 @@ def set_mode(mode: str) -> None:
 
 
 def _atomic_write(path: Path, text: str, mode: int = 0o600) -> None:
-    """Write ``text`` to ``path`` atomically (temp file + os.replace) with
-    ``mode`` permissions, so a crash mid-write never leaves a truncated
-    config and the file is never world-readable (F5)."""
+    """Atomic temp-file + os.replace write (F5: never truncated/world-readable)."""
     state.atomic_write(path, text, mode, on_commit=_hand_back_ownership)
 
 
@@ -1075,7 +1073,7 @@ def policy_action(name: str, reason) -> tuple[str, int]:
 
 
 def _iso_ts(epoch: int) -> str:
-    """ISO-8601 UTC timestamp for machine-readable egress markers."""
+    """ISO-8601 UTC timestamp for machine-readable egress markers."""  # noqa: E501
     return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).isoformat()
 
 
@@ -1341,8 +1339,7 @@ def egress_is_exhausted(name: str, profile: Path, now: int | None = None) -> boo
 
 
 def provider_quota_exhausted(name: str) -> bool:
-    """No exit on ``name`` may carry traffic: quota or stale health (#219).
-    Proxies key off ``proxy_profile_key()``; pools need all exits unusable."""
+    """No exit may carry traffic: quota or stale health (#219)."""
     if is_proxy_provider(name):
         profiles = [proxy_profile_key(name)]  # synthetic key; no _profile_error
     else:
@@ -1358,10 +1355,8 @@ def provider_quota_exhausted(name: str) -> bool:
 
 
 def _is_block_reason(reason: str) -> bool:
-    """True when an upstream failure reason describes an egress-IP reputation
-    block (Cloudflare 1010/403) rather than a transient error."""
-    text = str(reason).lower()
-    return "1010" in text or "403" in text or "blocked" in text or "cloudflare" in text
+    """True when ``reason`` describes an egress-IP reputation block (1010/403)."""
+    return any(tok in str(reason).lower() for tok in ("1010", "403", "blocked", "cloudflare"))
 
 
 def _egress_error_text(exc: Exception) -> str:
@@ -1501,6 +1496,7 @@ def activate_fallback(name: str, *, target: str | None = None, reason: str = "tr
         rc = engine_reload()
         if rc == 0:
             print(f"fallback active: {name} -> {candidate} ({reason})")
+            state.log_event(ROOT, "fallback_activated", provider=name, target=candidate, reason=reason)
             return 0
         last_error = f"fallback '{candidate}' failed to start"
         if previous is None:
@@ -1640,6 +1636,7 @@ def restore_fallback(name: str, host: str, *, automatic: bool = False) -> int:
         if successes >= RESTORE_SUCCESS_THRESHOLD:
             marker.unlink(missing_ok=True)
             print(f"primary restored: {name} after {successes} successful checks")
+            state.log_event(ROOT, "primary_restored", provider=name, wins=successes)
             return 0
         _atomic_write(marker, json.dumps({
             "attempted_at": now, "host": host, "successes": successes,
@@ -1680,6 +1677,7 @@ def deactivate_fallback(name: str, *, automatic: bool = False) -> int:
         _atomic_write(path, previous, 0o600)
         return rc
     print(f"fallback cleared: {name}")
+    state.log_event(ROOT, "fallback_deactivated", provider=name)
     return 0
 
 
@@ -2359,10 +2357,12 @@ def _egress_rank(record: dict, now: int | None = None) -> tuple[int, float]:
 
 def record_rotation(name: str, profile: Path) -> None:
     """Persist the last switch (profile + epoch) for status --json."""
-    record = {"profile": profile.stem, "at": int(time.time())}
     path = ROOT / "state" / f"{name}.rotation"
-    _atomic_write(path, json.dumps(record, indent=2, sort_keys=True) + "\n", 0o600)
+    _atomic_write(path, json.dumps({"profile": profile.stem, "at": int(time.time())},
+                                   indent=2, sort_keys=True) + "\n", 0o600)
     _hand_back_ownership(path)
+    state.log_event(ROOT, "rotation", provider=name, profile=profile.stem)
+
 
 
 def scheduled_interval() -> int:
