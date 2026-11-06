@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import os
 import json
+import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -117,3 +119,34 @@ def publish_sing_box(config: dict, live_path: Path, validate: Callable[[Path], b
     text = json.dumps(config, indent=2) + "\n"
     return publish_validated(live_path, text, validate, on_commit=on_commit,
                              publish=publish)
+
+
+EVENTS_LOG_MAX_BYTES = 1_000_000
+
+
+def log_event(root: Path, kind: str, **fields) -> None:
+    """Append one bounded, secret-free lifecycle event (#184 item 1).
+
+    JSONL at ``<root>/state/events.jsonl``: kind, epoch, caller-supplied
+    fields (reason, duration_seconds, provider, config revision...). Best
+    effort: a failing write is reported to stderr and never raises, so event
+    logging cannot break the action it describes. Bounded by truncation from
+    the oldest half once the file passes EVENTS_LOG_MAX_BYTES.
+    """
+    path = Path(root) / "state" / "events.jsonl"
+    event = {"kind": str(kind), "at": int(time.time())}
+    event.update({key: value for key, value in fields.items() if value is not None})
+    line = json.dumps(event, separators=(",", ":"), sort_keys=True) + "\n"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if path.is_file() and path.stat().st_size > EVENTS_LOG_MAX_BYTES:
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+                keep = lines[len(lines) // 2:]
+                path.write_text("\n".join(keep) + ("\n" if keep else ""), encoding="utf-8")
+        except OSError:
+            pass  # bounding is best effort; the append below still tries
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(line)
+    except OSError as exc:
+        print(f"router: event log write failed ({kind}): {exc}", file=sys.stderr)
