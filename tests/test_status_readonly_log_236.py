@@ -10,7 +10,9 @@ from unittest import mock
 
 from tests.test_router_regressions import load_router
 
-FATAL_LOG = ("x" * 4096 + "\n") * 2000 + "FATAL: engine crashed\n"
+# Must exceed LOG_MAX_BYTES (10 MB) so the pre-#242 trim call would have
+# actually trimmed - not just been a size-guarded no-op (council note).
+FATAL_LOG = ("x" * 4096 + "\n") * 2600 + "FATAL: engine crashed\n"
 
 
 def _seed_log(r):
