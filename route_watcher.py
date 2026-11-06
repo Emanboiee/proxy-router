@@ -62,6 +62,13 @@ FAILURE_RE = re.compile(
     r"tls|ssl|eof|network is unreachable|no route to host|i/o timeout)\b",
     re.IGNORECASE,
 )
+# #176: explicit underlay signals. These mean the local network path is
+# missing — rotation would reload the WireGuard lane and cancel live
+# sessions without addressing the cause.
+UNDERLAY_RE = re.compile(
+    r"\b(?:network is unreachable|no route to host|network unreachable)\b",
+    re.IGNORECASE,
+)
 _CONTEXT_CANCEL_RE = re.compile(r"\bcontext\s+cancel(?:ed|led)\b", re.IGNORECASE)
 
 
@@ -388,12 +395,17 @@ def probe_target(root: Path, host: str, *, runner: Callable = subprocess.run) ->
             capture_output=True, text=True, timeout=10,
         )
     except subprocess.TimeoutExpired:
-        return {"ok": False, "transport_failure": True, "error": "curl timeout", "host": host}
+        return {"ok": False, "transport_failure": True, "underlay_signal": False,
+                "error": "curl timeout", "host": host}
     except OSError as exc:
-        return {"ok": False, "transport_failure": True, "error": type(exc).__name__, "host": host}
+        return {"ok": False, "transport_failure": True, "underlay_signal": False,
+                "error": type(exc).__name__, "host": host}
     code = (result.stdout or "").strip()
     if result.returncode != 0:
-        return {"ok": False, "transport_failure": True, "error": (result.stderr or "curl failed")[-200:], "host": host}
+        error = (result.stderr or "curl failed")[-200:]
+        return {"ok": False, "transport_failure": True,
+                "underlay_signal": bool(UNDERLAY_RE.search(error)),
+                "error": error, "host": host}
     try:
         status = int(code)
     except ValueError:
@@ -710,10 +722,13 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
                             append_event(root, {"kind": "restore", "observed_at": time.time(),
                                                 "provider": provider, "host": host, **restore})
                 append_event(root, {"kind": "probe", "observed_at": time.time(), **result})
-                if result.get("transport_failure") and not _underlay_healthy(root):
+                if result.get("transport_failure") and (
+                        result.get("underlay_signal") or not _underlay_healthy(root)):
                     append_event(root, {"kind": "rotation_deferred",
                                         "observed_at": time.time(),
-                                        "reason": "underlay_unavailable", "host": host})
+                                        "reason": "underlay_unavailable" if not result.get("underlay_signal")
+                                                  else "explicit_underlay_signal",
+                                        "host": host})
                 elif (result.get("transport_failure")
                       and guard.record_transport_failure(now, host)):
                     target = provider or "proton"

@@ -682,3 +682,27 @@ class ProviderForHostTests(unittest.TestCase):
         self.assertFalse(w._underlay_healthy(Path("/tmp"),
                          runner=lambda *a, **k: SimpleNamespace(returncode=1, stdout="{}", stderr="")))
         self.assertTrue(guard.record_transport_failure(101.0, "opencode.ai"))
+
+    def test_explicit_underlay_signal_detected_in_probe_error(self):
+        """#176: no-route/unreachable curl stderr is tagged as underlay."""
+        def fake_runner(*args, **kwargs):
+            return SimpleNamespace(returncode=7, stdout="000",
+                                   stderr="curl: (7) Failed to connect: network is unreachable")
+        result = w.probe_target(Path("/tmp"), "opencode.ai", runner=fake_runner)
+        self.assertTrue(result["transport_failure"])
+        self.assertTrue(result["underlay_signal"])
+
+    def test_ordinary_transport_failure_is_not_underlay(self):
+        def fake_runner(*args, **kwargs):
+            return SimpleNamespace(returncode=35, stdout="000",
+                                   stderr="curl: (35) TLS handshake failure")
+        result = w.probe_target(Path("/tmp"), "opencode.ai", runner=fake_runner)
+        self.assertTrue(result["transport_failure"])
+        self.assertFalse(result["underlay_signal"])
+
+    def test_no_route_to_host_is_underlay(self):
+        def fake_runner(*args, **kwargs):
+            return SimpleNamespace(returncode=7, stdout="000",
+                                   stderr="curl: (7) no route to host")
+        result = w.probe_target(Path("/tmp"), "opencode.ai", runner=fake_runner)
+        self.assertTrue(result["underlay_signal"])
