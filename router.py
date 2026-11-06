@@ -1343,23 +1343,23 @@ def egress_is_exhausted(name: str, profile: Path, now: int | None = None) -> boo
 
 
 def provider_quota_exhausted(name: str) -> bool:
-    """True when ``name`` has no exit that may carry traffic because of quota.
+    """No exit on ``name`` may carry traffic: quota or stale health (#219).
     Proxy providers have no ``*.conf``; their record keys off the synthetic
-    ``proxy_profile_key()`` stem (``state/egress/<name>/socks.json``). Pools
-    need every usable exit exhausted; no records reads eligible."""
+    ``proxy_profile_key()`` stem. Pools need every usable exit unusable."""
     if is_proxy_provider(name):
-        # Synthetic key has no file; _profile_error() would reject it (no-op gate).
+        # Synthetic key has no file; _profile_error() would reject it (no-op).
         profiles = [proxy_profile_key(name)]
     else:
         try:
             profiles = provider_files(name)
         except ValueError:
             return False
-        # Only exits provider_has_valid_exit() accepts may vote; a bad stem or
-        # unparseable .conf has no record and must not flip all() or raise.
+        # Only usable exits may vote; a bad .conf must not flip all() or raise.
         profiles = [p for p in profiles if _PROVIDER_NAME.fullmatch(p.stem)
                     and _profile_error(p) is None]
-    return bool(profiles) and all(egress_is_exhausted(name, p) for p in profiles)
+    now, window = int(time.time()), int(egress_settings()["ok_window"])
+    return bool(profiles) and all(egress.exit_unusable(read_egress(name, p), now, window)
+                                  for p in profiles)
 
 
 def _is_block_reason(reason: str) -> bool:
@@ -1489,15 +1489,14 @@ def activate_fallback(name: str, *, target: str | None = None, reason: str = "tr
             print(f"router: skipping fallback '{candidate}': no valid exit "
                   "(no parseable profile or bad socks5 upstream)", file=sys.stderr)
             continue
-        # Stale-but-clean still passes (#219); fail-closed needs a keepalive
-        # probe to clear. Reinstating a just-deactivated fallback is not a fresh
-        # choice; gate a nested chain by its leaf.
+        # Fail-closed needs a keepalive probe to clear. Reinstating a
+        # just-deactivated fallback is not a fresh choice; gate a nested
+        # chain by its leaf. Stale evidence is also unusable (#219).
         leaf = candidate if candidate == "direct" else _effective_route_provider(candidate)
         if not reinstating and leaf != "direct" and provider_quota_exhausted(leaf):
-            last_error = "fallback candidate(s) are quota-exhausted"
-            print(f"router: skipping fallback '{candidate}': exit quota is "
-                  "exhausted (record carries an unexpired marker)",
-                  file=sys.stderr)
+            last_error = "fallback candidate(s) are quota-exhausted or have stale health"
+            print(f"router: skipping fallback '{candidate}': quota exhausted or "
+                  "egress health too old to trust (#219)", file=sys.stderr)
             continue
         _atomic_write(path, json.dumps({
             "provider": candidate,

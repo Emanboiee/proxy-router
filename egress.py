@@ -157,6 +157,34 @@ def quota_active(record: dict | None, now: int) -> bool:
     return True
 
 
+def quota_unknown(record: dict | None, now: int, ok_window: int) -> bool:
+    """True when an egress record is too old to certify quota health (#219).
+
+    A clean-but-ancient ``ok=true, exhausted=false`` record is exactly the
+    state that parked a model lane on a dead fallback: the router trusted a
+    check from weeks ago. Outside ``ok_window`` the answer is unknown, not
+    healthy. An empty record (never probed) is unknown too.
+    """
+    if not isinstance(record, dict) or not record:
+        return True
+    checked = _int_or_none(record.get("checked_at") or record.get("last_ok_at"))
+    if checked is None:
+        return True
+    return int(now) - checked >= int(ok_window)
+
+
+def exit_unusable(record: dict | None, now: int, ok_window: int) -> bool:
+    """True when an exit is quota-exhausted OR its health is stale (#219).
+
+    No record at all stays eligible (fail-open): that is absence of evidence,
+    not bad evidence. Once a record exists, a clean-but-ancient one is unsafe
+    to trust for a model-path fallback.
+    """
+    if not isinstance(record, dict) or not record:
+        return False
+    return quota_active(record, now) or quota_unknown(record, now, ok_window)
+
+
 def restorable_fallback(router, name: str, *, automatic: bool) -> str | None:
     """Return the serving fallback when a restore may proceed, else ``None``.
 

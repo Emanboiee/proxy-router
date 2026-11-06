@@ -505,6 +505,30 @@ def provider_for_host(root: Path, host: str) -> str | None:
     return None
 
 
+def _underlay_healthy(root: Path, *, runner: Callable = subprocess.run) -> bool:
+    """Bounded default-network check before a provider rotation (#176).
+
+    A short Wi-Fi/DNS flap can produce TLS resets while the tunnel is still
+    recovering; rotating then reloads the WireGuard lane and cancels live
+    sessions. Ask the controller for a cheap underlay verdict and defer when
+    the answer is explicitly unavailable. Unknown/errored checks defer too.
+    """
+    try:
+        result = runner(
+            [sys.executable, str(Path(root) / "router.py"), "network-status", "--json"],
+            cwd=str(root), capture_output=True, text=True, timeout=8,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if result.returncode != 0:
+        return False
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except ValueError:
+        return False
+    return bool(isinstance(payload, dict) and payload.get("connected"))
+
+
 def rotate_provider(root: Path, provider: str = "proton", *, host: str | None = None,
                     runner: Callable = subprocess.run) -> dict:
     """Ask the controller to confirm failures and recover the affected route."""
@@ -686,7 +710,12 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
                             append_event(root, {"kind": "restore", "observed_at": time.time(),
                                                 "provider": provider, "host": host, **restore})
                 append_event(root, {"kind": "probe", "observed_at": time.time(), **result})
-                if result.get("transport_failure") and guard.record_transport_failure(now, host):
+                if result.get("transport_failure") and not _underlay_healthy(root):
+                    append_event(root, {"kind": "rotation_deferred",
+                                        "observed_at": time.time(),
+                                        "reason": "underlay_unavailable", "host": host})
+                elif (result.get("transport_failure")
+                      and guard.record_transport_failure(now, host)):
                     target = provider or "proton"
                     rotation = rotate_provider(root, provider or target, host=host)
                     append_event(root, {"kind": "rotation", "observed_at": time.time(), **rotation})
