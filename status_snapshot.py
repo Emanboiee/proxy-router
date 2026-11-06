@@ -196,3 +196,45 @@ def legacy_launch_agents(namespace: dict) -> list[str]:
     if not agents_dir.is_dir():
         return []
     return [path.name for path in sorted(agents_dir.glob("com.hermes.proxy-router*.plist"))]
+
+
+def explain_host(namespace: dict, host: str) -> int:
+    """#183: the matched rule, serving provider, effective leaf, and any
+    direct-fallback caveat for ``host``. Mirrors the attribution logic in
+    model_relay.route_provider via the router namespace, like the observer
+    does."""
+    import sys
+    from types import SimpleNamespace
+    router = SimpleNamespace(**namespace)
+    from model_relay import route_provider
+    host = str(host or "").strip().lower().rstrip(".")
+    if not host:
+        print("usage: routes explain <hostname>", file=sys.stderr)
+        return 1
+    matched = None
+    learned = False
+    configured = {d for route in router._routes for d in route.get("domains", [])}
+    for route in router._routes_with_autodetected_domains(router._routes):
+        for domain in route.get("domains", []):
+            if router._response_host_matches(host, domain):
+                matched = (route, domain)
+                learned = domain not in configured
+                break
+        if matched:
+            break
+    provider = route_provider(namespace, host)
+    if provider is None:
+        print(f"{host}: direct (bypass or safe-list direct; no route matched)")
+        return 0
+    leaf = router._effective_route_provider(provider)
+    if matched:
+        route, domain = matched
+        rule = (f"matched {'learned' if learned else 'configured'} rule '{domain}'"
+                f" in route '{route.get('id')}'")
+    else:
+        rule = "matched the routing default (no explicit rule)"
+    suffix = " (fallback applied)" if leaf != provider else ""
+    print(f"{host}: provider '{provider}'; {rule}; leaf {leaf}{suffix}")
+    if leaf == "direct":
+        print("  note: direct fallback may not reach a locally blocked destination")
+    return 0

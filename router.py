@@ -3561,8 +3561,8 @@ def validate_config(path: Path | None = None) -> bool:
 
 
 def write_sing_box(config: dict) -> bool:
-    egress = (any(e.get("type") == "wireguard" for e in config.get("endpoints", []))
-              or any(o.get("type") == "socks" for o in config.get("outbounds", [])))
+    egress = any(e.get("type") == "wireguard" for e in config.get("endpoints", [])) or \
+        any(o.get("type") == "socks" for o in config.get("outbounds", []))
     if not egress:
         print("router: refusing to write an egress-less sing-box config; keeping existing file",
               file=sys.stderr)
@@ -5546,14 +5546,9 @@ def vpn_capture(scope: str) -> int:
 
 
 def _degraded_lanes() -> list[str]:
-    """Routes whose provider cannot currently serve traffic.
-
-    Read-only view over persisted state (fallback markers + egress records),
-    so `status` reports what traffic is actually doing without probing the
-    network. #225: a proxy provider whose egress record is exhausted or too
-    old to certify health is reported even while its SOCKS listener accepts
-    TCP — an open port is not a usable exit.
-    """
+    """Degraded routes from persisted state (markers + egress records),
+    read-only, no probes. #225: an open SOCKS port is not a usable exit -
+    exhausted or stale evidence is reported."""
     lanes = []
     for route in _routes:
         provider = route.get("provider")
@@ -7719,7 +7714,8 @@ def main() -> int:
                             help="persist discoveries without reloading sing-box")
     autodetect.add_argument("--quiet", action="store_true",
                             help="suppress normal discovery output")
-    sub.add_parser("routes")
+    routes_parser = sub.add_parser("routes", help="list routes (or: routes explain <host>)")
+    routes_parser.add_argument("host", nargs="?", help="explain routing for this host (#183)")
     sub.add_parser("up")
     sub.add_parser("down")
 
@@ -8261,6 +8257,8 @@ def main() -> int:
             return profile_copy(args.provider, args.sources)
         parser.error("profile needs an action: copy")
     if args.cmd == "routes":
+        if getattr(args, "host", None):
+            return status_snapshot.explain_host(globals(), args.host)
         return routes_list()
     if args.cmd == "routing":
         if args.routing_action == "show":
