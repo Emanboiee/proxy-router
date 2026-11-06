@@ -168,7 +168,9 @@ PY
 }
 
 cached_setting() {
-  load_all_settings || { printf '%s\n' "$2"; return; }
+  # The cache is populated once in the PARENT shell by load_all_settings()
+  # below. Calling it here would run inside $(...) and the assignments would
+  # be lost to a subshell, spawning one interpreter per key (#238).
   local key="$1" default="$2" value
   value=$(printf '%s\n' "$_KEEPALIVE_SETTINGS_CACHE" | grep "^${key}=" | head -1 | cut -d= -f2-)
   printf '%s\n' "${value:-$default}"
@@ -183,6 +185,9 @@ autodetect_setting() {
     *) cached_setting "$1" "$2" ;;
   esac
 }
+
+# Populate the cache in this shell, before any command substitution reads it.
+load_all_settings || true
 
 ENABLED="${PROXY_KEEPALIVE_ENABLED:-$(config_setting enabled 1)}"
 case "$ENABLED" in
@@ -577,7 +582,9 @@ while true; do
   last_tick="$tick_now"
   # Re-read the enabled flag every tick so a runtime config flip takes effect
   # without waiting for an agent restart (env override still wins for
-  # temporary ops changes).
+  # temporary ops changes). Reload once here (mtime-gated) so an operator's
+  # router.json edit takes effect on the next tick without a per-key spawn.
+  load_all_settings || true
 ENABLED="${PROXY_KEEPALIVE_ENABLED:-$(config_setting enabled 1)}"
   AUTODETECT_ENABLED="${PROXY_AUTODETECT_ENABLED:-$(autodetect_setting enabled 0)}"
   AUTODETECT_INTERVAL="${PROXY_AUTODETECT_INTERVAL:-$(autodetect_setting interval_seconds 300)}"

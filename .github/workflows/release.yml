@@ -81,15 +81,18 @@ jobs:
           [ -d /tmp/proxy-router ] || { echo "error: archive did not contain proxy-router/" >&2; exit 1; }
           export PROXY_ROUTER_DIR="$(mktemp -d)/prefix"
           /tmp/proxy-router/install.sh >/dev/null
-          status_json=$("$PROXY_ROUTER_DIR/current/router.py" status --json) || {
-            echo "error: installed CLI status --json failed" >&2; exit 1; }
+          # A fresh install has no running engine, so status --json exits 1
+          # (up=false) by design. Capture stdout and assert the payload instead.
+          status_json=$("$PROXY_ROUTER_DIR/current/router.py" status --json 2>/dev/null || true)
           # #239: assert installed BEHAVIOR, not just parseable JSON. An install
           # reporting "unusable config" emits valid JSON and used to pass.
-          printf '%s' "$status_json" | python3 -c 'import json,sys,os; d=json.load(sys.stdin); c=json.load(open(os.path.join(os.environ["PROXY_ROUTER_DIR"],"router.json"))); assert d.get("up") is not None, d; assert d.get("port")==c.get("port",2080), d; assert d.get("mode") in ("proxy","tun"), d; assert d.get("error") is None, d; assert "down (unusable config" not in str(d), d'
+          printf '%s' "$status_json" | python3 -c 'import json,sys,os; d=json.load(sys.stdin); c=json.load(open(os.path.join(os.environ["PROXY_ROUTER_DIR"],"router.json"))); assert d.get("up") is False, d; assert d.get("port")==c.get("port",2080), d; assert d.get("mode") in ("proxy","tun"), d; assert d.get("error") is None, d; assert "down (unusable config" not in str(d), d'
           # #230: installed ROOT must resolve to the prefix so config/rulesets
-          # are found, not the immutable release directory.
-          "$PROXY_ROUTER_DIR/current/router.py" routes --json >/dev/null
+          # are found, not the immutable release directory. `routes` proves
+          # router.json loads; `providers`/`rulesets` prove the prefix layout.
+          "$PROXY_ROUTER_DIR/current/router.py" routes >/dev/null
           [ -f "$PROXY_ROUTER_DIR/router.json" ]
+          [ -d "$PROXY_ROUTER_DIR/rulesets" ]
           "$PROXY_ROUTER_DIR/current/router.py" --help >/dev/null
           echo "clean-install CLI smoke passed"
 

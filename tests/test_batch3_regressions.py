@@ -67,18 +67,50 @@ def test_assembly_fails_closed_and_rejects_version_override():
 def test_release_smoke_asserts_installed_behavior():
     """#239: valid JSON alone no longer passes the Unix clean-install gate."""
     text = (REPO / ".github/workflows/release.yml").read_text()
-    assert "|| true" not in text.split("clean-install CLI smoke")[0][-900:]
+    # A fresh install has up=false -> status --json exits 1 by design. The
+    # smoke must tolerate that while still asserting the payload.
+    assert "status --json 2>/dev/null || true" in text
     assert "down (unusable config" in text
-    assert "d.get(\"port\")" in text
+    assert 'd.get("port")' in text
+    assert "routes --json" not in text
+    assert "routes >/dev/null" in text
 
 
 def test_keepalive_reads_config_in_one_call():
     """#238: startup must not spawn one interpreter per key."""
     text = (REPO / "examples/keepalive.sh").read_text()
-    assert "load_all_settings()" in text
+    assert "load_all_settings || true" in text
     assert "_KEEPALIVE_SETTINGS_MTIME" in text
-    # Only ONE config-reading Python heredoc remains (other heredocs in the
-    # script are unrelated: generated config, wake-ssid, etc.).
-    assert 'config_setting() {' in text
+    # The cache must be populated in the PARENT shell, not inside cached_setting
+    # (which runs in a $(...) subshell, losing the assignments).
+    assert "load_all_settings() || { printf" not in text
+    assert text.count("load_all_settings || true") == 2  # startup + tick
     assert 'cached_setting "$@"' in text
     assert text.count('(data.get("keepalive")') == 0
+
+
+def test_keepalive_cache_persists_across_command_substitutions(tmp_path):
+    """#238: one Python spawn for many reads, not one per $(...) subshell."""
+    import textwrap
+    script = (REPO / "examples/keepalive.sh").read_text()
+    start = script.index("# #238: read every keepalive")
+    end = script.index('case "$ENABLED" in')
+    (tmp_path / "fns.sh").write_text(script[start:end])
+    (tmp_path / "router.json").write_text('{"keepalive":{"interval":7}}')
+    wrapper = tmp_path / "pywrap"
+    wrapper.write_text('#!/bin/bash\necho x >> "$COUNTER"\nexec python3 "$@"\n')
+    wrapper.chmod(0o755)
+    counter = tmp_path / "count"
+    probe = textwrap.dedent('''
+        source "$1/fns.sh"
+        for k in interval max_backoff probe_every dead_strikes storm_window sweep_every; do
+          config_setting "$k" 15 >/dev/null
+        done
+        printf '%s' "$(config_setting interval 15)"
+    ''')
+    env = dict(os.environ, ROOT=str(tmp_path), PROXY_ROUTER_PYTHON=str(wrapper),
+               COUNTER=str(counter))
+    out = subprocess.run(["bash", "-c", probe, "--", str(tmp_path)],
+                         capture_output=True, text=True, env=env, check=True)
+    assert out.stdout.strip() == "7"
+    assert len(counter.read_text().splitlines()) == 1, "one interpreter expected"
