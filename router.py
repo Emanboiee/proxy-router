@@ -5564,6 +5564,9 @@ def _degraded_lanes() -> list[str]:
             lanes.append(f"{route_id} ({provider} down, failing open to direct)")
             continue
         if is_proxy_provider(provider):
+            # The provider's own record, not its fallback chain's: a proxy
+            # provider parked on a WG exit that fails open to direct is
+            # reported by the WG-side fail-open branch, not here.
             record = read_egress(provider, proxy_profile_key(provider))
             now, window = int(time.time()), int(egress_settings()["ok_window"])
             # Status reports UNKNOWN when there is no record at all (#225:
