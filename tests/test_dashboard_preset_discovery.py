@@ -194,3 +194,31 @@ def test_full_routing_default_connection_can_change_without_route_edits(tmp_path
     manager.save_profile(tmp_path, profile, profile["id"])
     manager.apply_profile(tmp_path, profile["id"])
     assert json.loads((tmp_path / "router.json").read_text())["routing"]["default_provider"] == "second"
+
+
+@pytest.mark.parametrize("routes,keep_pin", [
+    ([{"id": "roblox", "provider": "proton", "domains": ["roblox.com"]}], False),
+    ([{"id": "opencode", "provider": "proton", "domains": ["opencode.ai"]}], True),
+    ([{"id": "opencode", "provider": "other", "domains": ["example.com"]}], False),
+    ([{"id": "opencode", "provider": "proton", "ip_cidr": ["198.51.100.0/24"]}], False),
+    ([{"id": "opencode", "provider": "proton", "domains": ["one.example"]},
+      {"id": "opencode", "provider": "proton", "domains": ["two.example"]}], False),
+])
+def test_preset_switch_reconciles_inherited_probe_pins(tmp_path, routes, keep_pin):
+    config = write_config(tmp_path)
+    config["providers"]["proton"]["probe_route_id"] = "opencode"
+    config["providers"]["other"] = {"directory": "providers/other"}
+    (tmp_path / "router.json").write_text(json.dumps(config))
+    source = tmp_path / "presets/roblox.json"
+    source.write_text(json.dumps({"routes": routes}))
+    original_preset = source.read_bytes()
+
+    result = manager.apply_profile(tmp_path, "preset-roblox")
+
+    applied = json.loads((tmp_path / "router.json").read_text())
+    assert result["activeProfileId"] == "preset-roblox"
+    assert applied["routes"] == routes
+    assert ("probe_route_id" in applied["providers"]["proton"]) is keep_pin
+    assert applied["providers"]["proton"]["directory"] == "providers/proton"
+    assert source.read_bytes() == original_preset
+    assert not (tmp_path / "sing-box.json").exists()

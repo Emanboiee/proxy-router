@@ -505,3 +505,61 @@ def test_server_remove_rolls_back_on_store_failure(tmp_path, monkeypatch):
         manager.manage_server(root, "proton", "b")
     assert (pool / "b.conf").read_text() == WIREGUARD
     assert not (pool / ".removed/b.conf").exists()
+
+
+@pytest.mark.parametrize("mode", ["selective", "full", "direct"])
+def test_saved_profile_switch_drops_obsolete_probe_pin(tmp_path, mode):
+    config_at(tmp_path, {"primary": {
+        "directory": "providers/primary", "probe_route_id": "old",
+    }})
+    config = json.loads((tmp_path / "router.json").read_text())
+    config["routes"] = [{"id": "old", "provider": "primary", "domains": ["old.example"]}]
+    (tmp_path / "router.json").write_text(json.dumps(config))
+    profile = manager.save_profile(tmp_path, {
+        "name": "Next", "providerId": "primary", "routeMode": mode,
+        "domains": ["next.example"] if mode == "selective" else [],
+    })["profiles"][-1]
+
+    result = manager.apply_profile(tmp_path, profile["id"])
+
+    applied = json.loads((tmp_path / "router.json").read_text())
+    assert result["activeProfileId"] == profile["id"]
+    assert applied["providers"]["primary"] == {"directory": "providers/primary"}
+
+
+def test_snapshot_route_edit_reconciles_pin_without_changing_live_config(tmp_path):
+    config_at(tmp_path, {"primary": {
+        "directory": "providers/primary", "probe_route_id": "old",
+    }})
+    config = json.loads((tmp_path / "router.json").read_text())
+    config["routes"] = [{"id": "old", "provider": "primary", "domains": ["old.example"]}]
+    path = tmp_path / "router.json"
+    path.write_text(json.dumps(config))
+    original = path.read_bytes()
+    profile = manager.state(tmp_path)["profiles"][0]
+
+    manager.save_profile(tmp_path, {**profile, "routeRules": [{
+        "id": "new", "providerId": "primary", "domains": ["new.example"],
+    }]}, profile["id"])
+    assert path.read_bytes() == original
+    manager.apply_profile(tmp_path, profile["id"])
+
+    applied = json.loads(path.read_text())
+    assert applied["routes"][0]["id"] == "new"
+    assert "probe_route_id" not in applied["providers"]["primary"]
+
+
+def test_deleting_last_profile_reconciles_probe_pin(tmp_path):
+    config_at(tmp_path, {"primary": {
+        "directory": "providers/primary", "probe_route_id": "old",
+    }})
+    config = json.loads((tmp_path / "router.json").read_text())
+    config["routes"] = [{"id": "old", "provider": "primary", "domains": ["old.example"]}]
+    (tmp_path / "router.json").write_text(json.dumps(config))
+    profile = manager.state(tmp_path)["profiles"][0]
+
+    manager.delete_profile(tmp_path, profile["id"])
+
+    applied = json.loads((tmp_path / "router.json").read_text())
+    assert applied["routes"] == []
+    assert "probe_route_id" not in applied["providers"]["primary"]
