@@ -66,6 +66,14 @@ install_runtime() {
   cp "$SCRIPT_DIR/examples/install-launchd.sh" "$dest/examples/install-launchd.sh"
   cp "$SCRIPT_DIR/examples/com.proxy-router.keepalive.plist.template" \
      "$dest/examples/com.proxy-router.keepalive.plist.template"
+  # Bundled defaults must live in the release dir too, not only the prefix:
+  # the prefix copy is created once by copy_missing_tree, but setup_tui and
+  # selective-TUN ruleset resolution read them relative to the running ROOT.
+  for dir in guides rulesets presets; do
+    if [ -d "$SCRIPT_DIR/$dir" ]; then
+      cp -R "$SCRIPT_DIR/$dir" "$dest/$dir"
+    fi
+  done
 }
 
 # --- rollback path -------------------------------------------------------
@@ -181,6 +189,9 @@ copy_missing_tree() {
 }
 for f in guides rulesets presets; do
   if [ -d "$PREFIX/current/$f" ]; then
+    # Target must exist even when the release has the dir (copy_missing_tree
+    # copies files into $PREFIX/$f, which may not exist on a fresh install).
+    mkdir -p "$PREFIX/$f"
     copy_missing_tree "$f"
   else
     mkdir -p "$PREFIX/$f"
