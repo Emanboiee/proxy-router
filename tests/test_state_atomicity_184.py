@@ -32,13 +32,18 @@ def test_set_mode_uses_atomic_helper(tmp_path):
     assert aw.call_args.args[0] == r.MODE_FILE
 
 
-def test_pid_file_write_is_atomic(tmp_path):
+def test_pid_file_write_survives_enospc(tmp_path):
+    """A truncated PID file orphans a running engine; the write must be atomic."""
     r = load_router(tmp_path)
     r.PID_FILE.parent.mkdir(parents=True, exist_ok=True)
     r.PID_FILE.write_text("9999")
-    with mock.patch.object(r, "_atomic_write") as aw:
-        r._atomic_write(r.PID_FILE, "4242")
-    aw.assert_called_once()
+    with mock.patch.object(r.state, "tempfile") as tf:
+        tf.NamedTemporaryFile.side_effect = OSError(28, "ENOSPC")
+        try:
+            r._atomic_write(r.PID_FILE, "4242")
+        except OSError:
+            pass
+    assert r.PID_FILE.read_text() == "9999"
 
 
 def test_set_active_uses_atomic_helper(tmp_path):
