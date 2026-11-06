@@ -30,6 +30,7 @@ archive_type="$3"
 exe="$4"
 ref="$5"
 : "${SING_BOX_VERSION:?SING_BOX_VERSION is required}"
+export SING_BOX_VERSION
 
 case "$archive_type" in
   tar.gz|zip) ;;
@@ -56,25 +57,43 @@ echo "Downloaded sing-box: $url"
 expected=$(python3 - <<'PY'
 import json
 import os
+import sys
 
 with open("sing-box-release.json") as f:
     doc = json.load(f)
 asset = os.environ["BUNDLE_ASSET"]
-arch = {"darwin-arm64": "arm64", "darwin-amd64": "x86_64"}.get(asset)
-if arch:
-    rec = doc["architectures"][arch]
-    assert asset in rec["name"], f"{asset} not in {rec['name']}"
-    print(rec["sha256"])
+version = os.environ["SING_BOX_VERSION"]
+# #232: reject a dispatch override that changes the binary without a digest gate.
+if version != doc["release"]["version"]:
+    sys.exit(f"error: SING_BOX_VERSION {version} != pinned {doc['release']['version']}")
+# Resolve every published target, not just Darwin.
+darwin = {"darwin-arm64": "arm64", "darwin-amd64": "x86_64"}
+if asset in darwin:
+    rec = doc["architectures"][darwin[asset]]
+elif asset == "linux-amd64-glibc":
+    rec = doc["platforms"]["linux"]["architectures"]["x86_64"]
+elif asset == "windows-amd64":
+    # Windows digest lives outside the security-validated manifest, whose
+    # schema is strict (privileged_helper._exact_object rejects extra keys).
+    with open("sing-box-windows.json") as f:
+        rec = json.load(f)
 else:
-    print("")
+    sys.exit(f"error: no digest mapping for asset {asset}")
+if asset not in rec["name"]:
+    sys.exit(f"error: asset {asset} does not match manifest entry {rec['name']}")
+print(rec["sha256"])
 PY
-)
-if [ -n "$expected" ]; then
-  echo "$expected  $bundle" | shasum -a 256 -c -
-  echo "verified sha256 for $bundle"
+) || exit 1
+# #232: fail closed. A published target with no digest must never ship.
+# sha256sum is standard on Linux/Git-Bash; shasum covers macOS runners.
+if command -v sha256sum >/dev/null 2>&1; then
+  echo "$expected  $bundle" | sha256sum -c - \
+    || { echo "error: sha256 verification failed for $bundle" >&2; exit 1; }
 else
-  echo "warning: no recorded digest for $asset; skipping verification"
+  echo "$expected  $bundle" | shasum -a 256 -c - \
+    || { echo "error: sha256 verification failed for $bundle" >&2; exit 1; }
 fi
+echo "verified sha256 for $bundle"
 
 mkdir -p dist/proxy-router/bin _sb
 if [ "$archive_type" = "tar.gz" ]; then

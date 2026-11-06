@@ -65,15 +65,15 @@ from config_schema import (
     DEFAULT_TUN_STACK,
     SCHEMA_VERSION,
     migrate as migrate_config,
+    runtime_root,
 )
-
 
 def _effective_uid() -> int:
     """Return the effective uid where the platform exposes POSIX ids."""
     getter = getattr(os, "geteuid", None)
     return int(getter()) if getter is not None else -1
 
-ROOT = Path(os.environ.get("PROXY_ROUTER_ROOT") or Path(__file__).resolve().parent).resolve()
+ROOT = runtime_root(Path(__file__).resolve().parent.resolve())
 CONFIG_FILE = ROOT / "router.json"
 SING_BOX_CONFIG = ROOT / "sing-box.json"
 LAST_GOOD_FILE = ROOT / "sing-box.json.last-good"

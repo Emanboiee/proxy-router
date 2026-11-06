@@ -110,95 +110,79 @@ python_runner() {
   fi
 }
 
-# Read one validated value from router.json. Environment variables below win,
-# so launchd/system operators can make temporary changes without rewriting
-# config. Missing or malformed config falls back to the safe defaults.
-config_setting() {
-  if [ -n "${PROXY_ROUTER_PYTHON:-}" ]; then
-    "$PROXY_ROUTER_PYTHON" - "$ROOT/router.json" "$1" "$2" <<'PY' 2>/dev/null || printf '%s\n' "$2"
-import json
-import sys
+# #238: read every keepalive/autodetect setting in ONE interpreter instead of
+# 11+ per startup and 3 per tick. Cache by router.json mtime; env overrides
+# still win at each call site below.
+_KEEPALIVE_SETTINGS_CACHE=""
+_KEEPALIVE_SETTINGS_MTIME=""
+declare -A _KEEPALIVE_SETTINGS 2>/dev/null || _KEEPALIVE_SETTINGS=""
 
-path, key, default = sys.argv[1:]
+load_all_settings() {
+  local path="$ROOT/router.json" mtime py
+  mtime=$(stat -f %m "$path" 2>/dev/null || stat -c %Y "$path" 2>/dev/null || echo missing)
+  [ "$mtime" = "$_KEEPALIVE_SETTINGS_MTIME" ] && return 0
+  py="${PROXY_ROUTER_PYTHON:-python3}"
+  local out
+  out=$("$py" - "$path" <<'PY' 2>/dev/null
+import json, sys
 try:
-    data = json.loads(open(path, encoding="utf-8").read())
-    value = (data.get("keepalive") or {}).get(key, default)
-    if key == "enabled":
-        print("1" if value not in (False, 0, "0", "false", "off") else "0")
-    else:
-        value = int(value)
-        if value < 1 and not (key == "sweep_every" and value == 0):
-            raise ValueError
-        print(value)
+    d = json.loads(open(sys.argv[1], encoding="utf-8").read())
 except (OSError, ValueError, TypeError, json.JSONDecodeError):
-    raise SystemExit(1)
-PY
-  else
-    python3 - "$ROOT/router.json" "$1" "$2" <<'PY' 2>/dev/null || printf '%s\n' "$2"
-import json
-import sys
-
-path, key, default = sys.argv[1:]
-try:
-    data = json.loads(open(path, encoding="utf-8").read())
-    value = (data.get("keepalive") or {}).get(key, default)
-    if key == "enabled":
-        print("1" if value not in (False, 0, "0", "false", "off") else "0")
-    else:
-        value = int(value)
-        if value < 1 and not (key == "sweep_every" and value == 0):
+    d = {}
+k = d.get("keepalive") or {}
+a = d.get("autodetect") or {}
+def num(v, default, lo, allow_zero=False):
+    try:
+        v = int(v)
+        if v < lo and not (allow_zero and v == 0):
             raise ValueError
-        print(value)
-except (OSError, ValueError, TypeError, json.JSONDecodeError):
-    raise SystemExit(1)
+        return v
+    except (ValueError, TypeError):
+        return default
+def flag(v, default):
+    return "1" if v not in (False, 0, "0", "false", "off") else "0"
+pairs = {
+ "enabled": flag(k.get("enabled", 1), 1),
+ "interval": num(k.get("interval", 15), 15, 1),
+ "max_backoff": num(k.get("max_backoff", 300), 300, 1),
+ "probe_every": num(k.get("probe_every", 4), 4, 1),
+ "dead_strikes": num(k.get("dead_strikes", 2), 2, 1),
+ "storm_window": num(k.get("storm_window", 600), 600, 1),
+ "max_rotations": num(k.get("max_rotations", 2), 2, 1),
+ "sweep_every": num(k.get("sweep_every", 1800), 1800, 1, allow_zero=True),
+ "fallback_restore_every": num(k.get("fallback_restore_every", 300), 300, 1),
+ "network_grace": num(k.get("network_grace", 1), 1, 1),
+ # wake_gap's default is computed in shell from INTERVAL; omit when absent
+ # so cached_setting() falls back to the caller's $WAKE_GAP_DEFAULT.
+ **({"wake_gap": num(k["wake_gap"], 0, 0)} if "wake_gap" in k else {}),
+ "ad_enabled": flag(a.get("enabled", 0), 0),
+ "ad_interval": num(a.get("interval_seconds", 300), 300, 30),
+}
+for key, value in pairs.items():
+    print(f"{key}={value}")
 PY
-  fi
+) || return 1
+  _KEEPALIVE_SETTINGS_CACHE="$out"
+  _KEEPALIVE_SETTINGS_MTIME="$mtime"
+  return 0
 }
 
-# Read one validated top-level autodetection setting. Environment overrides
-# remain available for temporary operator changes without rewriting config.
+cached_setting() {
+  load_all_settings || { printf '%s\n' "$2"; return; }
+  local key="$1" default="$2" value
+  value=$(printf '%s\n' "$_KEEPALIVE_SETTINGS_CACHE" | grep "^${key}=" | head -1 | cut -d= -f2-)
+  printf '%s\n' "${value:-$default}"
+}
+
+# Keep the original function names so every call site stays unchanged.
+config_setting() { cached_setting "$@"; }
 autodetect_setting() {
-  if [ -n "${PROXY_ROUTER_PYTHON:-}" ]; then
-    "$PROXY_ROUTER_PYTHON" - "$ROOT/router.json" "$1" "$2" <<'PY' 2>/dev/null || printf '%s\n' "$2"
-import json
-import sys
-
-path, key, default = sys.argv[1:]
-try:
-    data = json.loads(open(path, encoding="utf-8").read())
-    value = (data.get("autodetect") or {}).get(key, default)
-    if key == "enabled":
-        print("1" if value not in (False, 0, "0", "false", "off") else "0")
-    else:
-        value = int(value)
-        if value < 30:
-            raise ValueError
-        print(value)
-except (OSError, ValueError, TypeError, json.JSONDecodeError):
-    raise SystemExit(1)
-PY
-  else
-    python3 - "$ROOT/router.json" "$1" "$2" <<'PY' 2>/dev/null || printf '%s\n' "$2"
-import json
-import sys
-
-path, key, default = sys.argv[1:]
-try:
-    data = json.loads(open(path, encoding="utf-8").read())
-    value = (data.get("autodetect") or {}).get(key, default)
-    if key == "enabled":
-        print("1" if value not in (False, 0, "0", "false", "off") else "0")
-    else:
-        value = int(value)
-        if value < 30:
-            raise ValueError
-        print(value)
-except (OSError, ValueError, TypeError, json.JSONDecodeError):
-    raise SystemExit(1)
-PY
-  fi
+  case "$1" in
+    enabled) cached_setting ad_enabled "$2" ;;
+    interval_seconds) cached_setting ad_interval "$2" ;;
+    *) cached_setting "$1" "$2" ;;
+  esac
 }
-
 
 ENABLED="${PROXY_KEEPALIVE_ENABLED:-$(config_setting enabled 1)}"
 case "$ENABLED" in
@@ -594,7 +578,7 @@ while true; do
   # Re-read the enabled flag every tick so a runtime config flip takes effect
   # without waiting for an agent restart (env override still wins for
   # temporary ops changes).
-  ENABLED="${PROXY_KEEPALIVE_ENABLED:-$(config_setting enabled 1)}"
+ENABLED="${PROXY_KEEPALIVE_ENABLED:-$(config_setting enabled 1)}"
   AUTODETECT_ENABLED="${PROXY_AUTODETECT_ENABLED:-$(autodetect_setting enabled 0)}"
   AUTODETECT_INTERVAL="${PROXY_AUTODETECT_INTERVAL:-$(autodetect_setting interval_seconds 300)}"
   case "$ENABLED" in
