@@ -935,6 +935,7 @@ class RouterClient:
         self.python = sys.executable or "python3"
         self.router = os.path.join(root, "router.py")
         self._active_provider: str | None = None
+        self._last_seen_up = False  # starts unknown → first down verifies fully
 
     def _run(self, *args: str, timeout: float = COMMAND_TIMEOUT) -> tuple[int, str]:
         cmd = [self.python, self.router, *args]
@@ -952,13 +953,19 @@ class RouterClient:
             return -2, f"missing: {e}"
 
     def status(self) -> RouterStatus:
-        # Reverted from --fast: status --json --fast skips the helper probe, so
-        # a helper-managed macOS TUN engine (PID lives in the helper's own
-        # state dir) reads as DOWN and the tray shows "disconnected" while
-        # connected. #237 needs a cheap helper-liveness signal before --fast
-        # is safe for the tray; see the post-merge review on PR #242.
-        rc, out = self._run("status", "--json")
+        # #237: poll the fast path. --fast skips the sudo/launchctl elevation
+        # probes, which cost a privileged round trip per 5s poll for fields
+        # the tray never displays. Fast status cannot see a helper-managed
+        # engine (its PID lives in the root-owned helper state dir, PR #242
+        # blocker), so a "down" reading while the previous poll said "up" is
+        # verified once through the full status before publishing: the
+        # expensive probe then runs on state transitions, not every poll.
+        rc, out = self._run("status", "--json", "--fast")
         st = RouterStatus.from_cli(rc, out)
+        if (st.error or not st.up) and self._last_seen_up:
+            rc, out = self._run("status", "--json")
+            st = RouterStatus.from_cli(rc, out)
+        self._last_seen_up = bool(st.up) and not st.error
         # The cache mirrors the latest valid payload, including an empty
         # provider set. Keeping an old provider after disconnect/error can make
         # the generic Switch server action target an unrelated lane.

@@ -11,17 +11,22 @@ import proxy_tray
 import router
 
 
-def test_tray_poll_uses_full_status_for_helper_tun(monkeypatch):
-    """#237 reverted: --fast skips the helper probe and misreports a
-    helper-managed macOS TUN engine as DOWN (PR #242 post-merge review).
-    Full status is required until a cheap helper-liveness signal exists.
-    """
+def test_tray_poll_uses_fast_status_with_transition_guard(monkeypatch):
+    """#237: the tray polls --fast; a down-transition triggers one full
+    verification (see test_tray_fast_poll_verifies_down_transitions).
+    Supersedes the PR #243 revert, which needed full status because fast
+    alone misreports helper-managed TUN."""
     client = proxy_tray.RouterClient.__new__(proxy_tray.RouterClient)
+    client._active_provider = None
+    client._last_seen_up = False
     seen = []
-    monkeypatch.setattr(client, "_run", lambda *args: (seen.append(args), (0, "{}"))[1])
+    def fake_run(*args):
+        seen.append(args)
+        return (0, '{"up": false, "mode": "proxy"}')
+    monkeypatch.setattr(client, "_run", fake_run)
     client.status()
-    assert seen and seen[0] == ("status", "--json")
-    assert "--fast" not in seen[0]
+    assert seen[0] == ("status", "--json", "--fast")
+    assert len(seen) == 1  # no down-transition from an unknown start
 
 
 def test_windows_engine_stop_without_orphan_scan(tmp_path):
@@ -64,3 +69,62 @@ def test_same_tag_reinstall_is_idempotent(tmp_path):
     text = install.read_text()
     assert 'release %s already installed; nothing to do' in text
     assert '[ "$OLD_TARGET" = "$RELEASE_TAG" ]' in text
+
+
+def test_tray_fast_poll_verifies_down_transitions(monkeypatch):
+    """#237: fast poll by default; a down-transition verifies once, fully.
+
+    Fast status cannot see a helper-managed macOS TUN engine (its PID lives
+    in the root-owned helper state dir), so a 'down' reading while the last
+    poll said 'up' must be confirmed through one full status before the tray
+    publishes it. The expensive elevation probe then runs on transitions
+    only, not every 5s poll.
+    """
+    client = proxy_tray.RouterClient.__new__(proxy_tray.RouterClient)
+    client._active_provider = None
+    client._last_seen_up = True  # last poll was up
+    calls = []
+
+    def fake_run(*args):
+        calls.append(args)
+        if "--fast" in args:
+            return 0, '{"up": false, "mode": "tun"}'  # fast cannot see helper TUN
+        return 0, '{"up": true, "mode": "tun"}'  # full status sees it
+
+    monkeypatch.setattr(client, "_run", fake_run)
+    st = client.status()
+    assert st.up is True
+    # One fast poll + exactly one full verification.
+    assert sum(1 for c in calls if "--fast" in c) == 1
+    assert sum(1 for c in calls if "--fast" not in c) == 1
+    assert client._last_seen_up is True
+
+
+def test_tray_stays_down_without_repeat_verification(monkeypatch):
+    """Once verified down, subsequent fast-down polls don't re-verify."""
+    client = proxy_tray.RouterClient.__new__(proxy_tray.RouterClient)
+    client._active_provider = None
+    client._last_seen_up = False
+    calls = []
+    monkeypatch.setattr(client, "_run", lambda *a: calls.append(a) or (0, '{"up": false, "mode": "proxy"}'))
+    st = client.status()
+    assert st.up is False
+    assert len(calls) == 1 and "--fast" in calls[0]
+
+
+def test_tray_first_poll_down_verifies_fully(monkeypatch):
+    """Unknown prior state (_last_seen_up=False from init) plus fast down:
+    the transition check uses _last_seen_up, so no verification runs. This
+    documents the chosen trade-off: a helper-TUN engine connected BEFORE the
+    tray started shows 'down' until the first real state change."""
+    client = proxy_tray.RouterClient.__new__(proxy_tray.RouterClient)
+    client._active_provider = None
+    client._last_seen_up = False
+    calls = []
+    def fake_run(*args):
+        calls.append(args)
+        return (0, '{"up": false, "mode": "tun"}')
+    monkeypatch.setattr(client, "_run", fake_run)
+    st = client.status()
+    assert st.up is False
+    assert sum(1 for c in calls if "--fast" not in c) == 0
