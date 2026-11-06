@@ -1142,7 +1142,7 @@ def test_vpn_on_disables_system_proxy_after_tun_start(tmp_path, monkeypatch):
     router.resolve_sing_box = lambda: Path("/bin/true")
     router.sing_box_at_least = lambda v: True
     router.build_singbox_config = lambda: ({"inbounds": [{"type": "tun"}]}, {"proton": Path("p")})
-    router.write_sing_box = lambda c: None
+    router.publish_sing_box = lambda c: True
     router.validate_config = lambda: True
     router.vpn_note = lambda: None
     router.engine_start = lambda: 0
@@ -1597,7 +1597,7 @@ def test_engine_start_aborts_when_engine_stop_fails(tmp_path, monkeypatch):
     router.resolve_sing_box = lambda: Path("/bin/true")
     router.sing_box_at_least = lambda v: True
     router.build_singbox_config = lambda overrides=None: ({"inbounds": []}, {"proton": Path("p")})
-    router.write_sing_box = lambda c: None
+    router.publish_sing_box = lambda c: True
     router.validate_config = lambda: True
     router.engine_stop = lambda: 1
     setattr(router, "_helper_status", lambda: None)
@@ -1701,7 +1701,7 @@ def test_engine_reload_permission_error_on_sighup_only(tmp_path, monkeypatch):
     router.resolve_sing_box = lambda: Path("/bin/true")
     router.sing_box_at_least = lambda v: True
     router.build_singbox_config = lambda overrides=None: ({"inbounds": []}, {"proton": Path("p")})
-    router.write_sing_box = lambda c: None
+    router.publish_sing_box = lambda c: True
     router.validate_config = lambda: True
     router.PID_FILE.write_text("4242")
     router._pid_matches = lambda pid: True
@@ -1749,7 +1749,7 @@ def test_engine_reload_rejected_candidate_reports_failed_change_not_restore_succ
     router.resolve_sing_box = lambda: Path("/bin/true")
     router.sing_box_at_least = lambda v: True
     router.build_singbox_config = lambda overrides=None: ({"inbounds": []}, {"proton": Path("p")})
-    router.write_sing_box = lambda c: None
+    router.publish_sing_box = lambda c: False
     router.validate_config = lambda: False
     router.LAST_GOOD_FILE.write_text("{}")
     start_calls = []
@@ -1765,7 +1765,7 @@ def test_engine_reload_rejected_candidate_message_names_the_old_config(tmp_path,
     router.resolve_sing_box = lambda: Path("/bin/true")
     router.sing_box_at_least = lambda v: True
     router.build_singbox_config = lambda overrides=None: ({"inbounds": []}, {"proton": Path("p")})
-    router.write_sing_box = lambda c: None
+    router.publish_sing_box = lambda c: router.validate_config()
     validations = {"count": 0}
 
     def candidate_fails_restored_last_good_passes() -> bool:

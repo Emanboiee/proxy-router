@@ -1262,7 +1262,7 @@ class EngineStartSpawnRaceTests(unittest.TestCase):
         with mock.patch.object(router, "resolve_sing_box", return_value="/bin/echo"), \
              mock.patch.object(router, "sing_box_at_least", return_value=True), \
              mock.patch.object(router, "build_singbox_config",
-                               return_value=({"log": {}}, {"proton": self.root / "providers/proton/a.conf"})), \
+                               return_value=({"log": {}, "endpoints": [{"type": "wireguard"}]}, {"proton": self.root / "providers/proton/a.conf"})), \
              mock.patch.object(router, "validate_config", return_value=True), \
              mock.patch.object(router, "engine_stop", return_value=0), \
              mock.patch.object(router, "rotate_log_if_needed", return_value=None), \

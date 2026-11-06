@@ -3549,36 +3549,41 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
     return config, selected
 
 
-def write_sing_box(config: dict) -> None:
-    has_wireguard = any(endpoint.get("type") == "wireguard" for endpoint in config.get("endpoints", []))
-    has_proxy_hop = any(outbound.get("type") == "socks" for outbound in config.get("outbounds", []))
-    if not has_wireguard and not has_proxy_hop:
-        print("router: refusing to write an egress-less sing-box config; keeping existing file",
-              file=sys.stderr)
-        return
-    _atomic_write(SING_BOX_CONFIG, json.dumps(config, indent=2) + "\n", 0o600)
-
-
-def validate_config() -> bool:
+def validate_config(path: Path | None = None) -> bool:
     sing_box = resolve_sing_box()
     if sing_box is None:
         print(_sing_box_missing_message(), file=sys.stderr)
         return False
     try:
         result = subprocess.run(
-            [sing_box, "check", "-c", str(SING_BOX_CONFIG)],
+            [sing_box, "check", "-c", str(path or SING_BOX_CONFIG)],
             capture_output=True, text=True, timeout=20,
         )
-    except subprocess.TimeoutExpired:
-        print("router: sing-box config check timed out", file=sys.stderr)
-        return False
-    except OSError as exc:
-        print(f"router: could not run sing-box config check: {exc}", file=sys.stderr)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        print(f"router: sing-box config check failed: {exc}", file=sys.stderr)
         return False
     if result.returncode == 0:
         return True
     print(result.stderr or result.stdout, file=sys.stderr)
     return False
+
+
+def write_sing_box(config: dict) -> bool:
+    egress = (any(e.get("type") == "wireguard" for e in config.get("endpoints", []))
+              or any(o.get("type") == "socks" for o in config.get("outbounds", [])))
+    if not egress:
+        print("router: refusing to write an egress-less sing-box config; keeping existing file",
+              file=sys.stderr)
+        return False
+    _atomic_write(SING_BOX_CONFIG, json.dumps(config, indent=2) + "\n", 0o600)
+    return True
+
+
+def publish_sing_box(config: dict) -> bool:
+    """#233: validate a candidate, then publish it atomically."""
+    return state.publish_sing_box(config, SING_BOX_CONFIG, validate_config,
+                                  _hand_back_ownership,
+                                  lambda text: write_sing_box(config))
 
 
 def write_last_good() -> None:
@@ -4049,8 +4054,7 @@ def engine_start(use_existing_config: bool = False, *, recover: bool = True) -> 
         # config and still make proxy-mode startup valid.
         if not active and not active_proxy_providers():
             return fail("no provider profile available (drop *.conf into providers/<name>/)")
-        write_sing_box(config)
-        if not validate_config():
+        if not publish_sing_box(config):
             if LAST_GOOD_FILE.is_file():
                 print("router: generated config failed validation; restoring last-good", file=sys.stderr)
                 return restore_last_good()
@@ -4197,8 +4201,7 @@ def engine_switch() -> int:
         return fail(f"could not build sing-box config: {exc}")
     if not active and not active_proxy_providers():
         return fail("no provider endpoint available")
-    write_sing_box(config)
-    if not validate_config():
+    if not publish_sing_box(config):
         if previous_config is not None:
             _atomic_write(SING_BOX_CONFIG, previous_config, 0o600)
         return fail("sing-box config check failed")
@@ -4853,11 +4856,9 @@ def engine_reload(active_overrides: dict[str, Path] | None = None) -> int:
         return fail(f"could not build sing-box config: {exc}")
     if not active and not active_proxy_providers():
         return fail("no provider endpoint available")
-    write_sing_box(config)
-    if not validate_config():
-        # The bad config is already on disk; restore the last known-good one
-        # so a crash/restart can never boot it (F2: bad generated config must
-        # not leave the proxy dead while a known-good config exists).
+    if not publish_sing_box(config):
+        # #233: the candidate never reached sing-box.json. Still restore
+        # last-good so an older failed publish cannot linger on a reboot.
         print("router: new sing-box config failed validation; restoring last-good", file=sys.stderr)
         return _rejected_change_after_restore(restore_last_good())
     if error := provider_lifecycle.startup_error(ROOT, config, _providers, proxy_upstream):
@@ -5441,8 +5442,7 @@ def vpn_on() -> int:
         config, active = build_singbox_config()
         if not active:
             return fail("no provider profile available (drop *.conf into providers/<name>/)")
-        write_sing_box(config)
-        if not validate_config():
+        if not publish_sing_box(config):
             return fail("sing-box config check failed for tun mode")
         ok = True
     except SystemExit as exc:

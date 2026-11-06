@@ -222,7 +222,7 @@ def test_engine_start_accepts_proxy_only_provider(tmp_path, monkeypatch):
         "warp-proxy": ("127.0.0.1", 2181),
     })
     monkeypatch.setattr(router, "write_sing_box", lambda _config: None)
-    monkeypatch.setattr(router, "validate_config", lambda: False)
+    monkeypatch.setattr(router, "validate_config", lambda path=None: False)
 
     assert router.engine_start() == 1
 
