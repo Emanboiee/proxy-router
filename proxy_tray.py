@@ -952,7 +952,7 @@ class RouterClient:
             return -2, f"missing: {e}"
 
     def status(self) -> RouterStatus:
-        rc, out = self._run("status", "--json")
+        rc, out = self._run("status", "--json", "--fast")
         st = RouterStatus.from_cli(rc, out)
         # The cache mirrors the latest valid payload, including an empty
         # provider set. Keeping an old provider after disconnect/error can make

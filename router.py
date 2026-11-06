@@ -1344,22 +1344,19 @@ def egress_is_exhausted(name: str, profile: Path, now: int | None = None) -> boo
 
 def provider_quota_exhausted(name: str) -> bool:
     """No exit on ``name`` may carry traffic: quota or stale health (#219).
-    Proxy providers have no ``*.conf``; their record keys off the synthetic
-    ``proxy_profile_key()`` stem. Pools need every usable exit unusable."""
+    Proxies key off ``proxy_profile_key()``; pools need all exits unusable."""
     if is_proxy_provider(name):
-        # Synthetic key has no file; _profile_error() would reject it (no-op).
-        profiles = [proxy_profile_key(name)]
+        profiles = [proxy_profile_key(name)]  # synthetic key; no _profile_error
     else:
         try:
             profiles = provider_files(name)
         except ValueError:
             return False
         # Only usable exits may vote; a bad .conf must not flip all() or raise.
-        profiles = [p for p in profiles if _PROVIDER_NAME.fullmatch(p.stem)
-                    and _profile_error(p) is None]
+        profiles = [p for p in profiles
+                    if _PROVIDER_NAME.fullmatch(p.stem) and _profile_error(p) is None]
     now, window = int(time.time()), int(egress_settings()["ok_window"])
-    return bool(profiles) and all(egress.exit_unusable(read_egress(name, p), now, window)
-                                  for p in profiles)
+    return bool(profiles) and all(egress.exit_unusable(read_egress(name, p), now, window) for p in profiles)
 
 
 def _is_block_reason(reason: str) -> bool:
@@ -3741,7 +3738,7 @@ def engine_alive(*, skip_helper: bool = False) -> bool:
         return False
     if not _pid_matches(pid):
         return False
-    trim_live_log_if_needed()
+    # #236: status is read-only; log bounding happens at engine_start only.
     try:
         if os.name == "nt":
             out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True, timeout=3).stdout
@@ -4491,8 +4488,11 @@ def engine_stop() -> int:
     try:
         orphans = _find_our_engine_pids()
     except EngineIdentityError as exc:
-        print(f"router: cannot prove engine termination: {exc}", file=sys.stderr)
-        return 1
+        if os.name != "nt":
+            print(f"router: cannot prove engine termination: {exc}", file=sys.stderr)
+            return 1
+        # #235: Windows has no orphan scan; failing here aborts every start.
+        orphans = []
     if orphans:
         for pid in orphans:
             try:
@@ -4935,7 +4935,8 @@ def engine_reload(active_overrides: dict[str, Path] | None = None) -> int:
     # SIGHUP did not come up cleanly; try a full (re)start of the new config
     # before giving up and restoring last-good.
     print("router: engine did not come up after SIGHUP; trying a full start", file=sys.stderr)
-    if engine_start(recover=False) != 0:
+    # #234: boot the validated candidate, not a stale-marker rebuild.
+    if engine_start(recover=False, use_existing_config=True) != 0:
         print("router: engine failed to start with new config; restoring last-good", file=sys.stderr)
         return _rejected_change_after_restore(restore_last_good())
     # The restart path applies the new config just like a clean SIGHUP

@@ -124,6 +124,12 @@ if [ "$archive_type" = "tar.gz" ]; then
 else
   cp install.ps1 VERSION dist/proxy-router/
 fi
+# #231: stamp the real release tag so install.sh's transactional release
+# directory is unique per tag and upgrades/rollback work. $5 is GITHUB_REF_NAME.
+release_tag="${5:-}"
+if [ -n "$release_tag" ]; then
+  printf '%s\n' "$release_tag" > dist/proxy-router/VERSION
+fi
 
 mkdir -p dist/proxy-router/examples
 cp -R examples/. dist/proxy-router/examples/

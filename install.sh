@@ -133,6 +133,12 @@ fi
 
 mkdir -p "$PREFIX/releases"
 if [ -e "$PREFIX/releases/$RELEASE_TAG" ]; then
+  # #231: re-running the installer for the SAME tag is an idempotent no-op.
+  # A different tag must still fail rather than clobber an existing release.
+  if [ "$OLD_TARGET" = "$RELEASE_TAG" ] && [ -L "$CURRENT" ]; then
+    printf 'release %s already installed; nothing to do\n' "$RELEASE_TAG" >&2
+    exit 0
+  fi
   printf 'error: release %s already exists under %s; refusing to overwrite an existing release\n' \
     "$RELEASE_TAG" "$PREFIX/releases" >&2
   exit 1
