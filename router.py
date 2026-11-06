@@ -7714,8 +7714,9 @@ def main() -> int:
                             help="persist discoveries without reloading sing-box")
     autodetect.add_argument("--quiet", action="store_true",
                             help="suppress normal discovery output")
-    routes_parser = sub.add_parser("routes", help="list routes (or: routes explain <host>)")
-    routes_parser.add_argument("host", nargs="?", help="explain routing for this host (#183)")
+    routes_parser = sub.add_parser("routes", help="list routes")
+    routes_explain = sub.add_parser("routes-explain", help="explain routing for a host (#183)")
+    routes_explain.add_argument("host", help="hostname to explain")
     sub.add_parser("up")
     sub.add_parser("down")
 
@@ -8257,9 +8258,9 @@ def main() -> int:
             return profile_copy(args.provider, args.sources)
         parser.error("profile needs an action: copy")
     if args.cmd == "routes":
-        if getattr(args, "host", None):
-            return status_snapshot.explain_host(globals(), args.host)
         return routes_list()
+    if args.cmd == "routes-explain":
+        return status_snapshot.explain_host(globals(), args.host)
     if args.cmd == "routing":
         if args.routing_action == "show":
             return routing_cli_show()
