@@ -8,7 +8,9 @@ values and the schema version now have one source of truth.
 from __future__ import annotations
 
 from copy import deepcopy
+from pathlib import Path
 from typing import Any
+import os
 
 
 SCHEMA_VERSION = 1
@@ -62,3 +64,16 @@ def migrate(data: dict[str, Any]) -> dict[str, Any]:
     migrated = deepcopy(data)
     migrated["schema_version"] = SCHEMA_VERSION
     return migrated
+
+
+def runtime_root(source: Path) -> Path:
+    """#230: installed launchers resolve to ``releases/<tag>``, but mutable
+    state lives at the prefix root (which has ``current/`` + ``router.json``).
+    """
+    if "PROXY_ROUTER_ROOT" in os.environ:
+        return Path(os.environ["PROXY_ROUTER_ROOT"]).resolve()
+    prefix = source.parent.parent
+    if len(source.parts) >= 2 and source.parts[-2] == "releases" \
+            and (prefix / "current").is_symlink() and (prefix / "router.json").is_file():
+        return prefix.resolve()
+    return source
