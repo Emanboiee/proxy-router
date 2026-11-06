@@ -30,6 +30,10 @@ let profileReturnFocus: { action: 'new-profile' } | { action: 'edit-profile'; id
 let providerReturnFocusContext: 'providers' | 'profile' | undefined;
 let requestGeneration = 0;
 let busy = false;
+// #241: desktop engine verbs have their own in-flight flag so a click is
+// acknowledged immediately and the 5s poll cannot repaint mid-action.
+let engineActionLabel = '';
+let engineActionError = '';
 let networkNamesVisible = false;
 let networkIdentityNotice = '';
 let actionQueue: Promise<void> = Promise.resolve();
@@ -140,7 +144,32 @@ async function performDashboard(action: () => Promise<DashboardState>, message: 
   }
 }
 function button(label: string, action: string, className = '', extra = ''): string { return `<button type="button" class="${className}" data-action="${action}" ${extra} ${busy ? 'disabled' : ''}>${label}</button>`; }
-function statusTitle(): [string, string] { return copy[previewState]; }
+// #241: show a truthful in-flight state and a persistent error line in the
+// hero, not just a transient toast.
+// #240: the status payload carries current_mode(); the configured default in
+// router.json is a different thing and can diverge after `vpn on` / `vpn off`.
+function liveMode(): string {
+  const mode = livePayload?.mode;
+  return mode === 'tun' ? 'TUN' : mode === 'proxy' ? 'Proxy' : 'Unknown';
+}
+function modeLabel(): string {
+  const mode = liveMode();
+  return mode === 'Proxy' ? `Proxy · 127.0.0.1:${esc(String(livePayload?.port ?? 2080))}` : mode;
+}
+function statusTitle(): [string, string] {
+  if (engineActionLabel) return [engineActionLabel, 'Applying the change to the live engine…'];
+  if (engineActionError) return [copy[previewState][0], engineActionError];
+  const [title, description] = copy[previewState];
+  // #240: never tell a TUN user their traffic is "proxied".
+  if (previewState === 'connected' && liveMode() === 'TUN') {
+    return [title, 'All traffic is captured by the VPN.'];
+  }
+  return [title, description];
+}
+function heroActionError(): string {
+  return engineActionError
+    ? `<p class="field-note" role="alert" id="engine-action-error">${esc(engineActionError)}</p>` : '';
+}
 function providerOptions(selected: string): string { return snapshot.providers.map(provider => `<option value="${esc(provider.id)}" ${provider.id === selected ? 'selected' : ''}>${esc(provider.name)}</option>`).join('') || '<option value="">No connections yet</option>'; }
 function fallbackProviderOptions(selected: string, primary: string): string {
   const choices = snapshot.providers.filter(provider => provider.id !== primary);
@@ -229,6 +258,7 @@ function homePage(): string {
       <h1 tabindex="-1">${title}</h1>
       <p class="lead">${description}</p>
       <div class="hero-actions">${action}</div>
+      ${heroActionError()}
       <div class="mode-selector" data-profile-picker><span id="home-profile-label">Mode</span><span class="select-wrap custom-select"><button type="button" role="combobox" class="select-trigger" id="home-profile" data-profile-trigger aria-labelledby="home-profile-label" aria-haspopup="listbox" aria-expanded="false" aria-controls="home-profile-options"><span class="select-value">${esc(profile.name)}</span><span class="select-chevron" aria-hidden="true"></span></button><div class="select-menu" id="home-profile-options" role="listbox" aria-labelledby="home-profile-label" hidden>${profileMenuOptions(snapshot.activeProfileId)}</div></span></div>
       <p class="connection-status" aria-label="Connection status"><span>${esc(compactStatus)}</span><a class="text-link" href="#profiles">Edit profile <span aria-hidden="true">↗</span></a></p>
     </div>
@@ -305,7 +335,9 @@ function liveHomePage(): string {
       <div class="connection-emblem" aria-hidden="true"><img src="/gremlin-cat-goblin-cat.gif" alt="" width="88" height="88" decoding="async"></div>
       <h1 tabindex="-1">${title}</h1>
       <p class="lead">${description}</p>
+      <p class="badge" id="live-vpn-mode" aria-label="Live VPN mode">${esc(modeLabel())}</p>
       <div class="hero-actions">${action}</div>
+      ${heroActionError()}
       ${dashboardStateReady && snapshot.profiles.length ? `<div class="mode-selector" data-profile-picker><span id="home-profile-label">Profile</span><span class="select-wrap custom-select"><button type="button" role="combobox" class="select-trigger" id="home-profile" data-profile-trigger aria-labelledby="home-profile-label" aria-haspopup="listbox" aria-expanded="false" aria-controls="home-profile-options"><span class="select-value">${esc(activeProfile().name)}</span><span class="select-chevron" aria-hidden="true"></span></button><div class="select-menu" id="home-profile-options" role="listbox" aria-labelledby="home-profile-label" hidden>${profileMenuOptions(snapshot.activeProfileId)}</div></span></div>` : ''}
 
       <p class="connection-status" aria-label="Live engine configuration"><span>Preset: <strong id="active-preset">${esc(preset)}</strong> · Providers: ${providerSummary} · Routes: ${esc(routeSummary)} · Latency: ${esc(latency)}</span><a class="text-link" href="#profiles">Manage routes <span aria-hidden="true">↗</span></a></p>
@@ -549,7 +581,7 @@ function liveSettingsPage(): string {
   const row = (label: string, value: unknown) => `<li><strong>${esc(label)}</strong> <span class="muted">${esc(String(value ?? '—'))}</span></li>`;
   return `<section class="page-section"><div class="section-heading"><div><h1 tabindex="-1">Settings</h1><p class="lead">Values the engine is actually running with.</p></div><span class="badge">from router.json</span></div>
 <article class="panel"><h2>Routing mode</h2><div class="card-actions">${modes}</div><p class="muted">Current mode: <strong>${esc(String(mode))}</strong></p></article>
-<article class="panel"><h2>Engine</h2><ul class="route-list">${row('Proxy port', engineConfig?.port)}${row('Preset', engineConfig?.preset)}${row('VPN default mode', vpn.default_mode)}${row('Capture', vpn.capture)}${row('MTU', vpn.mtu)}${row('DNS transport', vpn.dns_transport)}</ul></article>
+<article class="panel"><h2>Engine</h2><ul class="route-list">${row('Live VPN mode', liveMode() === 'Unknown' ? '—' : modeLabel())}${row('Configured default mode', vpn.default_mode)}${row('Proxy port', engineConfig?.port)}${row('Preset', engineConfig?.preset)}${row('Capture', vpn.capture)}${row('MTU', vpn.mtu)}${row('DNS transport', vpn.dns_transport)}</ul></article>
 <article class="panel"><h2>Network detection</h2><ul class="route-list">${row('Auto-switch on Wi-Fi change', net?.auto === true ? 'on' : 'off')}${row('Mapped networks', Object.keys(net?.presets ?? {}).length)}${row('Current network', currentNetwork)}</ul><div class="card-actions">${net?.auto ? button('Turn auto-switch off', 'network-auto', 'quiet', 'data-network-state="off"') : button('Turn auto-switch on', 'network-auto', 'quiet', 'data-network-state="on"')}<a class="text-link" href="#connectivity">Map a network <span aria-hidden="true">↗</span></a></div></article>
 <article class="panel"><h2>Rotation & keepalive</h2><ul class="route-list">${row('Rotate every (s)', (engineConfig?.rotation as Record<string, unknown> | undefined)?.interval_seconds)}${row('Rotation jitter (s)', (engineConfig?.rotation as Record<string, unknown> | undefined)?.jitter_seconds)}${row('Keepalive enabled', (engineConfig?.keepalive as Record<string, unknown> | undefined)?.enabled)}${row('Keepalive interval (s)', (engineConfig?.keepalive as Record<string, unknown> | undefined)?.interval)}</ul></article></section>`;
 }
@@ -886,12 +918,26 @@ app.addEventListener('click', event => {
   const target = element.closest<HTMLElement>('[data-action]'); if (!target) return;
   const action = target.dataset.action; const profileId = target.dataset.profile;
   if (action === 'connect' || action === 'disconnect' || action === 'reconnect') {
+    // #241: ignore a second click while a verb is in flight.
+    if (busy || engineActionLabel) return;
     // Desktop: change the real engine, then re-read it so the hero shows the
     // truth. Browser preview keeps the local demo controller.
     void (async () => {
       if (isTauri()) {
-        try { await applyEngineAction(action); } catch (error) { announce(error instanceof Error ? error.message : 'Engine action failed'); }
-        await refreshStatus();
+        busy = true;
+        engineActionLabel = action === 'connect' ? 'Connecting…'
+          : action === 'disconnect' ? 'Disconnecting…' : 'Reconnecting…';
+        engineActionError = '';
+        render();
+        try { await applyEngineAction(action); }
+        catch (error) {
+          engineActionError = error instanceof Error ? error.message : 'Engine action failed';
+          announce(engineActionError);
+        }
+        try { await refreshStatus({ silent: true }); }
+        catch { /* keep the persistent error line below */ }
+        busy = false;
+        engineActionLabel = '';
         render();
         return;
       }
