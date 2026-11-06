@@ -446,9 +446,7 @@ def _hand_back_ownership(path: Path) -> None:
 
 def set_mode(mode: str) -> None:
     MODE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    MODE_FILE.write_text(mode)
-    os.chmod(MODE_FILE, 0o600)
-    _hand_back_ownership(MODE_FILE)
+    _atomic_write(MODE_FILE, mode)
 
 
 def _atomic_write(path: Path, text: str, mode: int = 0o600) -> None:
@@ -1764,11 +1762,7 @@ def response_event(host: str, status: int, *, provider: str | None = None,
         print(f"response-event: suppressed duplicate {label} for {host}")
         return 0
     marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text(json.dumps({"at": now, "host": str(host).lower(), "status": status, "reason": reason}) + "\n")
-    try:
-        marker.chmod(0o600)
-    except OSError:
-        pass
+    _atomic_write(marker, json.dumps({"at": now, "host": str(host).lower(), "status": status, "reason": reason}) + "\n")
 
     effective = active_fallback(route_provider) or route_provider
     print(f"response-event: {label} for {host}; rotating {effective}")
@@ -2629,9 +2623,7 @@ def resolve_active(name: str) -> Path | None:
 def set_active(name: str, profile: Path) -> None:
     state = ROOT / "state" / f"{name}.active"
     state.parent.mkdir(parents=True, exist_ok=True)
-    state.write_text(profile.stem)
-    os.chmod(state, 0o600)
-    _hand_back_ownership(state)
+    _atomic_write(state, profile.stem)
 
 
 def _profile_error(profile: Path) -> str | None:
@@ -4139,9 +4131,7 @@ def engine_start(use_existing_config: bool = False, *, recover: bool = True) -> 
     finally:
         if log_handle is not None:
             log_handle.close()
-    PID_FILE.write_text(str(process.pid))
-    os.chmod(PID_FILE, 0o600)
-    _hand_back_ownership(PID_FILE)
+    _atomic_write(PID_FILE, str(process.pid))
     # The elevated start opened LOG_FILE as root (log_handle above); hand it
     # back so non-root readers (log_has_fatal, keepalive rotation, status)
     # can still open it. The engine keeps writing through its inherited fd.
@@ -5386,14 +5376,8 @@ def _write_manual_off() -> int:
     """Publish manual-stop intent atomically before lifecycle teardown."""
     try:
         MANUAL_OFF_FILE.parent.mkdir(parents=True, exist_ok=True)
-        MANUAL_OFF_FILE.write_text(
-            f"manual stop {datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')}\n",
-            encoding="utf-8",
-        )
-        try:
-            MANUAL_OFF_FILE.chmod(0o600)
-        except OSError:
-            pass
+        _atomic_write(MANUAL_OFF_FILE,
+            f"manual stop {datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')}\n")
     except OSError as exc:
         print(f"router: could not write manual-off marker: {exc}", file=sys.stderr)
         return 1
