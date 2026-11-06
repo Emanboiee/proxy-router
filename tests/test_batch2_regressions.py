@@ -11,13 +11,17 @@ import proxy_tray
 import router
 
 
-def test_tray_poll_uses_fast_status(monkeypatch):
-    """#237: the 5s tray poll must not spawn sudo/launchctl probes."""
+def test_tray_poll_uses_full_status_for_helper_tun(monkeypatch):
+    """#237 reverted: --fast skips the helper probe and misreports a
+    helper-managed macOS TUN engine as DOWN (PR #242 post-merge review).
+    Full status is required until a cheap helper-liveness signal exists.
+    """
     client = proxy_tray.RouterClient.__new__(proxy_tray.RouterClient)
     seen = []
     monkeypatch.setattr(client, "_run", lambda *args: (seen.append(args), (0, "{}"))[1])
     client.status()
-    assert seen and seen[0] == ("status", "--json", "--fast")
+    assert seen and seen[0] == ("status", "--json")
+    assert "--fast" not in seen[0]
 
 
 def test_windows_engine_stop_without_orphan_scan(tmp_path):
