@@ -92,7 +92,11 @@ jobs:
           # router.json loads; `providers`/`rulesets` prove the prefix layout.
           "$PROXY_ROUTER_DIR/current/router.py" routes >/dev/null
           [ -f "$PROXY_ROUTER_DIR/router.json" ]
-          [ -d "$PROXY_ROUTER_DIR/rulesets" ]
+          # #239: bundled assets must be present AND non-empty - an install
+          # with a missing/empty ruleset or guides tree used to pass the gate.
+          [ -d "$PROXY_ROUTER_DIR/rulesets" ] && [ -n "$(ls -A "$PROXY_ROUTER_DIR/rulesets")" ]
+          [ -d "$PROXY_ROUTER_DIR/guides" ] && [ -n "$(ls -A "$PROXY_ROUTER_DIR/guides")" ]
+          [ -d "$PROXY_ROUTER_DIR/current/guides" ] && [ -n "$(ls -A "$PROXY_ROUTER_DIR/current/guides")" ]
           "$PROXY_ROUTER_DIR/current/router.py" --help >/dev/null
           echo "clean-install CLI smoke passed"
 
