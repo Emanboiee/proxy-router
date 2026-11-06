@@ -952,7 +952,12 @@ class RouterClient:
             return -2, f"missing: {e}"
 
     def status(self) -> RouterStatus:
-        rc, out = self._run("status", "--json", "--fast")
+        # Reverted from --fast: status --json --fast skips the helper probe, so
+        # a helper-managed macOS TUN engine (PID lives in the helper's own
+        # state dir) reads as DOWN and the tray shows "disconnected" while
+        # connected. #237 needs a cheap helper-liveness signal before --fast
+        # is safe for the tray; see the post-merge review on PR #242.
+        rc, out = self._run("status", "--json")
         st = RouterStatus.from_cli(rc, out)
         # The cache mirrors the latest valid payload, including an empty
         # provider set. Keeping an old provider after disconnect/error can make
