@@ -76,3 +76,44 @@ def write_json(
         mode,
         on_commit=on_commit,
     )
+
+
+def publish_validated(path: Path, text: str, validate: Callable[[Path], bool],
+                      mode: int = 0o600,
+                      on_commit: Callable[[Path], None] | None = None,
+                      publish: Callable[[str], bool] | None = None) -> bool:
+    """Write ``text`` to a candidate, validate it, then publish atomically.
+
+    #233: the live path is never exposed to an unvalidated or partially
+    written config. OSError (e.g. ENOSPC) propagates like ``atomic_write``;
+    the candidate is always removed, and a failed validation returns False
+    without touching the live file.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    candidate = path.with_name(f".{path.name}.candidate")
+    try:
+        atomic_write(candidate, text, mode)
+        if not validate(candidate):
+            return False
+        # Publish the already-validated bytes. Callers may supply their own
+        # writer (router.write_sing_box) to preserve ownership/ENOSPC hooks.
+        if publish is not None:
+            return bool(publish(text))
+        atomic_write(path, text, mode, on_commit=on_commit)
+        return True
+    finally:
+        candidate.unlink(missing_ok=True)
+
+
+def publish_sing_box(config: dict, live_path: Path, validate: Callable[[Path], bool],
+                     on_commit: Callable[[Path], None] | None = None,
+                     publish: Callable[[str], None] | None = None) -> bool:
+    """#233: validate a generated config as a candidate, then publish it.
+
+    The egress check, candidate write, validation, and publish all happen
+    before the live file is touched. False leaves it byte-identical.
+    """
+    text = json.dumps(config, indent=2) + "\n"
+    return publish_validated(live_path, text, validate, on_commit=on_commit,
+                             publish=publish)
