@@ -928,21 +928,29 @@ app.addEventListener('click', event => {
         engineActionLabel = action === 'connect' ? 'Connecting…'
           : action === 'disconnect' ? 'Disconnecting…' : 'Reconnecting…';
         engineActionError = '';
-        render();
-        try { await applyEngineAction(action); }
-        catch (error) {
-          engineActionError = error instanceof Error ? error.message : 'Engine action failed';
-          announce(engineActionError);
+        try {
+          render();
+          try { await applyEngineAction(action); }
+          catch (error) {
+            // Tauri rejects with the raw Err value (often a plain string),
+            // not an Error instance — preserve the controller's real reason.
+            engineActionError = typeof error === 'string' && error ? error
+              : error instanceof Error ? error.message : String(error ?? 'Engine action failed');
+            announce(engineActionError);
+          }
+          try { await refreshStatus({ silent: true }); }
+          catch { /* keep the persistent error line below */ }
+        } finally {
+          // Never leave busy set: a throw in render()/announce() would
+          // otherwise disable every control and block the poll forever.
+          busy = false;
+          engineActionLabel = '';
+          render();
         }
-        try { await refreshStatus({ silent: true }); }
-        catch { /* keep the persistent error line below */ }
-        busy = false;
-        engineActionLabel = '';
-        render();
         return;
       }
       await perform(() => action === 'connect' ? controller.connect() : action === 'disconnect' ? controller.disconnect() : controller.reconnect());
-    })();
+    })().catch(error => { busy = false; engineActionLabel = ''; render(); announce(String(error)); });
   }
   else if (action === 'refresh') void refreshStatus();
   else if (action === 'new-profile') { profileReturnFocus = { action: 'new-profile' }; editingProfileId = 'new'; pendingProviderId = undefined; profileDraft = undefined; addingProviderFromProfile = false; render(); }

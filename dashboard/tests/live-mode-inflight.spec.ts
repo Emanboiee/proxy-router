@@ -30,7 +30,7 @@ const desktopMock = ({ mode = 'proxy', startConnected = true } = {}) => {
       }
       if (name === 'run_router_action') {
         if (state.__actionGate) return new Promise((resolve, reject) => {
-          state.__actionGate!(() => state.__failAction ? reject(new Error('Verb failed')) : (connected = (payload as { action: string }).action === 'connect', resolve('ok')));
+          state.__actionGate!(() => state.__failAction ? reject('controller exited 1: verb failed') : (connected = (payload as { action: string }).action === 'connect', resolve('ok')));
         });
         connected = (payload as { action: string }).action === 'connect';
         return Promise.resolve('ok');
@@ -95,6 +95,24 @@ test('#241 a failing verb leaves a persistent error in the hero', async ({ page 
   });
   await page.getByRole('button', { name: 'Connect', exact: true }).click();
   await page.evaluate(() => (window as unknown as { __release: () => void }).__release());
-  await expect(page.locator('#engine-action-error')).toContainText('Verb failed');
+  await expect(page.locator('#engine-action-error')).toContainText('controller exited 1: verb failed');
   await expect(page.getByRole('button', { name: 'Connect', exact: true })).toBeEnabled();
+});
+
+
+test('#241 a throw during the verb does not strand controls busy', async ({ page }) => {
+  await page.addInitScript(desktopMock, { mode: 'proxy', startConnected: false });
+  await page.goto('/');
+  await page.evaluate(() => {
+    const s = window as unknown as { __actionGate?: (release: () => void) => void; __failAction?: boolean };
+    s.__failAction = true;
+    s.__actionGate = release => { (window as unknown as { __release: () => void }).__release = release; };
+  });
+  await page.getByRole('button', { name: 'Connect', exact: true }).click();
+  await expect(page.getByText('Connecting…')).toBeVisible();
+  await page.evaluate(() => (window as unknown as { __release: () => void }).__release());
+  // The finally must clear busy even when the catch path ran.
+  await expect(page.getByText('Connecting…')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Connect', exact: true })).toBeEnabled();
+  await expect(page.locator('#engine-action-error')).toContainText('controller exited 1');
 });
