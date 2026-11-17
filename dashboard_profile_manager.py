@@ -188,6 +188,10 @@ def _reconcile_probe_routes(config: dict) -> None:
             continue  # malformed provider entries are rejected by strict config validation
         pin = spec.get("probe_route_id")
         if not isinstance(pin, str) or not pin.strip():
+            # #227: blank/non-str pins are invalid; self-heal by removing them
+            # rather than leaving a pin that blocks the profile switch.
+            if "probe_route_id" in spec:
+                spec.pop("probe_route_id")
             continue
         matches = [route for route in routes if isinstance(route, dict) and route.get("id") == pin]
         if (len(matches) != 1 or matches[0].get("provider") != provider_id

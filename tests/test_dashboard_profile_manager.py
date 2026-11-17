@@ -565,6 +565,31 @@ def test_deleting_last_profile_reconciles_probe_pin(tmp_path):
     assert "probe_route_id" not in applied["providers"]["primary"]
 
 
+def test_reconcile_self_heals_blank_and_non_str_pins():
+    """Council: blank/non-str pins are invalid and must be removed, matching
+    the docstring's self-heal promise, so a migrated config can't wedge a switch."""
+    config = {"routes": [], "providers": {
+        "blank": {"probe_route_id": "   "},
+        "non_str": {"probe_route_id": 123},
+        "missing": {},
+    }}
+    manager._reconcile_probe_routes(config)
+    assert "probe_route_id" not in config["providers"]["blank"]
+    assert "probe_route_id" not in config["providers"]["non_str"]
+    assert "probe_route_id" not in config["providers"]["missing"]
+
+
+def test_reconcile_preserves_a_valid_pin():
+    """Council: a pin that matches exactly one same-provider route with domains
+    must be preserved, not dropped by reconciliation."""
+    config = {"routes": [{"id": "keep", "provider": "primary", "domains": ["x.example"]}],
+              "providers": {"primary": {"probe_route_id": "keep"}}}
+    before = json.dumps(config, sort_keys=True)
+    manager._reconcile_probe_routes(config)
+    assert config["providers"]["primary"]["probe_route_id"] == "keep"
+    assert json.dumps(config, sort_keys=True) == before
+
+
 def test_reconcile_tolerates_non_dict_provider_spec():
     """Council (correctness + security): a malformed non-dict provider entry
     must not raise AttributeError in reconciliation; validation handles it."""
