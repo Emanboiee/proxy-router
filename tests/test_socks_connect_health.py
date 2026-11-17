@@ -294,6 +294,24 @@ def test_egress_check_surfaces_connect_rejection_reason(tmp_path, capsys):
     assert '"detail": "probe connection"' not in out
 
 
+def test_failed_http_probe_preserves_connect_rejection_evidence(tmp_path):
+    """Deploy seat: a failed HTTP probe must KEEP the CONNECT rejection fields
+    so egress probe/status can surface the rep= reason; only an HTTP success
+    supersedes them. This exercises the real record_egress write path."""
+    r = load_router(tmp_path)
+    from pathlib import Path as _P
+    profile = _P("socks")
+    r._write_proxy_egress("warp", {"ok": False, "checked_at": int(time.time()),
+                                   "socks_connect_ok": False, "socks_connect_code": 5,
+                                   "error": "socks connect rejected (rep=5)"})
+    # A failed HTTP probe (transport error) writes via record_egress
+    r.record_egress("warp", profile, ok=False, error="probe connection")
+    rec = r.read_egress("warp", profile)
+    assert rec.get("socks_connect_ok") is False
+    assert rec.get("socks_connect_code") == 5
+    assert "connect rejected" in r.egress.degraded_detail(rec, int(time.time()), 86400)
+
+
 def test_later_http_probe_clears_connect_rejection_reason(tmp_path):
     """CodeRabbit: REP=5, then HTTP 200, then HTTP 403 must report the 403 as
     the cause, not reuse the old REP=5 from a superseded CONNECT check."""

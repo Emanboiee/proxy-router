@@ -1263,8 +1263,8 @@ def record_egress(name: str, profile: Path, *, ok: bool, latency_ms: float | Non
     record["tls_target"] = target_key
     record["ok"] = bool(ok)
     record["checked_at"] = now
-    for k in ("socks_connect_ok", "socks_connect_code"): record.pop(k, None)  # #225: HTTP probe supersedes older CONNECT evidence
     if ok:
+        for k in ("socks_connect_ok", "socks_connect_code"): record.pop(k, None)  # #225: HTTP success supersedes CONNECT rejection
         record["fails"] = 0
         record["last_ok_at"] = now
         record["latency_ms"] = round(float(latency_ms), 2) if latency_ms is not None else None
