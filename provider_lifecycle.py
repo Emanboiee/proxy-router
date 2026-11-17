@@ -150,6 +150,36 @@ def referenced_providers(config: dict) -> set[str]:
     return result
 
 
+def connect_target_for(config: dict, name: str) -> tuple[str, int]:
+    """#225: pick a CONNECT target actually routed through ``name``.
+
+    Probing a fixed external host can false-dead a working proxy that only
+    permits its configured destinations, which would flip routed traffic to
+    direct (an IP leak). Prefer the first concrete domain this provider routes;
+    fall back to example.com only when config exposes no routable domain.
+    """
+    def walk(value):
+        if isinstance(value, dict):
+            if value.get("outbound") == name:
+                for key in ("domain", "domain_suffix", "full_domain"):
+                    hosts = value.get(key)
+                    if isinstance(hosts, list) and hosts and isinstance(hosts[0], str):
+                        host = hosts[0].lstrip(".")
+                        if host and "." in host and not host.startswith("*"):
+                            return host
+            for child in value.values():
+                found = walk(child)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for child in value:
+                found = walk(child)
+                if found:
+                    return found
+        return None
+    return (walk(config.get("route", {})) or "example.com", 443)
+
+
 def _launch_options(root: Path) -> dict:
     env = dict(os.environ)
     for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
@@ -310,7 +340,8 @@ def recover_routed(root: Path, name: str, config_path: Path, endpoint,
         ensure(root, name, host, port)
     except (OSError, ValueError, TimeoutError) as exc:
         return {"detail": f"provider startup failed: {exc}", "dns_ok": None}
-    connect = socks_connect_result(host, port, "example.com", 443, timeout=0.8)
+    target_host, target_port = connect_target_for(config, name)
+    connect = socks_connect_result(host, port, target_host, target_port, timeout=0.8)
     if not connect["ok"]:
         record = {"ok": False, "checked_at": int(time.time()),
                   "socks_connect_ok": False, "error": connect["error"]}

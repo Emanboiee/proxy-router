@@ -235,6 +235,14 @@ def degraded_detail(record: dict | None, now: int, ok_window: int) -> str:
         return "egress health stale or unknown"
     if quota_active(record, now):
         return "quota exhausted"
+    # A FRESH ok=true probe rode the tunnel and is authoritative: mirror the
+    # fresh_failure override so a recovered exit cannot misreport an old CONNECT
+    # rejection as its cause (#225 correctness council). A STALE ok=true record
+    # is still stale evidence and must keep the "stale" reason.
+    if record.get("ok") is True:
+        checked = _int_or_none(record.get("checked_at") or record.get("last_ok_at"))
+        if checked is not None and int(now) - checked < int(ok_window):
+            return "egress probe failed"
     if record.get("socks_connect_ok") is False:
         code = record.get("socks_connect_code")
         return f"socks connect rejected (rep={code})" if code is not None else "socks connect rejected"

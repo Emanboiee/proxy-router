@@ -193,6 +193,17 @@ def test_reconnect_success_clears_degradation(tmp_path):
     assert r._degraded_lanes() == []
 
 
+def test_connect_target_uses_routed_domain_not_fixed_host():
+    """#225: probe a domain the provider actually routes, so a whitelist-only
+    proxy isn't false-deaded for rejecting an arbitrary external host."""
+    cfg = {"route": {"rules": [
+        {"outbound": "other", "domain_suffix": ["unrelated.example"]},
+        {"outbound": "warp", "domain_suffix": [".school.example"]},
+    ]}}
+    assert lifecycle.connect_target_for(cfg, "warp") == ("school.example", 443)
+    assert lifecycle.connect_target_for(cfg, "missing") == ("example.com", 443)
+
+
 def test_recover_routed_persists_connect_rejection(socks_factory, tmp_path):
     server = socks_factory(connect_rep=5)
     name = "warp"
@@ -239,6 +250,12 @@ def test_recovered_http_probe_clears_stale_connect_rejection(tmp_path):
     # The observable verdict, not the internal field: a fresh ok=true exit is usable.
     assert r.egress.fresh_failure(rec, now, 86400) is False
     assert r.egress.usable_evidence(rec, now, 86400) is True
+    # And the actual user-visible status path: no degraded lane after recovery.
+    r._providers = {"warp": {"socks5": {"host": "127.0.0.1", "port": 2181}}}
+    r._routes = [{"id": "route-warp", "provider": "warp"}]
+    r.active_fallback = lambda name: None
+    r.is_proxy_provider = lambda name: True
+    assert r._degraded_lanes() == []
 
 
 def test_connect_rejection_merges_into_existing_egress_record(tmp_path):
