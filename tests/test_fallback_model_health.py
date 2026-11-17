@@ -66,6 +66,31 @@ def test_recovery_probes_model_path_not_root(tmp_path):
     assert any(u and "/zen/v1/models" in u for u in urls), urls
 
 
+def test_trailing_dot_host_still_probes_model_path(tmp_path):
+    """Security seat: 'opencode.ai.' must normalize to the model path."""
+    r = load_router(tmp_path)
+    r._providers = {"warp": {"fallback_providers": ["proton"], "fail_open_direct": False},
+                    "proton": {}}
+    r._routes = [{"id": "opencode-zen", "domains": ["opencode.ai"], "provider": "warp"}]
+    r._routing = {}
+    r._vpn = {}
+    r._port = 2080
+    r.current_mode = lambda: "proxy"
+    r._automatic_proxy_mode = lambda: True
+    r.response_provider_for_host = lambda host: "warp"
+    r._diagnostic_host_is_routed = lambda host: True
+    r.egress_dns_probe = mock.Mock(return_value=True)
+    r.engine_reload = mock.Mock(return_value=0)
+    profile = tmp_path / "test.conf"
+    r.provider_files = lambda name: [profile]
+    r._profile_error = lambda p: None
+    r.probe_egress = mock.Mock(return_value={"status": 429, "error": "rate-limit-429",
+                                             "latency_ms": 5.0, "block_reason": None})
+    r.recover_route("warp", "opencode.ai.")
+    urls = [c.kwargs.get("url") for c in r.probe_egress.call_args_list]
+    assert any(u and "/zen/v1/models" in u for u in urls), urls
+
+
 def test_recover_route_does_not_confirm_recovery_on_model_429(tmp_path):
     """recover_route must not return 'already reachable' when the only HTTP
     response is a model-path 429 — that is the exact #219 incident shape."""

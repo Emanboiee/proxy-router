@@ -1526,8 +1526,8 @@ def recover_route(name: str, host: str) -> int:
         return fail("recovery target does not belong to the configured provider")
     if not _diagnostic_host_is_routed(host):
         return 3
-    # #219: probe the model path so a root 200 can't confirm a quota-dead lane.
-    url = f"https://{host}{_PROBE_DOMAIN_PATHS.get(host, '')}"
+    # #219: model path so a root 200 can't confirm a quota-dead lane; normalize host.
+    host = host.strip().lower().rstrip("."); url = f"https://{host}{_PROBE_DOMAIN_PATHS.get(host, '')}"
     if urllib.parse.urlsplit(url).hostname != host or unsafe_probe_target(url):
         return fail("unsafe recovery target")
     # Ignore old log bursts after a recent recovery; one provider owns the budget.
@@ -1604,7 +1604,7 @@ def restore_fallback(name: str, host: str, *, automatic: bool = False) -> int:
     if routing["mode"] == "vpn-list" and not any(
             _response_host_matches(host, domain) for domain in _effective_vpn_domains(routing)):
         return 3
-    url = f"https://{host}{_PROBE_DOMAIN_PATHS.get(host, '')}"
+    host = host.strip().lower().rstrip("."); url = f"https://{host}{_PROBE_DOMAIN_PATHS.get(host, '')}"
     if urllib.parse.urlsplit(url).hostname != host or unsafe_probe_target(url):
         return fail("unsafe restore target")
     serving = egress.restorable_fallback(
