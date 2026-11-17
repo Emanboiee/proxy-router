@@ -239,3 +239,31 @@ def test_recovered_http_probe_clears_stale_connect_rejection(tmp_path):
     # The observable verdict, not the internal field: a fresh ok=true exit is usable.
     assert r.egress.fresh_failure(rec, now, 86400) is False
     assert r.egress.usable_evidence(rec, now, 86400) is True
+
+
+def test_connect_rejection_merges_into_existing_egress_record(tmp_path):
+    """A CONNECT-rejection record must not wipe quota/block/fail-streak fields
+    from the existing egress record (council deploy P1): clearing a reputation
+    block would make provider_quota_exhausted report the exit eligible again."""
+    r = load_router(tmp_path)
+    from pathlib import Path
+    profile = Path("socks")
+    # Pre-existing record with an active block + fail streak + quota marker.
+    r.record_egress("warp", profile, ok=False, status=403)
+    existing = r.read_egress("warp", profile)
+    existing.update({"blocked": True, "block_reason": "1010",
+                     "exhausted": True, "exhausted_until": "2099-01-01T00:00:00+00:00",
+                     "fails": 3, "tls_fails": 2})
+    path = r.egress_record_path("warp", profile)
+    path.write_text(json.dumps(existing))
+
+    # Production path: recover_routed writes a rejection via the proxy adapter.
+    r._write_proxy_egress("warp", {"ok": False, "checked_at": int(time.time()),
+                                   "socks_connect_ok": False,
+                                   "error": "socks connect rejected (rep=5)",
+                                   "socks_connect_code": 5})
+    merged = r.read_egress("warp", profile)
+    assert merged["blocked"] is True, "reputation block must survive the merge"
+    assert merged["exhausted"] is True, "quota marker must survive the merge"
+    assert merged["fails"] == 3, "fail streak must survive the merge"
+    assert merged["socks_connect_ok"] is False, "new rejection evidence is recorded"

@@ -1238,7 +1238,8 @@ def write_egress(name: str, profile: Path, record: dict) -> None:
     _hand_back_ownership(path.parent)
 
 
-def _write_proxy_egress(name, record): write_egress(name, proxy_profile_key(name), record)  # #225
+def _write_proxy_egress(name, record):  # #225: merge, never wipe quota/block/streak
+    p = proxy_profile_key(name); r = read_egress(name, p); r.update(record); write_egress(name, p, r)
 
 
 def record_egress(name: str, profile: Path, *, ok: bool, latency_ms: float | None = None,
@@ -5567,9 +5568,8 @@ def _degraded_lanes() -> list[str]:
             # reported by the WG-side fail-open branch, not here.
             record = read_egress(provider, proxy_profile_key(provider))
             now, window = int(time.time()), int(egress_settings()["ok_window"])
-            # Status reports UNKNOWN when there is no record at all (#225:
-            # missing evidence must not read healthy). The fallback gate
-            # stays fail-open (#219): absence of evidence is not exhaustion.
+            # #225: missing/invalid evidence reads UNKNOWN, not healthy. The #219
+            # fallback gate stays fail-open; the two contracts are distinct.
             if not record or not egress.usable_evidence(record, now, window):
                 lanes.append(f"{route_id} ({provider} {egress.degraded_detail(record, now, window)})")
             continue
