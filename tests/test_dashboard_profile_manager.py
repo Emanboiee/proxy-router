@@ -505,3 +505,94 @@ def test_server_remove_rolls_back_on_store_failure(tmp_path, monkeypatch):
         manager.manage_server(root, "proton", "b")
     assert (pool / "b.conf").read_text() == WIREGUARD
     assert not (pool / ".removed/b.conf").exists()
+
+
+@pytest.mark.parametrize("mode", ["selective", "full", "direct"])
+def test_saved_profile_switch_drops_obsolete_probe_pin(tmp_path, mode):
+    config_at(tmp_path, {"primary": {
+        "directory": "providers/primary", "probe_route_id": "old",
+    }})
+    config = json.loads((tmp_path / "router.json").read_text())
+    config["routes"] = [{"id": "old", "provider": "primary", "domains": ["old.example"]}]
+    (tmp_path / "router.json").write_text(json.dumps(config))
+    profile = manager.save_profile(tmp_path, {
+        "name": "Next", "providerId": "primary", "routeMode": mode,
+        "domains": ["next.example"] if mode == "selective" else [],
+    })["profiles"][-1]
+
+    result = manager.apply_profile(tmp_path, profile["id"])
+
+    applied = json.loads((tmp_path / "router.json").read_text())
+    assert result["activeProfileId"] == profile["id"]
+    assert applied["providers"]["primary"] == {"directory": "providers/primary"}
+
+
+def test_snapshot_route_edit_reconciles_pin_without_changing_live_config(tmp_path):
+    config_at(tmp_path, {"primary": {
+        "directory": "providers/primary", "probe_route_id": "old",
+    }})
+    config = json.loads((tmp_path / "router.json").read_text())
+    config["routes"] = [{"id": "old", "provider": "primary", "domains": ["old.example"]}]
+    path = tmp_path / "router.json"
+    path.write_text(json.dumps(config))
+    original = path.read_bytes()
+    profile = manager.state(tmp_path)["profiles"][0]
+
+    manager.save_profile(tmp_path, {**profile, "routeRules": [{
+        "id": "new", "providerId": "primary", "domains": ["new.example"],
+    }]}, profile["id"])
+    assert path.read_bytes() == original
+    manager.apply_profile(tmp_path, profile["id"])
+
+    applied = json.loads(path.read_text())
+    assert applied["routes"][0]["id"] == "new"
+    assert "probe_route_id" not in applied["providers"]["primary"]
+
+
+def test_deleting_last_profile_reconciles_probe_pin(tmp_path):
+    config_at(tmp_path, {"primary": {
+        "directory": "providers/primary", "probe_route_id": "old",
+    }})
+    config = json.loads((tmp_path / "router.json").read_text())
+    config["routes"] = [{"id": "old", "provider": "primary", "domains": ["old.example"]}]
+    (tmp_path / "router.json").write_text(json.dumps(config))
+    profile = manager.state(tmp_path)["profiles"][0]
+
+    manager.delete_profile(tmp_path, profile["id"])
+
+    applied = json.loads((tmp_path / "router.json").read_text())
+    assert applied["routes"] == []
+    assert "probe_route_id" not in applied["providers"]["primary"]
+
+
+def test_reconcile_self_heals_blank_and_non_str_pins():
+    """Council: blank/non-str pins are invalid and must be removed, matching
+    the docstring's self-heal promise, so a migrated config can't wedge a switch."""
+    config = {"routes": [], "providers": {
+        "blank": {"probe_route_id": "   "},
+        "non_str": {"probe_route_id": 123},
+        "missing": {},
+    }}
+    manager._reconcile_probe_routes(config)
+    assert "probe_route_id" not in config["providers"]["blank"]
+    assert "probe_route_id" not in config["providers"]["non_str"]
+    assert "probe_route_id" not in config["providers"]["missing"]
+
+
+def test_reconcile_preserves_a_valid_pin():
+    """Council: a pin that matches exactly one same-provider route with domains
+    must be preserved, not dropped by reconciliation."""
+    config = {"routes": [{"id": "keep", "provider": "primary", "domains": ["x.example"]}],
+              "providers": {"primary": {"probe_route_id": "keep"}}}
+    before = json.dumps(config, sort_keys=True)
+    manager._reconcile_probe_routes(config)
+    assert config["providers"]["primary"]["probe_route_id"] == "keep"
+    assert json.dumps(config, sort_keys=True) == before
+
+
+def test_reconcile_tolerates_non_dict_provider_spec():
+    """Council (correctness + security): a malformed non-dict provider entry
+    must not raise AttributeError in reconciliation; validation handles it."""
+    config = {"routes": [], "providers": {"broken": "not-a-dict"}}
+    manager._reconcile_probe_routes(config)  # must not raise
+    assert config["providers"]["broken"] == "not-a-dict"

@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 import network_control
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -538,3 +539,52 @@ def test_network_preset_exception_restores_config_and_previous_marker(tmp_path):
             raise AssertionError("Expected profile application to fail")
     assert (tmp_path / "router.json").read_text() == original
     assert json.loads(marker.read_text()) == {"preset": "default"}
+
+
+@pytest.mark.parametrize("reload_rc", [0, 1])
+def test_network_profile_switch_reconciles_probe_pin_and_rolls_back_on_failure(tmp_path, reload_rc):
+    import dashboard_profile_manager as manager
+
+    router = load_router(tmp_path)
+    _write_config(tmp_path, mappings={"SchoolWiFi": "profile:preset-school"})
+    path = tmp_path / "router.json"
+    config = json.loads(path.read_text())
+    config["providers"]["proton"]["probe_route_id"] = "opencode-zen"
+    config["providers"]["cloudflare"] = {"socks5": {"host": "127.0.0.1", "port": 2181}}
+    path.write_text(json.dumps(config))
+    original = path.read_bytes()
+    (tmp_path / "presets").mkdir()
+    routes = [{"id": "school", "provider": "cloudflare", "domains": ["x.com"]}]
+    (tmp_path / "presets/school.json").write_text(json.dumps({"routes": routes}))
+    assert router.load_config() == 0
+    observed = []
+
+    def reload():
+        observed.append((router._routes, dict(router._providers["proton"])))
+        return reload_rc
+
+    with (
+        mock.patch.object(router, "current_ssid", return_value="SchoolWiFi"),
+        mock.patch.object(router, "engine_alive", return_value=True),
+        mock.patch.object(router, "_engine_runs_as_root", return_value=False),
+        mock.patch.object(router, "engine_reload", side_effect=reload),
+    ):
+        result = router.apply_network_preset()
+        if reload_rc == 0:
+            # Rechecking the same SSID is a no-op, with no second engine reload.
+            assert router.apply_network_preset()["reason"] == "already active"
+
+    assert len(observed) == 1
+    assert observed[0][0][0]["id"] == "school"
+    assert "probe_route_id" not in observed[0][1]
+    assert result["applied"] is (reload_rc == 0)
+    store_path = tmp_path / "state" / manager.STORE_NAME
+    if reload_rc:
+        assert path.read_bytes() == original
+        assert not store_path.exists()
+        assert not router.network_preset_marker(tmp_path).exists()
+        assert router._providers["proton"]["probe_route_id"] == "opencode-zen"
+    else:
+        assert json.loads(path.read_text())["routes"] == routes
+        assert manager.state(tmp_path)["activeProfileId"] == "preset-school"
+        assert json.loads(router.network_preset_marker(tmp_path).read_text())["preset"] == "profile:preset-school"

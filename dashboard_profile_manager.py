@@ -175,6 +175,30 @@ def _publish_config_store(root: Path, config: dict, store: dict, extra: dict | N
     _publish_files(files)
 
 
+def _reconcile_probe_routes(config: dict) -> None:
+    """Keep provider probe pins only while their profile route remains usable.
+
+    Profiles replace routes but share provider connections. An obsolete pin must
+    fall back to normal probe selection rather than prevent the profile switch.
+    This runs only for route changes; loading config still validates pins strictly.
+    """
+    routes = config.get("routes", [])
+    for provider_id, spec in config["providers"].items():
+        if not isinstance(spec, dict):
+            continue  # malformed provider entries are rejected by strict config validation
+        pin = spec.get("probe_route_id")
+        if not isinstance(pin, str) or not pin.strip():
+            # #227: blank/non-str pins are invalid; self-heal by removing them
+            # rather than leaving a pin that blocks the profile switch.
+            if "probe_route_id" in spec:
+                spec.pop("probe_route_id")
+            continue
+        matches = [route for route in routes if isinstance(route, dict) and route.get("id") == pin]
+        if (len(matches) != 1 or matches[0].get("provider") != provider_id
+                or not matches[0].get("domains")):
+            spec.pop("probe_route_id")
+
+
 def _route_snapshot(config: dict) -> dict:
     return {
         "routes": copy.deepcopy(config.get("routes", [])),
@@ -245,6 +269,7 @@ def _edit_route_snapshot(root: Path, config: dict, snapshot: dict, rows: Any, mo
     candidate.update({key: value for key, value in result.items() if value is not None})
     if autodetect is None:
         candidate.pop("autodetect", None)
+    _reconcile_probe_routes(candidate)
     _validate_config(root, candidate)
     return result
 
@@ -684,6 +709,8 @@ def delete_profile(root: Path, profile_id: str) -> dict[str, Any]:
     elif deleting_active:
         config["routes"] = []
         config["routing"] = {"mode": "default"}
+    if deleting_active:
+        _reconcile_probe_routes(config)
     _publish_config_store(root, config, store)
     return state(root)
 
@@ -763,6 +790,7 @@ def apply_profile(root: Path, profile_id: str) -> dict[str, Any]:
     if not any(item.get("id") == clean["id"] for item in profiles if isinstance(item, dict)):
         profiles.append(clean)
     store["profiles"] = profiles
+    _reconcile_probe_routes(config)
     _publish_config_store(root, config, store)
     return state(root)
 
