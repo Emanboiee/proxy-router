@@ -278,6 +278,27 @@ class RunElevatedFallbackTests(unittest.TestCase):
             self.assertEqual(self.client.rotate(), (1, "no active provider"))
         run.assert_not_called()
 
+    def test_status_verify_full_probe_after_down_when_never_seen_up(self):
+        """#237: a post-action verify must use the full status even when the
+        previous poll never saw 'up' (helper-managed TUN from a down state)."""
+        fast = json.dumps({"up": False, "mode": "proxy", "providers": {}})
+        full = json.dumps({"up": True, "mode": "tun", "providers": {}})
+        self.client._last_seen_up = False
+        with mock.patch.object(self.client, "_run", side_effect=[(1, fast), (0, full)]) as run:
+            st = self.client.status(verify=True)
+        self.assertTrue(st.up, "verify must publish the full-status 'up'")
+        calls = [c.args for c in run.call_args_list]
+        self.assertEqual(calls[0], ("status", "--json", "--fast"))
+        self.assertEqual(calls[1], ("status", "--json"))
+
+    def test_status_without_verify_keeps_fast_down_from_initial_state(self):
+        fast = json.dumps({"up": False, "mode": "proxy", "providers": {}})
+        self.client._last_seen_up = False
+        with mock.patch.object(self.client, "_run", return_value=(1, fast)) as run:
+            st = self.client.status()
+        self.assertFalse(st.up)
+        self.assertEqual(run.call_count, 1)
+
     def test_status_clears_cached_provider_when_payload_has_none(self):
         payload = json.dumps({"up": False, "mode": "proxy", "providers": {}})
         self.client._active_provider = "proton"

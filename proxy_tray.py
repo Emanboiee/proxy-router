@@ -952,7 +952,7 @@ class RouterClient:
         except FileNotFoundError as e:
             return -2, f"missing: {e}"
 
-    def status(self) -> RouterStatus:
+    def status(self, *, verify: bool = False) -> RouterStatus:
         # #237: poll the fast path. --fast skips the sudo/launchctl elevation
         # probes, which cost a privileged round trip per 5s poll for fields
         # the tray never displays. Fast status cannot see a helper-managed
@@ -962,7 +962,7 @@ class RouterClient:
         # expensive probe then runs on state transitions, not every poll.
         rc, out = self._run("status", "--json", "--fast")
         st = RouterStatus.from_cli(rc, out)
-        if (st.error or not st.up) and self._last_seen_up:
+        if (st.error or not st.up) and (self._last_seen_up or verify):
             rc, out = self._run("status", "--json")
             st = RouterStatus.from_cli(rc, out)
         self._last_seen_up = bool(st.up) and not st.error
@@ -1978,7 +1978,10 @@ class TrayApp:
                 if detail:
                     result += f" — {detail}"
                 try:
-                    refreshed = self.client.status()
+                    # #237: after a mutation, verify through the full status so a
+                    # helper-managed TUN engine that fast status cannot see reads
+                    # connected (down->up transitions need the privileged probe).
+                    refreshed = self.client.status(verify=True)
                 except Exception as e:
                     refreshed = RouterStatus(error=str(e)[:80])
                 with self.lock:
