@@ -14,7 +14,21 @@ import provider_lifecycle as lifecycle
 from tests.test_router_regressions import load_router
 
 
-pytestmark = [pytest.mark.enable_socket, pytest.mark.allow_hosts(["127.0.0.1"])]
+# allow_hosts alone enforces loopback-only at the pytest-socket layer; adding
+# enable_socket would short-circuit it and turn this into a docstring claim.
+pytestmark = [pytest.mark.allow_hosts(["127.0.0.1"])]
+
+
+def test_non_loopback_is_blocked_by_the_guard():
+    """The loopback-only claim is enforced by pytest-socket, not just documented."""
+    sock = socket.socket()
+    try:
+        sock.connect(("8.8.8.8", 53))
+        pytest.fail("non-loopback connect must be blocked")
+    except Exception:
+        pass
+    finally:
+        sock.close()
 
 
 class FakeSocks:
