@@ -1245,10 +1245,9 @@ def _write_proxy_egress(name, record):  # #225: merge, never wipe quota/block/st
 def record_egress(name: str, profile: Path, *, ok: bool, latency_ms: float | None = None,
                   status: int | None = None, error: str | None = None,
                   dns_ok: bool | None = None, target: str | None = None) -> dict:
-    """Merge one probe outcome into the profile's egress record. A passing
-    probe clears the fail streak and any blocked marker; a failure bumps the
-    streak so rotation deprioritizes the exit. ``dns_ok`` (True/False from the
-    tunnel-DNS companion check) is persisted when it could be determined."""
+    """Merge one probe outcome into the egress record: a pass clears the fail
+    streak and block markers, a failure bumps it for rotation. ``dns_ok`` from
+    the companion DNS check is persisted when it could be determined."""
     record = read_egress(name, profile)
     now = int(time.time())
     # Keep TLS evidence separate from generic failures: a profile can have
@@ -1265,6 +1264,8 @@ def record_egress(name: str, profile: Path, *, ok: bool, latency_ms: float | Non
     record["tls_target"] = target_key
     record["ok"] = bool(ok)
     record["checked_at"] = now
+    # #225: current HTTP probe supersedes any older CONNECT rejection reason.
+    for k in ("socks_connect_ok", "socks_connect_code"): record.pop(k, None)
     if ok:
         record["fails"] = 0
         record["last_ok_at"] = now
@@ -5568,8 +5569,7 @@ def _degraded_lanes() -> list[str]:
             # reported by the WG-side fail-open branch, not here.
             record = read_egress(provider, proxy_profile_key(provider))
             now, window = int(time.time()), int(egress_settings()["ok_window"])
-            # #225: missing/invalid evidence reads UNKNOWN, not healthy. The #219
-            # fallback gate stays fail-open; the two contracts are distinct.
+            # #225: missing/stale evidence is UNKNOWN, not healthy (#219 gate stays fail-open).
             if not record or not egress.usable_evidence(record, now, window):
                 lanes.append(f"{route_id} ({provider} {egress.degraded_detail(record, now, window)})")
             continue

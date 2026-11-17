@@ -92,7 +92,7 @@ def socks_connect_result(host: str, port: int, target_host: str, target_port: in
         with socket.create_connection((host, port), timeout=_remaining(deadline)) as connection:
             connection.settimeout(_remaining(deadline))
             connection.sendall(b"\x05\x01\x00")
-            greeting = connection.recv(2)
+            greeting = _recv_exact(connection, 2, deadline)
             if greeting != b"\x05\x00":
                 result["error"] = "socks greeting rejected"
                 return result
@@ -108,7 +108,7 @@ def socks_connect_result(host: str, port: int, target_host: str, target_port: in
                 (target_port >> 8) & 0xFF, target_port & 0xFF])
             connection.settimeout(_remaining(deadline))
             connection.sendall(request)
-            reply = connection.recv(4)
+            reply = _recv_exact(connection, 4, deadline)
             if len(reply) < 2:
                 result["error"] = "short CONNECT reply"
                 return result
@@ -124,6 +124,19 @@ def socks_connect_result(host: str, port: int, target_host: str, target_port: in
     except (OSError, StartupError) as exc:
         result["error"] = f"socks connect failed: {type(exc).__name__}"
         return result
+
+
+def _recv_exact(connection, size: int, deadline: float) -> bytes:
+    """Read exactly ``size`` bytes within the shared deadline (CodeRabbit:
+    ``recv(n)`` may return fewer than ``n`` bytes, splitting a SOCKS reply)."""
+    data = b""
+    while len(data) < size:
+        connection.settimeout(_remaining(deadline))
+        chunk = connection.recv(size - len(data))
+        if not chunk:
+            break
+        data += chunk
+    return data
 
 
 def _remaining(deadline: float) -> float:

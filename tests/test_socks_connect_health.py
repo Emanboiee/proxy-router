@@ -20,10 +20,11 @@ pytestmark = [pytest.mark.enable_socket, pytest.mark.allow_hosts(["127.0.0.1"])]
 class FakeSocks:
     """Bounded loopback SOCKS5 server with a configurable CONNECT reply."""
 
-    def __init__(self, *, connect_rep=0, greeting=True, blackhole=False):
+    def __init__(self, *, connect_rep=0, greeting=True, blackhole=False, fragment=False):
         self.connect_rep = connect_rep
         self.greeting = greeting
         self.blackhole = blackhole
+        self.fragment = fragment
         self.connect_requests = []
         self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -48,7 +49,12 @@ class FakeSocks:
             try:
                 if len(conn.recv(3)) < 3:
                     return
-                conn.sendall(b"\x05\x00" if self.greeting else b"\x05\xff")
+                greet = b"\x05\x00" if self.greeting else b"\x05\xff"
+                if self.fragment:
+                    for byte in greet:
+                        conn.sendall(bytes([byte]))
+                else:
+                    conn.sendall(greet)
                 if not self.greeting or self.blackhole:
                     return
                 head = conn.recv(4)
@@ -59,7 +65,12 @@ class FakeSocks:
                     conn.recv(length + 2)
                 self.connect_requests.append(head[1])
                 rep = self.connect_rep & 0xFF
-                conn.sendall(bytes([0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0]))
+                reply = bytes([0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                if self.fragment:
+                    for byte in reply:
+                        conn.sendall(bytes([byte]))
+                else:
+                    conn.sendall(reply)
             except OSError:
                 pass
 
@@ -191,6 +202,32 @@ def test_reconnect_success_clears_degradation(tmp_path):
 
     _write_record(r, "warp", ok=True, socks_connect_ok=True, socks_connect_code=0)
     assert r._degraded_lanes() == []
+
+
+def test_later_http_probe_clears_connect_rejection_reason(tmp_path):
+    """CodeRabbit: REP=5, then HTTP 200, then HTTP 403 must report the 403 as
+    the cause, not reuse the old REP=5 from a superseded CONNECT check."""
+    r = load_router(tmp_path)
+    from pathlib import Path
+    profile = Path("socks")
+    r._write_proxy_egress("warp", {"ok": False, "checked_at": int(time.time()),
+                                   "socks_connect_ok": False, "socks_connect_code": 5,
+                                   "error": "socks connect rejected (rep=5)"})
+    # A fresh HTTP probe (200 then 403) supersedes the CONNECT evidence.
+    r.record_egress("warp", profile, ok=True, status=200)
+    r.record_egress("warp", profile, ok=False, status=403)
+    rec = r.read_egress("warp", profile)
+    assert rec.get("socks_connect_ok") is None
+    assert "connect rejected" not in r.egress.degraded_detail(rec, int(time.time()), 86400)
+
+
+def test_fragmented_socks_replies_are_read_fully(socks_factory):
+    """CodeRabbit: recv(n) can return fewer bytes; a reply sent one byte at a
+    time must still be parsed as a successful CONNECT."""
+    server = socks_factory(connect_rep=0, fragment=True)
+    result = lifecycle.socks_connect_result("127.0.0.1", server.port, "example.com", timeout=1.0)
+    assert result["ok"] is True, result
+    assert result["code"] == 0
 
 
 def test_connect_target_uses_routed_domain_not_fixed_host():
