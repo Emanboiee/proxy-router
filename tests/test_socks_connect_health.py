@@ -218,3 +218,24 @@ def test_recover_routed_persists_connect_rejection(socks_factory, tmp_path):
     assert result["socks_connect_code"] == 5
     assert written[name]["socks_connect_code"] == 5
     assert written[name]["checked_at"] > 0
+
+
+def test_recovered_http_probe_clears_stale_connect_rejection(tmp_path):
+    """A fresh successful HTTP probe through the tunnel means the exit carries
+    traffic now; a lingering socks_connect_ok=false must not keep the lane
+    degraded forever (#225 deploy review finding)."""
+    r = load_router(tmp_path)
+    from pathlib import Path
+    profile = Path("socks")
+    # Production shape after a rejection then a successful HTTP probe.
+    r.record_egress("warp", profile, ok=True, status=200)
+    rec = r.read_egress("warp", profile)
+    rec["socks_connect_ok"] = False
+    rec["socks_connect_code"] = 5
+    path = r.egress_record_path("warp", profile)
+    path.write_text(json.dumps(rec))
+
+    now = int(time.time())
+    # The observable verdict, not the internal field: a fresh ok=true exit is usable.
+    assert r.egress.fresh_failure(rec, now, 86400) is False
+    assert r.egress.usable_evidence(rec, now, 86400) is True

@@ -197,6 +197,13 @@ def fresh_failure(record: dict | None, now: int, ok_window: int) -> bool:
     """
     if not isinstance(record, dict) or not record:
         return False
+    # A fresh successful HTTP probe rode the tunnel, so it is authoritative
+    # evidence the exit carries traffic now. Clear any lingering CONNECT flag
+    # from an older rejection (#225 deploy review): without this, a recovered
+    # lane stays degraded forever because record_egress(ok=True) never touched
+    # socks_connect_ok. The connect flag only matters when ok is not True.
+    if record.get("ok") is True:
+        return False
     if record.get("ok") is not False and record.get("socks_connect_ok") is not False:
         return False
     checked = _int_or_none(record.get("checked_at") or record.get("last_ok_at"))
