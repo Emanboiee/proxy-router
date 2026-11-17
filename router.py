@@ -6145,9 +6145,9 @@ def egress_check(name: str | None = None, as_json: bool = False) -> int:
         if record is not None and record.get("dns_ok") is not None:
             entry["dns_ok"] = record["dns_ok"]
         if status == "dead":
-            # #225: surface CONNECT rejection evidence, not a generic reason.
-            conn_err = record.get("error") if record and record.get("socks_connect_ok") is False else None
-            entry["detail"] = conn_err or ("dns" if entry.get("dns_ok") is False else "probe connection")
+            # #225: rep reason from the code field the HTTP probe can't overwrite.
+            code = record.get(egress.SOCKS_CONNECT_CODE) if record and record.get(egress.SOCKS_CONNECT_OK) is False else None
+            entry["detail"] = f"socks connect rejected (rep={code})" if code is not None else ("dns" if entry.get("dns_ok") is False else "probe connection")
             return provider, entry, True
         if status == "degraded" and record is not None:
             entry["detail"] = (f"HTTP {record['status']}" if record.get("status") is not None

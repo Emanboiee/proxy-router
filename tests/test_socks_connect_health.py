@@ -294,6 +294,27 @@ def test_egress_check_surfaces_connect_rejection_reason(tmp_path, capsys):
     assert '"detail": "probe connection"' not in out
 
 
+def test_egress_probe_detail_shows_rep_code_from_record(tmp_path, capsys, monkeypatch):
+    """Deploy final4: egress probe detail must print the rep=N code, not the
+    generic HTTP error that record_egress overwrote in the 'error' field."""
+    r = load_router(tmp_path)
+    r._providers = {"warp": {"socks5": {"host": "127.0.0.1", "port": 2181}}}
+    r.is_proxy_provider = lambda name: True
+    r.proxy_upstream = lambda name: ("127.0.0.1", 2181)
+    r.listener_up = lambda: True
+    r.active_fallback = lambda name: None
+    # Real record_egress overwrote 'error' with the HTTP error, but kept the code
+    r._write_proxy_egress("warp", {"ok": False, "socks_connect_ok": False,
+                                   "socks_connect_code": 5, "error": "socks connect rejected (rep=5)"})
+    from pathlib import Path as _P
+    r.record_egress("warp", _P("socks"), ok=False, error="probe connection")
+    profile = r.proxy_profile_key("warp")
+    r.check_egress_live = lambda name, prof: ("dead", r.read_egress(name, prof))
+    r.egress_check("warp", as_json=True)
+    out = capsys.readouterr().out
+    assert "socks connect rejected (rep=5)" in out, out
+
+
 def test_failed_http_probe_preserves_connect_rejection_evidence(tmp_path):
     """Deploy seat: a failed HTTP probe must KEEP the CONNECT rejection fields
     so egress probe/status can surface the rep= reason; only an HTTP success
