@@ -563,3 +563,11 @@ def test_deleting_last_profile_reconciles_probe_pin(tmp_path):
     applied = json.loads((tmp_path / "router.json").read_text())
     assert applied["routes"] == []
     assert "probe_route_id" not in applied["providers"]["primary"]
+
+
+def test_reconcile_tolerates_non_dict_provider_spec():
+    """Council (correctness + security): a malformed non-dict provider entry
+    must not raise AttributeError in reconciliation; validation handles it."""
+    config = {"routes": [], "providers": {"broken": "not-a-dict"}}
+    manager._reconcile_probe_routes(config)  # must not raise
+    assert config["providers"]["broken"] == "not-a-dict"

@@ -184,6 +184,8 @@ def _reconcile_probe_routes(config: dict) -> None:
     """
     routes = config.get("routes", [])
     for provider_id, spec in config["providers"].items():
+        if not isinstance(spec, dict):
+            continue  # malformed provider entries are rejected by strict config validation
         pin = spec.get("probe_route_id")
         if not isinstance(pin, str) or not pin.strip():
             continue
