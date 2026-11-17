@@ -20,11 +20,14 @@ pytestmark = [pytest.mark.enable_socket, pytest.mark.allow_hosts(["127.0.0.1"])]
 class FakeSocks:
     """Bounded loopback SOCKS5 server with a configurable CONNECT reply."""
 
-    def __init__(self, *, connect_rep=0, greeting=True, blackhole=False, fragment=False):
+    def __init__(self, *, connect_rep=0, greeting=True, blackhole=False, fragment=False,
+                 reject_first=0):
         self.connect_rep = connect_rep
         self.greeting = greeting
         self.blackhole = blackhole
         self.fragment = fragment
+        self.reject_first = reject_first  # reject the first N CONNECTs, then accept
+        self.connect_count = 0
         self.connect_requests = []
         self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -64,7 +67,9 @@ class FakeSocks:
                     length = conn.recv(1)[0]
                     conn.recv(length + 2)
                 self.connect_requests.append(head[1])
-                rep = self.connect_rep & 0xFF
+                self.connect_count += 1
+                rep = 5 if self.connect_count <= self.reject_first else self.connect_rep
+                rep &= 0xFF
                 reply = bytes([0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
                 if self.fragment:
                     for byte in reply:
@@ -202,6 +207,28 @@ def test_reconnect_success_clears_degradation(tmp_path):
 
     _write_record(r, "warp", ok=True, socks_connect_ok=True, socks_connect_code=0)
     assert r._degraded_lanes() == []
+
+
+def test_recover_routed_retries_a_transient_connect_rejection(socks_factory, tmp_path,
+                                                              monkeypatch):
+    """Council: a single transient CONNECT rejection must not dead-mark an
+    exit. recover_routed retries once before persisting a failure."""
+    server = socks_factory(connect_rep=0, reject_first=1)
+    config = tmp_path / "sing-box.json"
+    config.write_text(json.dumps({"route": {"rules": [{"outbound": "warp",
+                                                        "domain_suffix": ["school.example"]}]}}))
+    monkeypatch.setattr(lifecycle, "ensure", lambda *a, **k: True)
+    monkeypatch.setattr(lifecycle.time, "sleep", lambda s: None)
+    written = {}
+
+    def endpoint(_name):
+        return "127.0.0.1", server.port
+
+    result = lifecycle.recover_routed(tmp_path, "warp", config, endpoint,
+                                      lambda n, r: written.__setitem__(n, r))
+    assert result is None, "a single rejection then success must not persist failure"
+    assert written == {}, "no rejection record should be written on transient blip"
+    assert server.connect_count == 2, "CONNECT must be attempted twice"
 
 
 def test_egress_check_surfaces_connect_rejection_reason(tmp_path, capsys):

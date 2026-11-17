@@ -356,6 +356,13 @@ def recover_routed(root: Path, name: str, config_path: Path, endpoint,
     target_host, target_port = connect_target_for(config, name)
     connect = socks_connect_result(host, port, target_host, target_port, timeout=0.8)
     if not connect["ok"]:
+        # #225: one bounded retry before a hard dead verdict. A transient
+        # rejection (handshake race, single lost reply) must not dead-mark an
+        # exit that the next probe would accept — that could drive fail-open
+        # to direct and leak the client IP. Mirrors the HTTP probe's retry.
+        time.sleep(0.25)
+        connect = socks_connect_result(host, port, target_host, target_port, timeout=0.8)
+    if not connect["ok"]:
         record = {"ok": False, "checked_at": int(time.time()),
                   "socks_connect_ok": False, "error": connect["error"]}
         if connect["code"] is not None:
