@@ -160,6 +160,35 @@ def setup_router(tmp_path, monkeypatch):
     return r, paths
 
 
+def test_429_on_serving_fallback_forces_primary_restore(tmp_path, monkeypatch):
+    """#219: a 429 while a fallback serves forces the healthy primary back
+    within the same request, bypassing the two-win gate."""
+    r, paths = setup_router(tmp_path, monkeypatch)
+    fb = r._fallback_state_path('proton')
+    fb.parent.mkdir(parents=True, exist_ok=True)
+    fb.write_text(json.dumps({'provider': 'warp-proxy', 'reason': 'confirmed-stall'}))
+    # setup_router's proton provider has real profiles; ensure active set and fallback seen
+    r.set_active('proton', paths[0])
+    monkeypatch.setattr(r, 'response_provider_for_host', lambda h: 'proton')
+    monkeypatch.setattr(r, '_diagnostic_host_is_routed', lambda h: True)
+    monkeypatch.setattr(r, 'probe_egress',
+                        lambda **kw: {'status': 200, 'error': None, 'latency_ms': 5.0,
+                                      'block_reason': None})
+    recovery = RouterRecovery(r, 'opencode.ai')
+    before = recovery.snapshot()
+    assert before is not None
+    # Wire verification: recover() must invoke force restore on the primary.
+    called = []
+    def fake_restore(name, host, **kw):
+        called.append((name, host, kw))
+        # simulate a successful forced restore by clearing the fallback marker
+        r._fallback_state_path('proton').unlink(missing_ok=True)
+        return 0
+    monkeypatch.setattr(r, 'restore_fallback', fake_restore)
+    assert recovery.recover(before)
+    assert called and called[0][0] == 'proton' and called[0][2].get('force') is True, called
+
+
 def test_router_cooldown_fallback_and_late_response_attribution(tmp_path, monkeypatch):
     r, paths = setup_router(tmp_path, monkeypatch)
     recovery = RouterRecovery(r, 'opencode.ai')
