@@ -60,7 +60,7 @@ def classify_probe_body(status: int, text: str) -> str | None:
     return None
 
 
-def probe_is_model_healthy(result: dict | None) -> bool:
+def probe_is_model_healthy(result: dict | None, *, is_model: bool = True) -> bool:
     """#219: whether a probe result proves the MODEL path has quota.
 
     An HTTP 200 at a provider's root URL is not proof that its model endpoint
@@ -74,8 +74,13 @@ def probe_is_model_healthy(result: dict | None) -> bool:
     status = result.get("status")
     if not isinstance(status, int) or not 100 <= status < 600:
         return False
-    if result.get("error") in ("rate-limit-429", "quota-exhausted"):
-        return False
+    if is_model:
+        if result.get("error") in ("rate-limit-429", "quota-exhausted"):
+            return False
+        # #258: a 429 is a quota signal regardless of its classified error label;
+        # e.g. a 429 body with "error code: 1010" classifies as cloudflare-1010.
+        if status == 429:
+            return False
     return True
 
 

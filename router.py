@@ -1539,8 +1539,8 @@ def recover_route(name: str, host: str) -> int:
     except (OSError, ValueError, KeyError, TypeError):
         pass
     def reachable() -> bool:
-        # #219: a 429 quota error is not recovery even with an HTTP 200 status.
-        return egress.probe_is_model_healthy(probe_egress(url=url, timeout=3.0))
+        # #219: 429 is non-healthy for model hosts only; generic responses still prove transport.
+        return egress.probe_is_model_healthy(probe_egress(url=url, timeout=3.0), is_model=host in _PROBE_DOMAIN_PATHS)
     # Require a fresh confirmation and positive DNS, not merely old error lines.
     if reachable():
         return 0
@@ -1629,7 +1629,7 @@ def restore_fallback(name: str, host: str, *, automatic: bool = False, force: bo
         return rc
     result = probe_egress(url=url, timeout=3.0)
     # #219: a model-path 429 must not clear a fallback after two "wins".
-    healthy = egress.probe_is_model_healthy(result)
+    healthy = egress.probe_is_model_healthy(result, is_model=host in _PROBE_DOMAIN_PATHS)
     if healthy:
         successes += 1
         if successes >= (1 if force else RESTORE_SUCCESS_THRESHOLD):  # #219: quota-dead fast path

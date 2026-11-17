@@ -31,6 +31,14 @@ def test_probe_healthy_rejects_429_even_with_200_status():
     assert egress.probe_is_model_healthy({"status": 429, "error": "rate-limit-429"}) is False
 
 
+def test_429_with_1010_label_is_not_model_healthy():
+    """CodeRabbit: a 429 body with 'error code: 1010' classifies as cloudflare-1010
+    but is still a quota signal; must be rejected independent of the label."""
+    err, block = egress.probe_failure_reason(429, '{"error":"error code: 1010"}')
+    assert err == "cloudflare-1010", (err, block)
+    assert egress.probe_is_model_healthy({"status": 429, "error": err}) is False
+
+
 def test_probe_healthy_accepts_clean_2xx():
     assert egress.probe_is_model_healthy({"status": 200, "error": None}) is True
     assert egress.probe_is_model_healthy({"status": 204, "error": None}) is True
