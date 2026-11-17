@@ -1238,13 +1238,15 @@ def write_egress(name: str, profile: Path, record: dict) -> None:
     _hand_back_ownership(path.parent)
 
 
+def _write_proxy_egress(name, record): merged = read_egress(name, proxy_profile_key(name)); merged.update(record); write_egress(name, proxy_profile_key(name), merged)  # #225 merge
+
+
 def record_egress(name: str, profile: Path, *, ok: bool, latency_ms: float | None = None,
                   status: int | None = None, error: str | None = None,
                   dns_ok: bool | None = None, target: str | None = None) -> dict:
-    """Merge one probe outcome into the profile's egress record. A passing
-    probe clears the fail streak and any blocked marker; a failure bumps the
-    streak so rotation deprioritizes the exit. ``dns_ok`` (True/False from the
-    tunnel-DNS companion check) is persisted when it could be determined."""
+    """Merge one probe outcome into the egress record: a pass clears the fail
+    streak and block markers, a failure bumps it for rotation. ``dns_ok`` from
+    the companion DNS check is persisted when it could be determined."""
     record = read_egress(name, profile)
     now = int(time.time())
     # Keep TLS evidence separate from generic failures: a profile can have
@@ -1262,6 +1264,7 @@ def record_egress(name: str, profile: Path, *, ok: bool, latency_ms: float | Non
     record["ok"] = bool(ok)
     record["checked_at"] = now
     if ok:
+        for k in ("socks_connect_ok", "socks_connect_code"): record.pop(k, None)  # #225: HTTP success supersedes CONNECT rejection
         record["fails"] = 0
         record["last_ok_at"] = now
         record["latency_ms"] = round(float(latency_ms), 2) if latency_ms is not None else None
@@ -2274,9 +2277,9 @@ def check_egress_live(name: str, profile: Path, *, port: int | None = None,
     blocked marker, exactly like probe_profile.
     """
     if is_proxy_provider(name) and SING_BOX_CONFIG.is_file() and engine_alive():
-        record = provider_lifecycle.recover_routed(ROOT, name, SING_BOX_CONFIG, proxy_upstream)
-        if record is not None:
-            return "dead", record
+        conn_record = provider_lifecycle.recover_routed(ROOT, name, SING_BOX_CONFIG, proxy_upstream, _write_proxy_egress)
+        # #225: CONNECT rejection is only 'degraded' evidence; HTTP probe decides dead.
+        if conn_record is not None and "socks_connect_ok" not in conn_record: return "dead", conn_record
     url = url or probe_url_for(name)
     if url is None:
         return "alive", None
@@ -5564,13 +5567,9 @@ def _degraded_lanes() -> list[str]:
             # reported by the WG-side fail-open branch, not here.
             record = read_egress(provider, proxy_profile_key(provider))
             now, window = int(time.time()), int(egress_settings()["ok_window"])
-            # Status reports UNKNOWN when there is no record at all (#225:
-            # missing evidence must not read healthy). The fallback gate
-            # stays fail-open (#219): absence of evidence is not exhaustion.
-            if not record or egress.exit_unusable(record, now, window):
-                detail = ("quota exhausted" if egress.quota_active(record, now)
-                          else "egress health stale or unknown")
-                lanes.append(f"{route_id} ({provider} {detail})")
+            # #225: missing/stale evidence is UNKNOWN, not healthy (#219 gate stays fail-open).
+            if not record or not egress.usable_evidence(record, now, window):
+                lanes.append(f"{route_id} ({provider} {egress.degraded_detail(record, now, window)})")
             continue
         if _effective_route_provider(provider) != "direct":
             continue
@@ -6146,7 +6145,9 @@ def egress_check(name: str | None = None, as_json: bool = False) -> int:
         if record is not None and record.get("dns_ok") is not None:
             entry["dns_ok"] = record["dns_ok"]
         if status == "dead":
-            entry["detail"] = "dns" if entry.get("dns_ok") is False else "probe connection"
+            # #225: rep reason from the code field the HTTP probe can't overwrite.
+            code = record.get(egress.SOCKS_CONNECT_CODE) if record and record.get(egress.SOCKS_CONNECT_OK) is False else None
+            entry["detail"] = f"socks connect rejected (rep={code})" if code is not None else ("dns" if entry.get("dns_ok") is False else "probe connection")
             return provider, entry, True
         if status == "degraded" and record is not None:
             entry["detail"] = (f"HTTP {record['status']}" if record.get("status") is not None

@@ -134,6 +134,12 @@ AUTOMATIC_FALLBACK_REASONS = frozenset({
     "restore-pending", "primary-unhealthy",
 })
 
+# #225: shared egress-record field names for SOCKS CONNECT evidence. Kept here
+# (the egress leaf) as the single source of truth so writers and readers cannot
+# drift apart; provider_lifecycle imports these instead of hardcoding literals.
+SOCKS_CONNECT_OK = "socks_connect_ok"
+SOCKS_CONNECT_CODE = "socks_connect_code"
+
 
 def quota_active(record: dict | None, now: int) -> bool:
     """True while one egress record carries an unexpired quota marker.
@@ -183,6 +189,72 @@ def exit_unusable(record: dict | None, now: int, ok_window: int) -> bool:
     if not isinstance(record, dict) or not record:
         return False
     return quota_active(record, now) or quota_unknown(record, now, ok_window)
+
+
+def fresh_failure(record: dict | None, now: int, ok_window: int) -> bool:
+    """True when a record holds a recent failed probe (#225).
+
+    ``exit_unusable`` covers quota and staleness for the #219 fallback gate,
+    but a record with ``ok=false`` and a fresh timestamp still reads usable
+    there. Status must not repeat that mistake: a fresh failed probe is direct
+    evidence the exit cannot serve traffic, so the affected lane is degraded
+    until a fresh success clears it. An old failure ages out with ``ok_window``
+    and is then covered by ``quota_unknown`` instead.
+    """
+    if not isinstance(record, dict) or not record:
+        return False
+    # A fresh successful HTTP probe rode the tunnel, so it is authoritative
+    # evidence the exit carries traffic now. Clear any lingering CONNECT flag
+    # from an older rejection (#225 deploy review): without this, a recovered
+    # lane stays degraded forever because record_egress(ok=True) never touched
+    # socks_connect_ok. The connect flag only matters when ok is not True.
+    if record.get("ok") is True:
+        return False
+    if record.get("ok") is not False and record.get(SOCKS_CONNECT_OK) is not False:
+        return False
+    checked = _int_or_none(record.get("checked_at") or record.get("last_ok_at"))
+    if checked is None:
+        return True
+    return int(now) - checked < int(ok_window)
+
+
+def usable_evidence(record: dict | None, now: int, ok_window: int) -> bool:
+    """True only when a record is neither quota-dead/stale nor freshly failed.
+
+    This is the status-side health verdict (#225): missing or unparseable
+    evidence is not usable, stale evidence is not usable, and a fresh failed
+    probe is not usable. Kept separate from ``exit_unusable`` so the #219
+    fallback gate keeps its documented fail-open-on-absence contract.
+    """
+    if not isinstance(record, dict) or not record:
+        return False
+    return not exit_unusable(record, now, ok_window) and not fresh_failure(record, now, ok_window)
+
+
+def degraded_detail(record: dict | None, now: int, ok_window: int) -> str:
+    """One-line reason a proxy-backed lane is degraded (#225).
+
+    Priority matters: an active quota block is more specific than a generic
+    failed probe, and a rejected CONNECT more specific than an old success.
+    """
+    if not isinstance(record, dict) or not record:
+        return "egress health stale or unknown"
+    if quota_active(record, now):
+        return "quota exhausted"
+    # A FRESH ok=true probe rode the tunnel and is authoritative: mirror the
+    # fresh_failure override so a recovered exit cannot misreport an old CONNECT
+    # rejection as its cause (#225 correctness council). A STALE ok=true record
+    # is still stale evidence and must keep the "stale" reason.
+    if record.get("ok") is True:
+        checked = _int_or_none(record.get("checked_at") or record.get("last_ok_at"))
+        if checked is not None and int(now) - checked < int(ok_window):
+            return "egress probe failed"
+    if record.get(SOCKS_CONNECT_OK) is False:
+        code = record.get(SOCKS_CONNECT_CODE)
+        return f"socks connect rejected (rep={code})" if code is not None else "socks connect rejected"
+    if fresh_failure(record, now, ok_window):
+        return "egress probe failed"
+    return "egress health stale or unknown"
 
 
 def restorable_fallback(router, name: str, *, automatic: bool) -> str | None:
