@@ -1238,6 +1238,9 @@ def write_egress(name: str, profile: Path, record: dict) -> None:
     _hand_back_ownership(path.parent)
 
 
+def _write_proxy_egress(name, record): write_egress(name, proxy_profile_key(name), record)  # #225
+
+
 def record_egress(name: str, profile: Path, *, ok: bool, latency_ms: float | None = None,
                   status: int | None = None, error: str | None = None,
                   dns_ok: bool | None = None, target: str | None = None) -> dict:
@@ -2274,7 +2277,7 @@ def check_egress_live(name: str, profile: Path, *, port: int | None = None,
     blocked marker, exactly like probe_profile.
     """
     if is_proxy_provider(name) and SING_BOX_CONFIG.is_file() and engine_alive():
-        record = provider_lifecycle.recover_routed(ROOT, name, SING_BOX_CONFIG, proxy_upstream)
+        record = provider_lifecycle.recover_routed(ROOT, name, SING_BOX_CONFIG, proxy_upstream, _write_proxy_egress)
         if record is not None:
             return "dead", record
     url = url or probe_url_for(name)
@@ -5567,10 +5570,8 @@ def _degraded_lanes() -> list[str]:
             # Status reports UNKNOWN when there is no record at all (#225:
             # missing evidence must not read healthy). The fallback gate
             # stays fail-open (#219): absence of evidence is not exhaustion.
-            if not record or egress.exit_unusable(record, now, window):
-                detail = ("quota exhausted" if egress.quota_active(record, now)
-                          else "egress health stale or unknown")
-                lanes.append(f"{route_id} ({provider} {detail})")
+            if not record or not egress.usable_evidence(record, now, window):
+                lanes.append(f"{route_id} ({provider} {egress.degraded_detail(record, now, window)})")
             continue
         if _effective_route_provider(provider) != "direct":
             continue

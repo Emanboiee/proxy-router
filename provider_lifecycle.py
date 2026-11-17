@@ -53,7 +53,12 @@ def command_args(command: str) -> list[str]:
 
 
 def socks_ready(host: str, port: int, *, timeout: float = 0.4) -> bool:
-    """Check the SOCKS handshake within one connect/write/read budget."""
+    """Check the SOCKS greeting within one connect/write/read budget.
+
+    Issue #225: a successful greeting proves only that a TCP listener answered,
+    not that it will carry traffic. Use :func:`socks_connect_result` for usable
+    egress evidence; ``socks_ready`` stays as the cheap startup readiness probe.
+    """
     deadline = time.monotonic() + timeout
     try:
         with socket.create_connection((host, port), timeout=_remaining(deadline)) as connection:
@@ -63,6 +68,62 @@ def socks_ready(host: str, port: int, *, timeout: float = 0.4) -> bool:
             return connection.recv(2) == b"\x05\x00"
     except (OSError, StartupError):
         return False
+
+
+def socks_connect_result(host: str, port: int, target_host: str, target_port: int = 443,
+                         *, timeout: float = 0.8) -> dict:
+    """Issue #225: bounded SOCKS5 CONNECT evidence for one upstream.
+
+    Sends the greeting then a CONNECT request for ``target_host:target_port`` and
+    classifies the reply. A TCP accept and a valid greeting are NOT enough: a
+    listener that replies ``REP=4/5`` (host unreachable / connection refused)
+    accepts bytes but cannot carry routed traffic. All socket operations share
+    one monotonic deadline, so a blackhole listener is bounded.
+
+    Returns ``{"ok": bool, "code": int | None, "error": str | None}``. ``ok`` is
+    True only on ``REP=0x00``. ``code`` is the reply code when one was read.
+    """
+    result = {"ok": False, "code": None, "error": None}
+    if not isinstance(timeout, (int, float)) or timeout <= 0:
+        result["error"] = "invalid timeout"
+        return result
+    deadline = time.monotonic() + float(timeout)
+    try:
+        with socket.create_connection((host, port), timeout=_remaining(deadline)) as connection:
+            connection.settimeout(_remaining(deadline))
+            connection.sendall(b"\x05\x01\x00")
+            greeting = connection.recv(2)
+            if greeting != b"\x05\x00":
+                result["error"] = "socks greeting rejected"
+                return result
+            try:
+                host_b = target_host.encode("idna")
+            except (UnicodeError, AttributeError):
+                result["error"] = "invalid CONNECT target"
+                return result
+            if not host_b or len(host_b) > 255 or not 0 < int(target_port) <= 65535:
+                result["error"] = "invalid CONNECT target"
+                return result
+            request = b"\x05\x01\x00\x03" + bytes([len(host_b)]) + host_b + bytes([
+                (target_port >> 8) & 0xFF, target_port & 0xFF])
+            connection.settimeout(_remaining(deadline))
+            connection.sendall(request)
+            reply = connection.recv(4)
+            if len(reply) < 2:
+                result["error"] = "short CONNECT reply"
+                return result
+            if reply[0] != 0x05:
+                result["error"] = "invalid CONNECT reply version"
+                return result
+            result["code"] = reply[1]
+            if reply[1] == 0x00:
+                result["ok"] = True
+            else:
+                result["error"] = f"socks connect rejected (rep={reply[1]})"
+            return result
+    except (OSError, StartupError) as exc:
+        result["error"] = f"socks connect failed: {type(exc).__name__}"
+        return result
 
 
 def _remaining(deadline: float) -> float:
@@ -232,13 +293,30 @@ def startup_error(root: Path, config: dict, providers: dict, endpoint) -> str | 
     return None
 
 
-def recover_routed(root: Path, name: str, config_path: Path, endpoint) -> dict | None:
-    """Recover one active proxy; caller checks engine liveness first."""
+def recover_routed(root: Path, name: str, config_path: Path, endpoint,
+                   write_record=None) -> dict | None:
+    """Recover one active proxy; caller checks engine liveness first.
+
+    Issue #225: a listener that answers TCP and the SOCKS greeting but rejects
+    CONNECT cannot carry traffic. Probe CONNECT as well and persist a fresh
+    failed egress record through ``write_record(name, record)`` so status
+    reports the lane degraded instead of trusting an older green record.
+    """
     try:
         config = json.loads(config_path.read_text())
-        if name in referenced_providers(config):
-            host, port = endpoint(name)
-            ensure(root, name, host, port)
+        if name not in referenced_providers(config):
+            return None
+        host, port = endpoint(name)
+        ensure(root, name, host, port)
     except (OSError, ValueError, TimeoutError) as exc:
         return {"detail": f"provider startup failed: {exc}", "dns_ok": None}
+    connect = socks_connect_result(host, port, "example.com", 443, timeout=0.8)
+    if not connect["ok"]:
+        record = {"ok": False, "checked_at": int(time.time()),
+                  "socks_connect_ok": False, "error": connect["error"]}
+        if connect["code"] is not None:
+            record["socks_connect_code"] = connect["code"]
+        if write_record is not None:
+            write_record(name, record)
+        return record
     return None

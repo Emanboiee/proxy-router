@@ -185,6 +185,57 @@ def exit_unusable(record: dict | None, now: int, ok_window: int) -> bool:
     return quota_active(record, now) or quota_unknown(record, now, ok_window)
 
 
+def fresh_failure(record: dict | None, now: int, ok_window: int) -> bool:
+    """True when a record holds a recent failed probe (#225).
+
+    ``exit_unusable`` covers quota and staleness for the #219 fallback gate,
+    but a record with ``ok=false`` and a fresh timestamp still reads usable
+    there. Status must not repeat that mistake: a fresh failed probe is direct
+    evidence the exit cannot serve traffic, so the affected lane is degraded
+    until a fresh success clears it. An old failure ages out with ``ok_window``
+    and is then covered by ``quota_unknown`` instead.
+    """
+    if not isinstance(record, dict) or not record:
+        return False
+    if record.get("ok") is not False and record.get("socks_connect_ok") is not False:
+        return False
+    checked = _int_or_none(record.get("checked_at") or record.get("last_ok_at"))
+    if checked is None:
+        return True
+    return int(now) - checked < int(ok_window)
+
+
+def usable_evidence(record: dict | None, now: int, ok_window: int) -> bool:
+    """True only when a record is neither quota-dead/stale nor freshly failed.
+
+    This is the status-side health verdict (#225): missing or unparseable
+    evidence is not usable, stale evidence is not usable, and a fresh failed
+    probe is not usable. Kept separate from ``exit_unusable`` so the #219
+    fallback gate keeps its documented fail-open-on-absence contract.
+    """
+    if not isinstance(record, dict) or not record:
+        return False
+    return not exit_unusable(record, now, ok_window) and not fresh_failure(record, now, ok_window)
+
+
+def degraded_detail(record: dict | None, now: int, ok_window: int) -> str:
+    """One-line reason a proxy-backed lane is degraded (#225).
+
+    Priority matters: an active quota block is more specific than a generic
+    failed probe, and a rejected CONNECT more specific than an old success.
+    """
+    if not isinstance(record, dict) or not record:
+        return "egress health stale or unknown"
+    if quota_active(record, now):
+        return "quota exhausted"
+    if record.get("socks_connect_ok") is False:
+        code = record.get("socks_connect_code")
+        return f"socks connect rejected (rep={code})" if code is not None else "socks connect rejected"
+    if fresh_failure(record, now, ok_window):
+        return "egress probe failed"
+    return "egress health stale or unknown"
+
+
 def restorable_fallback(router, name: str, *, automatic: bool) -> str | None:
     """Return the serving fallback when a restore may proceed, else ``None``.
 
