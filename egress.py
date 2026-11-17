@@ -134,6 +134,12 @@ AUTOMATIC_FALLBACK_REASONS = frozenset({
     "restore-pending", "primary-unhealthy",
 })
 
+# #225: shared egress-record field names for SOCKS CONNECT evidence. Kept here
+# (the egress leaf) as the single source of truth so writers and readers cannot
+# drift apart; provider_lifecycle imports these instead of hardcoding literals.
+SOCKS_CONNECT_OK = "socks_connect_ok"
+SOCKS_CONNECT_CODE = "socks_connect_code"
+
 
 def quota_active(record: dict | None, now: int) -> bool:
     """True while one egress record carries an unexpired quota marker.
@@ -204,7 +210,7 @@ def fresh_failure(record: dict | None, now: int, ok_window: int) -> bool:
     # socks_connect_ok. The connect flag only matters when ok is not True.
     if record.get("ok") is True:
         return False
-    if record.get("ok") is not False and record.get("socks_connect_ok") is not False:
+    if record.get("ok") is not False and record.get(SOCKS_CONNECT_OK) is not False:
         return False
     checked = _int_or_none(record.get("checked_at") or record.get("last_ok_at"))
     if checked is None:
@@ -243,8 +249,8 @@ def degraded_detail(record: dict | None, now: int, ok_window: int) -> str:
         checked = _int_or_none(record.get("checked_at") or record.get("last_ok_at"))
         if checked is not None and int(now) - checked < int(ok_window):
             return "egress probe failed"
-    if record.get("socks_connect_ok") is False:
-        code = record.get("socks_connect_code")
+    if record.get(SOCKS_CONNECT_OK) is False:
+        code = record.get(SOCKS_CONNECT_CODE)
         return f"socks connect rejected (rep={code})" if code is not None else "socks connect rejected"
     if fresh_failure(record, now, ok_window):
         return "egress probe failed"

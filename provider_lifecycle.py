@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 
 import worker_lock
+import egress  # #225: shared SOCKS_CONNECT_* record-field constants (leaf-to-leaf)
 
 
 class StartupError(ValueError):
@@ -364,9 +365,9 @@ def recover_routed(root: Path, name: str, config_path: Path, endpoint,
         connect = socks_connect_result(host, port, target_host, target_port, timeout=0.8)
     if not connect["ok"]:
         record = {"ok": False, "checked_at": int(time.time()),
-                  "socks_connect_ok": False, "error": connect["error"]}
+                  egress.SOCKS_CONNECT_OK: False, "error": connect["error"]}
         if connect["code"] is not None:
-            record["socks_connect_code"] = connect["code"]
+            record[egress.SOCKS_CONNECT_CODE] = connect["code"]
         if write_record is not None:
             write_record(name, record)
         return record
