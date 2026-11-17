@@ -204,6 +204,24 @@ def test_reconnect_success_clears_degradation(tmp_path):
     assert r._degraded_lanes() == []
 
 
+def test_egress_check_surfaces_connect_rejection_reason(tmp_path, capsys):
+    """Deploy council: egress probe must surface the rep= evidence, not a
+    generic 'probe connection' that hides why the SOCKS exit is dead."""
+    r = load_router(tmp_path)
+    r._providers = {"warp": {"socks5": {"host": "127.0.0.1", "port": 2181}}}
+    r.is_proxy_provider = lambda name: True
+    r.proxy_upstream = lambda name: ("127.0.0.1", 2181)
+    r.listener_up = lambda: True
+    r.active_fallback = lambda name: None
+    r.check_egress_live = lambda name, profile: ("dead", {
+        "socks_connect_ok": False, "socks_connect_code": 5,
+        "error": "socks connect rejected (rep=5)"})
+    r.egress_check("warp", as_json=True)
+    out = capsys.readouterr().out
+    assert "socks connect rejected (rep=5)" in out, out
+    assert '"detail": "probe connection"' not in out
+
+
 def test_later_http_probe_clears_connect_rejection_reason(tmp_path):
     """CodeRabbit: REP=5, then HTTP 200, then HTTP 403 must report the 403 as
     the cause, not reuse the old REP=5 from a superseded CONNECT check."""

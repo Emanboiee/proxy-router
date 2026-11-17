@@ -1238,8 +1238,7 @@ def write_egress(name: str, profile: Path, record: dict) -> None:
     _hand_back_ownership(path.parent)
 
 
-def _write_proxy_egress(name, record):  # #225: merge, never wipe quota/block/streak
-    p = proxy_profile_key(name); r = read_egress(name, p); r.update(record); write_egress(name, p, r)
+def _write_proxy_egress(name, record): merged = read_egress(name, proxy_profile_key(name)); merged.update(record); write_egress(name, proxy_profile_key(name), merged)  # #225 merge
 
 
 def record_egress(name: str, profile: Path, *, ok: bool, latency_ms: float | None = None,
@@ -1264,8 +1263,7 @@ def record_egress(name: str, profile: Path, *, ok: bool, latency_ms: float | Non
     record["tls_target"] = target_key
     record["ok"] = bool(ok)
     record["checked_at"] = now
-    # #225: current HTTP probe supersedes any older CONNECT rejection reason.
-    for k in ("socks_connect_ok", "socks_connect_code"): record.pop(k, None)
+    for k in ("socks_connect_ok", "socks_connect_code"): record.pop(k, None)  # #225: HTTP probe supersedes older CONNECT evidence
     if ok:
         record["fails"] = 0
         record["last_ok_at"] = now
@@ -6147,7 +6145,9 @@ def egress_check(name: str | None = None, as_json: bool = False) -> int:
         if record is not None and record.get("dns_ok") is not None:
             entry["dns_ok"] = record["dns_ok"]
         if status == "dead":
-            entry["detail"] = "dns" if entry.get("dns_ok") is False else "probe connection"
+            # #225: surface CONNECT rejection evidence, not a generic reason.
+            conn_err = record.get("error") if record and record.get("socks_connect_ok") is False else None
+            entry["detail"] = conn_err or ("dns" if entry.get("dns_ok") is False else "probe connection")
             return provider, entry, True
         if status == "degraded" and record is not None:
             entry["detail"] = (f"HTTP {record['status']}" if record.get("status") is not None
