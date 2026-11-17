@@ -209,6 +209,37 @@ def test_reconnect_success_clears_degradation(tmp_path):
     assert r._degraded_lanes() == []
 
 
+def test_connect_rejection_is_degraded_not_dead_without_http_corroboration(tmp_path, monkeypatch):
+    """Council: a CONNECT rejection must be capped at 'degraded' and the HTTP
+    probe given the final word. A working tunnel whose routed CONNECT target
+    is whitelisted must not be dead-marked into the fail-open/direct path."""
+    r = load_router(tmp_path)
+    from pathlib import Path as _P
+    r._providers = {"warp": {"socks5": {"host": "127.0.0.1", "port": 2181}}}
+    r._routes = [{"id": "r", "domains": ["school.example"], "provider": "warp"}]
+    r._port = 2080
+    r.is_proxy_provider = lambda name: True
+    r.SING_BOX_CONFIG = tmp_path / "sing-box.json"
+    r.SING_BOX_CONFIG.write_text(json.dumps({"route": {"final": "warp"}}))
+    r.engine_alive = lambda: True
+    r.proxy_upstream = lambda name: ("127.0.0.1", 2181)
+    r.probe_url_for = lambda name: "https://school.example/"
+    r._write_proxy_egress = lambda name, record: None
+    r.record_egress = lambda name, profile, **kw: kw
+    r._clear_cooldown = lambda name, profile: None
+
+    rejection = {"ok": False, "checked_at": int(time.time()),
+                 "socks_connect_ok": False, "socks_connect_code": 5,
+                 "error": "socks connect rejected (rep=5)"}
+    monkeypatch.setattr(lifecycle, "recover_routed", lambda *a, **k: rejection)
+    # HTTP probe succeeds — the tunnel carries traffic despite the CONNECT rejection.
+    r.probe_egress = lambda **kw: {"ok": True, "latency_ms": 5.0, "status": 200,
+                                    "error": None, "block_reason": None}
+    monkeypatch.setattr(r, "provider_lifecycle", lifecycle)
+    status, _ = r.check_egress_live("warp", _P("socks"))
+    assert status == "alive", f"HTTP-corroborated tunnel must be alive, got {status}"
+
+
 def test_recover_routed_retries_a_transient_connect_rejection(socks_factory, tmp_path,
                                                               monkeypatch):
     """Council: a single transient CONNECT rejection must not dead-mark an

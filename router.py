@@ -2277,9 +2277,9 @@ def check_egress_live(name: str, profile: Path, *, port: int | None = None,
     blocked marker, exactly like probe_profile.
     """
     if is_proxy_provider(name) and SING_BOX_CONFIG.is_file() and engine_alive():
-        record = provider_lifecycle.recover_routed(ROOT, name, SING_BOX_CONFIG, proxy_upstream, _write_proxy_egress)
-        if record is not None:
-            return "dead", record
+        conn_record = provider_lifecycle.recover_routed(ROOT, name, SING_BOX_CONFIG, proxy_upstream, _write_proxy_egress)
+        # #225: CONNECT rejection is only 'degraded' evidence; HTTP probe decides dead.
+        if conn_record is not None and "socks_connect_ok" not in conn_record: return "dead", conn_record
     url = url or probe_url_for(name)
     if url is None:
         return "alive", None
