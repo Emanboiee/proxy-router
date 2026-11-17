@@ -60,6 +60,25 @@ def classify_probe_body(status: int, text: str) -> str | None:
     return None
 
 
+def probe_is_model_healthy(result: dict | None) -> bool:
+    """#219: whether a probe result proves the MODEL path has quota.
+
+    An HTTP 200 at a provider's root URL is not proof that its model endpoint
+    can carry requests: the free-model path can return 429 (rate limited) while
+    the root still answers 200. A probe whose error is a quota signal is never
+    model-healthy, whatever its status. Used by recovery so a generic 200 cannot
+    confirm a fallback exit as recovered.
+    """
+    if not isinstance(result, dict):
+        return False
+    status = result.get("status")
+    if not isinstance(status, int) or not 100 <= status < 600:
+        return False
+    if result.get("error") in ("rate-limit-429", "quota-exhausted"):
+        return False
+    return True
+
+
 def probe_failure_reason(status: int, text: str) -> tuple[str | None, str | None]:
     """Return ``(error, block_reason)`` for one HTTP probe response."""
     reason = classify_probe_body(status, text)

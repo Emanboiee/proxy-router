@@ -1526,7 +1526,8 @@ def recover_route(name: str, host: str) -> int:
         return fail("recovery target does not belong to the configured provider")
     if not _diagnostic_host_is_routed(host):
         return 3
-    url = f"https://{host}/"
+    # #219: probe the model path so a root 200 can't confirm a quota-dead lane.
+    url = f"https://{host}{_PROBE_DOMAIN_PATHS.get(host, '')}"
     if urllib.parse.urlsplit(url).hostname != host or unsafe_probe_target(url):
         return fail("unsafe recovery target")
     # Ignore old log bursts after a recent recovery; one provider owns the budget.
@@ -1538,9 +1539,8 @@ def recover_route(name: str, host: str) -> int:
     except (OSError, ValueError, KeyError, TypeError):
         pass
     def reachable() -> bool:
-        result = probe_egress(url=url, timeout=3.0)
-        status = result.get("status")
-        return isinstance(status, int) and 100 <= status < 600
+        # #219: a 429 quota error is not recovery even with an HTTP 200 status.
+        return egress.probe_is_model_healthy(probe_egress(url=url, timeout=3.0))
     # Require a fresh confirmation and positive DNS, not merely old error lines.
     if reachable():
         return 0
@@ -1604,7 +1604,7 @@ def restore_fallback(name: str, host: str, *, automatic: bool = False) -> int:
     if routing["mode"] == "vpn-list" and not any(
             _response_host_matches(host, domain) for domain in _effective_vpn_domains(routing)):
         return 3
-    url = f"https://{host}/"
+    url = f"https://{host}{_PROBE_DOMAIN_PATHS.get(host, '')}"
     if urllib.parse.urlsplit(url).hostname != host or unsafe_probe_target(url):
         return fail("unsafe restore target")
     serving = egress.restorable_fallback(
@@ -1632,8 +1632,8 @@ def restore_fallback(name: str, host: str, *, automatic: bool = False) -> int:
     if rc != 0:
         return rc
     result = probe_egress(url=url, timeout=3.0)
-    status = result.get("status") if isinstance(result, dict) else None
-    healthy = isinstance(status, int) and 100 <= status < 600
+    # #219: a model-path 429 must not clear a fallback after two "wins".
+    healthy = egress.probe_is_model_healthy(result)
     if healthy:
         successes += 1
         if successes >= RESTORE_SUCCESS_THRESHOLD:
@@ -2518,7 +2518,7 @@ def _apply_upstream_failure(name: str, profile: Path | None, reason: str, cooldo
     record["upstream_error_at"] = int(time.time())
     record["error"] = f"upstream:{reason}"
     if action == "exhaust":
-        record["exhausted"] = True
+        record["exhausted"] = True; record["ok"] = False  # #219: no stale ok=true
         record["exhausted_at"] = int(time.time())
         record["exhausted_until"] = _iso_ts(int(time.time()) + seconds)
     else:
