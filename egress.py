@@ -299,7 +299,9 @@ def restorable_fallback(router, name: str, *, automatic: bool) -> str | None:
     marker = loaded if isinstance(loaded, dict) else {}
     if automatic and marker.get("reason") not in AUTOMATIC_FALLBACK_REASONS:
         return None
-    if serving != "direct" and marker.get("reason") != "confirmed-stall":
+    # #219: the relay parks quota-dead model lanes with reason="429"; those
+    # fallbacks are restorable too, otherwise the force fast-path is inert.
+    if serving != "direct" and marker.get("reason") not in ("confirmed-stall", "429"):
         return None
     return serving
 

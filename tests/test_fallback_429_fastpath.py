@@ -54,6 +54,18 @@ def test_normal_restore_still_requires_two_wins(tmp_path, monkeypatch):
     assert r.active_fallback("proton") == "cloudflare"
 
 
+def test_force_restore_works_for_429_reason_fallback(tmp_path, monkeypatch):
+    """Council P1: the relay creates reason='429' fallbacks, not 'confirmed-stall'.
+    Force restore must clear those too, or the fast path is inert."""
+    r = _setup(tmp_path, monkeypatch)
+    fb = r._fallback_state_path("proton")
+    fb.write_text(json.dumps({"provider": "cloudflare", "reason": "429"}))
+    marker = _marker(tmp_path)
+    rc = r.restore_fallback("proton", "opencode.ai", automatic=True, force=True)
+    assert rc == 0, f"force restore must clear a reason=429 fallback, got {rc}"
+    assert not r.active_fallback("proton")
+
+
 def test_force_restore_bypasses_cooldown(tmp_path, monkeypatch):
     r = _setup(tmp_path, monkeypatch)
     marker = _marker(tmp_path, age=0)  # just attempted -> normal path returns 3
