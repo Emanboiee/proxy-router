@@ -251,7 +251,12 @@ def warp_socks_hint(host: str, port: int, *, warp_status=None, timeout: float = 
     status = warp_status() if warp_status is not None else None
     if status is None:
         binary = _warp_binary(dict(os.environ))
-        status = _warp_status(binary, _launch_options(Path("."))) if binary else ""
+        try:
+            options = _launch_options(Path("."))
+        except (OSError, ValueError, StartupError, RuntimeError):
+            options = {"stdin": subprocess.DEVNULL, "stdout": subprocess.PIPE,
+                       "stderr": subprocess.DEVNULL}
+        status = _warp_status(binary, options) if binary else ""
     if str(status).strip().lower() == "connected":
         return ("WARP SOCKS listener is down while warp-cli reports Connected; "
                 "run 'warp-cli disconnect && warp-cli connect'")

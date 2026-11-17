@@ -12,6 +12,20 @@ from tests.test_router_regressions import load_router
 pytestmark = [pytest.mark.allow_hosts(["127.0.0.1"])]
 
 
+def test_warp_hint_does_not_crash_on_launch_options_error(monkeypatch):
+    """Deploy seat: _launch_options can raise under root-owned cwd; never crash doctor."""
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    def boom(*a, **k):
+        raise RuntimeError("root-owned cwd")
+    monkeypatch.setattr(lifecycle, "_launch_options", boom)
+    monkeypatch.setattr(lifecycle, "_warp_binary", lambda env: "/fake/warp-cli")
+    # no warp_status injected -> would hit _launch_options; must not raise
+    assert lifecycle.warp_socks_hint("127.0.0.1", port) is None
+
+
 def test_warp_hint_for_providers_scans_local_socks():
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
