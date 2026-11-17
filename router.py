@@ -5743,11 +5743,7 @@ def _diagnostic_direct_url() -> str | None:
 
 def _network_diagnostic(*, runner=subprocess.run, opener=None,
                         clock=time.monotonic) -> dict:
-    """Run the explicit, bounded direct/routed connectivity matrix.
-
-    This function has no rotation, DNS-write, or engine-restart side effects.
-    All subprocess/network dependencies are injectable for hermetic tests.
-    """
+    """Bounded direct/routed connectivity matrix; no side effects, deps injectable."""
     checked_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     generation = status_snapshot.network_generation(PID_FILE, SING_BOX_CONFIG)
     proxy = _effective_proxy_state(runner)
@@ -5814,9 +5810,11 @@ def _network_diagnostic(*, runner=subprocess.run, opener=None,
     recovery = None
     if overall == "direct_dns_unavailable":
         recovery = "inspect configured/DHCP DNS, restore automatic DHCP DNS, run 'router.py reload', then rerun 'router.py doctor --network'"
+    elif overall.startswith("routed"):
+        recovery = provider_lifecycle.warp_hint_for_providers(_providers)  # #140
     return {
-        "checked_at": checked_at, "generation": generation, "status": overall, "proxy": proxy,
-        "proxy_status": proxy_status, "direct_dns": direct_dns,
+        "checked_at": checked_at, "generation": generation, "status": overall,
+        "proxy": proxy, "proxy_status": proxy_status, "direct_dns": direct_dns,
         "direct": direct, "routed": routed, "routed_url": routed_url,
         "dns": _macos_dns_snapshot(runner) if sys.platform == "darwin" or runner is not subprocess.run else {},
         "recovery": recovery,

@@ -225,6 +225,39 @@ def _warp_binary(env: dict) -> str | None:
     return str(installed) if installed.is_file() else None
 
 
+def warp_hint_for_providers(providers: dict) -> str | None:
+    """#140: scan configured providers for a dead local WARP SOCKS upstream."""
+    for _name, cfg in providers.items():
+        spec = cfg.get("socks5") if isinstance(cfg, dict) else None
+        if spec and str(spec.get("host", "")) in ("127.0.0.1", "::1", "localhost"):
+            hint = warp_socks_hint(str(spec["host"]), int(spec["port"]))
+            if hint:
+                return hint
+    return None
+
+
+def warp_socks_hint(host: str, port: int, *, warp_status=None, timeout: float = 0.25) -> str | None:
+    """#140: actionable hint when a WARP SOCKS listener is dead while warp-cli
+    still reports Connected (lid-close drops the listener without warp-cli
+    noticing). A bounded TCP connect distinguishes a refused port from a live
+    listener; the hint only appears when WARP claims health. ``warp_status`` is
+    injectable for hermetic tests.
+    """
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return None  # listener is alive; nothing to hint
+    except OSError:
+        pass
+    status = warp_status() if warp_status is not None else None
+    if status is None:
+        binary = _warp_binary(dict(os.environ))
+        status = _warp_status(binary, _launch_options(Path("."))) if binary else ""
+    if str(status).strip().lower() == "connected":
+        return ("WARP SOCKS listener is down while warp-cli reports Connected; "
+                "run 'warp-cli disconnect && warp-cli connect'")
+    return None
+
+
 def _warp_status(binary: str, options: dict, *, timeout: float = 3) -> str:
     try:
         result = subprocess.run([binary, "--json", "status"], **{
