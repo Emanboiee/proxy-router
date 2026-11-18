@@ -218,7 +218,18 @@ def fresh_failure(record: dict | None, now: int, ok_window: int) -> bool:
     return int(now) - checked < int(ok_window)
 
 
-def usable_evidence(record: dict | None, now: int, ok_window: int) -> bool:
+def config_generation(path) -> list | None:
+    """#225: identity (inode, mtime_ns, size) of a config artifact. A health
+    record stamped with an older generation cannot certify the current network."""
+    try:
+        st = path.stat()
+        return [st.st_ino, st.st_mtime_ns, st.st_size]
+    except (OSError, AttributeError):
+        return None
+
+
+def usable_evidence(record: dict | None, now: int, ok_window: int,
+                    generation: list | None = None) -> bool:
     """True only when a record is neither quota-dead/stale nor freshly failed.
 
     This is the status-side health verdict (#225): missing or unparseable
@@ -227,6 +238,11 @@ def usable_evidence(record: dict | None, now: int, ok_window: int) -> bool:
     fallback gate keeps its documented fail-open-on-absence contract.
     """
     if not isinstance(record, dict) or not record:
+        return False
+    # #225: a record stamped with a previous config generation is not current
+    # evidence. Legacy records with no generation remain usable (no invalidation).
+    stamped = record.get("generation")
+    if stamped is not None and generation is not None and list(stamped) != list(generation):
         return False
     return not exit_unusable(record, now, ok_window) and not fresh_failure(record, now, ok_window)
 

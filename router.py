@@ -1262,7 +1262,7 @@ def record_egress(name: str, profile: Path, *, ok: bool, latency_ms: float | Non
     )
     record["tls_target"] = target_key
     record["ok"] = bool(ok)
-    record["checked_at"] = now
+    record["checked_at"] = now; record["generation"] = egress.config_generation(SING_BOX_CONFIG)  # #225
     if ok:
         for k in ("socks_connect_ok", "socks_connect_code"): record.pop(k, None)  # #225: HTTP success supersedes CONNECT rejection
         record["fails"] = 0
@@ -5566,9 +5566,9 @@ def _degraded_lanes() -> list[str]:
             # provider parked on a WG exit that fails open to direct is
             # reported by the WG-side fail-open branch, not here.
             record = read_egress(provider, proxy_profile_key(provider))
-            now, window = int(time.time()), int(egress_settings()["ok_window"])
-            # #225: missing/stale evidence is UNKNOWN, not healthy (#219 gate stays fail-open).
-            if not record or not egress.usable_evidence(record, now, window):
+            now, window = int(time.time()), int(egress_settings()["ok_window"]); gen = egress.config_generation(SING_BOX_CONFIG)  # #225
+            # #225: missing/stale/other-generation evidence is UNKNOWN, not healthy.
+            if not record or not egress.usable_evidence(record, now, window, gen):
                 lanes.append(f"{route_id} ({provider} {egress.degraded_detail(record, now, window)})")
             continue
         if _effective_route_provider(provider) != "direct":
