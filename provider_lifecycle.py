@@ -5,6 +5,7 @@ presets. Executables run without a shell or inherited root privileges.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import math
 import contextlib
@@ -223,6 +224,55 @@ def _warp_binary(env: dict) -> str | None:
         return binary
     installed = Path(env.get("ProgramFiles", r"C:\Program Files")) / "Cloudflare" / "Cloudflare WARP" / "warp-cli.exe"
     return str(installed) if installed.is_file() else None
+
+
+def warp_hint_for_providers(providers: dict) -> str | None:
+    """#140: scan configured providers for a dead local WARP SOCKS upstream."""
+    for _name, cfg in providers.items():
+        spec = cfg.get("socks5") if isinstance(cfg, dict) else None
+        if not spec:
+            continue
+        # #140: recognize every loopback spelling (LOCALHOST, whitespace,
+        # expanded IPv6 like 0:0:0:0:0:0:0:1) via ipaddress, as config-load does.
+        raw = str(spec.get("host", "")).strip().strip("[]").lower()
+        try:
+            addr = ipaddress.ip_address(raw)
+            loopback = addr.is_loopback
+            host = "::1" if addr.version == 6 else "127.0.0.1"
+        except ValueError:
+            loopback, host = (raw == "localhost"), "127.0.0.1"
+        if loopback:
+            hint = warp_socks_hint(host, int(spec["port"]))
+            if hint:
+                return hint
+    return None
+
+
+def warp_socks_hint(host: str, port: int, *, warp_status=None, timeout: float = 0.25) -> str | None:
+    """#140: actionable hint when a WARP SOCKS listener is dead while warp-cli
+    still reports Connected (lid-close drops the listener without warp-cli
+    noticing). A bounded TCP connect distinguishes a refused port from a live
+    listener; the hint only appears when WARP claims health. ``warp_status`` is
+    injectable for hermetic tests.
+    """
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return None  # listener is alive; nothing to hint
+    except OSError:
+        pass
+    status = warp_status() if warp_status is not None else None
+    if status is None:
+        binary = _warp_binary(dict(os.environ))
+        try:
+            options = _launch_options(Path("."))
+        except (OSError, ValueError, StartupError, RuntimeError):
+            options = {"stdin": subprocess.DEVNULL, "stdout": subprocess.PIPE,
+                       "stderr": subprocess.DEVNULL}
+        status = _warp_status(binary, options) if binary else ""
+    if str(status).strip().lower() == "connected":
+        return ("WARP SOCKS listener is down while warp-cli reports Connected; "
+                "run 'warp-cli disconnect && warp-cli connect'")
+    return None
 
 
 def _warp_status(binary: str, options: dict, *, timeout: float = 3) -> str:
