@@ -278,6 +278,27 @@ class RunElevatedFallbackTests(unittest.TestCase):
             self.assertEqual(self.client.rotate(), (1, "no active provider"))
         run.assert_not_called()
 
+    def test_status_verify_full_probe_after_down_when_never_seen_up(self):
+        """#237: a post-action verify must use the full status even when the
+        previous poll never saw 'up' (helper-managed TUN from a down state)."""
+        fast = json.dumps({"up": False, "mode": "proxy", "providers": {}})
+        full = json.dumps({"up": True, "mode": "tun", "providers": {}})
+        self.client._last_seen_up = False
+        with mock.patch.object(self.client, "_run", side_effect=[(1, fast), (0, full)]) as run:
+            st = self.client.status(verify=True)
+        self.assertTrue(st.up, "verify must publish the full-status 'up'")
+        calls = [c.args for c in run.call_args_list]
+        self.assertEqual(calls[0], ("status", "--json", "--fast"))
+        self.assertEqual(calls[1], ("status", "--json"))
+
+    def test_status_without_verify_keeps_fast_down_from_initial_state(self):
+        fast = json.dumps({"up": False, "mode": "proxy", "providers": {}})
+        self.client._last_seen_up = False
+        with mock.patch.object(self.client, "_run", return_value=(1, fast)) as run:
+            st = self.client.status()
+        self.assertFalse(st.up)
+        self.assertEqual(run.call_count, 1)
+
     def test_status_clears_cached_provider_when_payload_has_none(self):
         payload = json.dumps({"up": False, "mode": "proxy", "providers": {}})
         self.client._active_provider = "proton"
@@ -598,6 +619,21 @@ class MutationSerializationTests(unittest.TestCase):
         self.assertEqual(dones, ["a", "b", "c", "d"])
         # No two bodies ever overlapped: the pump leaves no residual count.
         self.assertEqual(app._concurrency_probe, 0)
+
+    def test_mutation_refresh_uses_full_status_verify(self):
+        """#237: the post-mutation status refresh must call status(verify=True)
+        so a helper-managed TUN engine reads connected from a down state."""
+        seen = []
+
+        class SpyClient:
+            def status(self, **kwargs):
+                seen.append(kwargs)
+                return tray.RouterStatus(up=True, mode="tun")
+
+        app = tray.TrayApp(SpyClient(), None)
+        app._do(lambda: (0, "started"), "connect")
+        self.assertTrue(self._wait_until(lambda: len(seen) >= 1))
+        self.assertTrue(seen[0].get("verify") is True, seen)
 
     def test_worker_exception_becomes_visible_failed_result(self):
         app = self._make_app()
