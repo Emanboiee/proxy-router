@@ -688,11 +688,13 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
                         provider = event.get("provider") or provider_for_host(root, host)
                         if provider:
                             last_provider[host] = provider
-                        if (
+                        if event.get("failure") and not _underlay_healthy(root):  # #176: defer before consuming the counter
+                            append_event(root, {"kind": "rotation_deferred", "observed_at": time.time(),
+                                                "reason": "underlay_unavailable", "host": host})
+                        elif (
                             event.get("failure")
                             and guard.record_transport_failure(now, host)
                             and confirm_context_cancellation(root, event)
-                            and _underlay_healthy(root)  # #176: defer on underlay flap
                         ):
                             target = last_provider.get(host) or "proton"
                             result = rotate_provider(root, provider_for_host(root, host) or target, host=host)

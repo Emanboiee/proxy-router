@@ -385,6 +385,44 @@ class RouteWatcherTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(calls, [], "log-driven rotation must defer when underlay is down")
 
+    def test_log_deferral_does_not_consume_failure_counter(self):
+        """Deploy seat P1: a Wi-Fi flap that defers rotation must NOT consume the
+        two-failure counter — a genuine dead exit right after must still rotate."""
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        w.state_dir(root).mkdir(parents=True)
+        (root / "router.json").write_text(json.dumps({
+            "routes": [{"id": "discord", "domains": ["discord.com"], "provider": "cloudflare"}],
+        }))
+        line = ("ERROR using outbound/wireguard[cloudflare]: open connection to "
+                "discord.com:443: connection reset\n")
+        reads = [0]
+
+        def fake_read(_path, offset):
+            if reads[0] == 0:
+                reads[0] += 1
+                return offset, [line, line]
+            return offset, []
+
+        def stop(_seconds):
+            w.enabled_file(root).unlink(missing_ok=True)
+
+        with mock.patch.object(w, "engine_pid_alive", return_value=True), \
+             mock.patch.object(w, "_read_new_lines", side_effect=fake_read), \
+             mock.patch.object(w, "client_snapshot", return_value=[]), \
+             mock.patch.object(w, "_network_check_hop"), \
+             mock.patch.object(w, "_underlay_healthy", return_value=False), \
+             mock.patch.object(w, "probe_target", return_value={"transport_failure": False}), \
+             mock.patch.object(w.RotationGuard, "record_transport_failure", return_value=False) as spy:
+            w.worker(root, interval=0.05, sleep=stop)
+        # A down underlay must defer BEFORE touching the failure counter, so the
+        # two-failure budget survives for a genuine dead exit after the flap.
+        spy.assert_not_called()
+        # The deferral must be observable in the event log.
+        events = [json.loads(line) for line in
+                  (w.events_file(root).read_text().splitlines() if w.events_file(root).exists() else [])]
+        self.assertTrue(any(e.get("kind") == "rotation_deferred" for e in events), events)
+
     def test_worker_rotates_provider_from_outbound_tag(self):
         root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, root, ignore_errors=True)
