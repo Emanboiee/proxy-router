@@ -24,13 +24,13 @@ def test_warp_hint_normalizes_loopback_variants(monkeypatch):
         seen.append(host)
         return "hint"
     monkeypatch.setattr(lifecycle, "warp_socks_hint", fake_hint)
-    providers = {
-        "upper": {"socks5": {"host": "LOCALHOST", "port": port}},
-        "space": {"socks5": {"host": " 127.0.0.1 ", "port": port}},
-        "v6": {"socks5": {"host": "0:0:0:0:0:0:0:1", "port": port}},
-    }
-    assert lifecycle.warp_hint_for_providers(providers) is not None
-    assert all(h in ("127.0.0.1", "::1") for h in seen), seen
+    # The helper returns on first hint, so probe each spelling in its own call.
+    for spelling in ("LOCALHOST", " 127.0.0.1 ", "0:0:0:0:0:0:0:1", "[::1]"):
+        seen.clear()
+        hint = lifecycle.warp_hint_for_providers(
+            {"warp": {"socks5": {"host": spelling, "port": port}}})
+        assert hint is not None, f"{spelling!r} must be recognized as loopback"
+        assert len(seen) == 1 and seen[0] in ("127.0.0.1", "::1"), (spelling, seen)
 
 
 def test_warp_hint_does_not_crash_on_launch_options_error(monkeypatch):

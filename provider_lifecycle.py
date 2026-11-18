@@ -5,6 +5,7 @@ presets. Executables run without a shell or inherited root privileges.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import math
 import contextlib
@@ -231,10 +232,16 @@ def warp_hint_for_providers(providers: dict) -> str | None:
         spec = cfg.get("socks5") if isinstance(cfg, dict) else None
         if not spec:
             continue
-        # #140: normalize like config-load so LOCALHOST / whitespace / expanded
-        # IPv6 are recognized as loopback (no hint is silently skipped).
-        host = str(spec.get("host", "")).strip().strip("[]").lower().replace("localhost", "127.0.0.1")
-        if host in ("127.0.0.1", "::1") or host.replace(":", "").strip("0") == "":
+        # #140: recognize every loopback spelling (LOCALHOST, whitespace,
+        # expanded IPv6 like 0:0:0:0:0:0:0:1) via ipaddress, as config-load does.
+        raw = str(spec.get("host", "")).strip().strip("[]").lower()
+        try:
+            addr = ipaddress.ip_address(raw)
+            loopback = addr.is_loopback
+            host = "::1" if addr.version == 6 else "127.0.0.1"
+        except ValueError:
+            loopback, host = (raw == "localhost"), "127.0.0.1"
+        if loopback:
             hint = warp_socks_hint(host, int(spec["port"]))
             if hint:
                 return hint
