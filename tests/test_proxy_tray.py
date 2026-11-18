@@ -620,6 +620,21 @@ class MutationSerializationTests(unittest.TestCase):
         # No two bodies ever overlapped: the pump leaves no residual count.
         self.assertEqual(app._concurrency_probe, 0)
 
+    def test_mutation_refresh_uses_full_status_verify(self):
+        """#237: the post-mutation status refresh must call status(verify=True)
+        so a helper-managed TUN engine reads connected from a down state."""
+        seen = []
+
+        class SpyClient:
+            def status(self, **kwargs):
+                seen.append(kwargs)
+                return tray.RouterStatus(up=True, mode="tun")
+
+        app = tray.TrayApp(SpyClient(), None)
+        app._do(lambda: (0, "started"), "connect")
+        self.assertTrue(self._wait_until(lambda: len(seen) >= 1))
+        self.assertTrue(seen[0].get("verify") is True, seen)
+
     def test_worker_exception_becomes_visible_failed_result(self):
         app = self._make_app()
 
