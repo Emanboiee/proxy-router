@@ -12,6 +12,27 @@ from tests.test_router_regressions import load_router
 pytestmark = [pytest.mark.allow_hosts(["127.0.0.1"])]
 
 
+def test_warp_hint_normalizes_loopback_variants(monkeypatch):
+    """Council P3: LOCALHOST / whitespace / expanded IPv6 must be recognized
+    as loopback, matching config-load normalization."""
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    seen = []
+    def fake_hint(host, p, **kw):
+        seen.append(host)
+        return "hint"
+    monkeypatch.setattr(lifecycle, "warp_socks_hint", fake_hint)
+    providers = {
+        "upper": {"socks5": {"host": "LOCALHOST", "port": port}},
+        "space": {"socks5": {"host": " 127.0.0.1 ", "port": port}},
+        "v6": {"socks5": {"host": "0:0:0:0:0:0:0:1", "port": port}},
+    }
+    assert lifecycle.warp_hint_for_providers(providers) is not None
+    assert all(h in ("127.0.0.1", "::1") for h in seen), seen
+
+
 def test_warp_hint_does_not_crash_on_launch_options_error(monkeypatch):
     """Deploy seat: _launch_options can raise under root-owned cwd; never crash doctor."""
     s = socket.socket()

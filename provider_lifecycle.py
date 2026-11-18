@@ -229,8 +229,13 @@ def warp_hint_for_providers(providers: dict) -> str | None:
     """#140: scan configured providers for a dead local WARP SOCKS upstream."""
     for _name, cfg in providers.items():
         spec = cfg.get("socks5") if isinstance(cfg, dict) else None
-        if spec and str(spec.get("host", "")) in ("127.0.0.1", "::1", "localhost"):
-            hint = warp_socks_hint(str(spec["host"]), int(spec["port"]))
+        if not spec:
+            continue
+        # #140: normalize like config-load so LOCALHOST / whitespace / expanded
+        # IPv6 are recognized as loopback (no hint is silently skipped).
+        host = str(spec.get("host", "")).strip().strip("[]").lower().replace("localhost", "127.0.0.1")
+        if host in ("127.0.0.1", "::1") or host.replace(":", "").strip("0") == "":
+            hint = warp_socks_hint(host, int(spec["port"]))
             if hint:
                 return hint
     return None
