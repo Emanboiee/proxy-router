@@ -3989,10 +3989,7 @@ def rotate_log_if_needed() -> None:
         LOG_FILE.rename(archive); os.chmod(archive, 0o600)
     except OSError as exc:
         print(f"router: log retention failed (archive): {exc}", file=sys.stderr)
-    try:
-        os.chmod(LOG_FILE, 0o600)
-    except OSError as exc:
-        print(f"router: log retention failed (chmod): {exc}", file=sys.stderr)
+    # After rename the live path is gone; engine_start recreates it with 0600.
 
 
 def trim_live_log_if_needed() -> None:

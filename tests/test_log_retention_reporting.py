@@ -33,6 +33,19 @@ def test_trim_live_log_reports_oserror(tmp_path, capsys, monkeypatch):
     assert "log retention failed" in err, err
 
 
+def test_rotate_log_success_is_silent(tmp_path, capsys):
+    """Council P1: a successful rotation must not print a false failure. After
+    rename the live path no longer exists, so chmod-ing it always ENOENTs."""
+    r = load_router(tmp_path)
+    r.LOG_FILE = tmp_path / "sing-box.log"
+    r.LOG_FILE.write_text("x" * 20)
+    r.LOG_MAX_BYTES = 1
+    r.rotate_log_if_needed()
+    assert "log retention failed" not in capsys.readouterr().err
+    # the archive exists with the log content
+    assert (tmp_path / "sing-box.log.1").read_text() == "x" * 20
+
+
 def test_trim_live_log_success_is_silent(tmp_path, capsys):
     r = load_router(tmp_path)
     r.LOG_FILE = tmp_path / "sing-box.log"
