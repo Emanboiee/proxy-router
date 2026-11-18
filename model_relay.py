@@ -125,7 +125,14 @@ class RouterRecovery:
                     # late 429 to the newly selected server.
                     return True
                 r = self.router
-                _, effective, _ = current
+                primary, effective, _ = current
+                # #219: a 429 on a serving automatic fallback means the model
+                # lane has no quota there. Try an immediate forced restore of a
+                # healthy primary within this request budget instead of waiting
+                # for the two-win/cooldown path (which keeps serving 429s).
+                if effective != primary and r.active_fallback(primary) is not None:
+                    if r.restore_fallback(primary, self.host, automatic=True, force=True) == 0:
+                        return self._snapshot() not in (None, current)
                 if effective == "direct":
                     return False
                 if r.is_proxy_provider(effective):

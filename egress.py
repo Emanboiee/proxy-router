@@ -60,6 +60,30 @@ def classify_probe_body(status: int, text: str) -> str | None:
     return None
 
 
+def probe_is_model_healthy(result: dict | None, *, is_model: bool = True) -> bool:
+    """#219: whether a probe result proves the MODEL path has quota.
+
+    An HTTP 200 at a provider's root URL is not proof that its model endpoint
+    can carry requests: the free-model path can return 429 (rate limited) while
+    the root still answers 200. A probe whose error is a quota signal is never
+    model-healthy, whatever its status. Used by recovery so a generic 200 cannot
+    confirm a fallback exit as recovered.
+    """
+    if not isinstance(result, dict):
+        return False
+    status = result.get("status")
+    if not isinstance(status, int) or not 100 <= status < 600:
+        return False
+    if is_model:
+        if result.get("error") in ("rate-limit-429", "quota-exhausted"):
+            return False
+        # #258: a 429 is a quota signal regardless of its classified error label;
+        # e.g. a 429 body with "error code: 1010" classifies as cloudflare-1010.
+        if status == 429:
+            return False
+    return True
+
+
 def probe_failure_reason(status: int, text: str) -> tuple[str | None, str | None]:
     """Return ``(error, block_reason)`` for one HTTP probe response."""
     reason = classify_probe_body(status, text)
@@ -275,7 +299,10 @@ def restorable_fallback(router, name: str, *, automatic: bool) -> str | None:
     marker = loaded if isinstance(loaded, dict) else {}
     if automatic and marker.get("reason") not in AUTOMATIC_FALLBACK_REASONS:
         return None
-    if serving != "direct" and marker.get("reason") != "confirmed-stall":
+    # #219: all automatic transport reasons (429/timeout/tls/connection) are
+    # restorable; line 300 already restricts to the automatic set, so the
+    # force fast-path is not inert for response_event-parked fallbacks.
+    if serving != "direct" and marker.get("reason") not in AUTOMATIC_FALLBACK_REASONS:
         return None
     return serving
 
