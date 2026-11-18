@@ -242,12 +242,16 @@ def usable_evidence(record: dict | None, now: int, ok_window: int,
     # #225: a record stamped with a previous config generation is not current
     # evidence. Legacy records with no generation remain usable (no invalidation).
     stamped = record.get("generation")
-    if stamped is not None and generation is not None and list(stamped) != list(generation):
-        return False
+    if generation is not None and "generation" in record:
+        # A stamped (but None/malformed) generation cannot prove it is current;
+        # a record with no generation key at all is legacy and stays usable.
+        if not isinstance(stamped, (list, tuple)) or list(stamped) != list(generation):
+            return False
     return not exit_unusable(record, now, ok_window) and not fresh_failure(record, now, ok_window)
 
 
-def degraded_detail(record: dict | None, now: int, ok_window: int) -> str:
+def degraded_detail(record: dict | None, now: int, ok_window: int,
+                    generation: list | None = None) -> str:
     """One-line reason a proxy-backed lane is degraded (#225).
 
     Priority matters: an active quota block is more specific than a generic
@@ -257,6 +261,10 @@ def degraded_detail(record: dict | None, now: int, ok_window: int) -> str:
         return "egress health stale or unknown"
     if quota_active(record, now):
         return "quota exhausted"
+    if generation is not None and "generation" in record:
+        stamped = record.get("generation")
+        if not isinstance(stamped, (list, tuple)) or list(stamped) != list(generation):
+            return "egress health from previous config generation"
     # A FRESH ok=true probe rode the tunnel and is authoritative: mirror the
     # fresh_failure override so a recovered exit cannot misreport an old CONNECT
     # rejection as its cause (#225 correctness council). A STALE ok=true record

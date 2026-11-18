@@ -5569,7 +5569,7 @@ def _degraded_lanes() -> list[str]:
             now, window = int(time.time()), int(egress_settings()["ok_window"]); gen = egress.config_generation(SING_BOX_CONFIG)  # #225
             # #225: missing/stale/other-generation evidence is UNKNOWN, not healthy.
             if not record or not egress.usable_evidence(record, now, window, gen):
-                lanes.append(f"{route_id} ({provider} {egress.degraded_detail(record, now, window)})")
+                lanes.append(f"{route_id} ({provider} {egress.degraded_detail(record, now, window, gen)})")
             continue
         if _effective_route_provider(provider) != "direct":
             continue

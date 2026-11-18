@@ -32,6 +32,28 @@ def test_record_from_other_generation_is_not_usable():
     assert not egress.usable_evidence(rec, int(time.time()), 86400, generation=["new", 9, 9])
 
 
+def test_malformed_generation_does_not_crash_status():
+    """Council nit 2: a corrupted non-iterable generation must not crash status."""
+    rec = {"ok": True, "checked_at": int(time.time()), "generation": 12345}
+    # Must not raise; treat as unusable (cannot prove current generation).
+    assert egress.usable_evidence(rec, int(time.time()), 86400, generation=["a", 1, 2]) is False
+
+
+def test_missing_generation_stamp_is_not_pinned_as_legacy():
+    """Council nit 1: a record stamped with None generation (config missing at
+    probe time) must not become permanently 'legacy' once config appears."""
+    rec = {"ok": True, "checked_at": int(time.time()), "generation": None}
+    assert egress.usable_evidence(rec, int(time.time()), 86400, generation=["a", 1, 2]) is False
+
+
+def test_degraded_detail_names_generation_mismatch():
+    """Council nit 3: an old-generation record should say config changed,
+    not 'probe failed'."""
+    rec = {"ok": True, "checked_at": int(time.time()), "generation": ["old", 1, 2]}
+    detail = egress.degraded_detail(rec, int(time.time()), 86400, generation=["new", 9, 9])
+    assert "generation" in detail.lower() or "config" in detail.lower(), detail
+
+
 def test_config_rewrite_marks_existing_evidence_stale(tmp_path, monkeypatch):
     """#225: a WARP/network/exit transition rewrites sing-box.json; a green
     record stamped with the old generation must then read degraded."""
