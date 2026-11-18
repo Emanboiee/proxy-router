@@ -66,6 +66,18 @@ def test_force_restore_works_for_429_reason_fallback(tmp_path, monkeypatch):
     assert not r.active_fallback("proton")
 
 
+def test_force_restore_works_for_transport_reason_fallbacks(tmp_path, monkeypatch):
+    """Council TOP_1: response_event parks fallbacks with reason timeout/tls/
+    connection; the force fast-path must restore those too, not just 429."""
+    for reason in ("timeout", "tls", "connection"):
+        r = _setup(tmp_path, monkeypatch)
+        fb = r._fallback_state_path("proton")
+        fb.write_text(json.dumps({"provider": "cloudflare", "reason": reason}))
+        _marker(tmp_path)
+        rc = r.restore_fallback("proton", "opencode.ai", automatic=True, force=True)
+        assert rc == 0, f"force restore must clear a reason={reason} fallback, got {rc}"
+
+
 def test_force_restore_bypasses_cooldown(tmp_path, monkeypatch):
     r = _setup(tmp_path, monkeypatch)
     marker = _marker(tmp_path, age=0)  # just attempted -> normal path returns 3
