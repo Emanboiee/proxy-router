@@ -692,6 +692,7 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
                             event.get("failure")
                             and guard.record_transport_failure(now, host)
                             and confirm_context_cancellation(root, event)
+                            and _underlay_healthy(root)  # #176: defer on underlay flap
                         ):
                             target = last_provider.get(host) or "proton"
                             result = rotate_provider(root, provider_for_host(root, host) or target, host=host)

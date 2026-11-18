@@ -334,6 +334,7 @@ class RouteWatcherTests(unittest.TestCase):
              mock.patch.object(w, "_read_new_lines", side_effect=fake_read), \
              mock.patch.object(w, "client_snapshot", return_value=[]), \
              mock.patch.object(w, "_network_check_hop"), \
+             mock.patch.object(w, "_underlay_healthy", return_value=True), \
              mock.patch.object(w, "probe_target", return_value={
                  "host": "opencode.ai", "transport_failure": True,
                  "error": "SSL_ERROR_SYSCALL",
@@ -342,6 +343,47 @@ class RouteWatcherTests(unittest.TestCase):
             rc = w.worker(root, interval=0.05, sleep=stop_after_tick)
         self.assertEqual(rc, 0)
         self.assertEqual(calls, [(root.resolve(), "proton")])
+
+    def test_worker_log_rotation_defers_when_underlay_down(self):
+        """#176: the log-driven rotation path must honor the same underlay gate
+        as the probe-driven path — a Wi-Fi flap must not rotate the WG lane."""
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        w.state_dir(root).mkdir(parents=True)
+        (root / "router.json").write_text(json.dumps({
+            "routes": [{"id": "opencode", "domains": ["opencode.ai"], "provider": "proton"}],
+        }))
+        lines = [
+            "ERROR connection: open connection to opencode.ai:443 using "
+            "outbound/wireguard[proton]: context canceled\n",
+            "ERROR connection: open connection to opencode.ai:443 using "
+            "outbound/wireguard[proton]: context canceled\n",
+        ]
+        reads = [0]
+        calls = []
+
+        def fake_read(_path, offset):
+            if reads[0] == 0:
+                reads[0] += 1
+                return offset, lines
+            return offset, []
+
+        def stop_after_tick(_seconds):
+            w.enabled_file(root).unlink(missing_ok=True)
+
+        with mock.patch.object(w, "engine_pid_alive", return_value=True), \
+             mock.patch.object(w, "_read_new_lines", side_effect=fake_read), \
+             mock.patch.object(w, "client_snapshot", return_value=[]), \
+             mock.patch.object(w, "_network_check_hop"), \
+             mock.patch.object(w, "_underlay_healthy", return_value=False), \
+             mock.patch.object(w, "probe_target", return_value={
+                 "host": "opencode.ai", "transport_failure": True,
+                 "error": "SSL_ERROR_SYSCALL",
+             }), \
+             mock.patch.object(w, "rotate_provider", side_effect=lambda *args, **kwargs: calls.append(args) or {"rotated": True}):
+            rc = w.worker(root, interval=0.05, sleep=stop_after_tick)
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, [], "log-driven rotation must defer when underlay is down")
 
     def test_worker_rotates_provider_from_outbound_tag(self):
         root = Path(tempfile.mkdtemp())
@@ -371,6 +413,7 @@ class RouteWatcherTests(unittest.TestCase):
              mock.patch.object(w, "_read_new_lines", side_effect=fake_read), \
              mock.patch.object(w, "client_snapshot", return_value=[]), \
              mock.patch.object(w, "_network_check_hop"), \
+             mock.patch.object(w, "_underlay_healthy", return_value=True), \
              mock.patch.object(w, "probe_target", return_value={"transport_failure": False}), \
              mock.patch.object(w, "rotate_provider", side_effect=lambda *args, **kwargs: calls.append(args) or {"rotated": False}):
             rc = w.worker(root, interval=0.05, sleep=stop_after_tick)
