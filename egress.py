@@ -208,7 +208,14 @@ def fresh_failure(record: dict | None, now: int, ok_window: int) -> bool:
     # from an older rejection (#225 deploy review): without this, a recovered
     # lane stays degraded forever because record_egress(ok=True) never touched
     # socks_connect_ok. The connect flag only matters when ok is not True.
+    # #216: a fresh model-path stall (response-header timeout) is degraded
+    # evidence even though the generic probe returned ok=true/200. Only the
+    # timeout class counts; quota 429 stays on its own axis.
     if record.get("ok") is True:
+        stall = _int_or_none(record.get("upstream_error_at"))
+        if stall is not None and int(now) - stall < int(ok_window) \
+                and record.get("upstream_error") == "timeout":
+            return True
         return False
     if record.get("ok") is not False and record.get(SOCKS_CONNECT_OK) is not False:
         return False
@@ -246,6 +253,10 @@ def degraded_detail(record: dict | None, now: int, ok_window: int) -> str:
     # rejection as its cause (#225 correctness council). A STALE ok=true record
     # is still stale evidence and must keep the "stale" reason.
     if record.get("ok") is True:
+        stall = _int_or_none(record.get("upstream_error_at"))
+        if stall is not None and int(now) - stall < int(ok_window) \
+                and record.get("upstream_error") == "timeout":
+            return "model path stalled (response headers timeout)"
         checked = _int_or_none(record.get("checked_at") or record.get("last_ok_at"))
         if checked is not None and int(now) - checked < int(ok_window):
             return "egress probe failed"
