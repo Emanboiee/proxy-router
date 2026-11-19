@@ -755,6 +755,18 @@ class ProviderForHostTests(unittest.TestCase):
             return SimpleNamespace(returncode=0, stdout="not json", stderr="")
         self.assertFalse(w._underlay_healthy(Path("/tmp"), runner=malformed))
 
+    def test_underlay_check_defers_when_probe_unavailable(self):
+        """#176: a fail-open probe (connected=true, supported=false,
+        identity=unavailable) is UNKNOWN, not healthy. Rotating on it reloads
+        the WireGuard lane during a missing/unknown underlay."""
+        def fake_runner(*args, **kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout='{"connected": true, "supported": false, "identity": "unavailable"}',
+                stderr="",
+            )
+        self.assertFalse(w._underlay_healthy(Path("/tmp"), runner=fake_runner))
+
     def test_rotation_deferred_preserves_failure_evidence(self):
         """#176: an underlay flap must not consume the two-failure counter."""
         guard = w.RotationGuard()
