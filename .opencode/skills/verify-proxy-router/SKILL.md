@@ -31,8 +31,8 @@ Settings, all optional:
 | `PROXY_ROUTER_PYTHON` | `python3` | interpreter for `router.py` |
 | `PROXY_ROUTER_PORT` | `2080` | proxy listener port |
 | `PROXY_ROUTER_FETCH_URL` | Cloudflare trace | URL for the live fetch |
-| `PROXY_ROUTER_EXPECT_PROVIDERS` | `cloudflare,proton` | providers that should be healthy |
-| `PROXY_ROUTER_EXPECT_FALLBACK` | `cloudflare:proton` | configured fallback to assert; empty disables |
+| `PROXY_ROUTER_EXPECT_PROVIDERS` | keys of `router.json` | providers that should be healthy |
+| `PROXY_ROUTER_EXPECT_FALLBACK` | first chain in `router.json` | configured fallback to assert; empty disables |
 | `PROXY_ROUTER_SKIP_MACOS` | `0` | set `1` to skip launchd/tray checks |
 
 ## Drive

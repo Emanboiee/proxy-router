@@ -10,10 +10,32 @@ ROOT="${PROXY_ROUTER_ROOT:-$(CDPATH= cd -- "$HERE/../../.." && pwd)}"
 PY="${PROXY_ROUTER_PYTHON:-python3}"
 PORT="${PROXY_ROUTER_PORT:-2080}"
 FETCH_URL="${PROXY_ROUTER_FETCH_URL:-https://www.cloudflare.com/cdn-cgi/trace}"
-EXPECT_PROVIDERS="${PROXY_ROUTER_EXPECT_PROVIDERS:-cloudflare,proton}"
-EXPECT_FALLBACK="${PROXY_ROUTER_EXPECT_FALLBACK:-cloudflare:proton}"
 EVIDENCE_ROOT="${PROXY_ROUTER_EVIDENCE:-$ROOT/.verify-evidence}"
 SKIP_MACOS="${PROXY_ROUTER_SKIP_MACOS:-0}"
+
+# Provider defaults come from router.json unless explicitly overridden, so the
+# skill is not tied to one operator's provider names.
+if [ -n "${PROXY_ROUTER_EXPECT_PROVIDERS+x}" ]; then
+  EXPECT_PROVIDERS="$PROXY_ROUTER_EXPECT_PROVIDERS"
+else
+  EXPECT_PROVIDERS="$(cd "$ROOT" && "$PY" -c 'import json; print(",".join(json.load(open("router.json")).get("providers", {})))' 2>/dev/null)"
+fi
+if [ -n "${PROXY_ROUTER_EXPECT_FALLBACK+x}" ]; then
+  EXPECT_FALLBACK="$PROXY_ROUTER_EXPECT_FALLBACK"
+else
+  EXPECT_FALLBACK="$(cd "$ROOT" && "$PY" - <<'PY' 2>/dev/null
+import json
+d = json.load(open("router.json"))
+for name, spec in d.get("providers", {}).items():
+    fb = spec.get("fallback_providers") or spec.get("fallback_provider") or []
+    if isinstance(fb, str):
+        fb = [fb]
+    if fb:
+        print(f"{name}:{fb[0]}")
+        break
+PY
+)"
+fi
 
 RUN_ID="$(date '+%Y%m%d-%H%M%S')"
 EVIDENCE="$EVIDENCE_ROOT/$RUN_ID"
@@ -63,10 +85,30 @@ else
 fi
 
 # 4. egress: no dead lanes, at least one alive (respect expected providers)
-EGRESS="$(cd "$ROOT" && timeout 25 "$PY" router.py egress check 2>&1)"
+EGRESS_RC=0
+EGRESS="$(cd "$ROOT" && "$PY" - "$PY" <<'PY' 2>&1
+import subprocess, sys
+py = sys.argv[1]
+try:
+    r = subprocess.run([py, "router.py", "egress", "check"],
+                       capture_output=True, text=True, timeout=25)
+    sys.stdout.write(r.stdout)
+    sys.stderr.write(r.stderr)
+    sys.exit(r.returncode)
+except subprocess.TimeoutExpired:
+    print("egress check timed out")
+    sys.exit(1)
+PY
+)" || EGRESS_RC=$?
 echo "$EGRESS" > "$EVIDENCE/egress.txt"
-if echo "$EGRESS" | grep -q ': dead'; then
+if [ "$EGRESS_RC" -ne 0 ]; then
+  check "egress:no-dead" 1 "egress check rc=$EGRESS_RC: $(echo "$EGRESS" | head -1)"
+elif [ -z "$EGRESS" ]; then
+  check "egress:no-dead" 1 "egress check produced no output"
+elif echo "$EGRESS" | grep -q ': dead'; then
   check "egress:no-dead" 1 "$(echo "$EGRESS" | grep ': dead' | tr '\n' ' ')"
+elif echo "$EGRESS" | grep -qE 'error|Traceback|not found'; then
+  check "egress:no-dead" 1 "egress error: $(echo "$EGRESS" | head -1)"
 else
   check "egress:no-dead" 0 "no dead providers"
 fi
