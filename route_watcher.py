@@ -538,7 +538,17 @@ def _underlay_healthy(root: Path, *, runner: Callable = subprocess.run) -> bool:
         payload = json.loads(result.stdout or "{}")
     except ValueError:
         return False
-    return bool(isinstance(payload, dict) and payload.get("connected"))
+    # #176: the controller's network probe fails open with
+    # connected=true, supported=false, identity="unavailable" when it cannot
+    # determine the underlay. That is UNKNOWN, not healthy: rotating here would
+    # reload the WireGuard lane during a missing/unknown network path. Keep the
+    # isinstance guard so a non-dict JSON payload cannot raise.
+    return bool(
+        isinstance(payload, dict)
+        and payload.get("connected")
+        and payload.get("supported") is not False
+        and payload.get("identity") != "unavailable"
+    )
 
 
 def rotate_provider(root: Path, provider: str = "proton", *, host: str | None = None,
