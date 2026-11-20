@@ -50,6 +50,7 @@ import egress
 import net_safety
 import provider_lifecycle
 import state
+from singbox import _bad_endpoint, dns_server_for, parse_endpoint
 import status_snapshot
 from providers_check import provider_config_errors as _provider_config_errors
 from config_schema import (
@@ -2741,33 +2742,6 @@ def resolve_host(host: str) -> str:
     return host
 
 
-def _bad_endpoint(endpoint: str) -> None:
-    raise SystemExit(f"bad Endpoint '{endpoint}' (expected host:port or [v6]:port)")
-
-
-def parse_endpoint(endpoint: str) -> tuple[str, str]:
-    """Split a WireGuard ``host:port`` (or ``[v6]:port``) Endpoint into
-    (host, port) without breaking on IPv6 colons."""
-    endpoint = endpoint.strip()
-    if endpoint.startswith("["):
-        host, _, rest = endpoint[1:].partition("]")
-        port = rest.lstrip(":")
-    else:
-        host, sep, port = endpoint.rpartition(":")
-        if not sep:
-            _bad_endpoint(endpoint)
-    if not host or not port:
-        _bad_endpoint(endpoint)
-    port_number = 0
-    try:
-        port_number = int(port)
-    except ValueError:
-        _bad_endpoint(endpoint)
-    if not 1 <= port_number <= 65535:
-        _bad_endpoint(endpoint)
-    return host, str(port_number)
-
-
 def parse_wireguard(profile: Path) -> dict:
     parser = configparser.ConfigParser(interpolation=None)
     parser.read(profile)
@@ -2793,20 +2767,6 @@ def parse_wireguard(profile: Path) -> dict:
     else:
         endpoint["mtu"] = int(_vpn.get("mtu") or DEFAULT_ENDPOINT_MTU)
     return endpoint
-
-
-def dns_server_for(profile: Path) -> str:
-    parser = configparser.ConfigParser(interpolation=None)
-    parser.read(profile)
-    dns = parser.get("Interface", "DNS", fallback="").strip()
-    if dns:
-        dns = re.split(r"[,\s]+", dns)[0]
-    # Proton's private tunnel resolver intermittently blackholes DNS on macOS
-    # (10.2.0.1 / 2a07:b944::). Resolve through Cloudflare DNS over the same
-    # WireGuard endpoint instead; the destination traffic remains provider-routed.
-    if dns.startswith("10.") or dns.lower().startswith("2a07:b944:"):
-        return "1.1.1.1"
-    return dns or "1.1.1.1"
 
 
 _DNS_STRATEGIES = ("ipv4_only", "ipv6_only", "ipv4_prefer", "ipv6_prefer")
