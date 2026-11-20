@@ -937,6 +937,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn frame_interval_uses_the_documented_frontend_clock_origin() {
+        // Clock origin = performance.now() at render navigation completion,
+        // captured in the frontend. The interval is first-frame minus origin.
+        assert_eq!(frame_interval_ms(100.0, 118.5), 18.5);
+        assert_eq!(frame_interval_ms(100.0, 100.0), 0.0);
+    }
+
+    #[test]
+    fn frame_interval_never_reports_a_negative_or_non_finite_value() {
+        assert_eq!(frame_interval_ms(200.0, 100.0), 0.0);
+        assert_eq!(frame_interval_ms(f64::NAN, 100.0), 0.0);
+        assert_eq!(frame_interval_ms(100.0, f64::INFINITY), 0.0);
+    }
+
+    #[test]
+    fn frame_timing_origin_is_set_once_then_reports_the_interval() {
+        let mut timing = FrameTiming::default();
+        assert_eq!(timing.record_origin(100.0), None);
+        assert_eq!(timing.record_frame(118.5), Some(18.5));
+        // A second frame uses the same origin, not the previous frame.
+        assert_eq!(timing.record_frame(130.0), Some(30.0));
+    }
+
+    #[test]
     fn controller_returns_only_the_fixture_contract() {
         let status = get_preview_status().unwrap();
         assert_eq!(status["version"], 1);
