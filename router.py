@@ -3977,36 +3977,24 @@ def _report_log_retention_failure(stage: str, exc: BaseException) -> None:
 def rotate_log_if_needed() -> None:
     """Archive an oversized logs/sing-box.log to logs/sing-box.log.1.
 
-    Called from engine_start only, when no engine holds the log fd. Every
-    fallible step is guarded so a retention error can never abort the engine
-    start it protects. Each call reports at most one failure (no retry storm).
+    Called only from engine_start; guarded so no failure aborts startup.
     """
     try:
-        size = LOG_FILE.stat().st_size
-    except FileNotFoundError:
-        # First start: engine_start creates the log with mode "ab" below.
-        # No file yet is a legitimate state, not a retention failure.
-        return
-    except OSError as exc:
-        _report_log_retention_failure("stat", exc)
-        return
-    if size < LOG_MAX_BYTES:
-        try:
+        if LOG_FILE.stat().st_size < LOG_MAX_BYTES:
             os.chmod(LOG_FILE, 0o600)
-        except OSError as exc:
-            _report_log_retention_failure("chmod", exc)
+            return
+    except OSError as exc:
+        # Missing log on first start is legitimate (engine_start creates it).
+        if not isinstance(exc, FileNotFoundError):
+            _report_log_retention_failure("stat", exc)
         return
     archive = Path(str(LOG_FILE) + ".1")
     try:
         archive.unlink(missing_ok=True)
         LOG_FILE.rename(archive)
-    except OSError as exc:
-        _report_log_retention_failure("archive", exc)
-        return
-    try:
         os.chmod(archive, 0o600)
     except OSError as exc:
-        _report_log_retention_failure("chmod", exc)
+        _report_log_retention_failure("archive", exc)
     # After rename the live path is gone; engine_start recreates it with 0600.
 
 
