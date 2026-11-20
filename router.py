@@ -3982,19 +3982,31 @@ def rotate_log_if_needed() -> None:
     start it protects. Each call reports at most one failure (no retry storm).
     """
     try:
-        if LOG_FILE.stat().st_size < LOG_MAX_BYTES:
-            os.chmod(LOG_FILE, 0o600)
-            return
+        size = LOG_FILE.stat().st_size
+    except FileNotFoundError:
+        # First start: engine_start creates the log with mode "ab" below.
+        # No file yet is a legitimate state, not a retention failure.
+        return
     except OSError as exc:
         _report_log_retention_failure("stat", exc)
+        return
+    if size < LOG_MAX_BYTES:
+        try:
+            os.chmod(LOG_FILE, 0o600)
+        except OSError as exc:
+            _report_log_retention_failure("chmod", exc)
         return
     archive = Path(str(LOG_FILE) + ".1")
     try:
         archive.unlink(missing_ok=True)
         LOG_FILE.rename(archive)
-        os.chmod(archive, 0o600)
     except OSError as exc:
         _report_log_retention_failure("archive", exc)
+        return
+    try:
+        os.chmod(archive, 0o600)
+    except OSError as exc:
+        _report_log_retention_failure("chmod", exc)
     # After rename the live path is gone; engine_start recreates it with 0600.
 
 
