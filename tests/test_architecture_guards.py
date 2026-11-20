@@ -15,6 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 LEAF_MODULES = (
+    "singbox.py",
     "state.py",
     "egress.py",
     "config_schema.py",
@@ -33,7 +34,7 @@ TOP_LEVEL_MODULES = (
     "privileged_helper",
     "privileged_installer",
 )
-ROUTER_LINE_CAP = 8400
+ROUTER_LINE_CAP = 8360
 
 
 def _imported_names(path: Path) -> set[str]:
