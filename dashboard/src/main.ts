@@ -4,7 +4,7 @@ import {applyDashboardPalette, polishDashboard} from './dashboard-polish';
 import {connectionControls, serverInventory} from './server-controls';
 import './tokens.css';
 import './style.css';
-import { LocalController, manageDashboardServer, saveServerPreference, switchDashboardServer, applyEngineAction, applyDashboardProfile, deleteDashboardProfile, deleteDashboardProvider, getCachedLiveStatus, getDashboardState, getLiveStatus, getPreviewStatus, reportPreviewFrame, saveDashboardProfile, saveDashboardProvider, setTrayStatus, states, type Accent, type Connection, type DashboardState, type Density, type FallbackMode, type LayoutPreset, type MotionSpeed, type PreviewState, type Profile, type Provider, type ProviderKind, type RouteMode, type Scheme, type Snapshot, type Status, type TailscaleMode } from './controller';
+import { LocalController, manageDashboardServer, saveServerPreference, switchDashboardServer, applyEngineAction, applyDashboardProfile, deleteDashboardProfile, deleteDashboardProvider, getCachedLiveStatus, getDashboardState, getLiveStatus, getPreviewStatus, reportNavigationDone, reportPreviewFrame, saveDashboardProfile, saveDashboardProvider, setTrayStatus, states, type Accent, type Connection, type DashboardState, type Density, type FallbackMode, type LayoutPreset, type MotionSpeed, type PreviewState, type Profile, type Provider, type ProviderKind, type RouteMode, type Scheme, type Snapshot, type Status, type TailscaleMode } from './controller';
 import { open as openNativeFile } from '@tauri-apps/plugin-dialog';
 import { isTauri } from '@tauri-apps/api/core';
 import { parseProfileExport } from './controller';
@@ -1318,7 +1318,8 @@ async function routeRemoveAction(id: string): Promise<void> {
 }
 
 window.addEventListener('hashchange', () => navigate(true));
-navigate(false); requestAnimationFrame(reportPreviewFrame);
+navigate(false); reportNavigationDone(performance.now());
+requestAnimationFrame((timestamp) => reportPreviewFrame(timestamp));
 
 // The hero, the rail and the tray follow the real controller (#144):
 // refresh now and poll on the cadence the Rust backend already uses.

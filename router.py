@@ -3968,23 +3968,33 @@ def prepare_log_directory() -> None:
             os.chmod(target, 0o600)
 
 
+def _report_log_retention_failure(stage: str, exc: BaseException) -> None:
+    """Report one bounded retention failure. Stage names are fixed literals and
+    ``exc`` is an OS error; no log content or private data is emitted."""
+    print(f"router: log retention failed ({stage}): {exc}", file=sys.stderr)
+
+
 def rotate_log_if_needed() -> None:
     """Archive an oversized logs/sing-box.log to logs/sing-box.log.1.
 
-    Called from engine_start only, when no engine holds the log fd.
+    Called only from engine_start; guarded so no failure aborts startup.
     """
     try:
         if LOG_FILE.stat().st_size < LOG_MAX_BYTES:
             os.chmod(LOG_FILE, 0o600)
             return
-    except OSError:
+    except OSError as exc:
+        # Missing log on first start is legitimate (engine_start creates it).
+        if not isinstance(exc, FileNotFoundError):
+            _report_log_retention_failure("stat", exc)
         return
     archive = Path(str(LOG_FILE) + ".1")
-    archive.unlink(missing_ok=True)
     try:
-        LOG_FILE.rename(archive); os.chmod(archive, 0o600)
+        archive.unlink(missing_ok=True)
+        LOG_FILE.rename(archive)
+        os.chmod(archive, 0o600)
     except OSError as exc:
-        print(f"router: log retention failed (archive): {exc}", file=sys.stderr)
+        _report_log_retention_failure("archive", exc)
     # After rename the live path is gone; engine_start recreates it with 0600.
 
 
@@ -4004,7 +4014,7 @@ def trim_live_log_if_needed() -> None:
             handle.truncate()
         os.chmod(LOG_FILE, 0o600)
     except (OSError, ValueError) as exc:
-        print(f"router: log retention failed (trim): {exc}", file=sys.stderr)
+        _report_log_retention_failure("trim", exc)
 
 
 def engine_start(use_existing_config: bool = False, *, recover: bool = True) -> int:
