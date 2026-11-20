@@ -437,7 +437,8 @@ export async function removeRoute(id: string): Promise<void> {
   await invoke('remove_route', { id });
 }
 
-export function reportPreviewFrame(): void { if (isTauri()) void invoke('preview_rendered').catch(() => {}); }
+export function reportNavigationDone(atMs: number): void { if (isTauri()) void invoke('preview_navigation_done', { atMs }).catch(() => {}); }
+export function reportPreviewFrame(atMs?: number): void { if (isTauri()) void invoke('preview_rendered', { atMs: atMs ?? null }).catch(() => {}); }
 
 export async function saveServerPreference(providerId: string, server: string): Promise<DashboardState> {
   return await invoke<DashboardState>("save_server_preference", { providerId, server });

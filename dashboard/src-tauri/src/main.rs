@@ -25,7 +25,58 @@ use tauri::{
     AppHandle, Manager, Runtime,
 };
 
-struct LaunchTime(Instant);
+/// Clock origin for first-frame timing: `performance.now()` in the frontend,
+/// captured when navigation/render completes. The first animation frame's
+/// `performance.now()` is the endpoint. Rust only records and subtracts, so
+/// the interval measures the actual render-to-frame gap rather than elapsed
+/// process lifetime (issue #184 item 4).
+struct FrameTiming {
+    origin_ms: Option<f64>,
+}
+
+/// Pure interval math: saturating, non-negative, non-finite-safe.
+fn frame_interval_ms(origin_ms: f64, frame_ms: f64) -> f64 {
+    if !origin_ms.is_finite() || !frame_ms.is_finite() || frame_ms <= origin_ms {
+        0.0
+    } else {
+        frame_ms - origin_ms
+    }
+}
+
+impl Default for FrameTiming {
+    fn default() -> Self {
+        Self { origin_ms: None }
+    }
+}
+
+impl FrameTiming {
+    /// Record the render-complete origin; returns None (it is set once).
+    fn record_origin(&mut self, at_ms: f64) -> Option<f64> {
+        self.origin_ms = Some(at_ms);
+        None
+    }
+
+    /// Report the interval from the last origin to this first frame.
+    fn record_frame(&self, at_ms: f64) -> Option<f64> {
+        self.origin_ms.map(|origin| frame_interval_ms(origin, at_ms))
+    }
+}
+
+#[tauri::command]
+fn preview_navigation_done(at_ms: f64, timing: tauri::State<Mutex<FrameTiming>>) {
+    if let Ok(mut timing) = timing.lock() {
+        timing.record_origin(at_ms);
+    }
+}
+
+#[tauri::command]
+fn preview_rendered(at_ms: Option<f64>, timing: tauri::State<Mutex<FrameTiming>>) {
+    if let (Some(at), Ok(timing)) = (at_ms, timing.lock()) {
+        if let Some(interval) = timing.record_frame(at) {
+            eprintln!("preview_first_frame_ms={}", interval as u128);
+        }
+    }
+}
 
 /// One complete controller reading, published and read as a unit.
 #[derive(Default)]
@@ -79,11 +130,6 @@ const POLL_SECONDS: u64 = 15;
 
 /// A cached reading younger than this is served without re-running the CLI.
 const CACHE_FRESH_MS: u128 = 2500;
-
-#[tauri::command]
-fn preview_rendered(start: tauri::State<LaunchTime>) {
-    eprintln!("preview_first_frame_ms={}", start.0.elapsed().as_millis());
-}
 
 /// Build-time fixture, kept for the non-Tauri browser preview contract.
 #[tauri::command]
@@ -742,7 +788,7 @@ fn main() {
     let owner_root = controller::router_root();
 
     let run_result = tauri::Builder::default()
-        .manage(LaunchTime(Instant::now()))
+        .manage(Mutex::new(FrameTiming::default()))
         .manage(LiveStatus::default())
         .manage(network_refresh::NetworkRefresh::default())
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
@@ -915,6 +961,7 @@ fn main() {
             save_server_preference,
             switch_dashboard_server,
             set_tray_status,
+            preview_navigation_done,
             preview_rendered
         ])
         .on_window_event(|window, event| {
