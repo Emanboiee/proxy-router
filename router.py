@@ -66,6 +66,8 @@ from config_schema import (
     DEFAULT_TUN_STACK,
     SCHEMA_VERSION,
     migrate as migrate_config,
+    parse_error_policy as _parse_error_policy,
+    routing_error as _routing_error,
     runtime_root,
 )
 
@@ -979,30 +981,6 @@ def egress_settings() -> dict:
     merged over module defaults). Rotation consults these to avoid
     known-blocked/slow exits without hardcoding thresholds."""
     return _egress_settings or DEFAULT_EGRESS_SETTINGS
-
-
-def _parse_error_policy(supplied) -> dict:
-    """Validate one error-policy table: {reason: {action, seconds}}. Returns
-    the cleaned table ({} when absent). Raises ValueError with a precise
-    message on malformed input so load_config rejects the config instead of
-    silently guessing."""
-    if supplied is None:
-        return {}
-    if not isinstance(supplied, dict):
-        raise ValueError("'error_policy' must be an object of reason -> {\"action\", \"seconds\"}")
-    cleaned: dict[str, dict] = {}
-    for key, entry in supplied.items():
-        if not isinstance(entry, dict):
-            raise ValueError(f"'error_policy.{key}' must be an object with 'action' and 'seconds'")
-        action = entry.get("action", "cooldown")
-        if action not in ("cooldown", "exhaust", "block"):
-            raise ValueError(f"'error_policy.{key}.action' must be 'cooldown'|'exhaust'|'block' (got {action!r})")
-        try:
-            seconds = max(0, int(entry.get("seconds", 300)))
-        except (TypeError, ValueError):
-            raise ValueError(f"'error_policy.{key}.seconds' must be a non-negative integer") from None
-        cleaned[str(key)] = {"action": action, "seconds": seconds}
-    return cleaned
 
 
 def _load_error_policy(data: dict, providers: dict) -> None:
@@ -5194,37 +5172,6 @@ def routing_state() -> dict:
         "default_provider": routing.get("default_provider"),
         "health_order": bool(routing.get("health_order", False)),
     }
-
-
-def _routing_error(routing: dict, known_providers: set) -> str | None:
-    """Precise error for a malformed routing section, else None.
-
-    Shared by ``load_config`` and the ``routing`` CLI writer so both paths
-    enforce exactly the same schema - malformed config fails loudly, never a
-    silent guess. ``mode`` "default" is the explicit spelling of the absent
-    (pre-existing) behavior; ``default_provider`` is only meaningful (and only
-    required/validated against known providers) in safe-list mode.
-    """
-    mode = routing.get("mode", "default")
-    if mode not in ("default", "safe-list", "vpn-list"):
-        return f"routing.mode must be 'safe-list', 'vpn-list', or absent (default); got '{mode}'"
-    for key in ("direct_domains", "vpn_domains"):
-        value = routing.get(key)
-        if value is not None and (not isinstance(value, list) or not all(isinstance(v, str) for v in value)):
-            return f"routing.{key} must be a string list"
-    default_provider = routing.get("default_provider")
-    if default_provider is not None and not isinstance(default_provider, str):
-        return "routing.default_provider must be a provider name string"
-    health_order = routing.get("health_order")
-    if health_order is not None and not isinstance(health_order, bool):
-        return "routing.health_order must be a boolean"
-    if mode == "safe-list":
-        if not default_provider:
-            return "routing mode 'safe-list' needs 'default_provider' (everything not on the direct list goes through it)"
-        if default_provider not in known_providers:
-            return (f"routing.default_provider '{default_provider}' is not a known provider "
-                    f"(have {', '.join(sorted(known_providers))})")
-    return None
 
 
 def _routing_mutate(routing: dict) -> int:
