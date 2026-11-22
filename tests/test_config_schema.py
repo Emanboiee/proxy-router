@@ -115,3 +115,11 @@ def test_config_runtime_view_is_isolated_from_snapshot():
     routes[0]["domains"].append("b.example")
     assert cfg.providers["p"]["v"] == [1]
     assert cfg.routes[0]["domains"] == ["a.example"]
+
+
+def test_config_runtime_view_deep_copies_nested_routing():
+    cfg = make_config()
+    cfg.routing["direct_domains"] = ["a.example"]
+    (port, providers, routes, vpn, routing, autodetect, bypass) = cfg.runtime_view()
+    routing["direct_domains"].append("b.example")
+    assert cfg.routing["direct_domains"] == ["a.example"]

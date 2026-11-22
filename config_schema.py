@@ -217,7 +217,7 @@ class Config:
         in-place writes never reach this snapshot."""
         return (
             self.port, deepcopy(self.providers), deepcopy(self.routes),
-            deepcopy(self.vpn), dict(self.routing),
+            deepcopy(self.vpn), deepcopy(self.routing),
             deepcopy(self.autodetect), list(self.proxy_bypass_domains),
         )
 
