@@ -11,7 +11,9 @@ from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+import ipaddress
 import os
+import re
 import urllib.parse
 
 
@@ -171,6 +173,31 @@ def parse_egress_settings(data: dict) -> dict:
     if not sane:
         settings["probe_url"] = DEFAULT_EGRESS_SETTINGS["probe_url"]
     return settings
+
+
+def public_dns_error(value) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        return "vpn.public_dns must be an object"
+    if not isinstance(value.get("server"), str):
+        return "vpn.public_dns.server must be an IP address (no bootstrap DNS)"
+    try:
+        address = ipaddress.ip_address(value.get("server", ""))
+    except ValueError:
+        return "vpn.public_dns.server must be an IP address (no bootstrap DNS)"
+    if address.is_unspecified or address.is_multicast:
+        return "vpn.public_dns.server must be a unicast address"
+    if value.get("transport", "https") not in ("https", "udp", "tcp", "tls"):
+        return "vpn.public_dns.transport must be 'https', 'udp', 'tcp', or 'tls'"
+    domains = value.get("private_domains", ["local", "ts.net"])
+    if (not isinstance(domains, list)
+            or any(not isinstance(domain, str)
+                   or not re.fullmatch(r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*", domain)
+                   for domain in domains)):
+        return "vpn.public_dns.private_domains must be a list of domain suffixes"
+    return None
+
 
 
 @dataclass(frozen=True)

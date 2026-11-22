@@ -123,3 +123,20 @@ def test_config_runtime_view_deep_copies_nested_routing():
     (port, providers, routes, vpn, routing, autodetect, bypass) = cfg.runtime_view()
     routing["direct_domains"].append("b.example")
     assert cfg.routing["direct_domains"] == ["a.example"]
+
+
+def test_public_dns_error_exact_strings():
+    fn = config_schema.public_dns_error
+    assert fn(None) is None
+    assert fn("x") == "vpn.public_dns must be an object"
+    assert fn({"server": "bad"}) == "vpn.public_dns.server must be an IP address (no bootstrap DNS)"
+    assert fn({"server": "0.0.0.0"}) == "vpn.public_dns.server must be a unicast address"
+    assert fn({"server": "1.1.1.1", "transport": "x"}) == "vpn.public_dns.transport must be 'https', 'udp', 'tcp', or 'tls'"
+    assert fn({"server": "1.1.1.1", "private_domains": ["bad domain"]}) == "vpn.public_dns.private_domains must be a list of domain suffixes"
+    assert fn({"server": "1.1.1.1"}) is None
+
+
+def test_config_schema_has_no_upward_import_after_dns_move():
+    source = (ROOT / "config_schema.py").read_text(encoding="utf-8")
+    for mod in ("import router", "import proxy_tray", "import monitor", "import route_watcher"):
+        assert mod not in source
