@@ -44,6 +44,7 @@ from types import SimpleNamespace
 from pathlib import Path
 from typing import Any
 
+import config_schema
 import domain_autodetect
 import autodetect_refresh
 import egress
@@ -54,6 +55,7 @@ from singbox import _bad_endpoint, dns_server_for, parse_endpoint
 import status_snapshot
 from providers_check import provider_config_errors as _provider_config_errors
 from config_schema import (
+    Config,
     DEFAULT_DIRECT_PROBE_URL,
     DEFAULT_EGRESS_SETTINGS,
     DEFAULT_ENDPOINT_MTU,
@@ -238,6 +240,7 @@ _vpn: dict = {}
 _routing: dict = {}
 _autodetect: dict = {}
 _proxy_bypass_domains: list[str] = []
+_config: "Config | None" = None
 
 
 def _bypass_domains() -> list[str]:
@@ -807,13 +810,18 @@ def load_config() -> int:
     except ValueError as exc:
         return fail(f"bad {CONFIG_FILE.name}: {exc}")
     _load_egress_settings(data)
-    _port = port
-    _providers = providers
-    _routes = routes
-    _vpn = vpn
-    _routing = dict(routing)
-    _autodetect = autodetect
-    _proxy_bypass_domains = [domain.strip() for domain in bypass_domains]
+    # Immutable validated snapshot; globals stay the mutable runtime table.
+    # from_loaded deep-copies each section so later in-place global writes never
+    # mutate the snapshot (#66 C1).
+    global _config
+    _config = Config.from_loaded(
+        port=port, providers=providers, routes=routes, vpn=vpn, routing=routing,
+        autodetect=autodetect, egress_settings=_egress_settings, rotation=_rotation,
+        error_policy=_error_policy or {},
+        proxy_bypass_domains=[d.strip() for d in bypass_domains],
+    )
+    (_port, _providers, _routes, _vpn, _routing,
+     _autodetect, _proxy_bypass_domains) = _config.runtime_view()
     return 0
 
 
@@ -1138,41 +1146,9 @@ def _transport_reason(error_text) -> str:
 
 
 def _load_egress_settings(data: dict) -> None:
-    """Merge router.json's optional top-level ``egress`` dict over defaults
-    with the same bounded leniency monitor.py applies to its settings."""
+    """Seed the runtime egress settings from the validated parse in config_schema."""
     global _egress_settings
-    settings = dict(DEFAULT_EGRESS_SETTINGS)
-    supplied = data.get("egress") if isinstance(data, dict) else None
-    if isinstance(supplied, dict):
-        for key in DEFAULT_EGRESS_SETTINGS:
-            if key in supplied:
-                settings[key] = supplied[key]
-    try:
-        settings["probe_timeout"] = min(max(1.0, float(settings["probe_timeout"])), 60.0)
-    except (TypeError, ValueError):
-        settings["probe_timeout"] = DEFAULT_EGRESS_SETTINGS["probe_timeout"]
-    for key in ("block_seconds", "upstream_cooldown_seconds", "ok_window"):
-        try:
-            settings[key] = max(0, int(settings[key]))
-        except (TypeError, ValueError):
-            settings[key] = DEFAULT_EGRESS_SETTINGS[key]
-    try:
-        settings["fail_threshold"] = min(max(1, int(settings["fail_threshold"])), 20)
-    except (TypeError, ValueError):
-        settings["fail_threshold"] = DEFAULT_EGRESS_SETTINGS["fail_threshold"]
-    try:
-        settings["slow_latency_ms"] = max(0.0, float(settings["slow_latency_ms"]))
-    except (TypeError, ValueError):
-        settings["slow_latency_ms"] = DEFAULT_EGRESS_SETTINGS["slow_latency_ms"]
-    url = settings["probe_url"]
-    try:
-        parsed = urllib.parse.urlsplit(str(url))
-        sane = parsed.scheme in ("http", "https") and bool(parsed.hostname)
-    except (TypeError, ValueError):
-        sane = False
-    if not sane:
-        settings["probe_url"] = DEFAULT_EGRESS_SETTINGS["probe_url"]
-    _egress_settings = settings
+    _egress_settings = config_schema.parse_egress_settings(data)
 
 
 def _load_rotation_settings(data: dict) -> None:

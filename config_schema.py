@@ -8,9 +8,11 @@ values and the schema version now have one source of truth.
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 import os
+import urllib.parse
 
 
 SCHEMA_VERSION = 1
@@ -132,3 +134,104 @@ def routing_error(routing: dict, known_providers: set) -> str | None:
             return (f"routing.default_provider '{default_provider}' is not a known provider "
                     f"(have {', '.join(sorted(known_providers))})")
     return None
+
+
+def parse_egress_settings(data: dict) -> dict:
+    """Merge router.json's optional ``egress`` dict over DEFAULT_EGRESS_SETTINGS
+    with bounded leniency. Pure: returns the settings dict, mutates no globals."""
+    settings = dict(DEFAULT_EGRESS_SETTINGS)
+    supplied = data.get("egress") if isinstance(data, dict) else None
+    if isinstance(supplied, dict):
+        for key in DEFAULT_EGRESS_SETTINGS:
+            if key in supplied:
+                settings[key] = supplied[key]
+    try:
+        settings["probe_timeout"] = min(max(1.0, float(settings["probe_timeout"])), 60.0)
+    except (TypeError, ValueError):
+        settings["probe_timeout"] = DEFAULT_EGRESS_SETTINGS["probe_timeout"]
+    for key in ("block_seconds", "upstream_cooldown_seconds", "ok_window"):
+        try:
+            settings[key] = max(0, int(settings[key]))
+        except (TypeError, ValueError):
+            settings[key] = DEFAULT_EGRESS_SETTINGS[key]
+    try:
+        settings["fail_threshold"] = min(max(1, int(settings["fail_threshold"])), 20)
+    except (TypeError, ValueError):
+        settings["fail_threshold"] = DEFAULT_EGRESS_SETTINGS["fail_threshold"]
+    try:
+        settings["slow_latency_ms"] = max(0.0, float(settings["slow_latency_ms"]))
+    except (TypeError, ValueError):
+        settings["slow_latency_ms"] = DEFAULT_EGRESS_SETTINGS["slow_latency_ms"]
+    url = settings["probe_url"]
+    try:
+        parsed = urllib.parse.urlsplit(str(url))
+        sane = parsed.scheme in ("http", "https") and bool(parsed.hostname)
+    except (TypeError, ValueError):
+        sane = False
+    if not sane:
+        settings["probe_url"] = DEFAULT_EGRESS_SETTINGS["probe_url"]
+    return settings
+
+
+@dataclass(frozen=True)
+class Config:
+    """Immutable snapshot of one validated router.json load.
+
+    The canonical shape for a parsed config (issue #66 C1). ``from_loaded``
+    deep-copies every section so two instances never alias mutable state, and
+    ``to_dict`` returns another fresh copy as the foundation of the save path.
+    Router's module globals remain the mutable runtime table, seeded from this
+    snapshot at load time; this object is never treated as live truth.
+    """
+    port: int
+    providers: dict[str, Any]
+    routes: list[dict[str, Any]]
+    vpn: dict[str, Any]
+    routing: dict[str, Any]
+    autodetect: dict[str, Any]
+    egress_settings: dict[str, Any]
+    rotation: dict[str, Any]
+    error_policy: dict[str, Any]
+    proxy_bypass_domains: list[str]
+
+    @classmethod
+    def from_loaded(cls, *, port: int, providers: dict, routes: list, vpn: dict,
+                    routing: dict, autodetect: dict, egress_settings: dict,
+                    rotation: dict, error_policy: dict,
+                    proxy_bypass_domains: list) -> "Config":
+        return cls(
+            port=port,
+            providers=deepcopy(providers),
+            routes=deepcopy(routes),
+            vpn=deepcopy(vpn),
+            routing=deepcopy(routing),
+            autodetect=deepcopy(autodetect),
+            egress_settings=deepcopy(egress_settings),
+            rotation=deepcopy(rotation),
+            error_policy=deepcopy(error_policy),
+            proxy_bypass_domains=deepcopy(proxy_bypass_domains),
+        )
+
+    def runtime_view(self) -> tuple:
+        """Fresh deep copies for router's mutable runtime globals, so later
+        in-place writes never reach this snapshot."""
+        return (
+            self.port, deepcopy(self.providers), deepcopy(self.routes),
+            deepcopy(self.vpn), deepcopy(self.routing),
+            deepcopy(self.autodetect), list(self.proxy_bypass_domains),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a fresh deep copy as a canonical serializable snapshot."""
+        return {
+            "port": self.port,
+            "providers": deepcopy(self.providers),
+            "routes": deepcopy(self.routes),
+            "vpn": deepcopy(self.vpn),
+            "routing": deepcopy(self.routing),
+            "autodetect": deepcopy(self.autodetect),
+            "egress_settings": deepcopy(self.egress_settings),
+            "rotation": deepcopy(self.rotation),
+            "error_policy": deepcopy(self.error_policy),
+            "proxy_bypass_domains": deepcopy(self.proxy_bypass_domains),
+        }
