@@ -8,6 +8,8 @@ so `import router` callers keep working during the #66 migration.
 from __future__ import annotations
 
 import configparser
+import socket
+import threading
 import re
 from pathlib import Path
 
@@ -51,3 +53,53 @@ def dns_server_for(profile: Path) -> str:
     if dns.startswith("10.") or dns.lower().startswith("2a07:b944:"):
         return "1.1.1.1"
     return dns or "1.1.1.1"
+
+
+def _capture_domain_name(value: object) -> str | None:
+    """Normalize one route target for destination-IP capture."""
+    if not isinstance(value, str):
+        return None
+    domain = value.strip().lower().rstrip(".")
+    while domain.startswith("*."):
+        domain = domain[2:]
+    return domain or None
+
+
+def _bounded_getaddrinfo(host: str, port: int, timeout: float) -> list[str] | None:
+    """Resolve ``host`` on a daemon worker so a broken resolver can never
+    stall the check (mirrors resolve_host's bounded pattern). None on
+    failure/timeout."""
+    resolved: list[str] = []
+
+    def _resolve() -> None:
+        try:
+            infos = socket.getaddrinfo(host, port, socket.AF_UNSPEC)
+        except (socket.gaierror, OSError, RuntimeError):
+            return
+        for info in infos:
+            resolved.append(info[4][0])
+
+    worker = threading.Thread(target=_resolve, name=f"dnscheck-{host}", daemon=True)
+    worker.start()
+    worker.join(timeout=timeout)
+    return resolved or None
+
+
+def _vpn_list_intersection(domains, vpn_domains) -> list[str]:
+    """Route domains narrowed to the vpn-list intersection, narrowest wins.
+
+    A route domain already inside the list keeps itself; a list entry that is
+    a subdomain of the route domain is emitted instead. Disjoint pairs drop.
+    """
+    out: list[str] = []
+    for domain in domains:
+        for vpn in sorted(vpn_domains):
+            if domain == vpn or domain.endswith("." + vpn):
+                candidate = domain
+            elif vpn.endswith("." + domain):
+                candidate = vpn
+            else:
+                continue
+            if candidate not in out:
+                out.append(candidate)
+    return out

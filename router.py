@@ -51,7 +51,7 @@ import egress
 import net_safety
 import provider_lifecycle
 import state
-from singbox import _bad_endpoint, dns_server_for, parse_endpoint
+from singbox import _bad_endpoint, _bounded_getaddrinfo, _capture_domain_name, dns_server_for, parse_endpoint, _vpn_list_intersection
 import status_snapshot
 from providers_check import provider_config_errors as _provider_config_errors
 from config_schema import (
@@ -2152,25 +2152,6 @@ def _dns_error_markers(text: str) -> bool:
     return egress.dns_error_markers(text)
 
 
-def _bounded_getaddrinfo(host: str, port: int, timeout: float) -> list[str] | None:
-    """Resolve ``host`` on a daemon worker so a broken resolver can never
-    stall the check (mirrors resolve_host's bounded pattern). None on
-    failure/timeout."""
-    resolved: list[str] = []
-
-    def _resolve() -> None:
-        try:
-            infos = socket.getaddrinfo(host, port, socket.AF_UNSPEC)
-        except (socket.gaierror, OSError, RuntimeError):
-            return
-        for info in infos:
-            resolved.append(info[4][0])
-
-    worker = threading.Thread(target=_resolve, name=f"dnscheck-{host}", daemon=True)
-    worker.start()
-    worker.join(timeout=timeout)
-    return resolved or None
-
 
 def egress_dns_probe(host: str, *, port: int | None = None, timeout: float | None = None,
                      opener=None) -> bool | None:
@@ -2862,25 +2843,6 @@ def _effective_vpn_domains(routing: dict | None = None) -> frozenset[str]:
     return frozenset(domains)
 
 
-def _vpn_list_intersection(domains, vpn_domains) -> list[str]:
-    """Route domains narrowed to the vpn-list intersection, narrowest wins.
-
-    A route domain already inside the list keeps itself; a list entry that is
-    a subdomain of the route domain is emitted instead. Disjoint pairs drop.
-    """
-    out: list[str] = []
-    for domain in domains:
-        for vpn in sorted(vpn_domains):
-            if domain == vpn or domain.endswith("." + vpn):
-                candidate = domain
-            elif vpn.endswith("." + domain):
-                candidate = vpn
-            else:
-                continue
-            if candidate not in out:
-                out.append(candidate)
-    return out
-
 
 def _routes_with_autodetected_domains(routes: list[dict]) -> list[dict]:
     if not _autodetect.get("enabled"):
@@ -2961,15 +2923,6 @@ def _routes_by_health_order(routes: list[dict], selected: dict[str, Path]) -> li
         key=lambda route: ranks.get(_effective_route_provider(route.get("provider", "")), (1, float("inf"))),
     )
 
-
-def _capture_domain_name(value: object) -> str | None:
-    """Normalize one route target for destination-IP capture."""
-    if not isinstance(value, str):
-        return None
-    domain = value.strip().lower().rstrip(".")
-    while domain.startswith("*."):
-        domain = domain[2:]
-    return domain or None
 
 
 def _route_capture_cidrs(routes: list[dict], routing: dict,
