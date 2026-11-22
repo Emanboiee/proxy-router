@@ -34,7 +34,7 @@ TOP_LEVEL_MODULES = (
     "privileged_helper",
     "privileged_installer",
 )
-ROUTER_LINE_CAP = 8285
+ROUTER_LINE_CAP = 8260
 
 
 def _imported_names(path: Path) -> set[str]:
