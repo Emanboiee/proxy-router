@@ -140,3 +140,28 @@ def test_config_schema_has_no_upward_import_after_dns_move():
     source = (ROOT / "config_schema.py").read_text(encoding="utf-8")
     for mod in ("import router", "import proxy_tray", "import monitor", "import route_watcher"):
         assert mod not in source
+
+
+def test_singbox_pure_helpers_reexported_and_behave():
+    import singbox
+    for name in ("_capture_domain_name", "_bounded_getaddrinfo", "_vpn_list_intersection"):
+        assert getattr(config_schema, name, None) is None  # not in config_schema
+    import router
+    for name in ("_capture_domain_name", "_bounded_getaddrinfo", "_vpn_list_intersection"):
+        assert getattr(router, name) is getattr(singbox, name)
+    assert router._capture_domain_name("*.Example.COM.") == "example.com"
+    assert router._capture_domain_name(123) is None
+    assert router._vpn_list_intersection(["a.example", "x.other"], ["example"]) == ["a.example"]
+
+
+def test_singbox_no_upward_import():
+    import ast as _ast
+    tree = _ast.parse((ROOT / "singbox.py").read_text(encoding="utf-8"))
+    imported = set()
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Import):
+            imported.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, _ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+    top = {"router", "monitor", "route_watcher", "setup_tui", "proxy_tray", "egress"}
+    assert not (imported & top), imported & top
