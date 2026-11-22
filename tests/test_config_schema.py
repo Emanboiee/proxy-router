@@ -165,3 +165,20 @@ def test_singbox_no_upward_import():
             imported.add(node.module.split(".")[0])
     top = {"router", "monitor", "route_watcher", "setup_tui", "proxy_tray", "egress"}
     assert not (imported & top), imported & top
+
+
+def test_normalize_reason_reexported_and_behaves():
+    import router
+    assert router._normalize_reason is config_schema.normalize_reason
+    cases = {
+        "HTTP 429 too many": "429",
+        "503 service unavailable": "503",
+        "TLS handshake failed": "tls",
+        "connection refused": "connection",
+        "timed out": "timeout",
+        "weird reason": "weird-reason",
+        "": "default",
+        None: "default",
+    }
+    for value, expected in cases.items():
+        assert router._normalize_reason(value) == expected, (value, router._normalize_reason(value))
