@@ -83,6 +83,25 @@ def runtime_root(source: Path) -> Path:
     return source
 
 
+def normalize_reason(reason) -> str:
+    """Map a failure reason string to the policy key it governs: HTTP status
+    codes (1010/403/429/503) and transport classes (tls/connection/timeout).
+    Unrecognized reasons keep their slugified text so exact-match overrides
+    still work; empty/unknown reasons fall back to ``default``."""
+    text = str(reason or "").lower()
+    for code in ("1010", "403", "429", "503"):
+        if re.search(rf"\b{code}\b", text):
+            return code
+    if any(token in text for token in ("tls", "ssl", "handshake", "certificate")):
+        return "tls"
+    if "timed out" in text or "timeout" in text:
+        return "timeout"
+    if any(token in text for token in ("connection", "refused", "reset", "unreachable", "eof")):
+        return "connection"
+    slug = re.sub(r"[^a-z0-9]+", "-", text).strip("-")
+    return slug or "default"
+
+
 def parse_error_policy(supplied) -> dict:
     """Validate one error-policy table: {reason: {action, seconds}}. Returns
     the cleaned table ({} when absent). Raises ValueError with a precise
