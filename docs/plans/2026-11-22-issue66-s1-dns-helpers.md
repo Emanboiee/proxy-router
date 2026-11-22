@@ -29,10 +29,10 @@ Rejected: moving `_route_capture_cidrs` (needs `_effective_vpn_domains`,
 
 ## Data shape
 No new types. Signatures unchanged; only the module that defines them moves.
-router re-exports all four under their original private names.
+router re-exports all three under their original private names.
 
 ## Verification gate
 - full pytest suite green
 - cap ratcheted down (router.py loses ~48 def lines, gains 1 import)
 - singbox.py remains stdlib-only / no upward import (architecture guard)
-- runtime identity check: router._name is singbox._name for all four
+- runtime identity check: router._name is singbox._name for all three
