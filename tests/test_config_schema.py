@@ -48,3 +48,70 @@ def test_router_status_exposes_schema_version_without_redefining_defaults(tmp_pa
     router_source = (ROOT / "router.py").read_text(encoding="utf-8")
     assert "from config_schema import" in router_source
     assert "DEFAULT_EGRESS_SETTINGS = {" not in router_source
+
+
+def make_config(providers=None, bypass=None):
+    """Build a Config directly via its constructor (all sections required)."""
+    return config_schema.Config(
+        port=2080,
+        providers=providers if providers is not None else {"p": {"directory": "providers/p"}},
+        routes=[{"id": "r", "provider": "p", "domains": ["a.example"]}],
+        vpn={"prefer_ipv6_peers": True},
+        routing={"mode": "default"},
+        autodetect={"enabled": False},
+        egress_settings={"probe_timeout": 8.0},
+        rotation={"policy": "latency"},
+        error_policy={"default": {"action": "cooldown", "seconds": 300}},
+        proxy_bypass_domains=bypass if bypass is not None else ["localhost"],
+    )
+
+
+def test_config_is_frozen():
+    cfg = make_config()
+    try:
+        cfg.port = 9999
+    except Exception as exc:
+        assert type(exc).__name__ in ("FrozenInstanceError", "AttributeError")
+    else:
+        raise AssertionError("Config must be immutable")
+
+
+def test_two_configs_never_share_mutable_state():
+    a = make_config(providers={"p": {"v": [1]}}, bypass=[" x "])
+    b = config_schema.Config.from_loaded(
+        port=a.port, providers=a.providers, routes=a.routes, vpn=a.vpn,
+        routing=a.routing, autodetect=a.autodetect,
+        egress_settings=a.egress_settings, rotation=a.rotation,
+        error_policy=a.error_policy, proxy_bypass_domains=a.proxy_bypass_domains,
+    )
+    a.providers["p"]["v"].append(2)
+    a.routes[0]["domains"].append("b.example")
+    assert b.providers["p"]["v"] == [1]
+    assert b.routes[0]["domains"] == ["a.example"]
+
+
+def test_config_to_dict_returns_fresh_copy():
+    cfg = make_config()
+    out = cfg.to_dict()
+    out["providers"]["p"]["directory"] = "MUTATED"
+    out["routes"].append({})
+    assert cfg.providers["p"]["directory"] == "providers/p"
+    assert len(cfg.routes) == 1
+
+
+def test_parse_egress_settings_is_pure_and_bounded():
+    supplied = {"probe_timeout": 999, "block_seconds": -5, "probe_url": "bad"}
+    out = config_schema.parse_egress_settings({"egress": supplied})
+    assert out["probe_timeout"] == 60.0
+    assert out["block_seconds"] == 0
+    assert out["probe_url"] == config_schema.DEFAULT_PROBE_URL
+    assert "egress" not in supplied  # input untouched: pure
+
+
+def test_config_runtime_view_is_isolated_from_snapshot():
+    cfg = make_config(providers={"p": {"v": [1]}})
+    (port, providers, routes, vpn, routing, autodetect, bypass) = cfg.runtime_view()
+    providers["p"]["v"].append(2)
+    routes[0]["domains"].append("b.example")
+    assert cfg.providers["p"]["v"] == [1]
+    assert cfg.routes[0]["domains"] == ["a.example"]
