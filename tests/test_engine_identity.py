@@ -22,7 +22,6 @@ class ExpectedCommandTests(unittest.TestCase):
 class ArgvCacheTests(unittest.TestCase):
     def setUp(self):
         engine._argv_cache = None
-        engine._argv_cache_source = None
 
     def test_none_command_returns_none(self):
         self.assertIsNone(engine.expected_engine_argv(None))
@@ -45,10 +44,13 @@ class ArgvCacheTests(unittest.TestCase):
         self.assertEqual(a, ["/a", "run", "-c", "/x"])
         self.assertEqual(b, ["/b", "run", "-c", "/y"])
 
-    def test_invalid_quote_returns_none_and_keeps_source(self):
+    def test_invalid_quote_returns_none_and_keeps_valid_cache(self):
+        valid = "/a run -c /x"
+        self.assertEqual(engine.expected_engine_argv(valid), ["/a", "run", "-c", "/x"])
+        # A bad command returns None and must NOT poison the valid cache entry.
         self.assertIsNone(engine.expected_engine_argv('/a "unterminated'))
-        # source unchanged after ValueError, so the previous valid cache survives
-        self.assertIsNone(engine._argv_cache_source)
+        self.assertEqual(engine._argv_cache, (valid, ("/a", "run", "-c", "/x")))
+        self.assertEqual(engine.expected_engine_argv(valid), ["/a", "run", "-c", "/x"])
 
 
 class CommandIsOurEngineTests(unittest.TestCase):
