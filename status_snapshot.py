@@ -51,6 +51,9 @@ def build_status_snapshot(namespace: dict, *, fast: bool = False) -> dict:
     rc, line = router._status_report(fast=fast)
     data = {"up": rc == 0, "state": line, "mode": router.current_mode(), "port": router._port,
             "sing_box": router.resolve_sing_box(), "schema_version": router.SCHEMA_VERSION}
+    # status_json must stay socket-free: derive listener presence from the
+    # state line _status_report already produced, never re-probe the port.
+    data["proxy_listener"] = line.startswith("up (proxy") or line.startswith("proxy listener answering")
     # Local settings inspection is read-only and does not perform a network
     # probe. Keep engine liveness separate from proxy readiness so a listener
     # alone cannot make the tray claim that GUI traffic is connected.
