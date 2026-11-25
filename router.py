@@ -47,7 +47,9 @@ from typing import Any
 import config_schema
 import domain_autodetect
 import engine
-import autodetect_refresh
+import probe_paths
+import provider_upstream
+
 import egress
 import net_safety
 import provider_lifecycle
@@ -80,6 +82,8 @@ def _effective_uid() -> int:
     """Return the effective uid where the platform exposes POSIX ids."""
     getter = getattr(os, "geteuid", None)
     return int(getter()) if getter is not None else -1
+
+
 
 ROOT = runtime_root(Path(__file__).resolve().parent.resolve())
 CONFIG_FILE = ROOT / "router.json"
@@ -265,9 +269,15 @@ _PROVIDER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 # loopback and public answers over time). The upstream port must never equal
 # the router's own listener port (proxy loop).
 _PROXY_PROFILE_STEM = "socks"
+
 _LOCAL_PROXY_BYPASS = ["*.local", "localhost", "127.0.0.1", "::1"]
 _TAILSCALE_DOMAINS = ["tailscale.com", "tailscale.io", "ts.net"]
 _TAILSCALE_CIDRS = ["100.64.0.0/10", "fd7a:115c:a1e0::/48"]
+PROBE_PORT_BASE = probe_paths.PROBE_PORT_BASE
+
+
+def probe_port(name: str) -> int | None:
+    return probe_paths.probe_port(_providers, name, _port)
 
 
 def is_proxy_provider(name: str) -> bool:
@@ -3047,18 +3057,10 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
         active[name] = endpoint
         selected[name] = profile
 
-    # DNS resolution must NOT ride the tunnel: a WireGuard blip would then
-    # take down resolution for the very request we're trying to route, which
-    # surfaces as "Connection error" storms upstream. DNS queries go out the
-    # direct physical path (no detour; sing-box 1.13 rejects detouring a DNS
-    # server to the "direct" outbound with "empty direct outbound" at start).
-    # The resolved IP still gets dialed through the provider's endpoint
-    # outbound, so the destination traffic stays provider-routed.
-    # Deduplicate identical resolvers: multiple providers commonly share the
-    # same DNS (e.g. every Proton profile pins 1.1.1.1). One server entry per
-    # distinct (type, server, port) keeps sing-box's connection pool warm in
-    # ONE session instead of fragmenting into N identical DoH handshakes;
-    # per-provider tags become aliases resolved to the shared entry.
+    # DNS stays on the direct path: a tunnel blip must not break resolution,
+    # and sing-box 1.13 rejects DNS detoured to a direct outbound. The resolved
+    # IP still dials through the provider. Dedupe identical resolvers so one
+    # server entry keeps the connection pool warm; provider tags alias it.
     def _dns_entry(tag: str, name: str) -> dict:
         return {
             "type": dns_transport(),
@@ -3101,6 +3103,11 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
             "server_port": upstream_port,
             "version": "5",
         })
+    probe_inbounds, probe_rules = probe_paths.build_probe_objects(
+        _providers, _port, is_tun=current_mode() == "tun", is_parked=active_fallback,
+        is_proxy=is_proxy_provider, proxy_upstream=proxy_upstream,
+        usable_profile=_usable_profile, parse_wg=parse_wireguard,
+        active=active, proxy_outbounds=proxy_outbounds)
     # sing-box 1.12+: any dial without an explicit resolver needs
     # route.default_domain_resolver; the system (local) transport keeps
     # non-routed domains away from the tunnels and silences the deprecated
@@ -3115,10 +3122,8 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
         dns_servers.append(entry)
     routing = routing_state()
     routing_mode = routing["mode"]
-    # health_order: emit provider rules in egress-health order instead of
-    # pure route-table order, so a healthy lane leads shared domains and a
-    # degraded one trails (or drops out) without manual reorders. Falls back
-    # to the configured route order when the flag is off.
+    # health_order leads healthy lanes and trails degraded ones; falls back
+    # to configured route order when off.
     routed_domains = _routes_with_autodetected_domains(_routes)
     if routing.get("health_order") and selected:
         build_routes = _routes_by_health_order(routed_domains, selected)
@@ -3325,6 +3330,8 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
     else:
         inbounds = [{"type": "mixed", "tag": "local-proxy", "listen": "127.0.0.1", "listen_port": _port}]
         route_final = "direct"
+    inbounds.extend(probe_inbounds)
+    rules[:0] = probe_rules
 
     if routing_mode == "safe-list":
         # route.final must be a live outbound tag: everything not pinned
