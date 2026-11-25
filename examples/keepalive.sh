@@ -151,6 +151,7 @@ pairs = {
  "max_rotations": num(k.get("max_rotations", 2), 2, 1),
  "sweep_every": num(k.get("sweep_every", 1800), 1800, 1, allow_zero=True),
  "fallback_restore_every": num(k.get("fallback_restore_every", 300), 300, 1),
+ "network_diagnostic_every": num(k.get("network_diagnostic_every", 240), 240, 30, allow_zero=True),
  "network_grace": num(k.get("network_grace", 1), 1, 1),
  # wake_gap's default is computed in shell from INTERVAL; omit when absent
  # so cached_setting() falls back to the caller's $WAKE_GAP_DEFAULT.
@@ -204,6 +205,7 @@ STORM_WINDOW="${PROXY_KEEPALIVE_STORM_WINDOW:-$(config_setting storm_window 600)
 MAX_ROTATIONS="${PROXY_KEEPALIVE_MAX_ROTATIONS:-$(config_setting max_rotations 2)}"
 SWEEP_EVERY="${PROXY_KEEPALIVE_SWEEP_EVERY:-$(config_setting sweep_every 1800)}"
 FALLBACK_RESTORE_EVERY="${PROXY_KEEPALIVE_FALLBACK_RESTORE_EVERY:-$(config_setting fallback_restore_every 300)}"
+NETWORK_DIAGNOSTIC_EVERY="${PROXY_KEEPALIVE_NETWORK_DIAGNOSTIC_EVERY:-$(config_setting network_diagnostic_every 240)}"
 NETWORK_GRACE="${PROXY_KEEPALIVE_NETWORK_GRACE:-$(config_setting network_grace 1)}"
 AUTODETECT_ENABLED="${PROXY_AUTODETECT_ENABLED:-$(autodetect_setting enabled 0)}"
 AUTODETECT_INTERVAL="${PROXY_AUTODETECT_INTERVAL:-$(autodetect_setting interval_seconds 300)}"
@@ -232,6 +234,7 @@ window_start=0
 last_sweep=0
 last_restore=0
 last_autodetect=0
+last_diagnostic=0
 network_lost=0
 network_quiet=0
 last_tick=0
@@ -731,6 +734,16 @@ ENABLED="${PROXY_KEEPALIVE_ENABLED:-$(config_setting enabled 1)}"
           echo "router: scheduled rotation: rotated provider(s)" >&2
         fi
       fi
+    fi
+    # Dashboard network diagnostic (#177): doctor --network is read-only and
+    # writes a timestamped cached record that status --json --fast consumes.
+    # The tray refuses "connected" on stale health, so refresh on a cadence
+    # shorter than NETWORK_DIAGNOSTIC_MAX_AGE_SECONDS (300s). 0 disables.
+    diagnostic_now=$(date +%s)
+    if [ "$NETWORK_DIAGNOSTIC_EVERY" -gt 0 ] \
+       && { [ "$last_diagnostic" -eq 0 ] || [ $((diagnostic_now - last_diagnostic)) -ge "$NETWORK_DIAGNOSTIC_EVERY" ]; }; then
+      controller doctor --network >/dev/null 2>&1 || true
+      last_diagnostic="$diagnostic_now"
     fi
     autodetect_now=$(date +%s)
     if [ "$AUTODETECT_ENABLED" != "0" ] && ! is_tun_mode \
