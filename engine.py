@@ -26,8 +26,9 @@ class EngineIdentityError(RuntimeError):
 
 # Cache keyed by the full command string: relocation or a patched resolver
 # changes the key, so no stale argv can be served (design B, arena-verified).
-_argv_cache: list[str] | None = None
-_argv_cache_source: str | None = None
+# Stored as ONE atomic tuple so concurrent readers can never observe a new
+# argv paired with the old source key (Codex PR2 audit P2).
+_argv_cache: tuple[str, tuple[str, ...]] | None = None
 
 
 def expected_engine_command(resolve: Callable[[], str | None],
@@ -41,16 +42,18 @@ def expected_engine_command(resolve: Callable[[], str | None],
 
 def expected_engine_argv(command: str | None) -> list[str] | None:
     """``expected_engine_command()`` split once, not per process-table row."""
-    global _argv_cache, _argv_cache_source
+    global _argv_cache
     if command is None:
         return None
-    if _argv_cache_source != command:
+    cached = _argv_cache
+    if cached is None or cached[0] != command:
         try:
-            _argv_cache = shlex.split(command)
+            argv = tuple(shlex.split(command))
         except ValueError:
             return None
-        _argv_cache_source = command
-    return _argv_cache
+        _argv_cache = (command, argv)  # one atomic assignment
+        return list(argv)
+    return list(cached[1])
 
 
 def command_is_our_engine(cmd: str, expected_argv: list[str] | None) -> bool:
@@ -118,6 +121,10 @@ def pid_matches(pid: int, expected_command: str | None,
     if expected_command is None:
         return False
     try:
+        pid = int(pid)  # reject/normalize before any PowerShell interpolation
+    except (TypeError, ValueError):
+        return False
+    try:
         if os.name == "nt":
             # Windows helper lifecycle is authoritative; this fallback remains
             # conservative and requires the configured path in the command line.
@@ -143,6 +150,10 @@ def pid_matches(pid: int, expected_command: str | None,
 
 def terminate_pid(pid: int, matches: Callable[[int], bool]) -> bool:
     """Terminate one PID after verifying its exact engine identity."""
+    try:
+        pid = int(pid)  # normalize before any subprocess/PowerShell use
+    except (TypeError, ValueError):
+        return False
     if not matches(pid):
         return False
     try:

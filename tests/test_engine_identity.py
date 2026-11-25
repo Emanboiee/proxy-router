@@ -22,7 +22,6 @@ class ExpectedCommandTests(unittest.TestCase):
 class ArgvCacheTests(unittest.TestCase):
     def setUp(self):
         engine._argv_cache = None
-        engine._argv_cache_source = None
 
     def test_none_command_returns_none(self):
         self.assertIsNone(engine.expected_engine_argv(None))
@@ -33,11 +32,11 @@ class ArgvCacheTests(unittest.TestCase):
             ["/opt/bin/sing-box", "run", "-c", "/root/sing-box.json"],
         )
 
-    def test_cache_hit_returns_same_object(self):
+    def test_cache_hit_returns_same_value(self):
         cmd = "/opt/bin/sing-box run -c /root/sing-box.json"
         first = engine.expected_engine_argv(cmd)
         second = engine.expected_engine_argv(cmd)
-        self.assertIs(first, second)
+        self.assertEqual(first, second)
 
     def test_new_command_invalidates_cache(self):
         a = engine.expected_engine_argv("/a run -c /x")
@@ -45,10 +44,13 @@ class ArgvCacheTests(unittest.TestCase):
         self.assertEqual(a, ["/a", "run", "-c", "/x"])
         self.assertEqual(b, ["/b", "run", "-c", "/y"])
 
-    def test_invalid_quote_returns_none_and_keeps_source(self):
+    def test_invalid_quote_returns_none_and_keeps_valid_cache(self):
+        valid = "/a run -c /x"
+        self.assertEqual(engine.expected_engine_argv(valid), ["/a", "run", "-c", "/x"])
+        # A bad command returns None and must NOT poison the valid cache entry.
         self.assertIsNone(engine.expected_engine_argv('/a "unterminated'))
-        # source unchanged after ValueError, so the previous valid cache survives
-        self.assertIsNone(engine._argv_cache_source)
+        self.assertEqual(engine._argv_cache, (valid, ("/a", "run", "-c", "/x")))
+        self.assertEqual(engine.expected_engine_argv(valid), ["/a", "run", "-c", "/x"])
 
 
 class CommandIsOurEngineTests(unittest.TestCase):
@@ -97,6 +99,10 @@ class FindPidsTests(unittest.TestCase):
 class PidMatchesTests(unittest.TestCase):
     def test_none_command_false(self):
         self.assertFalse(engine.pid_matches(4242, None, lambda c: True))
+
+    def test_string_pid_injection_rejected(self):
+        # A str pid must never reach PowerShell interpolation.
+        self.assertFalse(engine.pid_matches("1); Write-Output INJECTED; (Get-Process", "/a run -c /x", lambda c: True))
 
     def test_linux_exact(self):
         with mock.patch.object(engine.subprocess, "run",

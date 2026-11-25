@@ -46,6 +46,7 @@ from typing import Any
 
 import config_schema
 import domain_autodetect
+import engine
 import autodetect_refresh
 import egress
 import net_safety
@@ -3508,32 +3509,8 @@ def _any_our_engine_running() -> bool:
 
 
 def _pid_matches(pid: int) -> bool:
-    """True when PID is the exact resolved engine command line."""
-    expected = _expected_engine_command()
-    if expected is None:
-        return False
-    try:
-        if os.name == "nt":
-            # Windows helper lifecycle is authoritative; this fallback remains
-            # conservative and requires the configured path in the command line.
-            out = subprocess.run(
-                ["powershell", "-NoProfile", "-Command",
-                 f"(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine"],
-                capture_output=True, text=True, timeout=5,
-            ).stdout.strip()
-            return bool(out) and _command_is_our_engine(out)
-        result = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "uid=,command="],
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    if result.returncode != 0:
-        return False
-    parts = (result.stdout or "").strip().split(None, 1)
-    return len(parts) == 2 and parts[0].isdigit() and _command_is_our_engine(parts[1])
+    """True when PID is the exact resolved engine command line (delegates to engine)."""
+    return engine.pid_matches(pid, _expected_engine_command(), _command_is_our_engine)
 
 
 def engine_alive(*, skip_helper: bool = False) -> bool:
@@ -4164,122 +4141,32 @@ def engine_ensure(*, allow_network_off: bool = False) -> int:
     return rc
 
 
-class EngineIdentityError(RuntimeError):
-    """The process table could not prove engine identity safely."""
+EngineIdentityError = engine.EngineIdentityError
 
 
 def _expected_engine_command() -> str | None:
-    """Return the exact command line emitted by ``engine_start``."""
-    binary = resolve_sing_box()
-    if binary is None:
-        return None
-    return f"{binary} run -c {SING_BOX_CONFIG}"
-
-
-_expected_engine_argv_cache: list[str] | None = None
-_expected_engine_argv_source: str | None = None
+    """Return the exact command line emitted by ``engine_start`` (delegates to engine)."""
+    return engine.expected_engine_command(resolve_sing_box, SING_BOX_CONFIG)
 
 
 def _expected_engine_argv() -> list[str] | None:
-    """``_expected_engine_command()`` split once, not per process-table row."""
-    global _expected_engine_argv_cache, _expected_engine_argv_source
-    expected = _expected_engine_command()
-    if expected is None:
-        return None
-    if _expected_engine_argv_source != expected:
-        try:
-            _expected_engine_argv_cache = shlex.split(expected)
-        except ValueError:
-            return None
-        _expected_engine_argv_source = expected
-    return _expected_engine_argv_cache
+    """Split the expected command once (cache owned by engine.py)."""
+    return engine.expected_engine_argv(_expected_engine_command())
 
 
 def _command_is_our_engine(cmd: str) -> bool:
-    """Return true only for the exact resolved binary/argv command line."""
-    expected_argv = _expected_engine_argv()
-    if not expected_argv:
-        return False
-    try:
-        return shlex.split(str(cmd).strip()) == expected_argv
-    except ValueError:
-        return False
+    """Return true only for the exact resolved engine argv (delegates to engine)."""
+    return engine.command_is_our_engine(cmd, _expected_engine_argv())
 
 
 def _find_our_engine_pids() -> list[int]:
-    """Find exact engine processes, including root-owned orphan candidates.
-
-    The PID file is bookkeeping, not identity.  This scan is deliberately
-    fail-closed: an unavailable process table cannot be treated as proof that
-    no owned engine exists.
-    """
-    expected_argv = _expected_engine_argv()
-    if not expected_argv:
-        raise EngineIdentityError("sing-box binary is unavailable; engine identity is unknown")
-    engine_binary = expected_argv[0]
-    if os.name == "nt":
-        # The privileged helper owns Windows lifecycle in supported installs;
-        # retain a conservative no-result path for the cross-platform CLI.
-        raise EngineIdentityError("exact orphan scan is unavailable on Windows")
-    try:
-        result = subprocess.run(
-            ["ps", "-axo", "pid=,uid=,command="],
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise EngineIdentityError(f"cannot scan engine processes: {exc}") from exc
-    if result.returncode != 0:
-        raise EngineIdentityError("cannot scan engine processes")
-    raw_engine_binary = resolve_sing_box() or ""
-    pids: list[int] = []
-    for line in (result.stdout or "").splitlines():
-        parts = line.strip().split(None, 2)
-        if len(parts) != 3:
-            continue
-        try:
-            pid = int(parts[0])
-            int(parts[1])  # Parse UID as part of the authenticated row.
-        except ValueError:
-            continue
-        # Cheap prefilter: only a row carrying the normalized or raw binary
-        # can match, so unrelated rows skip shlex entirely.
-        if engine_binary not in parts[2] and not (
-            raw_engine_binary and raw_engine_binary in parts[2]
-        ):
-            continue
-        if pid > 1 and _command_is_our_engine(parts[2]):
-            pids.append(pid)
-    return sorted(set(pids))
+    """Find exact engine processes, including root-owned orphans (delegates to engine)."""
+    return engine.find_our_engine_pids(_expected_engine_argv(), resolve_sing_box, _command_is_our_engine)
 
 
 def _terminate_pid(pid: int) -> bool:
-    """Terminate one PID after verifying its exact engine identity."""
-    if not _pid_matches(pid):
-        return False
-    try:
-        if os.name == "nt":
-            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
-            return True
-        os.kill(pid, signal.SIGTERM)
-        grace_deadline = time.monotonic() + 0.4
-        while time.monotonic() < grace_deadline:
-            if not _pid_matches(pid):
-                break
-            time.sleep(0.02)
-        if _pid_matches(pid):
-            os.kill(pid, signal.SIGKILL)
-            kill_deadline = time.monotonic() + 0.5
-            while time.monotonic() < kill_deadline:
-                if not _pid_matches(pid):
-                    break
-                time.sleep(0.02)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        raise
+    """Terminate one PID after verifying identity (delegates to engine)."""
+    return engine.terminate_pid(pid, _pid_matches)
 
 
 def engine_stop() -> int:
