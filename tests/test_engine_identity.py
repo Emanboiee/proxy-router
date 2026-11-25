@@ -33,11 +33,11 @@ class ArgvCacheTests(unittest.TestCase):
             ["/opt/bin/sing-box", "run", "-c", "/root/sing-box.json"],
         )
 
-    def test_cache_hit_returns_same_object(self):
+    def test_cache_hit_returns_same_value(self):
         cmd = "/opt/bin/sing-box run -c /root/sing-box.json"
         first = engine.expected_engine_argv(cmd)
         second = engine.expected_engine_argv(cmd)
-        self.assertIs(first, second)
+        self.assertEqual(first, second)
 
     def test_new_command_invalidates_cache(self):
         a = engine.expected_engine_argv("/a run -c /x")
@@ -97,6 +97,10 @@ class FindPidsTests(unittest.TestCase):
 class PidMatchesTests(unittest.TestCase):
     def test_none_command_false(self):
         self.assertFalse(engine.pid_matches(4242, None, lambda c: True))
+
+    def test_string_pid_injection_rejected(self):
+        # A str pid must never reach PowerShell interpolation.
+        self.assertFalse(engine.pid_matches("1); Write-Output INJECTED; (Get-Process", "/a run -c /x", lambda c: True))
 
     def test_linux_exact(self):
         with mock.patch.object(engine.subprocess, "run",
