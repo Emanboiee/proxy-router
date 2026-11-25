@@ -15,6 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 LEAF_MODULES = (
+    "engine.py",
     "singbox.py",
     "state.py",
     "egress.py",
