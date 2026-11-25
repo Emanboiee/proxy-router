@@ -5407,9 +5407,9 @@ def _status_report(*, fast: bool = False) -> tuple[int, str]:
             suffix += "; DEGRADED: " + ", ".join(degraded)
         return 0, "up (proxy 127.0.0.1:{}{})".format(_port, suffix)
     if listener_up():
-        # F1: something answers the port but it is not our engine (stale pid
-        # file or a recycled/foreign process); never report that as up.
-        return 1, "down (foreign listener on 127.0.0.1:{}; run 'start')".format(_port)
+        # F1/#177: never claim a foreign process is OUR engine (rc stays 1),
+        # but a listener that answers is not "down"; status_json carries the flag.
+        return 1, "proxy listener answering on 127.0.0.1:{} (not our engine; run 'start')".format(_port)
     return 1, "down (proxy mode; run 'vpn on' for tun, 'start' for proxy)"
 
 

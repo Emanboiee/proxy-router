@@ -366,7 +366,15 @@ pub fn connection_state(status: &Value) -> &'static str {
     }
     let up = status.get("up").and_then(Value::as_bool).unwrap_or(false);
     if !up {
-        return "disconnected";
+        // A foreign process answering the proxy port is not OUR healthy engine
+        // (up stays false), but it is not "disconnected" either — the listener
+        // is reachable. Surface the existing "degraded" tray state so the UI
+        // stops claiming nothing is there while traffic actually flows.
+        let listener = status
+            .get("proxy_listener")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        return if listener { "degraded" } else { "disconnected" };
     }
     let degraded_lanes = status
         .get("degraded_lanes")
@@ -489,6 +497,18 @@ mod tests {
     fn tunnel_down_is_disconnected() {
         let status = json!({"up": false, "mode": "proxy", "error": null});
         assert_eq!(connection_state(&status), "disconnected");
+    }
+
+    #[test]
+    fn listening_foreign_engine_is_degraded_not_disconnected() {
+        let status = json!({
+            "up": false,
+            "mode": "proxy",
+            "error": null,
+            "proxy_listener": true,
+            "state": "proxy listener answering on 127.0.0.1:2080 (not our engine)"
+        });
+        assert_eq!(connection_state(&status), "degraded");
     }
 
     #[test]
