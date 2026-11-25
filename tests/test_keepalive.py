@@ -553,7 +553,8 @@ class KeepaliveEgressCheckTests(unittest.TestCase):
             ticks = [line for i, line in enumerate(lines)
                      if i not in restore_probes
                      and line not in {"network-status", "network-status --json",
-                                      "rotate --if-due", "egress sweep --json"}]
+                                      "rotate --if-due", "egress sweep --json",
+                                      "doctor --network"}]
             check_lines = [i for i, line in enumerate(ticks) if line == "egress check"]
             gaps = [b - a for a, b in zip(check_lines, check_lines[1:])]
             # every PROBE_EVERY ensures triggers a check; log distance is
