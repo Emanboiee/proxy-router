@@ -60,6 +60,28 @@ class ReleaseBundleSourceTests(unittest.TestCase):
             self.assertIn(name, powershell)
 
 
+    def test_every_manifest_named_module_exists_in_checkout(self):
+        """A manifest entry for an untracked/missing file must fail the gate.
+
+        The derived-import test only covers files that already exist, so a
+        manifest referencing a file nobody committed used to pass silently
+        (#274). Assert the reverse direction for every manifest.
+        """
+        manifests = {
+            "assemble-release-bundle.sh": ASSEMBLY_HELPER.read_text(),
+            "install.sh": (ROOT / "install.sh").read_text(),
+            "install.ps1": (ROOT / "install.ps1").read_text(),
+        }
+        for label, text in manifests.items():
+            names = re.findall(r"\b([A-Za-z_][A-Za-z0-9_-]*\.py)\b", text)
+            for name in sorted(set(names)):
+                if (ROOT / "tests" / name).is_file():
+                    continue
+                self.assertTrue(
+                    (ROOT / name).is_file(),
+                    f"{label} copies {name} but it is missing from the checkout",
+                )
+
     def test_every_locally_imported_module_is_listed_by_every_manifest(self):
         """Derive the runtime module set from the code, not a hand-kept list.
 
