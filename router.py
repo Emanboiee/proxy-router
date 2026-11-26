@@ -48,6 +48,7 @@ import config_schema
 import domain_autodetect
 import engine
 import autodetect_refresh
+import provider_upstream
 import egress
 import net_safety
 import provider_lifecycle
@@ -307,12 +308,7 @@ def proxy_upstream(name: str) -> tuple[str, int]:
 
 
 def proxy_profile_key(name: str) -> Path:
-    """Synthetic egress/cooldown key for a proxy-backed provider.
-
-    The health machinery (records, cooldowns, blocks) is keyed by profile
-    stem; a SOCKS5 upstream has no *.conf, so it reuses one fixed stem that
-    satisfies the _PROVIDER_NAME traversal guard."""
-    return Path(f"{_PROXY_PROFILE_STEM}.conf")
+    return provider_upstream.proxy_profile_key(_PROXY_PROFILE_STEM)
 
 
 def provider_has_valid_exit(name: str) -> bool:
@@ -331,18 +327,20 @@ def provider_has_valid_exit(name: str) -> bool:
 
 
 def active_proxy_providers() -> dict[str, tuple[str, int]]:
-    """Validated proxy-backed providers that are live in the current build.
-
-    A provider under an active fallback is parked (its routes follow the
-    fallback target), mirroring the WireGuard path in build_singbox_config."""
+    """Validated, live proxy providers (strict upstreams must answer)."""
     live: dict[str, tuple[str, int]] = {}
     for name in _providers:
         if not is_proxy_provider(name) or active_fallback(name):
             continue
         try:
-            live[name] = proxy_upstream(name)
+            upstream = proxy_upstream(name)
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
+        entry = _providers.get(name)
+        required = isinstance(entry, dict) and entry.get("upstream_required")
+        if not required or provider_upstream.reachable(
+                name, _providers, ROOT, _atomic_write, proxy_upstream):
+            live[name] = upstream
     return live
 
 
@@ -374,9 +372,7 @@ def _tun_proxy_blockers(build_routes: list[dict], routing: dict,
     return blockers
 
 
-def fail(message: str) -> int:
-    print(f"router: {message}", file=sys.stderr)
-    return 1
+fail = provider_upstream.fail
 
 
 def current_mode() -> str:
@@ -1639,11 +1635,7 @@ def response_provider_for_host(host: str) -> str | None:
     from model_relay import route_provider
     return route_provider(globals(), host)
 
-
-def _response_event_marker(provider: str) -> Path:
-    return ROOT / "state" / "response-events" / f"{provider}.json"
-
-
+_response_event_marker = lambda provider: provider_upstream.response_event_marker(ROOT, provider)
 # Real-traffic stall reasons accepted by response-event --reason. These are
 # the failures small egress probes cannot see: an exit that answers probes
 # yet throttles long streams. Each flows through the error-policy table
@@ -7562,6 +7554,7 @@ def main() -> int:
                          help="check a single provider instead of all")
     p_check.add_argument("--json", action="store_true",
                          help="machine-readable JSON report")
+    provider_upstream.register_commands(sub)
 
     profile = sub.add_parser("profile", help="manage local WireGuard profiles")
     profile_sub = profile.add_subparsers(dest="profile_action")
@@ -7936,6 +7929,11 @@ def main() -> int:
         if args.providers_action == "check":
             return providers_check(args.provider, as_json=args.json)
         parser.error("providers needs an action: check")
+    if args.cmd == "provider":
+        return provider_upstream.run_cli(args, provider_upstream.Upstreams(
+            providers=_providers, root=ROOT, write=_atomic_write,
+            is_proxy=is_proxy_provider, upstream_of=proxy_upstream),
+            is_proxy=is_proxy_provider)
     if args.cmd == "profile":
         if args.profile_action == "copy":
             return profile_copy(args.provider, args.sources)
