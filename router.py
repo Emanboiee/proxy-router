@@ -463,14 +463,13 @@ def _atomic_write(path: Path, text: str, mode: int = 0o600) -> None:
     state.atomic_write(path, text, mode, on_commit=_hand_back_ownership)
 
 
-
 def _autodetect_route_sources(routes: list[dict], providers: dict,
                               sources: dict[str, dict]) -> dict[str, dict]:
     """Create bounded discovery sources for routes without explicit sources."""
     covered_routes = {
         settings.get("route_id")
         for settings in sources.values()
-        if isinstance(settings, dict)
+        if isinstance(settings, dict) and settings.get("supplemental") is not True
     }
     generated = dict(sources)
     for route in routes:
@@ -602,6 +601,7 @@ def _load_autodetect(data: dict, routes: list, providers: dict) -> dict:
             "roots": sorted(set(normalized_roots)),
             "ttl_seconds": ttl,
         }
+        if supplied.get("supplemental") is True: cleaned_source["supplemental"] = True
         if normalized_extra_roots:
             cleaned_source["extra_roots"] = sorted(set(normalized_extra_roots))
         cleaned_sources[source] = cleaned_source
