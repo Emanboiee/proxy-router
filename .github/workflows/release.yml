@@ -255,14 +255,18 @@ jobs:
           mkdir -p dist/proxy-router
           cp router.py setup_tui.py monitor.py network_control.py route_watcher.py proxy_tray.py autodetect_refresh.py domain_autodetect.py egress.py state.py singbox.py engine.py config_schema.py worker_lock.py providers_check.py net_safety.py model_relay.py status_snapshot.py dashboard_profile_manager.py provider_lifecycle.py selective_tun.py README.md LICENSE .gitignore router.example.json pyproject.toml requirements-dev.txt dist/proxy-router/
           cp -R tests examples guides rulesets install.sh install.ps1 .github dashboard dist/proxy-router/
-          cp privileged_helper.py privileged_installer.py sing-box-release.json sing-box-windows.json VERSION dist/proxy-router/
+          cp privileged_helper.py privileged_installer.py sing-box-release.json sing-box-windows.json dist/proxy-router/
+          printf '%s\n' "${GITHUB_REF_NAME}" > dist/proxy-router/VERSION
           tar -czf "proxy-router-${GITHUB_REF_NAME}-source.tar.gz" -C dist proxy-router
+          sha256sum "proxy-router-${GITHUB_REF_NAME}-source.tar.gz" > "proxy-router-${GITHUB_REF_NAME}-source.tar.gz.sha256"
 
       - name: Upload source artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: bundle-source
-          path: proxy-router-${{ github.ref_name }}-source.tar.gz
+          path: |
+            proxy-router-${{ github.ref_name }}-source.tar.gz
+            proxy-router-${{ github.ref_name }}-source.tar.gz.sha256
           if-no-files-found: error
 
   test-gate:
@@ -306,6 +310,7 @@ jobs:
             proxy-router-${GITHUB_REF_NAME}-linux-amd64.tar.gz \
             proxy-router-${GITHUB_REF_NAME}-windows-amd64.zip \
             proxy-router-${GITHUB_REF_NAME}-source.tar.gz \
+            proxy-router-${GITHUB_REF_NAME}-source.tar.gz.sha256 \
             proxy-router-dashboard-${GITHUB_REF_NAME}-darwin-arm64.zip \
             proxy-router-dashboard-${GITHUB_REF_NAME}-darwin-arm64.zip.sha256 \
             proxy-router-dashboard-${GITHUB_REF_NAME}-windows-amd64.zip \
