@@ -106,6 +106,45 @@ def _int_or_none(value) -> int | None:
         return None
 
 
+def parse_deadline(value: object) -> int | None:
+    """Epoch seconds for an upstream reset, or None when it is unusable."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value) if value > 0 else None
+    text = str(value).strip()
+    if text.isdigit():
+        return int(text) or None
+    candidate = text[:-1] + "+00:00" if text[-1:] in ("Z", "z") else text
+    try:
+        moment = datetime.datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=datetime.timezone.utc)
+    try:
+        return int(moment.timestamp())
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+MAX_QUOTA_DEADLINE_SECONDS = 7 * 86400
+DEADLINE_SOURCE_UPSTREAM = "upstream-deadline"
+DEADLINE_SOURCE_POLICY = "policy-seconds"
+
+
+def validated_deadline(deadline, *, now: int) -> tuple[int | None, str]:
+    """Return a bounded upstream reset epoch and its evidence source.
+
+    Unusable values cannot extend a selector cooldown; the caller keeps its
+    configured policy window instead.
+    """
+    epoch = parse_deadline(deadline)
+    if epoch is None or not int(now) - 60 <= epoch <= int(now) + MAX_QUOTA_DEADLINE_SECONDS:
+        return None, DEADLINE_SOURCE_POLICY
+    return epoch, DEADLINE_SOURCE_UPSTREAM
+
+
 def egress_rank(record: dict, *, now: int, ok_window: int, slow_latency_ms: float,
                 fail_threshold: int) -> tuple[int, float]:
     """Rotation preference: lower is better. Recently-OK profiles rank by

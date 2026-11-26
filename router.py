@@ -49,7 +49,7 @@ import domain_autodetect
 import engine
 import autodetect_refresh
 import egress
-import net_safety
+import model_selector_integration as model_selector; import net_safety
 import provider_lifecycle
 import state
 from singbox import _bad_endpoint, _bounded_getaddrinfo, _capture_domain_name, dns_server_for, parse_endpoint, _vpn_list_intersection
@@ -658,6 +658,7 @@ def load_config() -> int:
     default_mode = vpn.get("default_mode")
     if default_mode is not None and default_mode not in ("proxy", "tun"):
         return fail(f"bad {CONFIG_FILE.name}: vpn.default_mode must be 'proxy' or 'tun'")
+    if err := model_selector.load_error(vpn, providers, port): return fail(f"bad {CONFIG_FILE.name}: {err}")
     if "tailscale_bypass" in vpn and not isinstance(vpn["tailscale_bypass"], bool):
         return fail(f"bad {CONFIG_FILE.name}: vpn.tailscale_bypass must be a boolean")
     if error := _public_dns_error(vpn.get("public_dns")):
@@ -3003,7 +3004,7 @@ def _route_capture_cidrs(routes: list[dict], routing: dict,
 
 
 def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tuple[dict, dict[str, Path]]:
-    public_dns = _vpn.get("public_dns")
+    model_selector.guard_mode(_vpn, _providers, _port, current_mode()); public_dns = _vpn.get("public_dns")
     if error := _public_dns_error(public_dns):
         raise ValueError(error)
     default_dns = "dns-public" if public_dns else "dns-local"
@@ -3364,8 +3365,7 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
             "final": route_final,
         },
     }
-    return config, selected
-
+    model_selector.integrate(config, _vpn, _providers, _port, ROOT, mode); return config, selected
 
 def validate_config(path: Path | None = None) -> bool:
     sing_box = resolve_sing_box()

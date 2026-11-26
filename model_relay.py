@@ -11,9 +11,12 @@ import select
 import socket
 import threading
 import time
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 from types import SimpleNamespace
+
+import egress
 
 log = logging.getLogger("proxy-router.model-relay")
 HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -69,16 +72,90 @@ def route_provider(namespace: dict, host: str) -> str | None:
     return default if routing["mode"] == "safe-list" and available(default) else None
 
 
+class UpstreamGate:
+    """Let model requests overlap while selector changes proceed without a reload."""
+    def __init__(self):
+        self.condition = threading.Condition()
+        self.active = set()
+        self.waiting_changes = 0
+        self.changing = False
+
+    def acquire(self):
+        with self.condition:
+            if self.waiting_changes or self.changing:
+                raise OSError("model selector control is switching")
+            lease = object()
+            self.active.add(lease)
+            return lease
+
+    def release(self, lease):
+        with self.condition:
+            self.active.discard(lease)
+            self.condition.notify_all()
+
+    @contextmanager
+    def change(self, timeout=3):
+        allowed = False
+        with self.condition:
+            self.waiting_changes += 1
+            deadline = time.monotonic() + timeout
+            while self.active or self.changing:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self.condition.wait(remaining)
+            else:
+                self.changing = allowed = True
+        try:
+            yield allowed
+        finally:
+            with self.condition:
+                self.waiting_changes -= 1
+                if self.changing:
+                    self.changing = False
+                self.condition.notify_all()
+
+
 class RouterRecovery:
     """Serialize response attribution and exit changes with the engine controller."""
+    CHANGE_TIMEOUT = 3.0
+    DEFERRED_RETRY = 5.0
+
     def __init__(self, router, host):
         self.router, self.host = router, host
         self.lock = threading.RLock()
+        self.upstream_gate = UpstreamGate()
+        self.model_exit_cooldowns = {}
+        self.deferred_until = {}
+
+    def _model_controller(self):
+        import model_selector
+        r = self.router
+        options = model_selector.settings(getattr(r, "_vpn", {}), getattr(r, "_providers", {}),
+                                          getattr(r, "_port", 2080))
+        if not options or not model_selector.matches(options, self.host):
+            return None
+        try:
+            credential = model_selector.secret(r.ROOT / "state" / "model-selector.secret")
+        except (OSError, ValueError) as exc:
+            raise OSError("invalid model selector credential") from exc
+        return model_selector.Controller(options, credential)
 
     def _snapshot(self):
         r = self.router
-        if r.load_config() != 0 or r.MANUAL_OFF_FILE.exists():
+        if (r.load_config() != 0 or r.MANUAL_OFF_FILE.exists()
+                or r.network_off_marker().exists()):
             return None
+        controller = self._model_controller()
+        if controller:
+            try:
+                provider = controller.current()["now"]
+            except (OSError, ValueError):
+                return None  # Control failure must never fall back to global rotation.
+            if r.is_proxy_provider(provider):
+                return controller.options["providers"][0], provider, r._PROXY_PROFILE_STEM
+            profile = r.persisted_active(provider)
+            return (controller.options["providers"][0], provider, profile.stem) if profile else None
         primary = r.response_provider_for_host(self.host)
         if not primary:
             return None
@@ -93,6 +170,10 @@ class RouterRecovery:
     def snapshot(self):
         with self.lock:
             return self._snapshot()
+
+    def prepare(self):
+        # Selector exits switch in place; global fallback restore never applies.
+        return False
 
     def recover_transport(self, expected, *, timeout=45):
         """Rotate a stalled primary without charging it a quota failure."""
@@ -115,6 +196,42 @@ class RouterRecovery:
             return self.router._with_lock(apply, timeout=min(45, timeout)) is True
 
     def recover(self, expected):
+        with self.lock:
+            controller = self._model_controller()
+            if controller:
+                try:
+                    return self._recover_selector(controller, expected)
+                except (OSError, ValueError):
+                    log.warning("model selector control unavailable; shared engine unchanged")
+                    return False
+            return self._recover_global(expected)
+
+    def _recover_selector(self, controller, expected):
+        with self.lock:
+            if (not self.router._automatic_proxy_mode() or not expected
+                    or self._snapshot() is None):
+                return False
+            current = controller.current()
+            if current["now"] != expected[1]:
+                return True
+            now = time.monotonic()
+            epoch = int(time.time())
+            resolved, _source = egress.validated_deadline(getattr(self, "deadline", None), now=epoch)
+            hold = controller.options["cooldown_seconds"]
+            if resolved is not None:
+                hold = max(hold, resolved - epoch)
+            self.model_exit_cooldowns[current["now"]] = now + hold
+            for candidate in controller.options["providers"]:
+                if (candidate in current["all"] and candidate != current["now"]
+                        and self.model_exit_cooldowns.get(candidate, 0) <= now):
+                    # Selector control is a local API call, not a tunnel reload:
+                    # it does not drain the shared upstream gate.
+                    controller.select(candidate)
+                    log.info("model-only selector changed exit; shared engine unchanged")
+                    return True
+            return False
+
+    def _recover_global(self, expected):
         with self.lock:
             def apply():
                 current = self._snapshot()
