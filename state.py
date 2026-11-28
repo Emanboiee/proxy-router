@@ -28,9 +28,10 @@ def atomic_write(
     """Replace ``path`` with ``text`` without exposing a partial file.
 
     The temporary file is created beside the destination so ``os.replace``
-    remains atomic on the same filesystem.  ``on_commit`` runs only after the
-    replacement succeeds; a failed write never reports a successful state
-    transition to the caller.
+    remains atomic on the same filesystem.  Its bytes are flushed and fsynced
+    before the replacement, so a crash after commit cannot expose an empty or
+    partial state file.  ``on_commit`` runs only after the replacement succeeds;
+    a failed write never reports a successful state transition to the caller.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -46,6 +47,8 @@ def atomic_write(
         ) as handle:
             temporary = Path(handle.name)
             handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.chmod(temporary, mode)
         os.replace(temporary, path)
         temporary = None

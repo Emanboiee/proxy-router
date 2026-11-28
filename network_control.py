@@ -44,6 +44,8 @@ def write_bytes(path, value):
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(name, path)
     finally:
         if os.path.exists(name):
