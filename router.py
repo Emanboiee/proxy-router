@@ -6112,10 +6112,14 @@ def _check_provider_validity(name: str) -> dict:
     issues: list[str] = result["issues"]
     entry = _providers.get(name)
 
-    if not isinstance(entry, dict):
+    def fail(detail: str) -> dict:
         result["valid"] = False
-        issues.append("not a configured provider object")
+        issues.append(detail)
         return result
+
+    if not isinstance(entry, dict):
+        return fail("not a configured provider object")
+    issues.extend(_provider_config_errors(name, entry))
 
     if is_proxy_provider(name):
         # No profile directory: the lane is one validated SOCKS5 hop.
@@ -6123,34 +6127,25 @@ def _check_provider_validity(name: str) -> dict:
         try:
             upstream_host, upstream_port = proxy_upstream(name)
         except ValueError as exc:
-            result["valid"] = False
-            issues.append(str(exc))
-            return result
+            return fail(str(exc))
         result["upstream"] = f"{upstream_host}:{upstream_port}"
         result["active"] = _PROXY_PROFILE_STEM
-        issues.extend(_provider_config_errors(name, entry))
         return result
 
     try:
         directory = provider_dir(name)
         relative = directory.relative_to(ROOT)
     except ValueError as exc:
-        result["valid"] = False
-        issues.append(str(exc))
-        return result
+        return fail(str(exc))
     result["directory"] = str(relative)
     if not directory.is_dir():
-        result["valid"] = False
-        issues.append(f"missing profile directory {relative} "
-                      f"(create it and drop valid .conf files inside)")
-        return result
+        return fail(f"missing profile directory {relative} "
+                    f"(create it and drop valid .conf files inside)")
 
     profiles = provider_files(name)
     result["profiles"] = len(profiles)
     if not profiles:
-        result["valid"] = False
-        issues.append(f"no .conf profiles in {relative}")
-        return result
+        return fail(f"no .conf profiles in {relative}")
 
     bad_profiles = []
     for profile in profiles:
@@ -6165,8 +6160,8 @@ def _check_provider_validity(name: str) -> dict:
             + ", ".join(item["profile"] for item in bad_profiles)
         )
     if usable_count == 0:
-        result["valid"] = False
         issues.insert(0, "no parseable profiles remain")
+        result["valid"] = False
         return result
 
     cooled = [p.stem for p in profiles
@@ -6174,15 +6169,18 @@ def _check_provider_validity(name: str) -> dict:
               and is_cooled_down(name, p)]
     result["cooled_down"] = cooled
 
-    active = persisted_active(name) or resolve_active(name)
+    persisted = persisted_active(name)
+    active = persisted or resolve_active(name)
     result["active"] = active.stem if active else None
     if active is None:
         result["valid"] = False
         detail = "every remaining profile is cooled down" if cooled \
             else "no active profile could be selected"
         issues.append(detail)
-
-    issues.extend(_provider_config_errors(name, entry))
+    elif persisted is not None and (_profile_error(persisted)
+                                    or is_cooled_down(name, persisted)):
+        issues.append(f"persisted active profile {persisted.stem} is cooled down or unparseable")
+        result["valid"] = False
     return result
 
 

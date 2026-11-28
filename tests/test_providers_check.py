@@ -205,6 +205,56 @@ def test_static_entry_issues_surface_without_invalidating(tmp_path, capsys):
     assert any("probe_url" in issue for issue in entry["issues"])
 
 
+def test_static_config_errors_survive_empty_pool(tmp_path, capsys):
+    router = load_router(tmp_path)
+    make_provider(tmp_path, "hollow", empty_dir=True)
+    configure(router, {"hollow": {"cooldown_seconds": "soon",
+                                 "probe_url": "http://insecure.example"}})
+
+    rc = router.providers_check("hollow", as_json=True)
+
+    out = json.loads(capsys.readouterr().out)
+    entry = out["results"]["hollow"] if isinstance(out["results"], dict) else out["results"][0]
+    assert rc == 1
+    assert entry["valid"] is False
+    assert any("no .conf profiles" in issue for issue in entry["issues"])
+    assert any("cooldown_seconds" in issue for issue in entry["issues"])
+    assert any("probe_url" in issue for issue in entry["issues"])
+
+
+def test_cooled_persisted_active_is_not_reported_valid(tmp_path, capsys):
+    router = load_router(tmp_path)
+    directory = tmp_path / "providers" / "proton"
+    make_provider(tmp_path, "proton", profiles=2)
+    router.set_active("proton", directory / "proton-0.conf")
+    cool_profile(router, "proton", "proton-0")
+    configure(router, {"proton": {}})
+
+    rc = router.providers_check("proton", as_json=True)
+
+    out = json.loads(capsys.readouterr().out)
+    entry = out["results"]["proton"] if isinstance(out["results"], dict) else out["results"][0]
+    assert rc == 1
+    assert entry["valid"] is False or entry["active"] != "proton-0"
+
+
+def test_unparseable_persisted_active_is_not_reported_valid(tmp_path, capsys):
+    router = load_router(tmp_path)
+    directory = tmp_path / "providers" / "proton"
+    directory.mkdir(parents=True)
+    (directory / "good.conf").write_text(VALID_CONF)
+    (directory / "broken.conf").write_text("[Interface]\nAddress = 10.2.0.2/32\n")
+    router.set_active("proton", directory / "broken.conf")
+    configure(router, {"proton": {}})
+
+    rc = router.providers_check("proton", as_json=True)
+
+    out = json.loads(capsys.readouterr().out)
+    entry = out["results"]["proton"] if isinstance(out["results"], dict) else out["results"][0]
+    assert rc == 1
+    assert entry["valid"] is False or entry["active"] != "broken"
+
+
 def test_main_dispatch_providers_check_json(tmp_path, monkeypatch, capsys):
     router = load_router(tmp_path)
     make_provider(tmp_path, "proton")
