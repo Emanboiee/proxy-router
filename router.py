@@ -5239,7 +5239,7 @@ def _degraded_lanes() -> list[str]:
     return lanes
 
 
-def _status_report(*, fast: bool = False) -> tuple[int, str]:
+def _status_report(*, fast: bool = False, fail_closed_unverified: bool = False) -> tuple[int, str]:
     """Single liveness check shared by `status` and `vpn status` (M13): both
     commands must report the same up/down state and exit code so automation
     cannot disagree with a human reading one or the other.
@@ -5259,6 +5259,13 @@ def _status_report(*, fast: bool = False) -> tuple[int, str]:
         return engine_mode_consistent(skip_helper=True) if fast else engine_mode_consistent()
 
     if mode == "tun":
+        # #285/#340: only the human CLI opts into fail_closed_unverified;
+        # --fast skips the privileged probe that proves running mode, so a
+        # proxy engine left up after a failed switch would look like up(tun).
+        if fast and fail_closed_unverified:
+            if _engine_alive():
+                return 1, "down (running engine mode unverified in fast status; run 'status' without --fast)"
+            return 1, "down (mode set to tun; run 'vpn on')"
         if _engine_alive() and _engine_mode_consistent():
             return 0, "up (tun)"
         if _engine_alive():
@@ -7829,7 +7836,7 @@ def main() -> int:
             data = status_json(fast=args.fast)
             print(json.dumps(data, indent=2, sort_keys=True))
             return 0 if data["up"] else 1
-        rc, line = _status_report()
+        rc, line = _status_report(fast=args.fast, fail_closed_unverified=args.fast)
         print(line)
         try:
             legacy = _legacy_launch_agents()
