@@ -26,6 +26,7 @@ import time
 from pathlib import Path
 from typing import Callable, Iterable
 
+import state
 import worker_lock
 
 ROOT = Path(os.environ.get("PROXY_ROUTER_ROOT") or Path(__file__).resolve().parent).resolve()
@@ -356,23 +357,27 @@ def _enforce_event_line_cap(path: Path) -> None:
 def append_event(root: Path, event: dict) -> None:
     path = events_file(root)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _rotate_events(path)
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, separators=(",", ":")) + "\n")
+        # #332 P1: start/stop locking only guards the spawn window, so two
+        # watcher workers can append here at once. Hold the shared events
+        # lock across rotate -> append -> line-cap rewrite so a non-atomic
+        # read-modify-write cannot discard the other worker's event.
+        with state.events_lock(root):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _rotate_events(path)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event, separators=(",", ":")) + "\n")
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+            _enforce_event_line_cap(path)
+            # A root-owned worker (sudo-start path) must hand events back to
+            # the invoking user; otherwise `watcher logs` fails on a 0600 file.
+            _hand_back_ownership(path)
     except OSError as exc:
         # An unwritable/starved log (e.g. root-owned from an elevated reload)
         # must never kill the watcher loop; drop the event with a trace.
         print(f"route-watcher: append_event skipped ({exc})", file=sys.stderr)
-        return
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
-    _enforce_event_line_cap(path)
-    # A root-owned worker (sudo-start path) must hand events back to the
-    # invoking user; otherwise `watcher logs` fails on a 0600 root file.
-    _hand_back_ownership(path)
 
 
 
