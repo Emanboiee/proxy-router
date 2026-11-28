@@ -367,6 +367,13 @@ def _events_lock(root: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = path.open("a")
     try:
+        # A sudo-started worker creates this persistent lock root-owned 0644.
+        # A later non-root worker opens the same path; without world-write its
+        # open raises PermissionError and append_event silently drops the event.
+        os.chmod(path, 0o666)
+    except OSError:
+        pass
+    try:
         if os.name == "nt":
             import msvcrt
 

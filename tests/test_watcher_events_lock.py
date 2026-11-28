@@ -10,6 +10,7 @@ sequence; ``state.log_event`` writes a different file and is unrelated.
 from __future__ import annotations
 
 import json
+import os
 import threading
 from pathlib import Path
 
@@ -68,6 +69,28 @@ def test_line_cap_rewrite_cannot_clobber_a_concurrent_append(tmp_path, monkeypat
 
     lines = path.read_text(encoding="utf-8").splitlines()
     assert any('"marker":"SENTINEL"' in line for line in lines), lines
+
+
+def test_events_lock_stays_openable_by_a_later_non_root_worker(tmp_path):
+    """PR #332 P1: a sudo-started worker creates events.lock root-owned 0644.
+
+    The lock is persistent and a later non-root worker opens the same path.
+    Without world-write the second open raises PermissionError, which
+    append_event swallows, so every event after the hand-off is silently lost.
+    """
+    lock = watcher.state_dir(tmp_path) / "events.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.touch()
+    os.chmod(lock, 0o644)  # state left behind by a root-started worker
+
+    with watcher._events_lock(tmp_path):
+        pass
+
+    mode = os.stat(lock).st_mode
+    assert mode & 0o002, (
+        f"events.lock must remain writable by a differently-owned opener, "
+        f"got mode {mode & 0o777:o}"
+    )
 
 
 def test_append_event_holds_the_local_events_lock(tmp_path):
