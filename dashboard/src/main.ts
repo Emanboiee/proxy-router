@@ -4,6 +4,7 @@ import {applyDashboardPalette, polishDashboard} from './dashboard-polish';
 import {connectionControls, serverInventory} from './server-controls';
 import './tokens.css';
 import './style.css';
+import './console.css';
 import { LocalController, manageDashboardServer, saveServerPreference, switchDashboardServer, applyEngineAction, applyDashboardProfile, deleteDashboardProfile, deleteDashboardProvider, getCachedLiveStatus, getDashboardState, getLiveStatus, getPreviewStatus, reportNavigationDone, reportPreviewFrame, saveDashboardProfile, saveDashboardProvider, setTrayStatus, states, type Accent, type Connection, type DashboardState, type Density, type FallbackMode, type LayoutPreset, type MotionSpeed, type PreviewState, type Profile, type Provider, type ProviderKind, type RouteMode, type Scheme, type Snapshot, type Status, type TailscaleMode } from './controller';
 import { open as openNativeFile } from '@tauri-apps/plugin-dialog';
 import { isTauri } from '@tauri-apps/api/core';
@@ -67,7 +68,7 @@ const accents: { id: Accent; name: string; colour: string }[] = [
   { id: 'moss', name: 'Moss', colour: '#a8ddb0' }, { id: 'iris', name: 'Iris', colour: '#c9b7ff' },
 ];
 
-app.innerHTML = `<aside class="rail"><header><img class="rail-logo" src="/gremlin-cat-goblin-cat.gif" alt="" width="32" height="32" decoding="async"><strong>proxy router</strong><button id="menu" aria-expanded="false" aria-controls="nav">Menu</button></header><nav id="nav" aria-label="Primary">${pages.map(item => `<a href="#${item.toLowerCase()}">${item}</a>`).join('')}</nav><div class="rail-status"><span class="status-dot" aria-hidden="true"></span><span id="rail-status">Local controller</span></div></aside><div class="workspace"><div class="topbar" role="banner"><span id="page-label">Home</span><span class="topbar-actions"><span class="badge" id="prototype-badge">Local prototype</span><span id="toast" role="status" aria-live="polite"></span></span></div><main id="main" tabindex="-1"></main><footer><span>Local data · router changes stay behind the controller</span><button id="preview" type="button">Preview states</button></footer></div><dialog id="preview-dialog" aria-labelledby="dialog-title"><form method="dialog"><h2 id="dialog-title">Preview a connection state</h2><p>These examples review the interface. They do not change your network or VPN.</p><label for="scenario">Connection state</label><select id="scenario">${states.map(item => `<option value="${item}">${copy[item][0]}</option>`).join('')}</select><div class="dialog-actions"><button value="cancel" autofocus>Cancel</button><button value="apply" class="primary">Show preview</button></div></form></dialog><dialog id="import-dialog" aria-labelledby="import-title"><form id="import-form" method="dialog"><h2 id="import-title">Import a profile</h2><p>Paste a proxy-router profile export. It is saved locally on this computer.</p><label for="profile-json">Profile JSON</label><textarea id="profile-json" rows="8" required placeholder="Profile export JSON"></textarea><div class="dialog-actions"><button value="cancel">Cancel</button><button value="import" class="primary">Import profile</button></div></form></dialog><dialog id="profile-dialog" aria-labelledby="profile-dialog-title"></dialog><dialog id="provider-dialog" aria-labelledby="provider-dialog-title"></dialog>`;
+app.innerHTML = `<aside class="rail"><header><img class="rail-logo" src="/gremlin-cat-goblin-cat.gif" alt="" width="32" height="32" decoding="async"><strong>proxy router</strong><button id="menu" aria-expanded="false" aria-controls="nav">Menu</button></header><nav id="nav" aria-label="Primary">${pages.map(item => `<a href="#${item.toLowerCase()}"><span class="nav-label" data-label="${item}" data-console-label="${consoleNavLabel(item)}">${item}</span></a>`).join('')}</nav><div class="rail-status"><span class="status-dot" aria-hidden="true"></span><span id="rail-status">Local controller</span></div></aside><div class="workspace"><div class="topbar" role="banner"><span class="console-crumb" aria-hidden="true"><span class="crumb-badge">PR</span><span class="crumb-text">Proxy Router <span class="crumb-sep">/</span> <span id="crumb-page">Overview</span></span></span><span class="view-heading" aria-hidden="true"><span id="view-breadcrumb" class="eyebrow">Overview</span><span id="view-title">Home</span></span><span id="page-label">Home</span><span class="topbar-actions"><span class="badge" id="prototype-badge">Local prototype</span><span id="toast" role="status" aria-live="polite"></span></span></div><main id="main" tabindex="-1"></main><footer><span>Local data · router changes stay behind the controller</span><button id="preview" type="button">Preview states</button></footer></div><dialog id="preview-dialog" aria-labelledby="dialog-title"><form method="dialog"><h2 id="dialog-title">Preview a connection state</h2><p>These examples review the interface. They do not change your network or VPN.</p><label for="scenario">Connection state</label><select id="scenario">${states.map(item => `<option value="${item}">${copy[item][0]}</option>`).join('')}</select><div class="dialog-actions"><button value="cancel" autofocus>Cancel</button><button value="apply" class="primary">Show preview</button></div></form></dialog><dialog id="import-dialog" aria-labelledby="import-title"><form id="import-form" method="dialog"><h2 id="import-title">Import a profile</h2><p>Paste a proxy-router profile export. It is saved locally on this computer.</p><label for="profile-json">Profile JSON</label><textarea id="profile-json" rows="8" required placeholder="Profile export JSON"></textarea><div class="dialog-actions"><button value="cancel">Cancel</button><button value="import" class="primary">Import profile</button></div></form></dialog><dialog id="profile-dialog" aria-labelledby="profile-dialog-title"></dialog><dialog id="provider-dialog" aria-labelledby="provider-dialog-title"></dialog>`;
 app.insertAdjacentHTML('beforeend', '<dialog id="server-dialog" aria-labelledby="server-dialog-title"><div class="server-dialog-heading"><h2 id="server-dialog-title">Installed servers</h2><button type="button" data-action="close-servers">Close</button></div><label for="server-search">Search installed servers</label><input id="server-search" type="search" placeholder="Server name"><div id="server-inventory"></div><p id="server-dialog-feedback" role="status"></p></dialog>');
 const serverDialog=document.querySelector<HTMLDialogElement>('#server-dialog')!;
 serverDialog.addEventListener('close',()=>{ const opener=serverDialogOpener?.isConnected?serverDialogOpener:main.querySelector<HTMLElement>('[data-action="manage-servers"]'); opener?.focus(); });
@@ -278,6 +279,120 @@ function homePage(): string {
       <p class="connection-status" aria-label="Connection status"><span>${esc(compactStatus)}</span><a class="text-link" href="#profiles">Edit profile <span aria-hidden="true">↗</span></a></p>
     </div>
   </section>`;
+}
+
+/**
+ * Signal Console Overview — a port of the isolated redesign's strongest screen.
+ * Values are clearly marked sample data; the connection control is the same
+ * real data-action the standard hero uses, so connect/disconnect stay truthful.
+ */
+function consoleHomePage(): string {
+  const [title] = statusTitle();
+  const connected = previewState === 'connected';
+  const action = connected ? 'disconnect' : 'connect';
+  const actionLabel = connected ? 'Disconnect' : 'Connect';
+  const sites = [
+    ['discord.com', 1284], ['twitch.tv', 642], ['opencode.ai', 318],
+    ['roblox.com', 207], ['static.twitchcdn.net', 96],
+  ] as const;
+  const maxHits = Math.max(...sites.map(site => site[1]));
+  const siteRows = sites.map(([domain, hits]) => `<li class="row"><span class="fav">${domain[0]}</span><div class="grow"><strong>${domain}</strong><div class="bar"><span style="width:${Math.round(hits / maxHits * 100)}%"></span></div></div><span class="hits mono">${hits.toLocaleString()}</span></li>`).join('');
+  const events = [
+    ['19:42:08', 'Network check passed'], ['19:38:15', 'Routing mode: safe-list'],
+    ['19:31:02', 'Switched to Cloudflare WARP'], ['19:24:47', 'Added opencode.ai'],
+    ['19:03:11', 'Profile: School access'],
+  ] as const;
+  const eventRows = events.map(([time, message]) => `<li><span>${message}</span><time>${time}</time></li>`).join('');
+  // A deterministic, hand-authored sample series — never live traffic.
+  const points = [48, 44, 39, 43, 41, 36, 38, 40, 47, 58, 74, 69, 61, 67, 72, 63, 58, 71, 66, 60];
+  const max = Math.max(...points);
+  const sparkPoints = points.map((value, index) => `${(index / (points.length - 1)) * 300},${120 - (value / max) * 112 - 4}`).join(' ');
+  return `<section class="page-section console-page" data-state="${previewState}">
+    <div class="console-head">
+      <h1 class="console-title" tabindex="-1">${esc(title)}</h1>
+    </div>
+    <div class="grid g-hero">
+      <section class="card hero" aria-label="Connection">
+        <button type="button" class="power" data-action="${action}" aria-label="${actionLabel}" aria-pressed="${connected}" ${busy ? 'disabled' : ''}>
+          <svg viewBox="0 0 156 156" aria-hidden="true"><circle class="track" cx="78" cy="78" r="74"/><circle class="arc" cx="78" cy="78" r="74"/></svg>
+          <span class="node"><img src="/gremlin-cat-goblin-cat.gif" alt="" width="64" height="64" decoding="async"></span>
+        </button>
+      </section>
+      <div class="right-col">
+        <div class="card">
+          <div class="card-h"><h2>Throughput</h2><div class="legend"><span><i class="direct-dot" aria-hidden="true"></i>Direct</span></div></div>
+          <svg class="spark" viewBox="0 0 300 120" preserveAspectRatio="none" role="img" aria-label="Sample throughput chart"><polyline points="${sparkPoints}" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" vector-effect="non-scaling-stroke"/></svg>
+        </div>
+      </div>
+    </div>
+    <div class="grid g-2">
+      <section class="card"><div class="card-h"><h2>Top routed sites</h2><a class="btn sm" href="#profiles">Manage →</a></div>
+        <ul class="list">${siteRows}</ul></section>
+      <section class="card activity"><div class="card-h"><h2>Activity</h2></div>
+        <ul class="event-log">${eventRows}</ul>
+        <div class="console-foot"><span>SAMPLE DATA</span></div>
+      </section>
+    </div>
+  </section>`;
+}
+
+/** The console renames app pages to the redesign's information architecture. */
+function consoleNavLabel(item: string): string {
+  return item === 'Home' ? 'Overview' : item === 'Profiles' ? 'Routes' : item === 'Connectivity' ? 'Network' : item;
+}
+
+/**
+ * Signal Console Routes — the desktop app reads and writes real engine routes;
+ * the browser preview uses the active profile's domain list. Either way these
+ * are destination rules, never per-application routing.
+ */
+function consoleRoutesPage(): string {
+  const live = isTauri();
+  const engineRoutes = live && Array.isArray(engineConfig?.routes) ? engineConfig!.routes! : [];
+  const domains = live ? [] : activeProfile()?.domains ?? [];
+  const mode = String(routingState?.mode ?? engineConfig?.routing?.mode ?? 'default');
+  const providerChoices = live
+    ? Object.keys(engineConfig?.providers ?? {})
+    : snapshot.providers.map(provider => provider.id);
+  const providerOptions = providerChoices.map(id => `<option value="${esc(id)}">${esc(id)}</option>`).join('');
+  const rows = live
+    ? engineRoutes.map(route => {
+      const id = String(route.id ?? '');
+      const routeDomains = Array.isArray(route.domains) ? route.domains as string[] : [];
+      const label = routeDomains.join(', ') || id;
+      return `<li class="row"><span class="fav" aria-hidden="true">${esc(label[0] ?? '?')}</span><div class="grow"><strong>${esc(label)}</strong><span class="console-row-note mono">${esc(String(route.provider ?? 'direct'))}</span></div><button type="button" class="btn sm danger" data-action="console-route-remove" data-route-id="${esc(id)}" aria-label="Remove ${esc(label)}">Remove</button></li>`;
+    })
+    : domains.map(domain => `<li class="row"><span class="fav" aria-hidden="true">${esc(domain[0] ?? '?')}</span><div class="grow"><strong>${esc(domain)}</strong><span class="console-row-note mono">${esc(activeProvider()?.name ?? 'direct')}</span></div><button type="button" class="btn sm danger" data-action="console-domain-remove" data-domain="${esc(domain)}" aria-label="Remove ${esc(domain)}">Remove</button></li>`);
+  const count = live ? engineRoutes.length : domains.length;
+  const rowsMarkup = rows.length ? rows.join('') : '<li class="row muted">No routed domains. Add one above.</li>';
+  return `<section class="page-section console-page" data-state="${previewState}">
+    <div class="console-head">
+      <h1 class="console-title" tabindex="-1">Routes</h1>
+    </div>
+    <section class="card"><div class="card-h"><h2 id="routing-mode-label">Routing mode</h2></div>
+      <div class="seg" role="group" aria-labelledby="routing-mode-label">
+        ${(['safe-list', 'vpn-list', 'default'] as const).map(value => `<button type="button" data-action="routing-mode" data-mode="${value}" aria-pressed="${mode === value}">${value === 'safe-list' ? 'Safe list' : value === 'vpn-list' ? 'VPN list' : 'Default'}</button>`).join('')}
+      </div>
+    </section>
+    <section class="card"><div class="card-h"><h2>Routed domains (${count})</h2></div>
+      <form class="console-route-add" data-console-route-form><label class="sr-only" for="route-domain">Domain to route</label><input id="route-domain" type="text" placeholder="example.com" autocomplete="off" spellcheck="false"><label class="sr-only" for="route-provider">Provider</label><select id="route-provider">${providerOptions}</select><button type="submit" class="btn primary">Add route</button></form>
+      <ul class="list console-route-rows">${rowsMarkup}</ul>
+      <div class="console-foot"><span>${live ? 'ENGINE ROUTES · FROM ROUTER.JSON' : 'LOCAL PROFILE · SELECTIVE ROUTING'}</span></div>
+    </section>
+  </section>`;
+}
+
+/** One submit path for both modes: the desktop app writes the engine, preview writes the profile. */
+async function consoleRouteAdd(): Promise<void> {
+  const domain = document.querySelector<HTMLInputElement>('#route-domain')?.value.trim() ?? '';
+  const provider = document.querySelector<HTMLSelectElement>('#route-provider')?.value ?? '';
+  if (!domain) { announce('Enter a domain to route'); return; }
+  if (!provider) { announce('Pick a provider for the route'); return; }
+  if (isTauri()) { await routeAddAction(); return; }
+  void perform(async () => {
+    if (provider !== activeProfile()?.providerId) await controller.setProvider(provider);
+    return controller.addDomain(domain);
+  });
 }
 
 function homeConnectionControls(): string {
@@ -635,10 +750,10 @@ function settingsPage(): string {
 }
 
 function appearancePage(): string {
-  const layoutPresets = (['vertical', 'horizontal'] as LayoutPreset[]).map(item => {
+  const layoutPresets = (['console', 'sidebar', 'vertical', 'horizontal'] as LayoutPreset[]).map(item => {
     const selected = snapshot.theme.layout === item;
-    const name = item === 'vertical' ? 'Vertical' : 'Horizontal';
-    const note = item === 'vertical' ? 'Stacked controls for a narrow window.' : 'Side-by-side controls for a wide window.';
+    const name = item === 'console' ? 'Console' : item === 'sidebar' ? 'Sidebar' : item === 'vertical' ? 'Vertical' : 'Horizontal';
+    const note = item === 'console' ? 'Signal Console: instrument-style status, routes, and activity.' : item === 'sidebar' ? 'Persistent side navigation with a focused overview.' : item === 'vertical' ? 'Stacked controls for a narrow window.' : 'Side-by-side controls for a wide window.';
     return `<button type='button' class='layout-preset ${selected ? 'selected' : ''}' data-action='theme-layout' data-layout='${item}' aria-pressed='${selected}'><strong>${name}</strong><small>${note}</small></button>`;
   }).join('');
   const schemeOptions = (['system', 'light', 'dark'] as Scheme[]).map(item => `<option value='${item}' ${snapshot.theme.scheme === item ? 'selected' : ''}>${item[0].toUpperCase() + item.slice(1)}</option>`).join('');
@@ -657,7 +772,12 @@ function render(options?: { background?: boolean }): void {
   app.dataset.state = previewState;
   app.dataset.page = page.toLowerCase();
   if (!isTauri() && lastTrayState !== previewState) { lastTrayState = previewState; setTrayStatus(previewState); }
-  document.querySelector('#page-label')!.textContent = page; document.title = `${page} — Proxy router`;
+  const consoleLayout = snapshot.theme.layout === 'console';
+  document.querySelector('#page-label')!.textContent = page;
+  document.querySelector('#view-breadcrumb')!.textContent = page === 'Home' ? 'Overview' : 'Proxy Router';
+  document.querySelector('#view-title')!.textContent = page;
+  document.querySelector('#crumb-page')!.textContent = consoleLayout ? consoleNavLabel(page) : page === 'Home' ? 'Overview' : page;
+  document.title = `${page} — Proxy router`;
   document.querySelector('#rail-status')!.textContent = busy ? 'Saving…' : previewState === 'failed' ? 'Controller unavailable' : `${previewState[0].toUpperCase()}${previewState.slice(1)}`;
   const nav = document.querySelector<HTMLElement>('#nav')!;
   nav.querySelectorAll<HTMLAnchorElement>('a').forEach(link => {
@@ -665,6 +785,11 @@ function render(options?: { background?: boolean }): void {
     link.classList.toggle('current', current);
     if (current) link.setAttribute('aria-current', 'page');
     else link.removeAttribute('aria-current');
+    const label = link.querySelector<HTMLElement>('.nav-label');
+    if (label) {
+      const next = consoleLayout ? label.dataset.consoleLabel : label.dataset.label;
+      if (next && label.textContent !== next) label.textContent = next;
+    }
   });
   const headingFocused = document.activeElement === main.querySelector('h1');
   const focused = document.activeElement instanceof HTMLElement
@@ -679,7 +804,9 @@ function render(options?: { background?: boolean }): void {
   const editing = options?.background && (focused || draft || main.querySelector('[data-network-draft="true"]') !== null
     || main.querySelector('[aria-expanded="true"][aria-haspopup="listbox"]') !== null);
   if (!editing) {
-    const markup = page === 'Home' ? homePage() : page === 'Profiles' ? profilesPage() : page === 'Providers' ? providersPage() : page === 'Connectivity' ? connectivityPage() : page === 'Settings' ? settingsPage() + diagnosticsSettings() : appearancePage();
+    const markup = page === 'Home'
+      ? (consoleLayout ? consoleHomePage() : homePage())
+      : page === 'Profiles' ? (consoleLayout ? consoleRoutesPage() : profilesPage()) : page === 'Providers' ? providersPage() : page === 'Connectivity' ? connectivityPage() : page === 'Settings' ? settingsPage() + diagnosticsSettings() : appearancePage();
     if (!options?.background || markup !== renderedPageMarkup) {
       const scrollTop = main.scrollTop;
       const scrollLeft = main.scrollLeft;
@@ -1068,6 +1195,8 @@ app.addEventListener('click', event => {
   else if (action === 'selective-apply') void selectRulesetAction();
   else if (action === 'route-add') void routeAddAction();
   else if (action === 'route-remove' && target.dataset.routeId) void routeRemoveAction(target.dataset.routeId);
+  else if (action === 'console-domain-remove' && target.dataset.domain) void perform(() => controller.removeDomain(target.dataset.domain!));
+  else if (action === 'console-route-remove' && target.dataset.routeId) void routeRemoveAction(target.dataset.routeId!);
   else if (action === 'network-remove-mapping') void networkRemoveMapping(target.dataset.networkSsid);
   else if (action === 'theme-layout' && target.dataset.layout) void perform(() => controller.updateTheme({ layout: target.dataset.layout as LayoutPreset }));
   else if (action === 'theme-scheme' && target.dataset.scheme) void perform(() => controller.updateTheme({ scheme: target.dataset.scheme as Scheme }));
@@ -1176,6 +1305,7 @@ app.addEventListener('input', event => {
 });
 app.addEventListener('submit', event => {
   const form = event.target as HTMLFormElement; if (form.id === 'domain-form') { event.preventDefault(); const domain = formInput(form, 'domain'); void perform(() => controller.addDomain(domain)); }
+  if (form.dataset.consoleRouteForm !== undefined) { event.preventDefault(); void consoleRouteAdd(); }
   if (form.id === 'provider-form') {
     event.preventDefault();
     const name = formInput(form, 'name'); const kind = formInput(form, 'kind') as ProviderKind; const context = form.dataset.providerContext === 'profile' ? 'profile' : 'providers';

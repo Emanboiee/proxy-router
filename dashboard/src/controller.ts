@@ -9,7 +9,7 @@ export type FallbackMode = 'direct' | 'retry' | 'block';
 export type Scheme = 'system' | 'light' | 'dark';
 export type Accent = 'signal' | 'ocean' | 'moss' | 'iris';
 export type Density = 'compact' | 'comfortable';
-export type LayoutPreset = 'vertical' | 'horizontal';
+export type LayoutPreset = 'vertical' | 'horizontal' | 'sidebar' | 'console';
 export type MotionSpeed = 'slow' | 'normal' | 'fast';
 export type ProviderStartup = { mode: 'external' | 'warp' | 'command'; command?: string };
 export type ProviderKind = 'warp' | 'proton' | 'wireguard' | 'socks5' | 'tailscale' | 'custom';
@@ -127,7 +127,7 @@ export class LocalController {
     const profiles = candidate.profiles.map(profile => ({ ...profile, autoSubdomains: profile.autoSubdomains === true }));
     const savedTailscale = (candidate.settings as Partial<Settings>).tailscale;
     const savedLayout = candidate.theme.layout;
-    const layout = savedLayout === 'vertical' || savedLayout === 'horizontal' ? savedLayout : defaultState.theme.layout;
+    const layout = savedLayout === 'vertical' || savedLayout === 'horizontal' || savedLayout === 'sidebar' || savedLayout === 'console' ? savedLayout : defaultState.theme.layout;
     return { ...clone(defaultState), ...clone(candidate), profiles, settings: { ...clone(defaultState.settings), ...candidate.settings, tailscale: { mode: savedTailscale?.mode ?? defaultState.settings.tailscale.mode } }, theme: { ...clone(defaultState.theme), ...candidate.theme, layout } };
   }
   snapshot(): Snapshot { return clone(this.data); }
