@@ -285,8 +285,10 @@ jobs:
           cache: pip
       - name: Install test dependencies
         run: python -m pip install -r requirements-dev.txt
-      - name: Full pytest suite
-        run: python -m pytest tests -q
+      - name: Full pytest suite (seed 58)
+        run: python -m pytest tests -q --randomly-seed=58
+      - name: Full pytest suite (seed 5800)
+        run: python -m pytest tests -q --randomly-seed=5800
 
   publish:
     name: publish release (gated)
