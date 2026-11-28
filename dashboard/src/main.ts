@@ -8,7 +8,7 @@ import { LocalController, manageDashboardServer, saveServerPreference, switchDas
 import { open as openNativeFile } from '@tauri-apps/plugin-dialog';
 import { isTauri } from '@tauri-apps/api/core';
 import { parseProfileExport } from './controller';
-import { addRoute, applyPreset, getConfig, getNetwork, revealNetwork, setNetworkDisconnect, getRouting, presetChoices, removeNetworkPreset, removeRoute, runNetworkAction, setNetworkAuto, setNetworkPreset, setRoutingMode, type EngineConfig, type NetworkPresetState, type RoutingState } from './controller';
+import { addRoute, applyPreset, getConfig, getNetwork, revealNetwork, selectRuleset, setNetworkDisconnect, getRouting, presetChoices, removeNetworkPreset, removeRoute, runNetworkAction, setNetworkAuto, setNetworkPreset, setRoutingMode, type EngineConfig, type NetworkPresetState, type RoutingState, type VpnRuleset } from './controller';
 
 const pages = ['Home', 'Profiles', 'Providers', 'Connectivity', 'Settings', 'Appearance'] as const;
 type Page = typeof pages[number];
@@ -34,6 +34,7 @@ let busy = false;
 // acknowledged immediately and the 5s poll cannot repaint mid-action.
 let engineActionLabel = '';
 let engineActionError = '';
+let selectiveRulesetError = '';
 let networkNamesVisible = false;
 let networkIdentityNotice = '';
 let actionQueue: Promise<void> = Promise.resolve();
@@ -584,6 +585,31 @@ function liveProfilesPage(): string {
 <article class="panel"><h2>Providers</h2><ul class="route-list" id="engine-provider-list">${providerRows}</ul></article></section>`;
 }
 
+/** Destination-based TUN capture: choose which sites/services use the tunnel. */
+function selectiveTunControl(): string {
+  const vpn = (engineConfig?.vpn ?? {}) as Record<string, unknown>;
+  const rulesets = (Array.isArray(vpn.rulesets) ? vpn.rulesets : []) as VpnRuleset[];
+  const current = typeof vpn.selective === 'string' ? vpn.selective : '';
+  const capture = typeof vpn.capture === 'string' && vpn.capture ? vpn.capture : '—';
+  const enabled = liveMode() === 'TUN' && !busy;
+  const options = rulesets.length
+    ? rulesets.map(item => {
+      const name = typeof item?.name === 'string' ? item.name : '';
+      const usable = item?.usable === true;
+      const suffix = usable ? '' : ' · provider unavailable';
+      return `<option value="${esc(name)}" ${name === current ? 'selected' : ''} ${usable ? '' : 'disabled'}>${esc(name)}${suffix}</option>`;
+    }).join('')
+    : '<option value="" selected>No rulesets available</option>';
+  const error = selectiveRulesetError
+    ? `<p class="field-note" role="alert" id="selective-ruleset-error">${esc(selectiveRulesetError)}</p>` : '';
+  const note = liveMode() === 'TUN'
+    ? 'Sends only destinations in the chosen ruleset through the tunnel — destination-based, not per-app routing.'
+    : 'Switch to TUN mode to choose destination rulesets.';
+  return `<article class="panel" id="selective-tun-panel"><div class="panel-heading"><div><span class="label">TUN capture</span><h2>Selective TUN capture</h2></div></div>
+<p class="muted">Capture: <strong>${esc(capture)}</strong> · Current ruleset: <strong>${esc(current || '—')}</strong></p>
+<div class="vpn-mode-control selective-tun-control"><div class="selective-tun-row"><label for="selective-ruleset">Destination ruleset</label><select id="selective-ruleset" ${enabled ? '' : 'disabled'}>${options}</select><button type="button" class="primary" id="selective-apply" data-action="selective-apply" ${enabled ? '' : 'disabled'}>Apply</button></div><small>${esc(note)}</small>${error}</div></article>`;
+}
+
 /** Settings page in the desktop app: the engine's real values. */
 function liveSettingsPage(): string {
   const vpn = (engineConfig?.vpn ?? {}) as Record<string, unknown>;
@@ -596,7 +622,8 @@ function liveSettingsPage(): string {
   const row = (label: string, value: unknown) => `<li><strong>${esc(label)}</strong> <span class="muted">${esc(String(value ?? '—'))}</span></li>`;
   return `<section class="page-section"><div class="section-heading"><div><h1 tabindex="-1">Settings</h1><p class="lead">Values the engine is actually running with.</p></div><span class="badge">from router.json</span></div>
 <article class="panel"><h2>Routing mode</h2><div class="card-actions">${modes}</div><p class="muted">Current mode: <strong>${esc(String(mode))}</strong></p></article>
-<article class="panel"><h2>Engine</h2><ul class="route-list">${row('Live VPN mode', liveMode() === 'Unknown' ? '—' : modeLabel())}${row('Configured default mode', vpn.default_mode)}${row('Proxy port', engineConfig?.port)}${row('Preset', engineConfig?.preset)}${row('Capture', vpn.capture)}${row('MTU', vpn.mtu)}${row('DNS transport', vpn.dns_transport)}</ul></article>
+<article class="panel"><h2>Engine</h2><ul class="route-list">${row('Live VPN mode', liveMode() === 'Unknown' ? '—' : modeLabel())}${row('Configured default mode', vpn.default_mode)}${row('Proxy port', engineConfig?.port)}${row('Preset', engineConfig?.preset)}${row('Capture', vpn.capture)}${row('MTU', vpn.mtu)}${row('DNS transport', vpn.dns_transport)}${row('Selective ruleset', vpn.selective)}${row('Ruleset provider', vpn.selective_provider)}</ul></article>
+${selectiveTunControl()}
 <article class="panel"><h2>Network detection</h2><ul class="route-list">${row('Auto-switch on Wi-Fi change', net?.auto === true ? 'on' : 'off')}${row('Mapped networks', Object.keys(net?.presets ?? {}).length)}${row('Current network', currentNetwork)}</ul><div class="card-actions">${net?.auto ? button('Turn auto-switch off', 'network-auto', 'quiet', 'data-network-state="off"') : button('Turn auto-switch on', 'network-auto', 'quiet', 'data-network-state="on"')}<a class="text-link" href="#connectivity">Map a network <span aria-hidden="true">↗</span></a></div></article>
 <article class="panel"><h2>Rotation & keepalive</h2><ul class="route-list">${row('Rotate every (s)', (engineConfig?.rotation as Record<string, unknown> | undefined)?.interval_seconds)}${row('Rotation jitter (s)', (engineConfig?.rotation as Record<string, unknown> | undefined)?.jitter_seconds)}${row('Keepalive enabled', (engineConfig?.keepalive as Record<string, unknown> | undefined)?.enabled)}${row('Keepalive interval (s)', (engineConfig?.keepalive as Record<string, unknown> | undefined)?.interval)}</ul></article></section>`;
 }
@@ -1038,6 +1065,7 @@ app.addEventListener('click', event => {
   else if (action === 'network-reveal') void toggleNetworkNames();
   else if (action === 'preset-apply' && target.dataset.preset) void applyPresetAction(target.dataset.preset);
   else if (action === 'routing-mode' && target.dataset.mode) void routingModeAction(target.dataset.mode);
+  else if (action === 'selective-apply') void selectRulesetAction();
   else if (action === 'route-add') void routeAddAction();
   else if (action === 'route-remove' && target.dataset.routeId) void routeRemoveAction(target.dataset.routeId);
   else if (action === 'network-remove-mapping') void networkRemoveMapping(target.dataset.networkSsid);
@@ -1283,6 +1311,29 @@ async function networkRemoveMapping(ssid?: string): Promise<void> {
     announce(error instanceof Error ? error.message : 'Could not remove the mapping');
   }
   render();
+}
+
+/** Apply a destination ruleset through the allowlisted Tauri command. */
+async function selectRulesetAction(): Promise<void> {
+  if (busy || engineActionLabel) return;
+  const chosen = app.querySelector<HTMLSelectElement>('#selective-ruleset')?.value ?? '';
+  if (!chosen) return;
+  busy = true;
+  selectiveRulesetError = '';
+  try {
+    render();
+    await selectRuleset(chosen);
+    announce(`Ruleset ${chosen} selected`);
+  } catch (error) {
+    selectiveRulesetError = typeof error === 'string' && error ? error
+      : error instanceof Error ? error.message : String(error ?? 'Could not select the ruleset');
+    announce(selectiveRulesetError);
+  } finally {
+    // Never leave busy set: a failed select must stay operable.
+    busy = false;
+    await refreshEngineConfig();
+    render();
+  }
 }
 
 /** Preset, routing-mode and route actions against the real engine. */

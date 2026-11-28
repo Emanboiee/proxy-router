@@ -349,6 +349,50 @@ fn apply_preset(app: AppHandle, name: String) -> Result<String, String> {
     Ok(applied)
 }
 
+/// Destination rulesets are engine-defined. Only names the engine advertised
+/// may cross the bridge: a path, a control string or an unknown name can never
+/// be forwarded as a CLI argument.
+fn valid_ruleset_name(name: &str, listing: &Value) -> bool {
+    if name.trim().is_empty() || name.len() > 64 || name.contains(|c: char| c.is_control()) {
+        return false;
+    }
+    listing
+        .get("rulesets")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_object)
+                .filter_map(|item| item.get("name").and_then(Value::as_str))
+                .any(|known| known == name)
+        })
+}
+
+/// Fixed argv for a selection: the user string is one bounded token, never a
+/// shell expression or a passthrough of arbitrary CLI arguments.
+fn select_ruleset_args(name: &str) -> Vec<String> {
+    vec!["vpn".to_string(), "select".to_string(), name.to_string()]
+}
+
+/// Apply a destination ruleset for selective TUN. This chooses which sites and
+/// services use the tunnel - destination-based routing, not per-app routing.
+#[tauri::command]
+fn select_ruleset(app: AppHandle, name: String) -> Result<String, String> {
+    let root = controller::router_root();
+    let listing = controller::json_command(&root, &["vpn", "rulesets"])?;
+    if !valid_ruleset_name(&name, &listing) {
+        return Err(format!("unsupported ruleset: {name}"));
+    }
+    let args = select_ruleset_args(&name);
+    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+    // controller::run_controller is the shared bridge that spawns the pinned
+    // interpreter via controller::run_controller_with_python - no shell and no
+    // arbitrary argv from the webview.
+    let output = controller::run_controller(&root, &borrowed)?;
+    refresh_live_status(&app, false);
+    Ok(output)
+}
+
 /// Keep the webview config contract narrow, including inside nested objects.
 /// Provider paths and SOCKS credentials stay in router.json and never cross
 /// the Tauri bridge.
@@ -435,7 +479,13 @@ fn dashboard_config(source: &Value) -> Value {
 
     if let Some(vpn) = source.get("vpn") {
         let mut safe = serde_json::Map::new();
-        for key in ["default_mode", "capture", "dns_transport"] {
+        for key in [
+            "default_mode",
+            "capture",
+            "dns_transport",
+            "selective",
+            "selective_provider",
+        ] {
             copy_string_field(vpn, &mut safe, key);
         }
         copy_number_field(vpn, &mut safe, "mtu");
@@ -477,6 +527,33 @@ fn copy_bool_field(source: &Value, target: &mut serde_json::Map<String, Value>, 
     }
 }
 
+/// Narrow view of `router.py vpn rulesets`. The listing is public data, but
+/// the webview only needs enough to render a picker; keep the same allowlist
+/// discipline used for router.json fields.
+fn dashboard_rulesets(listing: &Value) -> Value {
+    let empty = Vec::new();
+    let rulesets = listing
+        .get("rulesets")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
+    Value::Array(
+        rulesets
+            .iter()
+            .filter_map(Value::as_object)
+            .map(|item| {
+                let item = Value::Object(item.clone());
+                let mut safe = serde_json::Map::new();
+                for key in ["name", "provider", "description"] {
+                    copy_string_field(&item, &mut safe, key);
+                }
+                copy_bool_field(&item, &mut safe, "usable");
+                copy_number_field(&item, &mut safe, "cidr_count");
+                Value::Object(safe)
+            })
+            .collect(),
+    )
+}
+
 /// Preset/SSID slug rules, mirrored from the engine's validation.
 fn valid_slug(value: &str, max: usize) -> bool {
     // The engine (router.py cmd_network_preset_set) is the authority: any
@@ -498,7 +575,16 @@ fn get_config() -> Result<Value, String> {
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
     let parsed: Value = serde_json::from_str(&raw)
         .map_err(|error| format!("invalid router.json: {error}"))?;
-    Ok(dashboard_config(&parsed))
+    let mut config = dashboard_config(&parsed);
+    // The ruleset catalogue is engine output, not router.json. A failed
+    // listing still yields a usable settings page with an empty picker.
+    let rulesets = controller::json_command(&root, &["vpn", "rulesets"])
+        .map(|listing| dashboard_rulesets(&listing))
+        .unwrap_or_else(|_| Value::Array(Vec::new()));
+    if let Some(vpn) = config.get_mut("vpn").and_then(Value::as_object_mut) {
+        vpn.insert("rulesets".into(), rulesets);
+    }
+    Ok(config)
 }
 
 /// Live network detection: current Wi-Fi + the SSID -> preset mapping.
@@ -945,6 +1031,7 @@ fn main() {
             cached_live_status,
             run_router_action,
             apply_preset,
+            select_ruleset,
             get_config,
             get_network,
             reveal_network,
@@ -1114,6 +1201,8 @@ mod tests {
                 "capture": "selective",
                 "mtu": 1280,
                 "dns_transport": "https",
+                "selective": "roblox",
+                "selective_provider": "cloudflare",
                 "auth_token": "vpn-token",
                 "extra": {"secret": "nested-secret"}
             },
@@ -1141,6 +1230,8 @@ mod tests {
         );
         assert_eq!(safe["routing"]["mode"], "vpn-list");
         assert_eq!(safe["vpn"]["mtu"], 1280);
+        assert_eq!(safe["vpn"]["selective"], "roblox");
+        assert_eq!(safe["vpn"]["selective_provider"], "cloudflare");
 
         let serialized = safe.to_string();
         for secret in [
@@ -1183,5 +1274,73 @@ mod tests {
         assert!(valid_slug(&"界".repeat(255), 255));
         assert!(!valid_slug(&"界".repeat(256), 255));
         assert!(!valid_slug("bad\nnetwork", 255));
+    }
+
+    #[test]
+    fn ruleset_selection_maps_to_fixed_argv() {
+        assert_eq!(
+            select_ruleset_args("roblox"),
+            vec!["vpn", "select", "roblox"]
+        );
+        assert_eq!(
+            select_ruleset_args("../../etc/passwd"),
+            vec!["vpn", "select", "../../etc/passwd"]
+        );
+    }
+
+    #[test]
+    fn ruleset_name_validation_rejects_unknown_and_traversal() {
+        let listing = serde_json::json!({
+            "capture": "ruleset",
+            "selected": "roblox",
+            "rulesets": [
+                {"name": "roblox", "usable": true},
+                {"name": "school", "usable": false}
+            ]
+        });
+        assert!(valid_ruleset_name("roblox", &listing));
+        assert!(valid_ruleset_name("school", &listing));
+        let too_long = "x".repeat(65);
+        for bad in [
+            "unknown",
+            "../../etc/passwd",
+            "roblox.json",
+            "",
+            "  ",
+            "rob\nlox",
+            too_long.as_str(),
+        ] {
+            assert!(!valid_ruleset_name(bad, &listing), "accepted {bad:?}");
+        }
+        // No listing at all must never authorize a name.
+        assert!(!valid_ruleset_name("roblox", &serde_json::json!({})));
+    }
+
+    #[test]
+    fn dashboard_rulesets_only_copies_picker_fields() {
+        let listing = serde_json::json!({
+            "rulesets": [{
+                "name": "roblox",
+                "usable": true,
+                "provider": "cloudflare",
+                "description": "Roblox destinations",
+                "cidr_count": 6,
+                "cidrs": ["128.116.0.0/17"],
+                "secret": "must-not-cross"
+            }]
+        });
+        let safe = dashboard_rulesets(&listing);
+        assert_eq!(
+            safe,
+            serde_json::json!([{
+                "name": "roblox",
+                "usable": true,
+                "provider": "cloudflare",
+                "description": "Roblox destinations",
+                "cidr_count": 6
+            }])
+        );
+        assert!(!safe.to_string().contains("must-not-cross"));
+        assert_eq!(dashboard_rulesets(&serde_json::json!({})), serde_json::json!([]));
     }
 }
