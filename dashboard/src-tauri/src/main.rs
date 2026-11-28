@@ -292,6 +292,11 @@ fn action_args(action: &str, payload: Option<&Value>) -> Result<Vec<String>, Str
         // `stop` writes the manual-off marker, so the keepalive will not
         // resurrect the engine behind the user's back.
         "disconnect" => Ok(vec!["stop".to_string()]),
+        // Mode switch: the real `vpn on`/`vpn off` verbs, the same commands
+        // the tray uses. vpn_on fails closed with an elevate hint when the
+        // privileged helper is absent, so no admin dialog can hang the UI.
+        "vpn-on" => Ok(vec!["vpn".to_string(), "on".to_string()]),
+        "vpn-off" => Ok(vec!["vpn".to_string(), "off".to_string()]),
         "rotate" => {
             let provider = payload
                 .and_then(|value| value.get("active_providers"))
@@ -1045,6 +1050,8 @@ mod tests {
     fn tray_actions_are_whitelisted() {
         let payload = serde_json::json!({"active_providers": {"proton": "13-US-FREE-2"}});
         assert_eq!(action_args("connect", None).unwrap(), vec!["start"]);
+        assert_eq!(action_args("vpn-on", None).unwrap(), vec!["vpn", "on"]);
+        assert_eq!(action_args("vpn-off", None).unwrap(), vec!["vpn", "off"]);
         assert_eq!(action_args("sweep", None).unwrap(), vec!["egress", "sweep"]);
         assert_eq!(
             action_args("rotate", Some(&payload)).unwrap(),

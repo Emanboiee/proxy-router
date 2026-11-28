@@ -51,6 +51,7 @@ import autodetect_refresh
 import egress
 import net_safety
 import provider_lifecycle
+import selective_tun
 import state
 from singbox import _bad_endpoint, _bounded_getaddrinfo, _capture_domain_name, dns_server_for, parse_endpoint, _vpn_list_intersection
 import status_snapshot
@@ -2910,96 +2911,28 @@ def _routes_by_health_order(routes: list[dict], selected: dict[str, Path]) -> li
 
 def _route_capture_cidrs(routes: list[dict], routing: dict,
                          active: dict[str, dict]) -> list[str]:
-    """Resolve configured tunneled route targets into TUN route CIDRs.
+    """Resolve tunneled route targets into TUN CIDRs via the pure leaf."""
+    def domain(value: object) -> str | None:
+        return _capture_domain_name(value)
 
-    A TUN inbound can install destination IP routes, not hostname routes. The
-    route-based capture mode therefore snapshots the currently resolved IPs of
-    configured domain routes; sing-box still sniffs those captured flows to
-    select the provider. Any unresolved explicit route domain fails the build
-    rather than silently widening or bypassing the route.
-    """
-    routing_mode = routing.get("mode", "default")
+    def resolve(host: str, port: int, timeout: float) -> list[str] | None:
+        return _bounded_getaddrinfo(host, port, timeout=timeout)
+
     vpn_domains = {
-        domain for value in _effective_vpn_domains(routing)
-        if (domain := _capture_domain_name(value))
+        d for value in _effective_vpn_domains(routing) if (d := domain(value))
     }
     direct_domains = {
-        domain for value in (routing.get("direct_domains") or [])
-        if (domain := _capture_domain_name(value))
+        d for value in (routing.get("direct_domains") or []) if (d := domain(value))
     }
-    target_domains: set[str] = set()
-    raw_cidrs: list[str] = []
-
-    for route in routes:
-        route_provider = _effective_route_provider(route.get("provider", ""))
-        if route_provider not in active and route.get("on_unavailable") != "block":
-            continue
-        for value in (route.get("domains") or []):
-            domain = _capture_domain_name(value)
-            if domain is None:
-                continue
-            if routing_mode == "vpn-list" and not any(
-                domain == vpn or domain.endswith("." + vpn) for vpn in vpn_domains
-            ):
-                continue
-            if routing_mode == "safe-list" and any(
-                domain == direct or domain.endswith("." + direct) for direct in direct_domains
-            ):
-                continue
-            try:
-                address = ipaddress.ip_address(domain)
-            except ValueError:
-                target_domains.add(domain)
-            else:
-                raw_cidrs.append(f"{address}/{address.max_prefixlen}")
-        # Keep IP routes aligned with the existing route-rule behavior: the
-        # vpn-list domain allow-list does not activate arbitrary IP routes.
-        if routing_mode != "vpn-list":
-            raw_cidrs.extend(route.get("ip_cidr") or [])
-
-    unresolved_domains: list[str] = []
-    for domain in sorted(target_domains):
-        # Use a bounded worker: a broken system resolver must not hang a
-        # config build or keepalive-triggered reload indefinitely.
-        answers = _bounded_getaddrinfo(domain, 443, timeout=3.0)
-        if not answers:
-            unresolved_domains.append(domain)
-            continue
-        resolved_domain = False
-        for host in answers:
-            try:
-                host = str(host).split("%", 1)[0]
-                address = ipaddress.ip_address(host)
-            except (IndexError, TypeError, ValueError):
-                continue
-            raw_cidrs.append(f"{address}/{address.max_prefixlen}")
-            resolved_domain = True
-        if not resolved_domain:
-            unresolved_domains.append(domain)
-
-    if unresolved_domains:
-        raise SystemExit(
-            "selective tun: could not resolve route domains: "
-            + ", ".join(unresolved_domains)
+    try:
+        return selective_tun.route_capture_cidrs(
+            routes, routing, active,
+            vpn_domains=vpn_domains, direct_domains=direct_domains,
+            resolve_provider=_effective_route_provider,
+            domain_name=domain, getaddrinfo=resolve,
         )
-
-    networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
-    for value in raw_cidrs:
-        try:
-            networks.append(ipaddress.ip_network(value, strict=False))
-        except ValueError:
-            continue
-    collapsed = list(ipaddress.collapse_addresses(
-        [network for network in networks if network.version == 4]
-    )) + list(ipaddress.collapse_addresses(
-        [network for network in networks if network.version == 6]
-    ))
-    return [
-        str(network) for network in sorted(
-            collapsed,
-            key=lambda network: (network.version, int(network.network_address), network.prefixlen),
-        )
-    ]
+    except selective_tun.RulesetError as exc:
+        raise SystemExit(f"selective tun: {exc}") from None
 
 
 def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tuple[dict, dict[str, Path]]:
@@ -3244,24 +3177,21 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
         selective = _vpn.get("selective") if capture == "ruleset" else None
         rule_sets: list[dict] = []
         if selective:
-            if not isinstance(selective, str) or not _PROVIDER_NAME.fullmatch(selective):
-                raise SystemExit("selective tun: name must contain only letters, digits, dots, underscores, or hyphens")
-            ruleset_path = ROOT / "rulesets" / f"{selective}.json"
             try:
-                selective_data = json.loads(ruleset_path.read_text())
-            except FileNotFoundError:
-                raise SystemExit(f"selective tun: missing ruleset {ruleset_path}") from None
-            except (OSError, json.JSONDecodeError) as exc:
-                raise SystemExit(f"selective tun: could not read {ruleset_path}: {exc}") from None
-            if not isinstance(selective_data, dict) or not isinstance(selective_data.get("ip_cidr"), list):
-                raise SystemExit(f"selective tun: {ruleset_path} needs an ip_cidr string list")
-            cidrs = selective_data["ip_cidr"]
-            if not cidrs or not all(isinstance(cidr, str) and cidr for cidr in cidrs):
-                raise SystemExit(f"selective tun: {ruleset_path} has no valid ip_cidr entries")
-            provider = selective_data.get("provider", _vpn.get("selective_provider", "cloudflare"))
-            effective_provider = _effective_route_provider(provider)
-            if effective_provider not in active:
-                raise SystemExit(f"selective tun: provider '{provider}' has no active profile")
+                info = selective_tun.describe(
+                    ROOT / "rulesets", selective,
+                    default_provider=_vpn.get("selective_provider", "cloudflare"),
+                    resolve_provider=_effective_route_provider,
+                    active_providers=set(active),
+                )
+            except selective_tun.RulesetError as exc:
+                raise SystemExit(f"selective tun: {exc}") from None
+            if not info["usable"]:
+                raise SystemExit(
+                    f"selective tun: provider '{info['provider']}' has no active profile"
+                )
+            cidrs = info["cidrs"]
+            effective_provider = info["effective_provider"]
             tag = f"ruleset-{selective}"
             rule_sets.append({
                 "type": "inline",
@@ -5232,6 +5162,54 @@ def vpn_capture(scope: str) -> int:
     return 0
 
 
+def _ruleset_leaf_args():
+    """Router-owned values the selective_tun leaf needs at call time."""
+    return ROOT / "rulesets", _vpn.get("selective_provider", "cloudflare"), _effective_route_provider
+
+
+def vpn_rulesets() -> int:
+    """List selectable TUN destination rulesets as machine-readable JSON."""
+    rulesets_dir, default_provider, resolve = _ruleset_leaf_args()
+    try:
+        configured = json.loads(CONFIG_FILE.read_text())
+        vpn = configured.get("vpn", {}) if isinstance(configured, dict) else _vpn
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        vpn = _vpn
+    payload = selective_tun.listing(
+        rulesets_dir, vpn if isinstance(vpn, dict) else {},
+        default_provider=default_provider, resolve_provider=resolve,
+        active_providers=set(_providers),
+    )
+    print(json.dumps(payload))
+    return 0
+
+
+def vpn_select_ruleset(name: str) -> int:
+    """Select a destination ruleset for selective TUN, atomically."""
+    rulesets_dir, default_provider, resolve = _ruleset_leaf_args()
+    try:
+        configured = json.loads(CONFIG_FILE.read_text())
+        info = selective_tun.select_config(
+            configured, name, rulesets_dir,
+            default_provider=default_provider, resolve_provider=resolve,
+        )
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        return fail(f"vpn ruleset: {exc}")
+    vpn = configured["vpn"]
+    try:
+        _atomic_write(CONFIG_FILE, json.dumps(configured, indent=2) + "\n", 0o600)
+    except (OSError, TypeError, ValueError) as exc:
+        return fail(f"could not write {CONFIG_FILE.name}: {exc}")
+    _vpn.clear()
+    _vpn.update(vpn)
+    if current_mode() == "tun" and engine_alive():
+        rc = engine_reload()
+        if rc != 0:
+            return rc
+    print(f"vpn: ruleset={name} provider={info['provider']} (engine not started)")
+    return 0
+
+
 def _degraded_lanes() -> list[str]:
     """Degraded routes from persisted state (markers + egress records),
     read-only, no probes. #225: an open SOCKS port is not a usable exit -
@@ -6112,10 +6090,14 @@ def _check_provider_validity(name: str) -> dict:
     issues: list[str] = result["issues"]
     entry = _providers.get(name)
 
-    if not isinstance(entry, dict):
+    def fail(detail: str) -> dict:
         result["valid"] = False
-        issues.append("not a configured provider object")
+        issues.append(detail)
         return result
+
+    if not isinstance(entry, dict):
+        return fail("not a configured provider object")
+    issues.extend(_provider_config_errors(name, entry))
 
     if is_proxy_provider(name):
         # No profile directory: the lane is one validated SOCKS5 hop.
@@ -6123,34 +6105,25 @@ def _check_provider_validity(name: str) -> dict:
         try:
             upstream_host, upstream_port = proxy_upstream(name)
         except ValueError as exc:
-            result["valid"] = False
-            issues.append(str(exc))
-            return result
+            return fail(str(exc))
         result["upstream"] = f"{upstream_host}:{upstream_port}"
         result["active"] = _PROXY_PROFILE_STEM
-        issues.extend(_provider_config_errors(name, entry))
         return result
 
     try:
         directory = provider_dir(name)
         relative = directory.relative_to(ROOT)
     except ValueError as exc:
-        result["valid"] = False
-        issues.append(str(exc))
-        return result
+        return fail(str(exc))
     result["directory"] = str(relative)
     if not directory.is_dir():
-        result["valid"] = False
-        issues.append(f"missing profile directory {relative} "
-                      f"(create it and drop valid .conf files inside)")
-        return result
+        return fail(f"missing profile directory {relative} "
+                    f"(create it and drop valid .conf files inside)")
 
     profiles = provider_files(name)
     result["profiles"] = len(profiles)
     if not profiles:
-        result["valid"] = False
-        issues.append(f"no .conf profiles in {relative}")
-        return result
+        return fail(f"no .conf profiles in {relative}")
 
     bad_profiles = []
     for profile in profiles:
@@ -6165,8 +6138,8 @@ def _check_provider_validity(name: str) -> dict:
             + ", ".join(item["profile"] for item in bad_profiles)
         )
     if usable_count == 0:
-        result["valid"] = False
         issues.insert(0, "no parseable profiles remain")
+        result["valid"] = False
         return result
 
     cooled = [p.stem for p in profiles
@@ -6174,15 +6147,18 @@ def _check_provider_validity(name: str) -> dict:
               and is_cooled_down(name, p)]
     result["cooled_down"] = cooled
 
-    active = persisted_active(name) or resolve_active(name)
+    persisted = persisted_active(name)
+    active = persisted or resolve_active(name)
     result["active"] = active.stem if active else None
     if active is None:
         result["valid"] = False
         detail = "every remaining profile is cooled down" if cooled \
             else "no active profile could be selected"
         issues.append(detail)
-
-    issues.extend(_provider_config_errors(name, entry))
+    elif persisted is not None and (_profile_error(persisted)
+                                    or is_cooled_down(name, persisted)):
+        issues.append(f"persisted active profile {persisted.stem} is cooled down or unparseable")
+        result["valid"] = False
     return result
 
 
@@ -7429,10 +7405,14 @@ def main() -> int:
     init = sub.add_parser("init")
     init.add_argument("--force", action="store_true", help="overwrite an existing router.json")
 
-    vpn = sub.add_parser("vpn", help="toggle TUN mode (on|off|restart|status|capture)")
-    vpn.add_argument("action", choices=["on", "off", "restart", "status", "capture"])
-    vpn.add_argument("capture", nargs="?", choices=["ruleset", "routes"],
-                     help="TUN capture scope for `vpn capture`")
+    vpn = sub.add_parser("vpn", help="toggle TUN mode (on|off|restart|status|capture|rulesets|select)")
+    vpn.add_argument("action", choices=["on", "off", "restart", "status", "capture",
+                                        "rulesets", "select"])
+    # One optional value positional shared by `capture` (scope) and `select`
+    # (ruleset name). Two separate nargs="?" positionals made argparse bind
+    # the name to `capture` and reject every ruleset via its choices.
+    vpn.add_argument("value", nargs="?",
+                     help="scope for `vpn capture` (routes|ruleset) or ruleset name for `vpn select`")
 
     # setup / monitor / watcher delegate to their modules with a
     # parse_known_args passthrough, but they mirror each module's real
@@ -7956,9 +7936,15 @@ def main() -> int:
         parser.error("routing needs an action: show | set | add | remove")
     if args.cmd == "vpn":
         if args.action == "capture":
-            if args.capture is None:
+            if args.value not in ("ruleset", "routes"):
                 parser.error("vpn capture needs a scope: routes | ruleset")
-            return _with_lock(lambda: vpn_capture(args.capture))
+            return _with_lock(lambda: vpn_capture(args.value))
+        if args.action == "rulesets":
+            return vpn_rulesets()
+        if args.action == "select":
+            if not args.value:
+                parser.error("vpn select needs a ruleset name (see `vpn rulesets`)")
+            return _with_lock(lambda: vpn_select_ruleset(args.value))
         if args.action == "on":
             route_watcher_stop()
             rc = _with_lock(vpn_on)

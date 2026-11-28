@@ -270,7 +270,7 @@ export async function getCachedLiveStatus(): Promise<LiveStatus> {
   return await invoke<LiveStatus>('cached_live_status');
 }
 /** Engine verbs the desktop app may run (mirrors the Rust allowlist). */
-export type EngineAction = 'connect' | 'disconnect' | 'reconnect';
+export type EngineAction = 'connect' | 'disconnect' | 'reconnect' | 'vpn-on' | 'vpn-off';
 
 /** Preset each built-in profile maps to in the real router config. */
 const PROFILE_PRESET: Record<string, string> = {

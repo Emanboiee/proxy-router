@@ -37,6 +37,11 @@ EVENTS_NAME = "events.jsonl"
 WORKER_LOG_NAME = "worker.log"
 ENGINE_PID_NAME = "sing-box.pid"
 DEFAULT_INTERVAL = 2.0
+LIFECYCLE_LOCK_TIMEOUT = 5.0
+# The worker cleans up its own markers on exit. When a stopper already holds
+# the lifecycle lock it will clear them itself, so the child never waits on
+# the process that is waiting for the child to exit.
+WORKER_CLEANUP_LOCK_TIMEOUT = 0.05
 DEFAULT_ROUTER_PORT = 2080
 DEFAULT_CRITICAL_DOMAINS = ("opencode.ai",)
 ENGINE_DOWN_GRACE_TICKS = 3
@@ -864,6 +869,16 @@ def engine_pid_alive(root: Path | None = None) -> bool:
 def _cleanup_worker_state(root: Path, owner_pid: int) -> None:
     """Remove watcher markers only when they still belong to this worker."""
     try:
+        with worker_lock.exclusive(state_dir(root) / "start.lock",
+                                   timeout=WORKER_CLEANUP_LOCK_TIMEOUT):
+            _unlink_worker_state(root, owner_pid)
+    except TimeoutError:
+        # A concurrent lifecycle call owns the markers; leave them alone.
+        return
+
+
+def _unlink_worker_state(root: Path, owner_pid: int) -> None:
+    try:
         if pid_file(root).read_text().strip() != str(owner_pid):
             return
     except (OSError, ValueError):
@@ -958,6 +973,17 @@ def stop(root: Path | None = None, *, timeout: float = 5.0,
     stale/foreign (nothing live owns them).
     """
     root = Path(root) if root is not None else ROOT
+    try:
+        with worker_lock.exclusive(state_dir(root) / "start.lock",
+                                   timeout=LIFECYCLE_LOCK_TIMEOUT):
+            return _stop_locked(root, timeout=timeout, kill_timeout=kill_timeout,
+                                poll_interval=poll_interval)
+    except TimeoutError as exc:
+        return {"stopped": False, "error": str(exc)}
+
+
+def _stop_locked(root: Path, *, timeout: float, kill_timeout: float,
+                 poll_interval: float) -> dict:
     try:
         pid = int(pid_file(root).read_text().strip())
     except (OSError, ValueError):
