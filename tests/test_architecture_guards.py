@@ -25,6 +25,7 @@ LEAF_MODULES = (
     "providers_check.py",
     "net_safety.py",
     "provider_lifecycle.py",
+    "selective_tun.py",
 )
 TOP_LEVEL_MODULES = (
     "router",

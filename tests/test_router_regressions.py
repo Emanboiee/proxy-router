@@ -1887,3 +1887,124 @@ def test_tray_vpn_uses_plain_cli_off_macos(tmp_path, monkeypatch):
     assert rc == 0
     assert calls and calls[0][0][-2:] == ["vpn", "off"]
     assert not any(c[0][0] == "osascript" for c in calls)
+
+
+# --- Selective TUN capture: list + select rulesets -------------------------
+
+
+def _write_ruleset(tmp_path, name, *, provider="proton", cidrs=None):
+    (tmp_path / "rulesets").mkdir(exist_ok=True)
+    (tmp_path / "rulesets" / f"{name}.json").write_text(json.dumps({
+        "provider": provider,
+        "description": f"test ruleset {name}",
+        "ip_cidr": cidrs or ["203.0.113.0/24"],
+    }))
+
+
+def test_vpn_rulesets_lists_only_selectable_rulesets(tmp_path, capsys):
+    router = load_router(tmp_path)
+    router._providers = {"proton": {}}
+    router._vpn = {"capture": "ruleset", "selective": "roblox"}
+    _write_ruleset(tmp_path, "roblox")
+    _write_ruleset(tmp_path, "school", provider="cloudflare")
+    (tmp_path / "rulesets" / "broken.json").write_text("{not json")
+
+    rc = router.vpn_rulesets()
+    out = capsys.readouterr().out
+    assert rc == 0
+    payload = json.loads(out)
+    names = {entry["name"]: entry for entry in payload["rulesets"]}
+    assert names["roblox"]["usable"] is True
+    assert names["school"]["usable"] is False
+    assert payload["selected"] == "roblox"
+    assert "broken" not in names
+
+
+def test_vpn_select_ruleset_writes_atomic_config(tmp_path, capsys):
+    router = load_router(tmp_path)
+    config = {
+        "port": 2080,
+        "providers": {"proton": {"directory": "providers/proton"}},
+        "vpn": {"capture": "routes", "selective": "old"},
+    }
+    router.CONFIG_FILE.write_text(json.dumps(config))
+    _write_ruleset(tmp_path, "roblox")
+
+    rc = router.vpn_select_ruleset("roblox")
+    capsys.readouterr()
+    assert rc == 0
+    saved = json.loads(router.CONFIG_FILE.read_text())
+    assert saved["vpn"]["selective"] == "roblox"
+    assert saved["vpn"]["capture"] == "ruleset"
+    assert router._vpn["selective"] == "roblox"
+    assert router._vpn["capture"] == "ruleset"
+
+
+def test_vpn_select_ruleset_rejects_missing_and_traversal(tmp_path, capsys):
+    router = load_router(tmp_path)
+    router.CONFIG_FILE.write_text(json.dumps({
+        "providers": {"proton": {}}, "vpn": {"capture": "routes"},
+    }))
+    _write_ruleset(tmp_path, "roblox")
+
+    assert router.vpn_select_ruleset("../roblox") == 1
+    assert "name" in capsys.readouterr().err
+    assert router.vpn_select_ruleset("nope") == 1
+    assert "missing" in capsys.readouterr().err
+    assert json.loads(router.CONFIG_FILE.read_text())["vpn"]["capture"] == "routes"
+
+
+def test_vpn_select_ruleset_rejects_unusable_provider(tmp_path, capsys):
+    router = load_router(tmp_path)
+    router.CONFIG_FILE.write_text(json.dumps({
+        "providers": {"proton": {}}, "vpn": {"capture": "routes"},
+    }))
+    router._providers = {"proton": {}}
+    _write_ruleset(tmp_path, "school", provider="cloudflare")
+
+    assert router.vpn_select_ruleset("school") == 1
+    assert "provider" in capsys.readouterr().err
+    assert json.loads(router.CONFIG_FILE.read_text())["vpn"]["capture"] == "routes"
+
+
+def test_vpn_select_ruleset_reloads_live_tun(tmp_path):
+    router = load_router(tmp_path)
+    router.CONFIG_FILE.write_text(json.dumps({
+        "providers": {"proton": {}}, "vpn": {"capture": "routes"},
+    }))
+    router.current_mode = lambda: "tun"
+    router.engine_alive = lambda **kwargs: True
+    calls = []
+    router.engine_reload = lambda: calls.append("reload") or 0
+    _write_ruleset(tmp_path, "roblox")
+
+    assert router.vpn_select_ruleset("roblox") == 0
+    assert calls == ["reload"]
+
+
+def test_vpn_select_cli_reaches_ruleset_dispatch(tmp_path, monkeypatch):
+    # CLI wiring regression: the ruleset name must reach vpn_select_ruleset,
+    # not be swallowed by the optional `capture` positional (#328 council P0).
+    router = load_router(tmp_path)
+    router.CONFIG_FILE.write_text(json.dumps({
+        "providers": {"proton": {}}, "vpn": {"capture": "routes"},
+    }))
+    monkeypatch.setattr(router.sys, "argv", ["router.py", "vpn", "select", "roblox"])
+    monkeypatch.setattr(router, "load_config", lambda: 0)
+    seen = []
+    monkeypatch.setattr(router, "vpn_select_ruleset", lambda name: seen.append(name) or 0)
+
+    assert router.main() == 0
+    assert seen == ["roblox"]
+
+
+def test_vpn_capture_cli_reaches_scope_dispatch(tmp_path, monkeypatch):
+    router = load_router(tmp_path)
+    monkeypatch.setattr(router.sys, "argv", ["router.py", "vpn", "capture", "routes"])
+    monkeypatch.setattr(router, "load_config", lambda: 0)
+    seen = []
+    monkeypatch.setattr(router, "vpn_capture", lambda scope: seen.append(scope) or 0)
+    monkeypatch.setattr(router, "_with_lock", lambda action, timeout=None: action())
+
+    assert router.main() == 0
+    assert seen == ["routes"]
