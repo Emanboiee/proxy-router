@@ -156,6 +156,20 @@ function modeLabel(): string {
   const mode = liveMode();
   return mode === 'Proxy' ? `Proxy · 127.0.0.1:${esc(String(livePayload?.port ?? 2080))}` : mode;
 }
+// A real, visible switch for the two engine modes. The live badge above is
+// read-only; this is the only place in the window that actually calls the
+// `vpn on` / `vpn off` verbs the tray has always used. Unknown mode disables
+// the switch rather than guessing which verb to run.
+function vpnModeControl(): string {
+  const mode = liveMode();
+  const isTun = mode === 'TUN';
+  const action = isTun ? 'vpn-off' : 'vpn-on';
+  const label = isTun ? 'Switch to Proxy' : 'Switch to TUN';
+  const note = isTun
+    ? 'TUN captures all traffic, including UDP. Switch to Proxy for HTTP/HTTPS only.'
+    : 'Proxy handles HTTP/HTTPS only; games that use UDP need TUN.';
+  return `<div class="vpn-mode-control"><button type="button" class="quiet" data-action="${action}" ${mode === 'Unknown' || busy ? 'disabled' : ''}>${label}</button><small>${note}</small></div>`;
+}
 function statusTitle(): [string, string] {
   if (engineActionLabel) return [engineActionLabel, 'Applying the change to the live engine…'];
   if (engineActionError) return [copy[previewState][0], engineActionError];
@@ -336,6 +350,7 @@ function liveHomePage(): string {
       <h1 tabindex="-1">${title}</h1>
       <p class="lead">${description}</p>
       <p class="badge" id="live-vpn-mode" aria-label="Live VPN mode">${esc(modeLabel())}</p>
+      ${vpnModeControl()}
       <div class="hero-actions">${action}</div>
       ${heroActionError()}
       ${dashboardStateReady && snapshot.profiles.length ? `<div class="mode-selector" data-profile-picker><span id="home-profile-label">Profile</span><span class="select-wrap custom-select"><button type="button" role="combobox" class="select-trigger" id="home-profile" data-profile-trigger aria-labelledby="home-profile-label" aria-haspopup="listbox" aria-expanded="false" aria-controls="home-profile-options"><span class="select-value">${esc(activeProfile().name)}</span><span class="select-chevron" aria-hidden="true"></span></button><div class="select-menu" id="home-profile-options" role="listbox" aria-labelledby="home-profile-label" hidden>${profileMenuOptions(snapshot.activeProfileId)}</div></span></div>` : ''}
@@ -589,7 +604,7 @@ function liveSettingsPage(): string {
 function toggle(name: string, label: string, checked: boolean, note: string): string { return `<label class="setting-row"><span><strong>${label}</strong><small>${note}</small></span><input type="checkbox" data-setting="${name}" ${checked ? 'checked' : ''}></label>`; }
 function settingsPage(): string {
   if (isTauri()) return liveSettingsPage();
-  return `<section class="page-section"><div class="section-heading"><div><h1 tabindex="-1">Settings</h1><p class="lead">Small defaults that make the local proxy feel like a normal VPN client.</p></div><span class="badge">Saved locally</span></div><div class="two-column"><article class="panel settings-panel"><h2>Window & connection</h2>${toggle('launchAtLogin', 'Launch at login', snapshot.settings.launchAtLogin, 'Start the tray helper when you sign in.')}${toggle('closeToTray', 'Close to tray', snapshot.settings.closeToTray, 'Closing the window hides it; the tray menu can reopen it.')}${toggle('disconnectOnNetworkLoss', 'Disconnect on Wi-Fi loss', snapshot.settings.disconnectOnNetworkLoss, 'Prevent stale routes while moving between networks.')}${toggle('autoSwitch', 'Auto-switch providers', snapshot.settings.autoSwitch, 'Try the healthiest provider after repeated TLS errors.')}${toggle('fullTunnel', 'Full tunnel mode', snapshot.settings.fullTunnel, 'Route all traffic instead of only selected domains.')}</article><article class="panel settings-panel"><h2>Router details</h2><label>Proxy port<input type="number" min="1024" max="65535" data-setting-number="proxyPort" value="${snapshot.settings.proxyPort}"></label><label>Switch after TLS errors<select data-setting-select="switchAfterErrors"><option value="3" ${snapshot.settings.switchAfterErrors === 3 ? 'selected' : ''}>3 errors</option><option value="5" ${snapshot.settings.switchAfterErrors === 5 ? 'selected' : ''}>5 errors</option><option value="8" ${snapshot.settings.switchAfterErrors === 8 ? 'selected' : ''}>8 errors</option></select></label><label>Log detail<select data-setting-select="logLevel"><option value="normal" ${snapshot.settings.logLevel === 'normal' ? 'selected' : ''}>Normal</option><option value="verbose" ${snapshot.settings.logLevel === 'verbose' ? 'selected' : ''}>Verbose</option></select></label><div class="setting-link"><a class="text-link" href="#appearance">Customize appearance <span aria-hidden="true">↗</span></a></div></article></div></section>`;
+  return `<section class="page-section"><div class="section-heading"><div><h1 tabindex="-1">Settings</h1><p class="lead">Small defaults that make the local proxy feel like a normal VPN client.</p></div><span class="badge">Saved locally</span></div><div class="two-column"><article class="panel settings-panel"><h2>Window & connection</h2>${toggle('launchAtLogin', 'Launch at login', snapshot.settings.launchAtLogin, 'Start the tray helper when you sign in.')}${toggle('closeToTray', 'Close to tray', snapshot.settings.closeToTray, 'Closing the window hides it; the tray menu can reopen it.')}${toggle('disconnectOnNetworkLoss', 'Disconnect on Wi-Fi loss', snapshot.settings.disconnectOnNetworkLoss, 'Prevent stale routes while moving between networks.')}${toggle('autoSwitch', 'Auto-switch providers', snapshot.settings.autoSwitch, 'Try the healthiest provider after repeated TLS errors.')}</article><article class="panel settings-panel"><h2>Router details</h2><label>Proxy port<input type="number" min="1024" max="65535" data-setting-number="proxyPort" value="${snapshot.settings.proxyPort}"></label><label>Switch after TLS errors<select data-setting-select="switchAfterErrors"><option value="3" ${snapshot.settings.switchAfterErrors === 3 ? 'selected' : ''}>3 errors</option><option value="5" ${snapshot.settings.switchAfterErrors === 5 ? 'selected' : ''}>5 errors</option><option value="8" ${snapshot.settings.switchAfterErrors === 8 ? 'selected' : ''}>8 errors</option></select></label><label>Log detail<select data-setting-select="logLevel"><option value="normal" ${snapshot.settings.logLevel === 'normal' ? 'selected' : ''}>Normal</option><option value="verbose" ${snapshot.settings.logLevel === 'verbose' ? 'selected' : ''}>Verbose</option></select></label><div class="setting-link"><a class="text-link" href="#appearance">Customize appearance <span aria-hidden="true">↗</span></a></div></article></div></section>`;
 }
 
 function appearancePage(): string {
@@ -917,7 +932,7 @@ app.addEventListener('click', event => {
   closeProfileMenus();
   const target = element.closest<HTMLElement>('[data-action]'); if (!target) return;
   const action = target.dataset.action; const profileId = target.dataset.profile;
-  if (action === 'connect' || action === 'disconnect' || action === 'reconnect') {
+  if (action === 'connect' || action === 'disconnect' || action === 'reconnect' || action === 'vpn-on' || action === 'vpn-off') {
     // #241: ignore a second click while a verb is in flight.
     if (busy || engineActionLabel) return;
     // Desktop: change the real engine, then re-read it so the hero shows the
@@ -926,7 +941,9 @@ app.addEventListener('click', event => {
       if (isTauri()) {
         busy = true;
         engineActionLabel = action === 'connect' ? 'Connecting…'
-          : action === 'disconnect' ? 'Disconnecting…' : 'Reconnecting…';
+          : action === 'disconnect' ? 'Disconnecting…'
+          : action === 'reconnect' ? 'Reconnecting…'
+          : action === 'vpn-on' ? 'Enabling TUN…' : 'Switching to Proxy…';
         engineActionError = '';
         try {
           render();
