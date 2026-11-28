@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import collections
 import contextlib
+import ipaddress
 import json
 import os
 import re
@@ -453,6 +454,35 @@ class RotationGuard:
         return True
 
 
+_HOSTNAME_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\Z")
+
+
+def valid_probe_host(host: str) -> bool:
+    """Only a bare DNS name / IP may be interpolated into a probe URL.
+
+    Connection-log hosts are attacker-influenced: an ``@`` turns the host into
+    curl userinfo, and ``/``/``?``/``#`` rewrite the request target. Reject
+    anything that is not exactly one hostname or one IP literal.
+    """
+    if not isinstance(host, str) or not host or len(host) > 253:
+        return False
+    if host.startswith("["):
+        if not host.endswith("]"):
+            return False
+        try:
+            ipaddress.IPv6Address(host[1:-1])
+        except ValueError:
+            return False
+        return True
+    if _HOSTNAME_RE.fullmatch(host):
+        return True
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
+
+
 def probe_target(root: Path, host: str, *, runner: Callable = subprocess.run) -> dict:
     """Probe the exact routed target through the local proxy.
 
@@ -460,6 +490,10 @@ def probe_target(root: Path, host: str, *, runner: Callable = subprocess.run) ->
     A curl transport failure (exit code != 0) is the signal used for rotation;
     upstream HTTP errors are recorded but do not cause blind exit churn.
     """
+    if not valid_probe_host(host):
+        # Not a transport failure — a malformed target must never trigger rotation.
+        return {"ok": False, "transport_failure": False, "underlay_signal": False,
+                "error": "invalid target host", "host": host}
     url = f"https://{host}/zen/v1/models" if domain_matches(host, "opencode.ai") else f"https://{host}/"
     try:
         result = runner(
