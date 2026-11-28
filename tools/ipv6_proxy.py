@@ -16,6 +16,10 @@ import ipaddress
 import os
 import socket
 import sys
+
+# Legacy IPv4 spellings (``127.1``, ``2130706433``, ``0x7f000001``,
+# ``0177.0.0.1``) are accepted by the OS resolver but rejected by
+# ipaddress.ip_address(). inet_aton parses them without DNS/network access.
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -64,12 +68,20 @@ def is_allowed(host: str) -> bool:
             if host == entry or host.endswith("." + entry):
                 return True
         return False
-    if host.lower().rstrip(".") == "localhost":
+    normalized = host.lower().rstrip(".")
+    if normalized == "localhost":
         return False
     try:
-        return not ipaddress.ip_address(host).is_loopback
+        return not ipaddress.ip_address(normalized).is_loopback
     except ValueError:
-        return True
+        pass
+    # Fail closed for loopback even in legacy numeric/octal/hex dotted forms
+    # that ipaddress rejects but the system resolver happily routes to 127/8.
+    try:
+        packed = socket.inet_aton(normalized)
+    except OSError:
+        return True  # a hostname, not an IP literal
+    return packed[0] != 127
 
 
 class Ipv6ConnectHandler(BaseHTTPRequestHandler):

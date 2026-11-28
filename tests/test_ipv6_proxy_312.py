@@ -54,6 +54,14 @@ class AllowlistTests(unittest.TestCase):
             with self.subTest(host=host):
                 self.assertFalse(self.mod.is_allowed(host))
 
+    def test_alternate_loopback_spellings_rejected_by_default(self):
+        # #312 R1: numeric/legacy/trailing-dot spellings still resolve to
+        # loopback; the gate must deny them, not fail open.
+        for host in ("127.1", "2130706433", "0x7f000001", "127.0.0.1.",
+                     "0177.0.0.1"):
+            with self.subTest(host=host):
+                self.assertFalse(self.mod.is_allowed(host))
+
     def test_public_host_allowed_by_default(self):
         self.assertTrue(self.mod.is_allowed("example.com"))
 
