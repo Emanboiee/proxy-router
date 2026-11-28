@@ -7829,7 +7829,7 @@ def main() -> int:
             data = status_json(fast=args.fast)
             print(json.dumps(data, indent=2, sort_keys=True))
             return 0 if data["up"] else 1
-        rc, line = _status_report()
+        rc, line = _status_report(fast=args.fast)
         print(line)
         try:
             legacy = _legacy_launch_agents()
