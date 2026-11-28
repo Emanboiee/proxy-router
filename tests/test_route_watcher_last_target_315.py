@@ -36,6 +36,22 @@ class LastTargetEvictionTests(unittest.TestCase):
         w._prune_last_targets(last_target, ())
         self.assertEqual(last_target, {})
 
+    def test_cap_evicts_oldest_active_subdomains(self):
+        # Active subdomains all match the configured domain, so the domain
+        # prune keeps them; the hard cap must still bound the set by recency.
+        hosts = {f"h{i}.now-active.example": float(i) for i in range(64)}
+        w._prune_last_targets(hosts, ("now-active.example",))
+        self.assertLessEqual(len(hosts), w.LAST_TARGET_CAP)
+        self.assertIn("h63.now-active.example", hosts, "newest host must survive")
+        self.assertNotIn("h0.now-active.example", hosts, "oldest host must be evicted")
+
+
+class ProbeBudgetTests(unittest.TestCase):
+    def test_probe_budget_constant_is_bounded(self):
+        self.assertGreaterEqual(w.PROBES_PER_TICK, 1)
+        self.assertLess(w.PROBES_PER_TICK, 32,
+                        "per-tick probe budget must stay small vs the 2s loop")
+
 
 if __name__ == "__main__":
     unittest.main()

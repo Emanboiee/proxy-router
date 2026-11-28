@@ -49,6 +49,12 @@ DEFAULT_CRITICAL_DOMAINS = ("opencode.ai",)
 ENGINE_DOWN_GRACE_TICKS = 3
 TARGET_IDLE_SECONDS = 60.0
 PROBE_EVERY_SECONDS = 10.0
+# #315: active subdomains are not bounded by the configured-domain prune, and
+# each probe is a serial curl with an 8s timeout. Cap both the retained target
+# set and the probes launched per tick so a burst of hosts cannot stall the 2s
+# watcher loop.
+LAST_TARGET_CAP = 32
+PROBES_PER_TICK = 4
 CLIENT_SNAPSHOT_EVERY_SECONDS = 5.0
 FAILURE_WINDOW_SECONDS = 60.0
 MIN_TRANSPORT_FAILURES = 2
@@ -738,6 +744,13 @@ def _prune_last_targets(last_target: dict[str, float], domains: tuple[str, ...])
     for host in list(last_target):
         if not any(domain_matches(host, domain) for domain in domains):
             del last_target[host]
+    if len(last_target) > LAST_TARGET_CAP:
+        # Keep the most recently seen hosts (LRU by observation time); evict
+        # the oldest so a burst of subdomains cannot grow the dict without
+        # bound. ``last_target`` values are monotonic timestamps.
+        for host, _ in sorted(last_target.items(), key=lambda item: item[1])[
+                :len(last_target) - LAST_TARGET_CAP]:
+            del last_target[host]
 
 
 def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = time.sleep) -> int:
@@ -843,9 +856,18 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
                 last_network_check = time.monotonic()
                 _network_check_hop(root)
             now = time.monotonic()
-            for host, seen_at in list(last_target.items()):
-                if now - seen_at > TARGET_IDLE_SECONDS or now - last_probe.get(host, 0) < PROBE_EVERY_SECONDS:
+            probes_this_tick = 0
+            # #315: probe the least-recently-probed hosts first and stop after
+            # the per-tick budget, so a slow host (8s curl timeout) cannot
+            # delay the rest of the 2s watcher loop.
+            probe_order = sorted(last_target, key=lambda h: last_probe.get(h, 0.0))
+            for host in probe_order:
+                seen_at = last_target.get(host)
+                if seen_at is None or now - seen_at > TARGET_IDLE_SECONDS or now - last_probe.get(host, 0) < PROBE_EVERY_SECONDS:
                     continue
+                if probes_this_tick >= PROBES_PER_TICK:
+                    break
+                probes_this_tick += 1
                 last_probe[host] = now
                 result = probe_target(root, host)
                 provider = last_provider.get(host) or provider_for_host(root, host)
