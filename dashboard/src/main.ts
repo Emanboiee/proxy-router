@@ -287,12 +287,9 @@ function homePage(): string {
  */
 function consoleHomePage(): string {
   const [title] = statusTitle();
-  const profile = activeProfile();
-  const provider = activeProvider();
   const connected = previewState === 'connected';
   const action = connected ? 'disconnect' : 'connect';
   const actionLabel = connected ? 'Disconnect' : 'Connect';
-  const modeNote = `${connected ? 'tunnel on' : 'direct'} · ${provider ? esc(provider.name) : 'direct'} · ${profile ? esc(routeLabel(profile.routeMode)) : 'direct'}`;
   const sites = [
     ['discord.com', 1284], ['twitch.tv', 642], ['opencode.ai', 318],
     ['roblox.com', 207], ['static.twitchcdn.net', 96],
@@ -312,7 +309,6 @@ function consoleHomePage(): string {
   return `<section class="page-section console-page" data-state="${previewState}">
     <div class="console-head">
       <h1 class="console-title" tabindex="-1">${esc(title)}</h1>
-      <p class="console-status-line mono">${modeNote}</p>
     </div>
     <div class="grid g-hero">
       <section class="card hero" aria-label="Connection">
@@ -320,7 +316,6 @@ function consoleHomePage(): string {
           <svg viewBox="0 0 156 156" aria-hidden="true"><circle class="track" cx="78" cy="78" r="74"/><circle class="arc" cx="78" cy="78" r="74"/></svg>
           <span class="node"><img src="/gremlin-cat-goblin-cat.gif" alt="" width="64" height="64" decoding="async"></span>
         </button>
-        <span class="power-caption">${actionLabel}</span>
       </section>
       <div class="right-col">
         <div class="card">
@@ -372,7 +367,6 @@ function consoleRoutesPage(): string {
   return `<section class="page-section console-page" data-state="${previewState}">
     <div class="console-head">
       <h1 class="console-title" tabindex="-1">Routes</h1>
-      <p class="console-status-line mono">${esc(mode)} · ${count} routed domains</p>
     </div>
     <section class="card"><div class="card-h"><h2 id="routing-mode-label">Routing mode</h2></div>
       <div class="seg" role="group" aria-labelledby="routing-mode-label">

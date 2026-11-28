@@ -237,6 +237,24 @@ User rejection: "ngl the UI is not looking better i was talking about the comple
   cosmetic drift. Next pick: map provider ids to friendly display names while
   keeping ids as option values.
 - C2 council complete: R1 (A FAIL-P0/P1 / B FAIL-P1) → P0/P1 fixed red-first →
-  R2 (A PASS / B PASS). Ready to commit + push; do not merge without CI + clean
-  council.
+  R2 (A PASS / B PASS). Committed/pushed as 60147fd on PR #337 (ready for review,
+  NOT merged).
+
+### Iteration C3 — remove spaced captions and mono subtitles
+- User request: "remove these goddamn font and not needed subtitles." The flagged
+  element was the widely-tracked uppercase "CONNECT" caption under the power ring.
+  Reversible scope choice: remove `.power-caption` (Overview) and both
+  `.console-status-line` mono subtitles (Overview + Routes); keep honesty footers
+  (SAMPLE DATA / ENGINE ROUTES) but restyle them from letter-spaced mono to plain
+  sans. The power button keeps its accessible aria-label (Connect/Disconnect).
+- RED (verbatim /tmp/c3-red2.log): `1 failed` — `expect(locator).toHaveCount(expected) failed — Locator: locator('.power-caption') — Expected: 0 — Received: 1 — Timeout: 5000ms` at console-clean.spec.ts:22:48. Earlier weaker RED /tmp/c3-red.log failed on footer letterSpacing (Expected "normal", Received "0.8704px").
+- GREEN (verbatim /tmp/c3-green.log): `1 passed (5.1s)` — new tests/console-clean.spec.ts checks caption/subtitle counts are 0, the Connect button is still usable (Connect→Connected), footers are plain sans with letter-spacing normal and keep SAMPLE DATA, Axe [] on Overview + Routes.
+- Full suite (verbatim /tmp/c3-full.log): `82 passed (2.0m)`. `npx tsc --noEmit`: TSC_EXIT=0.
+- Visual: /tmp/c3-overview.png and /tmp/c3-routes.png — no CONNECT caption, no mono subtitle, honesty footers still present in plain sans.
+- Diff: main.ts (removed profile/provider/modeNote locals + subtitle + caption markup in both pages), console.css (removed `.console-status-line` and `.power-caption` rules, restyled `.console-foot`), NEW tests/console-clean.spec.ts.
+### Iteration C3 council gate — CLEAN
+- R1 seat A (ses_ddcbaa358ffeqyDblaGreoMrRh): **PASS**. Live DOM `.power-caption`=0 and `.console-status-line`=0 on Overview+Routes, no orphan CSS; native button aria-label Connect/pressed=false, focus+Enter → Connected/Disconnect/pressed=true, Axe []; footers SAMPLE DATA / LOCAL PROFILE · SELECTIVE ROUTING / ENGINE ROUTES · FROM ROUTER.JSON intact; computed fontFamily DM Sans Variable, letterSpacing normal. Own runs `1 passed (6.9s)`, full `82 passed (2.0m)`, tsc 0. P3: Overview loses at-a-glance provider/mode; test gap on Disconnect aria-label flip.
+- R1 seat B (ses_ddcbaa353ffeEK373Fe2rKH4FB): **PASS**. Ring state still explicit via title + rail status, mode on Routes segmented control, Axe clean, mobile covered; P3 next pick plain-sans power glyph inside ring.
+- R2 seat A: **PASS** — no drift (same 3 files, 17+/12-, hunks byte-identical), focused rerun `1 passed (5.8s)`, tsc 0; no new P0/P1. R2 seat B: **PASS** — no drift at HEAD 60147fd, live GREEN `1 passed (5.4s)` (/tmp/c3-r2-green.log), tsc 0; Axe [] on both pages, focus/mobile/footers intact.
+- C3 council complete: R1 (A PASS / B PASS) → R2 (A PASS / B PASS), zero P0/P1. Ready to commit + push; do not merge without CI + clean council.
 
