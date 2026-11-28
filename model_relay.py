@@ -265,6 +265,12 @@ class ModelRelay(ThreadingHTTPServer):
 class RelayHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    def setup(self):
+        super().setup()
+        # Bound the client header phase. _relay restores the longer stream
+        # idle timeout once request headers have been parsed.
+        self.connection.settimeout(self.server.header_timeout)
+
     def log_message(self, *_):
         # Model requests, credentials, and prompts never enter access logs.
         pass
