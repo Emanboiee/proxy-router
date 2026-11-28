@@ -37,8 +37,9 @@ def load_router(tmp_path):
 def _drive(router, monkeypatch, argv):
     captured = {}
 
-    def fake_report(*, fast=False):
+    def fake_report(*, fast=False, fail_closed_unverified=False):
         captured["fast"] = fast
+        captured["fail_closed_unverified"] = fail_closed_unverified
         return 0, "status ok"
 
     monkeypatch.setattr(router, "_status_report", fake_report)
@@ -91,7 +92,30 @@ def test_fast_tun_fails_closed_on_unverified_running_mode(tmp_path, monkeypatch)
     router.SING_BOX_CONFIG.write_text(
         '{"inbounds": [{"type": "tun"}]}')
 
-    rc, line = router._status_report(fast=True)
+    rc, line = router._status_report(fast=True, fail_closed_unverified=True)
     assert rc == 1, "fast tun status must fail closed, not report up"
     assert "unverified" in line.lower(), f"expected uncertainty in state line, got {line!r}"
     assert probes == [], "fast status must not probe the privileged helper"
+
+
+def test_json_fast_keeps_base_behavior_for_gui(tmp_path, monkeypatch):
+    """#340: the JSON fast path (status_snapshot.py:51, no new param) must keep
+    its base behavior so the dashboard/tray keep working. The human-only
+    fail-closed is opt-in and must NOT leak into GUI consumers.
+    """
+    router = load_router(tmp_path)
+    monkeypatch.setattr(router.sys, "platform", "darwin")
+    monkeypatch.setattr(router, "_effective_uid", lambda: 501)
+    monkeypatch.setattr(router, "_pid_matches", lambda pid: True)
+    monkeypatch.setattr(router.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(router, "_probe_helper_status",
+                        lambda: {"installed": True, "running": True, "mode": "proxy"})
+
+    router.MODE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    router.MODE_FILE.write_text("tun")
+    router.PID_FILE.write_text("4242")
+    router.SING_BOX_CONFIG.write_text('{"inbounds": [{"type": "tun"}]}')
+
+    rc, line = router._status_report(fast=True)  # no fail_closed_unverified
+    assert rc == 0, "JSON fast path must retain base up(tun) behavior"
+    assert line == "up (tun)", f"GUI path state changed unexpectedly: {line!r}"

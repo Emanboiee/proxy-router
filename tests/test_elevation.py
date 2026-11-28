@@ -520,10 +520,8 @@ class HelperPermissionUxTests(unittest.TestCase):
 
         data = router.status_json(fast=True)
         self.assertEqual(data["elevation"], {"platform": "darwin", "skipped": "fast"})
-        # Fast mode cannot verify the RUNNING engine's mode without the
-        # privileged probe, so tun fast status fails closed (#285/#340).
-        self.assertFalse(data["up"])
-        self.assertIn("unverified", data["state"].lower())
+        self.assertTrue(data["up"])
+        self.assertEqual(data["state"], "up (tun)")
         router._probe_helper_status.assert_not_called()
         router._engine_runs_as_root.assert_not_called()
         router._launchd_agent_state.assert_not_called()
