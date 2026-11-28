@@ -695,6 +695,14 @@ ENABLED="${PROXY_KEEPALIVE_ENABLED:-$(config_setting enabled 1)}"
       echo "$(date '+%Y-%m-%d %H:%M:%S') router: ensure ok; backoff reset to ${INTERVAL}s" >&2
     fi
     backoff="$INTERVAL"
+    # #321: is_tun_mode parses sing-box.json in a fresh interpreter. Sample it
+    # once per healthy tick and share the result across the four maintenance
+    # gates below; the earlier startup/dead-exit/restore probes stay live.
+    if is_tun_mode; then
+      tun_this_tick=1
+    else
+      tun_this_tick=0
+    fi
     if [ "$boot" -eq 1 ]; then
       boot=0
       # Boot self-test: one live egress check on the first successful ensure.
@@ -729,7 +737,7 @@ ENABLED="${PROXY_KEEPALIVE_ENABLED:-$(config_setting enabled 1)}"
       # Scheduled rotation: `rotate --if-due` self-gates on the configured
       # interval (exit 0 = rotated, 3 = not due); never logs when quiet.
       # TUN mode skips this shared-engine interruption.
-      if ! is_tun_mode; then
+      if [ "$tun_this_tick" -eq 0 ]; then
         if controller rotate --if-due >/dev/null 2>&1; then
           echo "router: scheduled rotation: rotated provider(s)" >&2
         fi
@@ -746,7 +754,7 @@ ENABLED="${PROXY_KEEPALIVE_ENABLED:-$(config_setting enabled 1)}"
       last_diagnostic="$diagnostic_now"
     fi
     autodetect_now=$(date +%s)
-    if [ "$AUTODETECT_ENABLED" != "0" ] && ! is_tun_mode \
+    if [ "$AUTODETECT_ENABLED" != "0" ] && [ "$tun_this_tick" -eq 0 ] \
        && { [ "$last_autodetect" -eq 0 ] || [ $((autodetect_now - last_autodetect)) -ge "$AUTODETECT_INTERVAL" ]; }; then
       # The controller refreshes every source under one lock, then compares
       # effective routing and performs at most one shared-engine reload.
@@ -767,7 +775,7 @@ ENABLED="${PROXY_KEEPALIVE_ENABLED:-$(config_setting enabled 1)}"
     # record, the sweep defers to the next tick.
     STAGGER="${PROXY_KEEPALIVE_STAGGER:-300}"
     newest_rotation=$(newest_rotation_at)
-    if is_tun_mode; then
+    if [ "$tun_this_tick" -ne 0 ]; then
       :
     elif [ "$SWEEP_EVERY" -le 0 ]; then
       # sweep_every 0 disables the automatic full-pool sweep: every profile hop
@@ -788,7 +796,7 @@ ENABLED="${PROXY_KEEPALIVE_ENABLED:-$(config_setting enabled 1)}"
     # Restore fail-open parks independently of the optional full-pool sweep.
     # A disabled sweep must not leave a parked provider sticky indefinitely.
     restore_now=$(date +%s)
-    if is_tun_mode; then
+    if [ "$tun_this_tick" -ne 0 ]; then
       :
     elif [ "$newest_rotation" -gt 0 ] && [ $((restore_now - newest_rotation)) -lt "$STAGGER" ]; then
       :
