@@ -254,6 +254,8 @@ summary { display: flex; align-items: center; cursor: pointer; color: var(--mute
 .connection-hero .lead { margin-top: var(--s1); }
 .connection-hero .hero-actions { justify-content: center; padding-top: var(--s3); }
 .connection-hero:has([aria-expanded="true"]) { position: relative; z-index: 2; }
+.vpn-mode-control { display: grid; justify-items: center; gap: var(--space-1); margin-top: var(--space-2); }
+.vpn-mode-control small { color: var(--muted); font-size: var(--text-sm); max-width: 26rem; }
 .mode-selector { display: grid; gap: var(--space-2); width: min(100%, 22rem); margin-top: var(--space-4); color: var(--muted); font-size: var(--text-sm); text-align: left; }
 .mode-selector .select-wrap { position: relative; display: block; }
 .select-trigger { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: var(--s4); text-align: left; background: var(--raised); }
