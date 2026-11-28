@@ -311,7 +311,16 @@ def profile_error(root, name):
 
 
 def apply_mapping(router, root, reload_engine=True):
+    """Apply a mapped preset to config, profile store, and engine as one writer."""
     root = Path(root)
+    # One lock around the read-mutate-reload window. Keep it separate from
+    # network-guard.lock: the guard holds that lock while calling this code
+    # through router.py network-check, so reusing it would deadlock.
+    with worker_lock.exclusive(root / "state" / "network-mapping.lock"):
+        return _apply_mapping(router, root, reload_engine)
+
+
+def _apply_mapping(router, root, reload_engine=True):
     now = int(time.time())
     if (root / "state" / "manual-off").exists():
         return {"applied": False, "reason": "manually disconnected", "checked_at": now}
