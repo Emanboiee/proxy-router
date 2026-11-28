@@ -7410,10 +7410,11 @@ def main() -> int:
     vpn = sub.add_parser("vpn", help="toggle TUN mode (on|off|restart|status|capture|rulesets|select)")
     vpn.add_argument("action", choices=["on", "off", "restart", "status", "capture",
                                         "rulesets", "select"])
-    vpn.add_argument("capture", nargs="?", choices=["ruleset", "routes"],
-                     help="TUN capture scope for `vpn capture`")
-    vpn.add_argument("ruleset", nargs="?",
-                     help="ruleset name for `vpn select` (see `vpn rulesets`)")
+    # One optional value positional shared by `capture` (scope) and `select`
+    # (ruleset name). Two separate nargs="?" positionals made argparse bind
+    # the name to `capture` and reject every ruleset via its choices.
+    vpn.add_argument("value", nargs="?",
+                     help="scope for `vpn capture` (routes|ruleset) or ruleset name for `vpn select`")
 
     # setup / monitor / watcher delegate to their modules with a
     # parse_known_args passthrough, but they mirror each module's real
@@ -7937,15 +7938,15 @@ def main() -> int:
         parser.error("routing needs an action: show | set | add | remove")
     if args.cmd == "vpn":
         if args.action == "capture":
-            if args.capture is None:
+            if args.value not in ("ruleset", "routes"):
                 parser.error("vpn capture needs a scope: routes | ruleset")
-            return _with_lock(lambda: vpn_capture(args.capture))
+            return _with_lock(lambda: vpn_capture(args.value))
         if args.action == "rulesets":
             return vpn_rulesets()
         if args.action == "select":
-            if not args.ruleset:
+            if not args.value:
                 parser.error("vpn select needs a ruleset name (see `vpn rulesets`)")
-            return _with_lock(lambda: vpn_select_ruleset(args.ruleset))
+            return _with_lock(lambda: vpn_select_ruleset(args.value))
         if args.action == "on":
             route_watcher_stop()
             rc = _with_lock(vpn_on)
