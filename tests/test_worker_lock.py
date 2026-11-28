@@ -149,5 +149,54 @@ class MonitorStopConfirmTests(unittest.TestCase):
         self.assertFalse(result["confirmed"])
 
 
+class WatcherStopStartRaceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_stop_keeps_markers_published_by_concurrent_start(self):
+        watcher = _load("route_watcher")
+        watcher.state_dir(self.root).mkdir(parents=True, exist_ok=True)
+        old_pid, new_pid = 1111, 2222
+        watcher.pid_file(self.root).write_text(str(old_pid))
+        watcher.enabled_file(self.root).write_text("enabled\n")
+        start_thread = None
+
+        def fake_status(root, **kwargs):
+            return {"running": False, "enabled": True, "pid": None}
+
+        def fake_running(pid, root=None):
+            nonlocal start_thread
+            if pid == old_pid:
+                # Stop has read the stale pid. Let a fresh start publish its
+                # markers while stop sits between its check and its unlink.
+                start_thread = threading.Thread(
+                    target=lambda: watcher.start(self.root))
+                start_thread.start()
+                deadline = time.monotonic() + 0.5
+                while time.monotonic() < deadline:
+                    try:
+                        if watcher.pid_file(self.root).read_text().strip() == str(new_pid):
+                            break
+                    except OSError:
+                        pass
+                    time.sleep(0.01)
+                return False
+            return pid == new_pid
+
+        with mock.patch.object(watcher.subprocess, "Popen",
+                               return_value=SimpleNamespace(pid=new_pid)), \
+             mock.patch.object(watcher, "status", side_effect=fake_status), \
+             mock.patch.object(watcher, "_pid_running", side_effect=fake_running):
+            result = watcher.stop(self.root)
+            if start_thread is not None:
+                start_thread.join(timeout=5.0)
+
+        self.assertTrue(result["stopped"], result)
+        self.assertTrue(watcher.enabled_file(self.root).is_file())
+        self.assertEqual(watcher.pid_file(self.root).read_text().strip(), str(new_pid))
+
+
 if __name__ == "__main__":
     unittest.main()
