@@ -2,13 +2,14 @@
 
 This module is intentionally a leaf.  It knows how to replace a state file
 atomically, but it does not know anything about providers, engines, or the
-router's module-level configuration.  Callers can supply an ownership
-callback for platforms where an elevated write must be handed back to the
-invoking user.
+router's module-level configuration.  It imports only the stdlib.  Callers can
+supply an ownership callback for platforms where an elevated write must be
+handed back to the invoking user.
 """
 
 from __future__ import annotations
 
+import contextlib
 import os
 import json
 import sys
@@ -125,16 +126,68 @@ def publish_sing_box(config: dict, live_path: Path, validate: Callable[[Path], b
 
 
 EVENTS_LOG_MAX_BYTES = 1_000_000
+_LOCK_ATTEMPTS = 100
+_LOCK_PAUSE_SECONDS = 0.05
+
+
+@contextlib.contextmanager
+def _append_lock(path: Path):
+    """Serialize writers with a fixed retry budget, not a clock.
+
+    ``worker_lock.exclusive`` reads ``time.monotonic`` before it tries the
+    lock. Recovery callers patch that clock, so log_event needs a lock that
+    does not consume their scheduled values. The retry cap still keeps a
+    stuck writer from blocking an event for more than about five seconds.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            handle.write("0")
+            handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            for _ in range(_LOCK_ATTEMPTS):
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    time.sleep(_LOCK_PAUSE_SECONDS)
+            else:
+                raise OSError("event log lock busy")
+        yield
+    finally:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            handle.close()
 
 
 def log_event(root: Path, kind: str, **fields) -> None:
     """Append one bounded, secret-free lifecycle event (#184 item 1).
 
     JSONL at ``<root>/state/events.jsonl``: kind, epoch, caller-supplied
-    fields (reason, duration_seconds, provider, config revision...). Best
-    effort: a failing write is reported to stderr and never raises, so event
-    logging cannot break the action it describes. Bounded by truncation from
-    the oldest half once the file passes EVENTS_LOG_MAX_BYTES.
+    fields (reason, duration_seconds, provider, config revision...). Appends
+    hold an exclusive lock against other writers and keep the file at 0600.
+    Best effort: a failing write is reported to stderr and never raises, so
+    event logging cannot break the action it describes. Bounded by truncation
+    from the oldest half once the file passes EVENTS_LOG_MAX_BYTES.
     """
     path = Path(root) / "state" / "events.jsonl"
     event = {"kind": str(kind), "at": int(time.time())}
@@ -142,14 +195,18 @@ def log_event(root: Path, kind: str, **fields) -> None:
     line = json.dumps(event, separators=(",", ":"), sort_keys=True) + "\n"
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            if path.is_file() and path.stat().st_size > EVENTS_LOG_MAX_BYTES:
-                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-                keep = lines[len(lines) // 2:]
-                path.write_text("\n".join(keep) + ("\n" if keep else ""), encoding="utf-8")
-        except OSError:
-            pass  # bounding is best effort; the append below still tries
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(line)
+        # One lock per log: trimming and appending share the same writer, so
+        # two processes cannot interleave halves of a JSON line.
+        with _append_lock(path.with_suffix(".lock")):
+            try:
+                if path.is_file() and path.stat().st_size > EVENTS_LOG_MAX_BYTES:
+                    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+                    keep = lines[len(lines) // 2:]
+                    path.write_text("\n".join(keep) + ("\n" if keep else ""), encoding="utf-8")
+            except OSError:
+                pass  # bounding is best effort; the append below still tries
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(line)
+            os.chmod(path, 0o600)
     except OSError as exc:
         print(f"router: event log write failed ({kind}): {exc}", file=sys.stderr)
