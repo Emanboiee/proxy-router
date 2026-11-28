@@ -256,5 +256,27 @@ User rejection: "ngl the UI is not looking better i was talking about the comple
 - R1 seat A (ses_ddcbaa358ffeqyDblaGreoMrRh): **PASS**. Live DOM `.power-caption`=0 and `.console-status-line`=0 on Overview+Routes, no orphan CSS; native button aria-label Connect/pressed=false, focus+Enter → Connected/Disconnect/pressed=true, Axe []; footers SAMPLE DATA / LOCAL PROFILE · SELECTIVE ROUTING / ENGINE ROUTES · FROM ROUTER.JSON intact; computed fontFamily DM Sans Variable, letterSpacing normal. Own runs `1 passed (6.9s)`, full `82 passed (2.0m)`, tsc 0. P3: Overview loses at-a-glance provider/mode; test gap on Disconnect aria-label flip.
 - R1 seat B (ses_ddcbaa353ffeEK373Fe2rKH4FB): **PASS**. Ring state still explicit via title + rail status, mode on Routes segmented control, Axe clean, mobile covered; P3 next pick plain-sans power glyph inside ring.
 - R2 seat A: **PASS** — no drift (same 3 files, 17+/12-, hunks byte-identical), focused rerun `1 passed (5.8s)`, tsc 0; no new P0/P1. R2 seat B: **PASS** — no drift at HEAD 60147fd, live GREEN `1 passed (5.4s)` (/tmp/c3-r2-green.log), tsc 0; Axe [] on both pages, focus/mobile/footers intact.
-- C3 council complete: R1 (A PASS / B PASS) → R2 (A PASS / B PASS), zero P0/P1. Ready to commit + push; do not merge without CI + clean council.
+- C3 council complete: R1 (A PASS / B PASS) → R2 (A PASS / B PASS), zero P0/P1. Committed/pushed as dfac161 on PR #337 (ready for review, NOT merged).
+
+### Iteration C4 — one font family across the console
+- User request: "make sure the font is fully consistent." Scope choice: every visible
+  text element under `data-layout=console` resolves to the DM Sans Variable stack;
+  no second (mono) family. Keep tabular numerals on `.mono` via font-variant-numeric.
+- Leak sources: console.css `--console-mono` (SF Mono stack) consumed by `.crumb-badge`,
+  `.mono`, `.list .fav`, `.event-log time`; base rules style.css:247 `.route-list
+  .route-domains` and style.css:651 `.diag-raw pre`.
+- RED (verbatim /tmp/c4-red.log): `1 failed` — "Overview still uses a mono font:"
+  16 offenders (`span.crumb-badge`, 6× `span.fav`, 6× `span.hits mono`, 5× `time.`)
+  all `"SF Mono", SFMono-Regular, "JetBrains Mono", Consolas, "Liberation Mono",
+  Menlo, monospace`; `Expected -1 + Received +18` at console-font.spec.ts:34:73.
+- GREEN (verbatim /tmp/c4-green2.log): `1 passed (6.3s)` — new tests/console-font.spec.ts
+  walks all six console pages and asserts zero visible elements compute a mono family.
+- Full suite (verbatim /tmp/c4-full.log): `83 passed (2.1m)`. `npx tsc --noEmit`: TSC_EXIT=0.
+- Diff: console.css (--console-mono redefined to the sans stack + scoped overrides for
+  `.route-domains`, `.diag-raw pre`, `.mono`), NEW tests/console-font.spec.ts. No markup changes.
+- Council R1 seat A (ses_ddcac4080ffexL2HFrcUAFDIYU): **FAIL** — P1 bare `<pre>`/`<code>` in the desktop WARP provider form (main.ts:531) still computes `monospace` under console; the scoped override patched only `.diag-raw pre`, which has no matching markup (dead selector). R1 seat B: PASS (all six pages one DM Sans family, Axe [], tabular-nums intact).
+- P1 fix (red-first): second test in console-font.spec.ts injects `<div class="font-probe"><pre><code>warp-cli connect</code></pre></div>` under console and asserts every family starts with `"DM Sans Variable"` and has no /mono/i. RED /tmp/c4-p1-red.log `1 failed` (`"DM Sans Variable", ... | monospace | monospace`, `Received: false` at console-font.spec.ts:52:119). Fix: console.css overrides now target `:root[data-layout="console"]` `.route-list .route-domains, .mono, pre, code, kbd, samp` with `font-family: var(--console-mono); font-variant-numeric: tabular-nums;`.
+- GREEN /tmp/c4-p1-green.log `2 passed (4.4s)`. Full /tmp/c4-full-final.log `84 passed (2.0m)`. `npx tsc --noEmit` TSC_EXIT=0.
+- Council R2: seat A (ses_ddcac4080ffexL2HFrcUAFDIYU) **PASS** — console.css:16-23 confirms `pre/code/kbd/samp` + `.route-domains/.mono` scoped to the sans stack; live probe of WARP-style pre/code and kbd/samp all compute `"DM Sans Variable", …`, `white-space: pre` intact, zero mono on all six pages, non-console `pre` still `monospace` (no leak), `.hits.mono` tabular-nums; rerun `2 passed (4.7s)`, tsc 0. Seat B (ses_ddcac407dffe1onllPtg769rYr) **PASS** — real Tauri-mocked desktop WARP dialog verified `<pre>` 14px/400 and `<code>` 12px/400 on DM Sans, document mono=[] incl. pseudo-elements, Axe dialog []; focused `7 passed (13.2s)`, full `84 passed (2.0m)`, tsc 0; diff exact (ITERATION_LOG.md, console.css, new console-font.spec.ts). P3 carried: WARP shell commands now proportional; probe-injection test instead of real-dialog test; `.event-log time` lacks tabular-nums.
+- C4 council complete: R1 (A FAIL-P1 / B PASS) → P1 fixed red-first → R2 (A PASS / B PASS). Ready to commit + push; do not merge without CI + clean council.
 

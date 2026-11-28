@@ -9,7 +9,18 @@
   --console-line: #2a2a2c;
   --console-card: #0c0c0d;
   --console-accent: #d4ff62;
-  --console-mono: "SF Mono", "SFMono-Regular", "JetBrains Mono", Consolas, "Liberation Mono", Menlo, monospace;
+  /* One stack for every text element in the console. Telemetry keeps tabular
+     numerals via .mono, but never switches to a second family. */
+  --console-mono: "DM Sans Variable", "DM Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+}
+:root[data-layout="console"] .route-list .route-domains,
+:root[data-layout="console"] .mono,
+:root[data-layout="console"] pre,
+:root[data-layout="console"] code,
+:root[data-layout="console"] kbd,
+:root[data-layout="console"] samp {
+  font-family: var(--console-mono);
+  font-variant-numeric: tabular-nums;
 }
 
 @media (min-width: 651px) {
