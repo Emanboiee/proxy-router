@@ -179,17 +179,6 @@ def _append_lock(path: Path):
             handle.close()
 
 
-def events_lock(root: Path) -> contextlib.AbstractContextManager:
-    """Serialize every writer of ``state/events.jsonl`` across processes.
-
-    The router's ``log_event`` and the watcher's ``append_event`` both hold
-    this around their own write sequences. They must lock the *same* persistent
-    file: an unlink-on-release would let a waiter guard an orphaned inode while
-    a fresh opener locks a new one at the same path.
-    """
-    return _append_lock(Path(root) / "state" / "events.lock")
-
-
 def log_event(root: Path, kind: str, **fields) -> None:
     """Append one bounded, secret-free lifecycle event (#184 item 1).
 
@@ -206,9 +195,9 @@ def log_event(root: Path, kind: str, **fields) -> None:
     line = json.dumps(event, separators=(",", ":"), sort_keys=True) + "\n"
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        # One shared lock per log: the router and the watcher must not
-        # interleave halves of a JSON line or a line-cap rewrite.
-        with events_lock(root):
+        # One lock per log: trimming and appending share the same writer, so
+        # two processes cannot interleave halves of a JSON line.
+        with _append_lock(path.with_suffix(".lock")):
             try:
                 if path.is_file() and path.stat().st_size > EVENTS_LOG_MAX_BYTES:
                     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()

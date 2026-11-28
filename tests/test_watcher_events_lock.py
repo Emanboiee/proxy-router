@@ -1,10 +1,11 @@
-"""PR #332 P1: events.jsonl rewrites must be serialized across writers.
+"""PR #332 P1: two watcher workers must not lose an event to a line-cap trim.
 
-``route_watcher.append_event`` trims the line count with a non-atomic
-``read_text`` -> ``write_text``. Two watcher processes (start/stop locking only
-guards the spawn window) can interleave an append into that window and lose it.
-Both the watcher and the router's ``state.log_event`` therefore hold one shared
-lock on ``state/events.lock`` around their write sequences.
+``state/route-watcher/events.jsonl`` has one writer function,
+``route_watcher.append_event``. Start/stop locking guards only the spawn
+window, so two workers can overlap briefly during cleanup. Its
+``_enforce_event_line_cap`` non-atomic read_text -> write_text can then discard
+the other worker's append. A local persistent lock serializes the whole append
+sequence; ``state.log_event`` writes a different file and is unrelated.
 """
 from __future__ import annotations
 
@@ -13,7 +14,6 @@ import threading
 from pathlib import Path
 
 import route_watcher as watcher
-import state
 
 
 def test_line_cap_rewrite_cannot_clobber_a_concurrent_append(tmp_path, monkeypatch):
@@ -46,8 +46,8 @@ def test_line_cap_rewrite_cannot_clobber_a_concurrent_append(tmp_path, monkeypat
             fired.set()
             window.set()
             assert started.wait(2.0), "second writer never reached the interleave"
-            appended.wait(2.0)  # bounded deadline: when both writers hold the
-            # shared lock, the append lands after the trim, not inside it.
+            appended.wait(2.0)  # bounded deadline: with the lock, the append
+            # lands after the trim, not inside it.
         return real_write_text(self, data, *args, **kwargs)
 
     monkeypatch.setattr(Path, "write_text", write_text_with_interleave)
@@ -70,19 +70,18 @@ def test_line_cap_rewrite_cannot_clobber_a_concurrent_append(tmp_path, monkeypat
     assert any('"marker":"SENTINEL"' in line for line in lines), lines
 
 
-def test_log_event_and_watcher_append_share_one_lock(tmp_path):
-    assert hasattr(state, "events_lock"), "state.events_lock is missing"
+def test_append_event_holds_the_local_events_lock(tmp_path):
+    assert hasattr(watcher, "_events_lock"), "route_watcher._events_lock is missing"
     locked = threading.Event()
     release = threading.Event()
     finished = threading.Event()
 
     def holder():
-        with state.events_lock(tmp_path):
+        with watcher._events_lock(tmp_path):
             locked.set()
             release.wait(3.0)
 
     def writer():
-        state.log_event(tmp_path, "rotation")
         watcher.append_event(tmp_path, {"kind": "probe"})
         finished.set()
 
@@ -92,7 +91,7 @@ def test_log_event_and_watcher_append_share_one_lock(tmp_path):
     assert locked.wait(2.0)
     writer_thread.start()
     try:
-        assert not finished.wait(0.3), "a writer ignored the shared events lock"
+        assert not finished.wait(0.3), "append_event ignored the events lock"
     finally:
         release.set()
         writer_thread.join(3.0)

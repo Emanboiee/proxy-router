@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import json
 import os
 import re
@@ -26,7 +27,6 @@ import time
 from pathlib import Path
 from typing import Callable, Iterable
 
-import state
 import worker_lock
 
 ROOT = Path(os.environ.get("PROXY_ROUTER_ROOT") or Path(__file__).resolve().parent).resolve()
@@ -354,14 +354,55 @@ def _enforce_event_line_cap(path: Path) -> None:
         pass
 
 
+@contextlib.contextmanager
+def _events_lock(root: Path):
+    """Serialize watcher writers of events.jsonl across processes.
+
+    Start/stop locking covers only the spawn window; two workers can overlap
+    for the brief cleanup window. The lock file is persistent: unlinking it on
+    release would let a waiter guard an orphaned inode while a fresh opener
+    locks a new file at the same path.
+    """
+    path = state_dir(root) / "events.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            handle.write("0")
+            handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            handle.close()
+
+
 def append_event(root: Path, event: dict) -> None:
     path = events_file(root)
     try:
-        # #332 P1: start/stop locking only guards the spawn window, so two
-        # watcher workers can append here at once. Hold the shared events
-        # lock across rotate -> append -> line-cap rewrite so a non-atomic
-        # read-modify-write cannot discard the other worker's event.
-        with state.events_lock(root):
+        # #332 P1: two watcher workers can overlap during stop/start, so the
+        # non-atomic line-cap trim must not run while the other appends.
+        with _events_lock(root):
             path.parent.mkdir(parents=True, exist_ok=True)
             _rotate_events(path)
             with path.open("a", encoding="utf-8") as handle:
