@@ -2,7 +2,7 @@ import {currentMonitor, getCurrentWindow, LogicalSize, PhysicalPosition, primary
 import type {LayoutPreset} from './controller';
 
 interface Rect {x: number; y: number; width: number; height: number}
-const presets = {vertical: {width: 560, height: 820}, horizontal: {width: 1440, height: 900}, sidebar: {width: 1440, height: 900}};
+const presets = {vertical: {width: 560, height: 820}, horizontal: {width: 1440, height: 900}, sidebar: {width: 1440, height: 900}, console: {width: 1440, height: 900}};
 
 /** Work area and frame are physical pixels; preset content sizes are logical. */
 export function fitWindowLayout(layout: LayoutPreset, area: Rect, scale: number, frame: {width: number; height: number}, current: Rect): Rect {

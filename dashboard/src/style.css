@@ -59,6 +59,7 @@ nav a.current { background: var(--raised); color: var(--ink); box-shadow: inset 
 /* Breadcrumb/title belong to the sidebar preset only. Kept outside the sidebar
    media query so mobile presets keep the original single-line page label. */
 .view-heading { display: none; }
+.console-crumb { display: none; }
 .badge { color: var(--accent); font-size: var(--text-sm); }
 #toast { color: var(--success); font-size: var(--text-sm); min-height: 1.2em; }
 main { flex: 1; min-height: 0; overflow: auto; padding: var(--space-5) clamp(var(--space-3), 4vw, var(--space-6)); }

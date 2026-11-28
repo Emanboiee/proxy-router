@@ -1,0 +1,270 @@
+/* Signal Console — an opt-in layout that ports the isolated redesign's
+   strongest screen. Everything is scoped to :root[data-layout="console"] so
+   the four existing layouts and every other page stay byte-for-byte intact. */
+
+:root[data-layout="console"] {
+  --console-bg: #000;
+  --console-ink: #fff;
+  --console-muted: #8b8b8f;
+  --console-line: #2a2a2c;
+  --console-card: #0c0c0d;
+  --console-accent: #d4ff62;
+  --console-mono: "SF Mono", "SFMono-Regular", "JetBrains Mono", Consolas, "Liberation Mono", Menlo, monospace;
+}
+
+@media (min-width: 651px) {
+  :root[data-layout="console"] #app {
+    grid-template-columns: 250px minmax(0, 1fr);
+    grid-template-rows: 1fr;
+  }
+}
+
+/* Console is lime-on-ink by identity. The scheme picker is still selectable
+   and persisted, so remap light-scheme tokens to the console palette here —
+   otherwise light text lands on a forced-black canvas (WCAG contrast fail). */
+:root[data-layout="console"],
+html[data-layout="console"]:has(.polished-preview),
+html[data-layout="console"][data-scheme="light"]:has(.polished-preview) {
+  color-scheme: dark;
+  --canvas: #000; --surface: #0c0c0d; --raised: #141414; --raised-2: #1d1d1d;
+  --ink: #fff; --muted: #8b8b8f; --line: #2a2a2c; --line-strong: #75757e;
+  --accent: #d4ff62; --accent-strong: #b8e84c; --accent-ink: #0a0a08;
+  --success: #8cdda8; --warning: #efc276; --error: #ffa39c; --focus: #b8ddff;
+  --shadow: none;
+}
+
+:root[data-layout="console"] body,
+:root[data-layout="console"] {
+  background: var(--console-bg);
+  color: var(--console-ink);
+}
+
+:root[data-layout="console"] #app {
+  font-family: "DM Sans Variable", "DM Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  background: var(--console-bg);
+  color: var(--console-ink);
+  background-image: linear-gradient(color-mix(in srgb, var(--console-line) 45%, transparent) 1px, transparent 1px), linear-gradient(90deg, color-mix(in srgb, var(--console-line) 45%, transparent) 1px, transparent 1px);
+  background-size: 44px 44px;
+}
+
+@media (min-width: 651px) {
+  :root[data-layout="console"] .rail {
+    width: 250px;
+    height: 100dvh;
+    position: sticky;
+    top: 0;
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--space-4);
+    padding: var(--space-4) var(--space-3);
+    border-right: 1px solid var(--console-line);
+    border-bottom: 0;
+    background: #070707;
+  }
+  :root[data-layout="console"] .rail header { gap: var(--space-2); align-items: flex-start; }
+  :root[data-layout="console"] .rail header strong { display: grid; line-height: 1.05; font-size: .92rem; letter-spacing: -.02em; }
+  :root[data-layout="console"] .rail header strong::after {
+    content: "v2.4 signal console";
+    color: var(--console-muted);
+    font-size: .72rem;
+    font-weight: 400;
+    letter-spacing: .04em;
+  }
+  :root[data-layout="console"] .rail-logo {
+    width: 44px;
+    height: 44px;
+    border-radius: 12px;
+    border: 1px solid var(--console-line);
+    background: var(--console-accent);
+  }
+  :root[data-layout="console"] #menu { display: none; }
+  :root[data-layout="console"] .rail nav { display: grid; flex: initial; gap: 2px; }
+  :root[data-layout="console"] .rail nav a {
+    gap: var(--space-2);
+    min-height: 40px;
+    color: var(--console-muted);
+    border: 1px solid transparent;
+    background: transparent;
+  }
+  :root[data-layout="console"] .rail nav a svg { width: 18px; height: 18px; }
+  :root[data-layout="console"] #app[data-page] nav a.current {
+    background: color-mix(in srgb, var(--console-accent) 12%, #0e1008);
+    border-color: color-mix(in srgb, var(--console-accent) 30%, transparent);
+    box-shadow: none;
+    color: var(--console-ink);
+  }
+  :root[data-layout="console"] #app[data-page] nav a:hover { background: #141414; color: var(--console-ink); }
+  :root[data-layout="console"] .rail-status {
+    order: 3;
+    margin: auto 0 0;
+    padding: var(--space-2);
+    border: 1px solid var(--console-line);
+    border-radius: 12px;
+    background: #0d0d0d;
+    color: var(--console-muted);
+  }
+  :root[data-layout="console"] .rail-status strong { color: var(--console-ink); font-weight: 500; display: block; }
+}
+
+/* Header: PR badge + breadcrumb; hide the other presets' heading and chrome. */
+:root[data-layout="console"] .topbar {
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-5);
+  border-bottom: 1px solid var(--console-line);
+  background: rgba(0, 0, 0, .82);
+  color: var(--console-muted);
+}
+:root[data-layout="console"] .view-heading,
+:root[data-layout="console"] #prototype-badge { display: none; }
+:root[data-layout="console"] .console-crumb { display: flex; align-items: center; gap: var(--space-2); min-width: 0; }
+:root[data-layout="console"] .crumb-badge {
+  display: inline-grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  background: var(--console-accent);
+  color: #0a0a08;
+  font: 700 .72rem/1 var(--console-mono);
+  letter-spacing: .04em;
+}
+:root[data-layout="console"] .crumb-text { font-size: .82rem; color: var(--console-ink); }
+:root[data-layout="console"] .crumb-sep { color: var(--console-muted); padding: 0 .3rem; }
+:root[data-layout="console"] #crumb-page { color: var(--console-muted); }
+:root[data-layout="console"] #page-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+
+:root[data-layout="console"] main {
+  padding: var(--space-4) var(--space-5);
+  background: var(--console-bg);
+  color: var(--console-ink);
+}
+:root[data-layout="console"] .page-section { max-width: 90rem; }
+:root[data-layout="console"] footer { background: #070707; border-top: 1px solid var(--console-line); color: var(--console-muted); }
+
+/* Console Overview: hairline cards, lime accent, mono telemetry, no glows. */
+:root[data-layout="console"] .console-page { animation: none; }
+:root[data-layout="console"] .console-head { margin-bottom: var(--space-4); }
+:root[data-layout="console"] .console-title {
+  font-size: 1.9rem;
+  font-weight: 600;
+  letter-spacing: -.04em;
+  margin: 0 0 4px;
+  color: var(--console-ink);
+}
+:root[data-layout="console"] .console-status-line { color: var(--console-muted); font-size: .78rem; margin: 0; }
+:root[data-layout="console"] .mono { font-family: var(--console-mono); font-variant-numeric: tabular-nums; }
+
+:root[data-layout="console"] .grid { display: grid; gap: var(--space-3); }
+:root[data-layout="console"] .g-hero { grid-template-columns: minmax(260px, 1fr) minmax(0, 2.4fr); }
+:root[data-layout="console"] .g-2 { grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); margin-top: var(--space-3); }
+:root[data-layout="console"] .right-col { display: grid; gap: var(--space-3); align-content: start; }
+:root[data-layout="console"] .card {
+  background: var(--console-card);
+  border: 1px solid var(--console-line);
+  border-radius: 14px;
+  padding: var(--space-4);
+  box-shadow: none;
+  color: var(--console-ink);
+}
+:root[data-layout="console"] .hero {
+  display: grid;
+  place-items: center;
+  min-height: 320px;
+  border-color: var(--console-line);
+}
+:root[data-layout="console"] .card-h {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+  border-bottom: 1px solid var(--console-line);
+  padding-bottom: var(--space-2);
+}
+:root[data-layout="console"] .card-h h2 { font-size: .95rem; font-weight: 600; margin: 0; color: var(--console-ink); }
+:root[data-layout="console"] .legend { display: flex; gap: var(--space-3); font-size: .72rem; color: var(--console-muted); }
+:root[data-layout="console"] .legend span { display: inline-flex; align-items: center; gap: .4rem; }
+:root[data-layout="console"] .legend i { width: 8px; height: 8px; border-radius: 2px; background: var(--console-muted); }
+:root[data-layout="console"] .spark { display: block; width: 100%; height: 190px; color: var(--console-muted); }
+
+:root[data-layout="console"] .power {
+  position: relative;
+  width: 156px;
+  height: 156px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  padding: 0;
+  color: var(--console-muted);
+}
+:root[data-layout="console"] .power:hover { background: transparent; border-color: transparent; }
+:root[data-layout="console"] .power svg { position: absolute; inset: 0; width: 100%; height: 100%; transform: rotate(-90deg); }
+:root[data-layout="console"] .power .track { fill: none; stroke: #232326; stroke-width: 6; }
+:root[data-layout="console"] .power .arc { fill: none; stroke: var(--console-accent); stroke-width: 6; stroke-linecap: round; stroke-dasharray: 425 465; }
+:root[data-layout="console"] .power .node { position: absolute; inset: 0; display: grid; place-items: center; }
+:root[data-layout="console"] .power .node img { width: 64px; height: 64px; border-radius: 14px; }
+:root[data-layout="console"] .power-caption { font: .72rem/1 var(--console-mono); letter-spacing: .08em; text-transform: uppercase; color: var(--console-muted); }
+
+:root[data-layout="console"] .list, :root[data-layout="console"] .event-log { list-style: none; margin: 0; padding: 0; }
+:root[data-layout="console"] .list .row { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-2) 0; border-bottom: 1px solid var(--console-line); }
+:root[data-layout="console"] .list .row:last-child { border-bottom: 0; }
+:root[data-layout="console"] .list .fav {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  flex: 0 0 auto;
+  border: 1px solid var(--console-line);
+  border-radius: 7px;
+  font: 600 .72rem/1 var(--console-mono);
+  color: var(--console-muted);
+}
+:root[data-layout="console"] .list .grow { flex: 1; min-width: 0; }
+:root[data-layout="console"] .list .grow strong { font-size: .86rem; font-weight: 500; }
+:root[data-layout="console"] .list .bar { height: 4px; margin-top: 6px; border-radius: 99px; background: #1d1d20; overflow: hidden; }
+:root[data-layout="console"] .list .bar span { display: block; height: 100%; border-radius: 99px; background: var(--console-accent); }
+:root[data-layout="console"] .list .hits { font-size: .78rem; color: var(--console-muted); }
+:root[data-layout="console"] .btn.sm { padding: 4px 10px; min-height: 30px; font-size: .74rem; border: 1px solid var(--console-line); border-radius: 8px; background: #141414; color: var(--console-ink); text-decoration: none; }
+:root[data-layout="console"] .btn.sm:hover { border-color: var(--console-accent); color: var(--console-accent); }
+
+:root[data-layout="console"] .event-log li {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-2) 0;
+  border-bottom: 1px solid var(--console-line);
+  font-size: .82rem;
+}
+:root[data-layout="console"] .event-log li:last-child { border-bottom: 0; }
+:root[data-layout="console"] .event-log time { font: .72rem/1.5 var(--console-mono); color: var(--console-muted); flex: 0 0 auto; }
+:root[data-layout="console"] .console-foot {
+  margin-top: var(--space-2);
+  border-top: 1px solid var(--console-line);
+  padding-top: var(--space-2);
+  font: .68rem/1 var(--console-mono);
+  letter-spacing: .08em;
+  color: var(--console-muted);
+}
+
+@media (max-width: 1100px) {
+  :root[data-layout="console"] .g-hero { grid-template-columns: minmax(220px, 1fr) minmax(0, 1.6fr); }
+  :root[data-layout="console"] .g-2 { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 650px) {
+  :root[data-layout="console"] .topbar { padding: var(--space-2) var(--space-3); }
+  :root[data-layout="console"] main { padding: var(--space-4) var(--space-3); }
+  :root[data-layout="console"] .g-hero { grid-template-columns: 1fr; }
+  :root[data-layout="console"] .g-2 { grid-template-columns: 1fr; }
+  :root[data-layout="console"] .hero { min-height: 240px; }
+  :root[data-layout="console"] .spark { height: 150px; }
+  :root[data-layout="console"] .rail-status { display: none; }
+  :root[data-layout="console"] #app { display: block; height: auto; min-height: 100dvh; }
+  :root[data-layout="console"] .rail { width: auto; height: auto; position: static; flex-direction: row; align-items: center; padding: var(--space-2) var(--space-3); border-bottom: 1px solid var(--console-line); }
+  :root[data-layout="console"] .rail header strong::after { display: none; }
+  :root[data-layout="console"] .rail-logo { width: 32px; height: 32px; }
+  :root[data-layout="console"] #menu { display: block; }
+  :root[data-layout="console"] .rail nav { display: none; }
+  :root[data-layout="console"] .rail:has(#menu[aria-expanded="true"]) nav { display: grid; }
+  :root[data-layout="console"] main { overflow: visible; }
+}

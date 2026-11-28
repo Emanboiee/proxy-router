@@ -55,7 +55,9 @@ function colorHue(color: string): number {
 
 export function applyDashboardPalette(): void {
   const root = document.documentElement;
-  const light = root.dataset.scheme === 'light' || root.dataset.scheme === 'system' && matchMedia('(prefers-color-scheme: light)').matches;
+  // Console is lime-on-ink by identity; ignore the scheme picker while it is active.
+  const light = root.dataset.layout !== 'console'
+    && (root.dataset.scheme === 'light' || root.dataset.scheme === 'system' && matchMedia('(prefers-color-scheme: light)').matches);
   const hues: Record<string, number> = {signal: 230, ocean: 205, moss: 145, iris: 265};
   const custom = storageGet('router-custom-theme-color');
   const hue = custom && /^#[\da-f]{6}$/i.test(custom) ? colorHue(custom) : hues[root.dataset.accent ?? 'signal'] ?? 230;

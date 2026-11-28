@@ -4,6 +4,7 @@ import {applyDashboardPalette, polishDashboard} from './dashboard-polish';
 import {connectionControls, serverInventory} from './server-controls';
 import './tokens.css';
 import './style.css';
+import './console.css';
 import { LocalController, manageDashboardServer, saveServerPreference, switchDashboardServer, applyEngineAction, applyDashboardProfile, deleteDashboardProfile, deleteDashboardProvider, getCachedLiveStatus, getDashboardState, getLiveStatus, getPreviewStatus, reportNavigationDone, reportPreviewFrame, saveDashboardProfile, saveDashboardProvider, setTrayStatus, states, type Accent, type Connection, type DashboardState, type Density, type FallbackMode, type LayoutPreset, type MotionSpeed, type PreviewState, type Profile, type Provider, type ProviderKind, type RouteMode, type Scheme, type Snapshot, type Status, type TailscaleMode } from './controller';
 import { open as openNativeFile } from '@tauri-apps/plugin-dialog';
 import { isTauri } from '@tauri-apps/api/core';
@@ -66,7 +67,7 @@ const accents: { id: Accent; name: string; colour: string }[] = [
   { id: 'moss', name: 'Moss', colour: '#a8ddb0' }, { id: 'iris', name: 'Iris', colour: '#c9b7ff' },
 ];
 
-app.innerHTML = `<aside class="rail"><header><img class="rail-logo" src="/gremlin-cat-goblin-cat.gif" alt="" width="32" height="32" decoding="async"><strong>proxy router</strong><button id="menu" aria-expanded="false" aria-controls="nav">Menu</button></header><nav id="nav" aria-label="Primary">${pages.map(item => `<a href="#${item.toLowerCase()}">${item}</a>`).join('')}</nav><div class="rail-status"><span class="status-dot" aria-hidden="true"></span><span id="rail-status">Local controller</span></div></aside><div class="workspace"><div class="topbar" role="banner"><span class="view-heading" aria-hidden="true"><span id="view-breadcrumb" class="eyebrow">Overview</span><span id="view-title">Home</span></span><span id="page-label">Home</span><span class="topbar-actions"><span class="badge" id="prototype-badge">Local prototype</span><span id="toast" role="status" aria-live="polite"></span></span></div><main id="main" tabindex="-1"></main><footer><span>Local data · router changes stay behind the controller</span><button id="preview" type="button">Preview states</button></footer></div><dialog id="preview-dialog" aria-labelledby="dialog-title"><form method="dialog"><h2 id="dialog-title">Preview a connection state</h2><p>These examples review the interface. They do not change your network or VPN.</p><label for="scenario">Connection state</label><select id="scenario">${states.map(item => `<option value="${item}">${copy[item][0]}</option>`).join('')}</select><div class="dialog-actions"><button value="cancel" autofocus>Cancel</button><button value="apply" class="primary">Show preview</button></div></form></dialog><dialog id="import-dialog" aria-labelledby="import-title"><form id="import-form" method="dialog"><h2 id="import-title">Import a profile</h2><p>Paste a proxy-router profile export. It is saved locally on this computer.</p><label for="profile-json">Profile JSON</label><textarea id="profile-json" rows="8" required placeholder="Profile export JSON"></textarea><div class="dialog-actions"><button value="cancel">Cancel</button><button value="import" class="primary">Import profile</button></div></form></dialog><dialog id="profile-dialog" aria-labelledby="profile-dialog-title"></dialog><dialog id="provider-dialog" aria-labelledby="provider-dialog-title"></dialog>`;
+app.innerHTML = `<aside class="rail"><header><img class="rail-logo" src="/gremlin-cat-goblin-cat.gif" alt="" width="32" height="32" decoding="async"><strong>proxy router</strong><button id="menu" aria-expanded="false" aria-controls="nav">Menu</button></header><nav id="nav" aria-label="Primary">${pages.map(item => `<a href="#${item.toLowerCase()}">${item}</a>`).join('')}</nav><div class="rail-status"><span class="status-dot" aria-hidden="true"></span><span id="rail-status">Local controller</span></div></aside><div class="workspace"><div class="topbar" role="banner"><span class="console-crumb" aria-hidden="true"><span class="crumb-badge">PR</span><span class="crumb-text">Proxy Router <span class="crumb-sep">/</span> <span id="crumb-page">Overview</span></span></span><span class="view-heading" aria-hidden="true"><span id="view-breadcrumb" class="eyebrow">Overview</span><span id="view-title">Home</span></span><span id="page-label">Home</span><span class="topbar-actions"><span class="badge" id="prototype-badge">Local prototype</span><span id="toast" role="status" aria-live="polite"></span></span></div><main id="main" tabindex="-1"></main><footer><span>Local data · router changes stay behind the controller</span><button id="preview" type="button">Preview states</button></footer></div><dialog id="preview-dialog" aria-labelledby="dialog-title"><form method="dialog"><h2 id="dialog-title">Preview a connection state</h2><p>These examples review the interface. They do not change your network or VPN.</p><label for="scenario">Connection state</label><select id="scenario">${states.map(item => `<option value="${item}">${copy[item][0]}</option>`).join('')}</select><div class="dialog-actions"><button value="cancel" autofocus>Cancel</button><button value="apply" class="primary">Show preview</button></div></form></dialog><dialog id="import-dialog" aria-labelledby="import-title"><form id="import-form" method="dialog"><h2 id="import-title">Import a profile</h2><p>Paste a proxy-router profile export. It is saved locally on this computer.</p><label for="profile-json">Profile JSON</label><textarea id="profile-json" rows="8" required placeholder="Profile export JSON"></textarea><div class="dialog-actions"><button value="cancel">Cancel</button><button value="import" class="primary">Import profile</button></div></form></dialog><dialog id="profile-dialog" aria-labelledby="profile-dialog-title"></dialog><dialog id="provider-dialog" aria-labelledby="provider-dialog-title"></dialog>`;
 app.insertAdjacentHTML('beforeend', '<dialog id="server-dialog" aria-labelledby="server-dialog-title"><div class="server-dialog-heading"><h2 id="server-dialog-title">Installed servers</h2><button type="button" data-action="close-servers">Close</button></div><label for="server-search">Search installed servers</label><input id="server-search" type="search" placeholder="Server name"><div id="server-inventory"></div><p id="server-dialog-feedback" role="status"></p></dialog>');
 const serverDialog=document.querySelector<HTMLDialogElement>('#server-dialog')!;
 serverDialog.addEventListener('close',()=>{ const opener=serverDialogOpener?.isConnected?serverDialogOpener:main.querySelector<HTMLElement>('[data-action="manage-servers"]'); opener?.focus(); });
@@ -275,6 +276,66 @@ function homePage(): string {
       ${heroActionError()}
       <div class="mode-selector" data-profile-picker><span id="home-profile-label">Mode</span><span class="select-wrap custom-select"><button type="button" role="combobox" class="select-trigger" id="home-profile" data-profile-trigger aria-labelledby="home-profile-label" aria-haspopup="listbox" aria-expanded="false" aria-controls="home-profile-options"><span class="select-value">${esc(profile.name)}</span><span class="select-chevron" aria-hidden="true"></span></button><div class="select-menu" id="home-profile-options" role="listbox" aria-labelledby="home-profile-label" hidden>${profileMenuOptions(snapshot.activeProfileId)}</div></span></div>
       <p class="connection-status" aria-label="Connection status"><span>${esc(compactStatus)}</span><a class="text-link" href="#profiles">Edit profile <span aria-hidden="true">↗</span></a></p>
+    </div>
+  </section>`;
+}
+
+/**
+ * Signal Console Overview — a port of the isolated redesign's strongest screen.
+ * Values are clearly marked sample data; the connection control is the same
+ * real data-action the standard hero uses, so connect/disconnect stay truthful.
+ */
+function consoleHomePage(): string {
+  const [title] = statusTitle();
+  const profile = activeProfile();
+  const provider = activeProvider();
+  const connected = previewState === 'connected';
+  const action = connected ? 'disconnect' : 'connect';
+  const actionLabel = connected ? 'Disconnect' : 'Connect';
+  const modeNote = `${connected ? 'tunnel on' : 'direct'} · ${provider ? esc(provider.name) : 'direct'} · ${profile ? esc(routeLabel(profile.routeMode)) : 'direct'}`;
+  const sites = [
+    ['discord.com', 1284], ['twitch.tv', 642], ['opencode.ai', 318],
+    ['roblox.com', 207], ['static.twitchcdn.net', 96],
+  ] as const;
+  const maxHits = Math.max(...sites.map(site => site[1]));
+  const siteRows = sites.map(([domain, hits]) => `<li class="row"><span class="fav">${domain[0]}</span><div class="grow"><strong>${domain}</strong><div class="bar"><span style="width:${Math.round(hits / maxHits * 100)}%"></span></div></div><span class="hits mono">${hits.toLocaleString()}</span></li>`).join('');
+  const events = [
+    ['19:42:08', 'Network check passed'], ['19:38:15', 'Routing mode: safe-list'],
+    ['19:31:02', 'Switched to Cloudflare WARP'], ['19:24:47', 'Added opencode.ai'],
+    ['19:03:11', 'Profile: School access'],
+  ] as const;
+  const eventRows = events.map(([time, message]) => `<li><span>${message}</span><time>${time}</time></li>`).join('');
+  // A deterministic, hand-authored sample series — never live traffic.
+  const points = [48, 44, 39, 43, 41, 36, 38, 40, 47, 58, 74, 69, 61, 67, 72, 63, 58, 71, 66, 60];
+  const max = Math.max(...points);
+  const sparkPoints = points.map((value, index) => `${(index / (points.length - 1)) * 300},${120 - (value / max) * 112 - 4}`).join(' ');
+  return `<section class="page-section console-page" data-state="${previewState}">
+    <div class="console-head">
+      <h1 class="console-title" tabindex="-1">${esc(title)}</h1>
+      <p class="console-status-line mono">${modeNote}</p>
+    </div>
+    <div class="grid g-hero">
+      <section class="card hero" aria-label="Connection">
+        <button type="button" class="power" data-action="${action}" aria-label="${actionLabel}" aria-pressed="${connected}" ${busy ? 'disabled' : ''}>
+          <svg viewBox="0 0 156 156" aria-hidden="true"><circle class="track" cx="78" cy="78" r="74"/><circle class="arc" cx="78" cy="78" r="74"/></svg>
+          <span class="node"><img src="/gremlin-cat-goblin-cat.gif" alt="" width="64" height="64" decoding="async"></span>
+        </button>
+        <span class="power-caption">${actionLabel}</span>
+      </section>
+      <div class="right-col">
+        <div class="card">
+          <div class="card-h"><h2>Throughput</h2><div class="legend"><span><i class="direct-dot" aria-hidden="true"></i>Direct</span></div></div>
+          <svg class="spark" viewBox="0 0 300 120" preserveAspectRatio="none" role="img" aria-label="Sample throughput chart"><polyline points="${sparkPoints}" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" vector-effect="non-scaling-stroke"/></svg>
+        </div>
+      </div>
+    </div>
+    <div class="grid g-2">
+      <section class="card"><div class="card-h"><h2>Top routed sites</h2><a class="btn sm" href="#profiles">Manage →</a></div>
+        <ul class="list">${siteRows}</ul></section>
+      <section class="card activity"><div class="card-h"><h2>Activity</h2></div>
+        <ul class="event-log">${eventRows}</ul>
+        <div class="console-foot"><span>SAMPLE DATA</span></div>
+      </section>
     </div>
   </section>`;
 }
@@ -608,10 +669,10 @@ function settingsPage(): string {
 }
 
 function appearancePage(): string {
-  const layoutPresets = (['sidebar', 'vertical', 'horizontal'] as LayoutPreset[]).map(item => {
+  const layoutPresets = (['console', 'sidebar', 'vertical', 'horizontal'] as LayoutPreset[]).map(item => {
     const selected = snapshot.theme.layout === item;
-    const name = item === 'sidebar' ? 'Sidebar' : item === 'vertical' ? 'Vertical' : 'Horizontal';
-    const note = item === 'sidebar' ? 'Persistent side navigation with a focused overview.' : item === 'vertical' ? 'Stacked controls for a narrow window.' : 'Side-by-side controls for a wide window.';
+    const name = item === 'console' ? 'Console' : item === 'sidebar' ? 'Sidebar' : item === 'vertical' ? 'Vertical' : 'Horizontal';
+    const note = item === 'console' ? 'Signal Console: instrument-style status, routes, and activity.' : item === 'sidebar' ? 'Persistent side navigation with a focused overview.' : item === 'vertical' ? 'Stacked controls for a narrow window.' : 'Side-by-side controls for a wide window.';
     return `<button type='button' class='layout-preset ${selected ? 'selected' : ''}' data-action='theme-layout' data-layout='${item}' aria-pressed='${selected}'><strong>${name}</strong><small>${note}</small></button>`;
   }).join('');
   const schemeOptions = (['system', 'light', 'dark'] as Scheme[]).map(item => `<option value='${item}' ${snapshot.theme.scheme === item ? 'selected' : ''}>${item[0].toUpperCase() + item.slice(1)}</option>`).join('');
@@ -633,6 +694,7 @@ function render(options?: { background?: boolean }): void {
   document.querySelector('#page-label')!.textContent = page;
   document.querySelector('#view-breadcrumb')!.textContent = page === 'Home' ? 'Overview' : 'Proxy Router';
   document.querySelector('#view-title')!.textContent = page;
+  document.querySelector('#crumb-page')!.textContent = page === 'Home' ? 'Overview' : page;
   document.title = `${page} — Proxy router`;
   document.querySelector('#rail-status')!.textContent = busy ? 'Saving…' : previewState === 'failed' ? 'Controller unavailable' : `${previewState[0].toUpperCase()}${previewState.slice(1)}`;
   const nav = document.querySelector<HTMLElement>('#nav')!;
@@ -655,7 +717,10 @@ function render(options?: { background?: boolean }): void {
   const editing = options?.background && (focused || draft || main.querySelector('[data-network-draft="true"]') !== null
     || main.querySelector('[aria-expanded="true"][aria-haspopup="listbox"]') !== null);
   if (!editing) {
-    const markup = page === 'Home' ? homePage() : page === 'Profiles' ? profilesPage() : page === 'Providers' ? providersPage() : page === 'Connectivity' ? connectivityPage() : page === 'Settings' ? settingsPage() + diagnosticsSettings() : appearancePage();
+    const consoleLayout = snapshot.theme.layout === 'console';
+    const markup = page === 'Home'
+      ? (consoleLayout ? consoleHomePage() : homePage())
+      : page === 'Profiles' ? profilesPage() : page === 'Providers' ? providersPage() : page === 'Connectivity' ? connectivityPage() : page === 'Settings' ? settingsPage() + diagnosticsSettings() : appearancePage();
     if (!options?.background || markup !== renderedPageMarkup) {
       const scrollTop = main.scrollTop;
       const scrollLeft = main.scrollLeft;

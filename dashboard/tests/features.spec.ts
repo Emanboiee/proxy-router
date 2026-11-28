@@ -193,7 +193,7 @@ test('connection actions, settings, themes, and diagnostics persist', async ({ p
   await page.getByLabel('Proxy port').press('Tab');
   await selectWeb(page.getByLabel('Switch after TLS errors'), '3');
   await page.getByRole('link', { name: 'Appearance', exact: true }).click();
-  await expect(page.locator('[data-action="theme-layout"]')).toHaveCount(3);
+  await expect(page.locator('[data-action="theme-layout"]')).toHaveCount(4);
   await page.getByRole('button', { name: /^Vertical/ }).click();
   await expect(page.locator('html')).toHaveAttribute('data-layout', 'vertical');
   const verticalShell = await page.locator('#app').evaluate(element => {

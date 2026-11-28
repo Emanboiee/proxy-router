@@ -103,3 +103,63 @@ State file — re-read at every seam. Worktree: feat/dashboard-ui-v2 (off origin
   R3 (A PASS / B PASS). Two P1 rounds fixed, final clean.
 - Next pick (iteration 2): port the prototype's topbar profile picker wired to
   real active-profile controller state (both seats agree, both rounds).
+
+---
+
+## NEW TASK (replaces rejected iteration 1) — Signal Console port
+
+User rejection: "ngl the UI is not looking better i was talking about the completely new UI find it somewhere". Real target supplied at `/Users/kyson/botkrie/state/ui-run/` (entry `work/ui/redesign.html`, assets `work/ui/redesign/`, notes REDESIGN.md / COUNCIL-UI.md / RESULT.md). The earlier `sidebar` preset work is DONE and PR #337 — do not touch it further.
+
+### Iteration C1 — console layout preset: shell + Overview (implementation done)
+- Scope: NEW opt-in `console` layout preset porting the Signal Console identity:
+  lime-on-ink (#000/#fff, --console-accent #d4ff62), faint schematic grid, DM Sans
+  font stack, 250px side rail with PR breadcrumb header, power ring, throughput
+  sparkline, top routed sites with lime bars, timestamped activity log + SAMPLE DATA
+  footer. Reuses real `#nav`, real `data-action=connect/disconnect`, existing ids.
+  Default remains `horizontal`; other presets/pages untouched via CSS scoping.
+- RED (verbatim /tmp/console-red.log): `npx playwright test tests/console-shell.spec.ts`
+  → `3 failed`, each `locator.click: Test timeout of 30000ms exceeded. waiting for getByRole('button', { name: /^Console/ })` at `console-shell.spec.ts:13:54`.
+- GREEN (verbatim /tmp/console-green.log): `3 passed (4.8s)`.
+- First full run 74 passed/1 failed: new `.console-crumb` was visible in default layout
+  at mobile width, inflating topbar to 87px (topbar-regression expects <72). Fix:
+  global `.console-crumb{display:none}` in style.css next to `.view-heading`.
+- Final full suite (verbatim /tmp/console-full2.log): `75 passed (1.4m)`.
+  `npx tsc --noEmit` clean (TSC_EXIT=0).
+- Visual /tmp/console-overview.png: black canvas, lime ring, PR crumb, PR-badged
+  header, hero "Disconnected", sites bars + activity — matches UI-R4-OVERVIEW target.
+- Diff: controller.ts (2), window-layout.ts (1), main.ts (7 + big consoleHomePage fn),
+  style.css (2), features.spec.ts (1, count 3→4); NEW console.css (~230 lines) and
+  NEW tests/console-shell.spec.ts (3 tests). Council: PENDING (2 rounds x 2 seats).
+- Next picks: port the remaining prototype pages (Routes/Providers/Network/Settings)
+  into console identity; rename nav labels to match prototype; profile picker in header.
+
+### Iteration C1 council gate
+- R1 seat A (ap-implementer replacement; first ap-reviewer seat returned INVALID-DISPATCH
+  on its own Autoprompt-marker contract, did no review): FAIL — P1 Console+light scheme
+  produced 100+ Axe contrast violations (light tokens on forced-black canvas).
+  P2 half-ported UI off Overview; P3 drift from R4 target (156px ring, H1, PR crumb).
+- R1 seat B: PASS — no P0/P1; verified real connect/disconnect, persistence, no CSS
+  leak, Axe clean in dark. P2 partial fidelity/sample marking; P3 DM Sans not loaded,
+  grid hidden under main.
+- P1 fix (red-first): new test 'console stays readable when the light scheme is
+  selected' loops all six pages with Axe under data-scheme=light. RED /tmp/console-light-red.log
+  (`1 failed`, e.g. fg #595e77 on #070707 ratio 3.15). Root cause: dashboard-polish.ts
+  applyDashboardPalette() sets inline --muted from scheme alone — beats all CSS.
+  Fix: that function now treats data-layout="console" as dark; console.css remaps tokens
+  incl. `html[data-layout="console"][data-scheme="light"]:has(.polished-preview)`.
+  GREEN /tmp/console-light-green3.log `4 passed (8.3s)`; full `76 passed (1.4m)`; tsc 0.
+- R2 seat A (ses_ddcf7b841ffe4vZoOv3qPq5Ets): **PASS**, no P0/P1. Independently
+  re-ran targeted `4 passed (8.8s)`, full `76 passed (1.4m)`, tsc 0; P1 light-scheme
+  contrast resolved at head, other layouts unchanged. P2 carried: only Overview ported.
+  P3 carried: ring 156px vs ~84px target, H1/PR crumb/footer identity drift, scheme
+  picker still offers Light while console forces dark. Next pick: port remaining pages.
+- R2 seat B (ses_ddcf81f77ffeSDYwcz8teAu5k0): **PASS**, no P0/P1. Independent run
+  `4 passed (7.9s)`, tsc 0. Verified fix root cause in dashboard-polish.ts:58-60 +
+  applyTheme/sync ordering; also probed reverse path (Light first → Console), 5/5
+  Axe-clean across six pages. One earlier transient contrast hit did not reproduce.
+  P2 carried: Overview-only skin, other pages/rail labels unchanged, no header
+  profile picker; only Activity marked SAMPLE DATA. P3 carried: DM Sans declared
+  not loaded; grid hidden under main. Next pick: port Routes + relabel rail.
+- C1 council complete: R1 (A FAIL-P1 / B PASS) → R2 (A PASS / B PASS), P1 fixed
+  red-first. Ready to commit + PR; do not merge without CI + clean council.
+
