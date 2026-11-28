@@ -319,6 +319,15 @@ export interface EngineConfig {
   rotation?: Record<string, unknown>;
 }
 
+/** One destination ruleset advertised by `vpn rulesets`. */
+export interface VpnRuleset {
+  name: string;
+  usable: boolean;
+  provider?: string;
+  description?: string;
+  cidr_count?: number;
+}
+
 /** Network detection: current Wi-Fi plus the SSID -> preset map. */
 export interface NetworkPresetState {
   ssid: string | null;
@@ -418,6 +427,12 @@ export interface RoutingState {
 export async function applyPreset(name: string): Promise<void> {
   if (!isTauri()) return;
   await invoke('apply_preset', { name });
+}
+
+/** Select a destination ruleset for selective TUN (allowlisted engine-side). */
+export async function selectRuleset(name: string): Promise<void> {
+  if (!isTauri()) return;
+  await invoke('select_ruleset', { name });
 }
 
 export async function getRouting(): Promise<RoutingState> {
