@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import json
 import os
 import re
@@ -337,25 +338,94 @@ def _rotate_events(path: Path) -> None:
         pass
 
 
+def _enforce_event_line_cap(path: Path) -> None:
+    """Keep the newest EVENT_MAX_LINES events, independent of the byte cap.
+
+    A slow trickle of small events can outgrow the line count while staying
+    well under EVENT_MAX_BYTES, so the declared cap must be applied here too.
+    """
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        if len(lines) <= EVENT_MAX_LINES:
+            return
+        path.write_text("".join(lines[-EVENT_MAX_LINES:]), encoding="utf-8")
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+@contextlib.contextmanager
+def _events_lock(root: Path):
+    """Serialize watcher writers of events.jsonl across processes.
+
+    Start/stop locking covers only the spawn window; two workers can overlap
+    for the brief cleanup window. The lock file is persistent: unlinking it on
+    release would let a waiter guard an orphaned inode while a fresh opener
+    locks a new file at the same path.
+    """
+    path = state_dir(root) / "events.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a")
+    try:
+        # A sudo-started worker creates this persistent lock root-owned 0644.
+        # A later non-root worker opens the same path; without world-write its
+        # open raises PermissionError and append_event silently drops the event.
+        os.chmod(path, 0o666)
+    except OSError:
+        pass
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            handle.write("0")
+            handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            handle.close()
+
+
 def append_event(root: Path, event: dict) -> None:
     path = events_file(root)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _rotate_events(path)
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, separators=(",", ":")) + "\n")
+        # #332 P1: two watcher workers can overlap during stop/start, so the
+        # non-atomic line-cap trim must not run while the other appends.
+        with _events_lock(root):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _rotate_events(path)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event, separators=(",", ":")) + "\n")
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+            _enforce_event_line_cap(path)
+            # A root-owned worker (sudo-start path) must hand events back to
+            # the invoking user; otherwise `watcher logs` fails on a 0600 file.
+            _hand_back_ownership(path)
     except OSError as exc:
         # An unwritable/starved log (e.g. root-owned from an elevated reload)
         # must never kill the watcher loop; drop the event with a trace.
         print(f"route-watcher: append_event skipped ({exc})", file=sys.stderr)
-        return
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
-    # A root-owned worker (sudo-start path) must hand events back to the
-    # invoking user; otherwise `watcher logs` fails on a 0600 root file.
-    _hand_back_ownership(path)
 
 
 

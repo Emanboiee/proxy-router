@@ -8,7 +8,6 @@ on:
       sing-box-version:
         description: 'sing-box version to bundle in the archives'
         required: false
-        default: '1.13.19'
 
 permissions:
   contents: write
