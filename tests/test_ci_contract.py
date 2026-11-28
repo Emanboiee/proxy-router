@@ -37,6 +37,27 @@ def test_release_workflow_sing_box_version_has_one_source_of_truth():
     )
 
 
+def test_all_workflows_pin_the_pytest_random_seeds():
+    """Both the PR gate and the tagged-release gate must pin pytest seeds.
+
+    test.yml runs seeds 58 and 5800; release.yml previously ran an unpinned
+    ``python -m pytest tests -q``, so a release could pass with a different
+    ordering than CI validated. Keep every full-suite invocation seeded.
+    """
+    seeds = ("--randomly-seed=58", "--randomly-seed=5800")
+    for name in ("test.yml", "release.yml"):
+        text = (ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+        full_suite_lines = [
+            line for line in text.splitlines()
+            if "pytest" in line and "tests" in line and "-q" in line
+        ]
+        assert full_suite_lines, f"{name} has no full pytest invocation"
+        for line in full_suite_lines:
+            assert any(seed in line for seed in seeds), (
+                f"{name} full-suite run is not seed-pinned: {line.strip()}"
+            )
+
+
 def test_dev_requirements_cover_test_runtime():
     requirements = (ROOT / "requirements-dev.txt").read_text(encoding="utf-8").lower()
     for package in ("pytest", "pytest-randomly", "pytest-socket", "pyyaml"):
