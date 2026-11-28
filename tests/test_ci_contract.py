@@ -17,6 +17,26 @@ def test_pytest_configuration_is_canonical_and_strict():
     assert "enable_socket" in text
 
 
+def test_release_workflow_sing_box_version_has_one_source_of_truth():
+    """Issue #327: the dispatch input default duplicated the env fallback.
+
+    A manual dispatch with no input falls through to the env expression, and a
+    tag push (no inputs at all) already relies on it. Keeping a second copy in
+    the input default meant a version bump could update one and not the other.
+    """
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+    )
+    triggers = workflow.get("on", workflow.get(True))
+    input_spec = triggers["workflow_dispatch"]["inputs"]["sing-box-version"]
+    assert "default" not in input_spec, (
+        "dispatch input must not carry a default; the env fallback is the single source"
+    )
+    assert "1.13.19" in workflow["env"]["SING_BOX_VERSION"], (
+        "env fallback must still pin the version so tag-push releases work"
+    )
+
+
 def test_dev_requirements_cover_test_runtime():
     requirements = (ROOT / "requirements-dev.txt").read_text(encoding="utf-8").lower()
     for package in ("pytest", "pytest-randomly", "pytest-socket", "pyyaml"):

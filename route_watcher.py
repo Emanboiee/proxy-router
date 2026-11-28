@@ -332,6 +332,22 @@ def _rotate_events(path: Path) -> None:
         pass
 
 
+def _enforce_event_line_cap(path: Path) -> None:
+    """Keep the newest EVENT_MAX_LINES events, independent of the byte cap.
+
+    A slow trickle of small events can outgrow the line count while staying
+    well under EVENT_MAX_BYTES, so the declared cap must be applied here too.
+    """
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        if len(lines) <= EVENT_MAX_LINES:
+            return
+        path.write_text("".join(lines[-EVENT_MAX_LINES:]), encoding="utf-8")
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
 def append_event(root: Path, event: dict) -> None:
     path = events_file(root)
     try:
@@ -348,6 +364,7 @@ def append_event(root: Path, event: dict) -> None:
         os.chmod(path, 0o600)
     except OSError:
         pass
+    _enforce_event_line_cap(path)
     # A root-owned worker (sudo-start path) must hand events back to the
     # invoking user; otherwise `watcher logs` fails on a 0600 root file.
     _hand_back_ownership(path)

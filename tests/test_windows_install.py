@@ -1,5 +1,6 @@
 """Static Windows install contracts that run on every CI host."""
 
+import fnmatch
 import os
 import shutil
 import subprocess
@@ -26,6 +27,25 @@ def test_powershell_installer_handles_release_layout_and_native_launchers():
     assert 'py -3 -c "import sys"' in script
     assert "Task Scheduler" in (ROOT / "README.md").read_text(encoding="utf-8")
     assert "examples/keepalive.sh" not in script
+
+
+def test_installer_path_check_is_literal_for_bracketed_directories():
+    """Issue #327: `-like "*$Bin*"` reads [ ] as wildcard character classes.
+
+    A bin path such as ``C:\\Users\\[test]\\bin`` therefore never matches itself
+    and every run re-prepends the same PATH entry. PowerShell's -like and
+    fnmatch share the bracket-class semantics, so the proof holds without pwsh.
+    """
+    script = (ROOT / "install.ps1").read_text(encoding="utf-8")
+    assert "$UserPath.Contains($Bin)" in script, (
+        "PATH membership check must use an ordinal literal substring match"
+    )
+    assert '-notlike "*$Bin*"' not in script, "wildcard -like breaks on bracketed paths"
+
+    bin_path = r"C:\Users\[test]\bin"
+    user_path = rf"{bin_path};C:\Windows\System32"
+    assert not fnmatch.fnmatchcase(user_path, f"*{bin_path}*"), "old wildcard form must fail"
+    assert bin_path in user_path, "new literal form must match"
 
 
 def test_windows_installer_checks_wintun_and_hardens_private_state():

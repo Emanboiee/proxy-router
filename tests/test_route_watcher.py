@@ -593,6 +593,32 @@ class RouteWatcherTests(unittest.TestCase):
         self.assertEqual(uid, 501)
         self.assertEqual(gid, 20)
 
+    def test_append_event_enforces_event_line_cap(self):
+        """EVENT_MAX_LINES is declared but must actually bound events.jsonl.
+
+        The byte cap rotates the whole file, but a trickle of small events can
+        exceed 5000 lines while staying far below EVENT_MAX_BYTES. Keep the
+        newest EVENT_MAX_LINES lines and drop the oldest.
+        """
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        path = w.events_file(root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "".join(
+                json.dumps({"kind": "old", "n": i}, separators=(",", ":")) + "\n"
+                for i in range(w.EVENT_MAX_LINES + 20)
+            ),
+            encoding="utf-8",
+        )
+
+        w.append_event(root, {"kind": "new", "host": "opencode.ai"})
+
+        lines = path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), w.EVENT_MAX_LINES)
+        self.assertIn('"kind":"new"', lines[-1])
+        self.assertNotIn('{"kind":"old","n":0}', lines)
+
     def test_append_event_does_not_touch_ownership_as_user(self):
         root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, root, ignore_errors=True)

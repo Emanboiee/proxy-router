@@ -127,7 +127,7 @@ else {
 
 if ($SetPath) {
   $UserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-  if (-not $UserPath -or $UserPath -notlike "*$Bin*") {
+  if (-not $UserPath -or -not $UserPath.Contains($Bin)) {
     $NewPath = if ($UserPath) { "$Bin;$UserPath" } else { $Bin }
     [Environment]::SetEnvironmentVariable('Path', $NewPath, 'User')
     Write-Host "Added $Bin to your user PATH (takes effect in new shells)."
