@@ -47,8 +47,10 @@ from typing import Any
 import config_schema
 import domain_autodetect
 import engine
-import autodetect_refresh
+import probe_paths
+import provider_upstream
 import egress
+import probe_restore
 import net_safety
 import provider_lifecycle
 import selective_tun
@@ -81,6 +83,8 @@ def _effective_uid() -> int:
     """Return the effective uid where the platform exposes POSIX ids."""
     getter = getattr(os, "geteuid", None)
     return int(getter()) if getter is not None else -1
+
+
 
 ROOT = runtime_root(Path(__file__).resolve().parent.resolve())
 CONFIG_FILE = ROOT / "router.json"
@@ -266,9 +270,15 @@ _PROVIDER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 # loopback and public answers over time). The upstream port must never equal
 # the router's own listener port (proxy loop).
 _PROXY_PROFILE_STEM = "socks"
+
 _LOCAL_PROXY_BYPASS = ["*.local", "localhost", "127.0.0.1", "::1"]
 _TAILSCALE_DOMAINS = ["tailscale.com", "tailscale.io", "ts.net"]
 _TAILSCALE_CIDRS = ["100.64.0.0/10", "fd7a:115c:a1e0::/48"]
+PROBE_PORT_BASE = probe_paths.PROBE_PORT_BASE
+
+
+def probe_port(name: str) -> int | None:
+    return probe_paths.probe_port(_providers, name, _port)
 
 
 def is_proxy_provider(name: str) -> bool:
@@ -1467,7 +1477,8 @@ def recover_route(name: str, host: str) -> int:
     if not _diagnostic_host_is_routed(host):
         return 3
     # #219: model path so a root 200 can't confirm a quota-dead lane; normalize host.
-    host = host.strip().lower().rstrip("."); url = f"https://{host}{_PROBE_DOMAIN_PATHS.get(host, '')}"
+    host = host.strip().lower().rstrip(".")
+    url = f"https://{host}{_PROBE_DOMAIN_PATHS.get(host, '') or '/'}"
     if urllib.parse.urlsplit(url).hostname != host or unsafe_probe_target(url):
         return fail("unsafe recovery target")
     # Ignore old log bursts after a recent recovery; one provider owns the budget.
@@ -1524,15 +1535,19 @@ def recover_route(name: str, host: str) -> int:
 def restore_fallback(name: str, host: str, *, automatic: bool = False, force: bool = False) -> int:
     """Probe a primary and clear its fallback after two wins (one with force).
 
-    The serving fallback stays while the primary is checked; a failed check
-    reinstates it. ``automatic`` limits clearing to transport-owned fallbacks.
+    With a probe-only inbound, ``probe_restore`` measures the parked primary
+    while its fallback keeps serving; otherwise the legacy path unparks it.
+    ``automatic`` limits clearing to transport-owned fallbacks.
     ``force`` bypasses cooldown/two-win for a quota-dead fallback (#219).
     """
-    if MANUAL_OFF_FILE.exists() or not _automatic_proxy_mode():
+    if MANUAL_OFF_FILE.exists():
         return 3
-    # #219: force restore tolerates host attributing to the fallback leaf.
-    attributed = response_provider_for_host(host)
-    if name not in _providers or (attributed != name and not (force and attributed == active_fallback(name))):
+    if not host:
+        for route in _routes_with_autodetected_domains(_routes):
+            if route.get("provider") == name and route.get("domains"):
+                host = str(route["domains"][0])
+                break
+    if name not in _providers:
         return 3
     if not _diagnostic_host_is_routed(host):
         return 3
@@ -1540,63 +1555,46 @@ def restore_fallback(name: str, host: str, *, automatic: bool = False, force: bo
     if routing["mode"] == "vpn-list" and not any(
             _response_host_matches(host, domain) for domain in _effective_vpn_domains(routing)):
         return 3
-    host = host.strip().lower().rstrip("."); url = f"https://{host}{_PROBE_DOMAIN_PATHS.get(host, '')}"
+    host = host.strip().lower().rstrip(".")
+    url = f"https://{host}{_PROBE_DOMAIN_PATHS.get(host, '') or '/'}"
     if urllib.parse.urlsplit(url).hostname != host or unsafe_probe_target(url):
         return fail("unsafe restore target")
-    serving = egress.restorable_fallback(
-        _ROUTER_VIEW, name, automatic=automatic)
+    serving = active_fallback(name)
     if serving is None:
         return 3
     marker = ROOT / "state" / "recovery" / f"{name}-restore.json"
-    now = time.time()
-    previous: dict = {}
-    try:
-        loaded = json.loads(marker.read_text())
-        if isinstance(loaded, dict):
-            previous = loaded
-        if not force and now - float(previous.get("attempted_at", 0)) < RESTORE_COOLDOWN_SECONDS:
-            return 3  # #219: force path bypasses cooldown for a quota-dead fallback
-    except (OSError, ValueError, TypeError):
-        previous = {}
-    try:
-        successes = max(0, int(previous.get("successes", 0) or 0))
-    except (TypeError, ValueError):
-        successes = 0
-    # Temporarily restore the primary so this probe cannot accidentally measure
-    # the already-selected fallback path.
-    rc = deactivate_fallback(name, automatic=True)
-    if rc != 0:
-        return rc
-    result = probe_egress(url=url, timeout=3.0)
-    # #219: a model-path 429 must not clear a fallback after two "wins".
-    healthy = egress.probe_is_model_healthy(result, is_model=host in _PROBE_DOMAIN_PATHS)
-    if healthy:
-        successes += 1
-        if successes >= (1 if force else RESTORE_SUCCESS_THRESHOLD):  # #219: quota-dead fast path
-            marker.unlink(missing_ok=True)
-            print(f"primary restored: {name} after {successes} successful checks")
-            state.log_event(ROOT, "primary_restored", provider=name, wins=successes)
-            return 0
-        _atomic_write(marker, json.dumps({
-            "attempted_at": now, "host": host, "successes": successes,
-        }, sort_keys=True) + "\n", 0o600)
-        reason = "restore-pending" if serving == "direct" else "confirmed-stall"
-        if activate_fallback(name, target=serving, reason=reason,
-                             automatic=True, reinstating=True) == 0:
-            print(f"primary check passed for {name}; awaiting one more check")
-            return 1
-        return fail(f"provider '{name}' restore pending but fallback '{serving}' could not be reinstated")
-    # Keep service available through the original fallback while the primary is
-    # still unhealthy.
-    _atomic_write(marker, json.dumps({
-        "attempted_at": now, "host": host, "successes": 0,
-    }, sort_keys=True) + "\n", 0o600)
-    reason = "primary-unhealthy" if serving == "direct" else "confirmed-stall"
-    if activate_fallback(name, target=serving, reason=reason,
-                         automatic=True, reinstating=True) != 0:
-        return fail(f"provider '{name}' primary is still unhealthy and fallback '{serving}' failed")
-    print(f"primary still unhealthy: {name}; fallback '{serving}' retained", file=sys.stderr)
-    return 1
+    port = probe_restore.route_probe_port(name, probe_port(name), SING_BOX_CONFIG)
+    is_proxy = is_proxy_provider(name)
+    ctx = {
+        "proxy": is_proxy,
+        "now": time.time,
+        "cooldown": 0 if force else RESTORE_COOLDOWN_SECONDS,
+        "threshold": 1 if force else RESTORE_SUCCESS_THRESHOLD,
+        "write": _atomic_write,
+        "config_path": SING_BOX_CONFIG,
+        "provider_files": provider_files,
+        "parse_wireguard": parse_wireguard,
+        "fallback_path": _fallback_state_path(name),
+        "state_path": ROOT / "state" / f"{name}.active",
+        "upstream": proxy_upstream(name) if is_proxy else None,
+        "outbound": probe_restore.outbound_identity(name, SING_BOX_CONFIG) if is_proxy else None,
+        "build": build_singbox_config,
+        "set_active": set_active,
+        "reload": engine_reload,
+        "endpoint_identity": lambda p: probe_restore.endpoint_identity(p, parse_wireguard),
+        "probe": probe_egress,
+        "deactivate": deactivate_fallback,
+        "activate": lambda _name, *, target, reason, automatic: activate_fallback(
+            name, target=target, reason=reason, automatic=automatic, reinstating=True),
+        "event": lambda provider, wins: state.log_event(
+            ROOT, "primary_restored", provider=provider, wins=wins),
+        "rc": fail,
+    }
+    if port is None:
+        if automatic:
+            return 3
+        return probe_restore.legacy_restore(name, host, url, serving, marker, ctx=ctx)
+    return probe_restore.attributed_restore(name, host, url, marker, port, ctx=ctx)
 
 
 def deactivate_fallback(name: str, *, automatic: bool = False) -> int:
@@ -2980,18 +2978,10 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
         active[name] = endpoint
         selected[name] = profile
 
-    # DNS resolution must NOT ride the tunnel: a WireGuard blip would then
-    # take down resolution for the very request we're trying to route, which
-    # surfaces as "Connection error" storms upstream. DNS queries go out the
-    # direct physical path (no detour; sing-box 1.13 rejects detouring a DNS
-    # server to the "direct" outbound with "empty direct outbound" at start).
-    # The resolved IP still gets dialed through the provider's endpoint
-    # outbound, so the destination traffic stays provider-routed.
-    # Deduplicate identical resolvers: multiple providers commonly share the
-    # same DNS (e.g. every Proton profile pins 1.1.1.1). One server entry per
-    # distinct (type, server, port) keeps sing-box's connection pool warm in
-    # ONE session instead of fragmenting into N identical DoH handshakes;
-    # per-provider tags become aliases resolved to the shared entry.
+    # DNS stays on the direct path: a tunnel blip must not break resolution,
+    # and sing-box 1.13 rejects DNS detoured to a direct outbound. The resolved
+    # IP still dials through the provider. Dedupe identical resolvers so one
+    # server entry keeps the connection pool warm; provider tags alias it.
     def _dns_entry(tag: str, name: str) -> dict:
         return {
             "type": dns_transport(),
@@ -3034,6 +3024,11 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
             "server_port": upstream_port,
             "version": "5",
         })
+    probe_inbounds, probe_rules = probe_paths.build_probe_objects(
+        _providers, _port, is_tun=current_mode() == "tun", is_parked=active_fallback,
+        is_proxy=is_proxy_provider, proxy_upstream=proxy_upstream,
+        usable_profile=_usable_profile, parse_wg=parse_wireguard,
+        active=active, proxy_outbounds=proxy_outbounds)
     # sing-box 1.12+: any dial without an explicit resolver needs
     # route.default_domain_resolver; the system (local) transport keeps
     # non-routed domains away from the tunnels and silences the deprecated
@@ -3048,10 +3043,8 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
         dns_servers.append(entry)
     routing = routing_state()
     routing_mode = routing["mode"]
-    # health_order: emit provider rules in egress-health order instead of
-    # pure route-table order, so a healthy lane leads shared domains and a
-    # degraded one trails (or drops out) without manual reorders. Falls back
-    # to the configured route order when the flag is off.
+    # health_order leads healthy lanes and trails degraded ones; falls back
+    # to configured route order when off.
     routed_domains = _routes_with_autodetected_domains(_routes)
     if routing.get("health_order") and selected:
         build_routes = _routes_by_health_order(routed_domains, selected)
@@ -3255,6 +3248,8 @@ def build_singbox_config(active_overrides: dict[str, Path] | None = None) -> tup
     else:
         inbounds = [{"type": "mixed", "tag": "local-proxy", "listen": "127.0.0.1", "listen_port": _port}]
         route_final = "direct"
+    inbounds.extend(probe_inbounds)
+    rules[:0] = probe_rules
 
     if routing_mode == "safe-list":
         # route.final must be a live outbound tag: everything not pinned

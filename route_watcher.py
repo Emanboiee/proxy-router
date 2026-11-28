@@ -551,6 +551,32 @@ def _underlay_healthy(root: Path, *, runner: Callable = subprocess.run) -> bool:
     )
 
 
+def route_provider_for_host(root: Path, host: str) -> str | None:
+    """Configured route provider, before any active fallback rewrites it."""
+    try:
+        config = json.loads((Path(root) / "router.json").read_text())
+    except (OSError, ValueError, TypeError):
+        return None
+    normalized = normalize_host(str(host))
+    routing = config.get("routing") or {}
+    mode = routing.get("mode") if isinstance(routing, dict) else None
+    vpn_domains = [normalize_host(str(domain)) for domain in
+                   (routing.get("vpn_domains") or [] if isinstance(routing, dict) else [])
+                   if str(domain).strip()]
+    for route in config.get("routes", []):
+        domains = [normalize_host(str(domain)) for domain in (route.get("domains") or [])]
+        if not any(domain_matches(normalized, domain) for domain in domains):
+            continue
+        if mode == "vpn-list" and not any(
+                domain_matches(normalized, vpn) or domain_matches(vpn, normalized)
+                for vpn in vpn_domains):
+            continue
+        provider = route.get("provider")
+        if isinstance(provider, str) and PROVIDER_NAME_RE.fullmatch(provider):
+            return provider
+    return None
+
+
 def rotate_provider(root: Path, provider: str = "proton", *, host: str | None = None,
                     runner: Callable = subprocess.run) -> dict:
     """Ask the controller to confirm failures and recover the affected route."""
@@ -573,7 +599,7 @@ def restore_provider(root: Path, provider: str, host: str,
     try:
         result = runner(
             [sys.executable, str(Path(root) / "router.py"), "failover", provider,
-             "restore", "--host", host],
+             "restore", "--host", host, "--automatic"],
             cwd=str(root), capture_output=True, text=True, timeout=60,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -728,12 +754,14 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
                 provider = last_provider.get(host) or provider_for_host(root, host)
                 if result.get("ok"):
                     guard.failure_times.pop(normalize_host(host), None)
-                    if provider and now - last_restore.get(provider, -RESTORE_COOLDOWN_SECONDS) >= RESTORE_COOLDOWN_SECONDS:
-                        restore = restore_provider(root, provider, host)
-                        last_restore[provider] = now
+                    route_provider = route_provider_for_host(root, host)
+                    if route_provider and now - last_restore.get(
+                            route_provider, -RESTORE_COOLDOWN_SECONDS) >= RESTORE_COOLDOWN_SECONDS:
+                        restore = restore_provider(root, route_provider, host)
+                        last_restore[route_provider] = now
                         if restore.get("returncode") is not None:
                             append_event(root, {"kind": "restore", "observed_at": time.time(),
-                                                "provider": provider, "host": host, **restore})
+                                                "provider": route_provider, "host": host, **restore})
                 append_event(root, {"kind": "probe", "observed_at": time.time(), **result})
                 if result.get("transport_failure") and (
                         result.get("underlay_signal") or not _underlay_healthy(root)):
