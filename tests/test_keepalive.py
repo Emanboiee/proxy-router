@@ -13,12 +13,14 @@ tests can assert on:
 """
 import json
 import os
+import shutil
 import signal
 import subprocess
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 KEEPALIVE_SRC = REPO / "examples" / "keepalive.sh"
@@ -211,6 +213,20 @@ exec "$@"
 """
 
 
+# Counts the interpreter spawns that is_tun_mode performs to parse
+# sing-box.json, tagged with the ensure number of the tick that spawned them.
+# Forwards to the real interpreter so settings parsing behaves normally.
+FAKE_PYTHON_PROBE_COUNTER = r"""#!/usr/bin/env bash
+case "${2:-}" in
+  *sing-box.json)
+    n=$(cat "${FAKE_ROUTER_ENSURE_COUNT:-/dev/null}" 2>/dev/null || echo 0)
+    printf '%s\n' "$n" >> "${PYTHON_PROBE_LOG:-/dev/null}"
+    ;;
+esac
+exec "${REAL_PYTHON:-python3}" "$@"
+"""
+
+
 class KeepaliveHarness:
     """Run the real keepalive.sh against fake router.py/sleep on PATH."""
 
@@ -218,7 +234,8 @@ class KeepaliveHarness:
                  probe_every="4", dead_strikes="2", storm_window="600",
                  max_rotations="2", restore_every="", fallback="", root=None,
                  pinned_python="", mode="proxy", network="connected", wake_gap="",
-                 clock=None, sweep_rotation_at="", ssid="proto"):
+                 clock=None, sweep_rotation_at="", ssid="proto",
+                  count_python_probes=False):
         self._tmp = None
         if root is None:
             self._tmp = tempfile.TemporaryDirectory()
@@ -251,6 +268,11 @@ class KeepaliveHarness:
             pinned_bin = self.root / "bin" / "pinned-python"
             pinned_bin.write_text(FAKE_PINNED_PYTHON)
             pinned_bin.chmod(0o755)
+        self.python_probe_log = self.root / "python-probes.log"
+        if count_python_probes:
+            python_bin = self.root / "bin" / "python3"
+            python_bin.write_text(FAKE_PYTHON_PROBE_COUNTER)
+            python_bin.chmod(0o755)
         target = self.root / "keepalive.sh"
         target.write_text(KEEPALIVE_SRC.read_text())
         target.chmod(0o755)
@@ -309,6 +331,9 @@ class KeepaliveHarness:
             pinned_bin = self.root / "bin" / "pinned-python"
             env["PROXY_ROUTER_PYTHON"] = str(pinned_bin)
             env["PINNED_LOG"] = str(self.pinned_log)
+        if count_python_probes:
+            env["REAL_PYTHON"] = shutil.which("python3")
+            env["PYTHON_PROBE_LOG"] = str(self.python_probe_log)
         if fail_ensures:
             env["FAKE_ROUTER_FAIL_ENSURES"] = fail_ensures
         self.env = env
@@ -733,6 +758,36 @@ class KeepaliveSweepStaggerTests(unittest.TestCase):
                                  f"sweep_every 0 must silence the stagger note: {h.err!r}")
             finally:
                 h.close()
+
+
+class KeepaliveTunProbeTests(unittest.TestCase):
+    """A healthy tick must pay for one TUN-mode sample, not four."""
+
+    def test_one_healthy_tick_spawns_at_most_one_tun_probe(self):
+        # Autodetect on every tick so all four call sites are armed; the boot
+        # tick skips the scheduled-rotation branch, so measure tick 2.
+        env = {"PROXY_AUTODETECT_ENABLED": "1", "PROXY_AUTODETECT_INTERVAL": "1"}
+        with mock.patch.dict(os.environ, env):
+            h = KeepaliveHarness(interval="1", count_python_probes=True)
+        try:
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                if h.sleep_log.is_file() and len(h.sleep_log.read_text().split()) >= 2:
+                    break
+                time.sleep(0.05)
+            self.assertTrue(h.sleep_log.is_file(),
+                            "loop never reached the second tick sleep")
+            # Tagged with ensure #2 so later ticks (fake sleep is instant)
+            # cannot inflate the count.
+            probes = [line for line in h.python_probe_log.read_text().splitlines()
+                      if line == "2"]
+            self.assertLessEqual(len(probes), 1,
+                                 f"one healthy tick spawned {len(probes)} TUN probes: "
+                                 f"{h.python_probe_log.read_text()!r}")
+            self.assertEqual(len(probes), 1,
+                             "the tick must sample TUN mode exactly once")
+        finally:
+            h.close()
 
 
 class KeepaliveFallbackRestoreTests(unittest.TestCase):
