@@ -12,13 +12,76 @@ Point https_proxy at it; add NO_PROXY=127.0.0.1,localhost so local providers
 (freellm, lami, zcode) bypass it.
 """
 
+import ipaddress
+import os
 import socket
 import sys
+
+# Legacy IPv4 spellings (``127.1``, ``2130706433``, ``0x7f000001``,
+# ``0177.0.0.1``) are accepted by the OS resolver but rejected by
+# ipaddress.ip_address(). inet_aton parses them without DNS/network access.
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 2081
 BUFSIZE = 65536
+ALLOW_ENV = "IPV6_PROXY_ALLOW"
+
+
+def parse_target(target: str) -> tuple[str, int]:
+    """Split a CONNECT authority into (host, port).
+
+    Bracketed IPv6 literals carry colons inside the host, so the port is
+    peeled off the right and the host is read between the brackets.
+    """
+    if not isinstance(target, str) or not target:
+        raise ValueError("empty CONNECT target")
+    if target.startswith("["):
+        end = target.find("]")
+        if end < 0 or not target[end + 1:].startswith(":"):
+            raise ValueError(f"malformed bracketed host: {target!r}")
+        host = target[1:end]
+        port_text = target[end + 2:]
+    else:
+        host, sep, port_text = target.rpartition(":")
+        if not sep:
+            raise ValueError(f"CONNECT target has no port: {target!r}")
+    if not host:
+        raise ValueError(f"CONNECT target has no host: {target!r}")
+    try:
+        port = int(port_text)
+    except (TypeError, ValueError):
+        raise ValueError(f"invalid CONNECT port: {port_text!r}") from None
+    if not 1 <= port <= 65535:
+        raise ValueError(f"CONNECT port out of range: {port}")
+    return host, port
+
+
+def is_allowed(host: str) -> bool:
+    """Gate CONNECT destinations; loopback is denied unless allowlisted."""
+    raw = os.environ.get(ALLOW_ENV, "").strip()
+    if raw:
+        entries = [entry.strip() for entry in raw.split(",") if entry.strip()]
+        host = host.lower().rstrip(".")
+        for entry in entries:
+            entry = entry.lower().rstrip(".")
+            if host == entry or host.endswith("." + entry):
+                return True
+        return False
+    normalized = host.lower().rstrip(".")
+    if normalized == "localhost":
+        return False
+    try:
+        return not ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        pass
+    # Fail closed for loopback even in legacy numeric/octal/hex dotted forms
+    # that ipaddress rejects but the system resolver happily routes to 127/8.
+    try:
+        packed = socket.inet_aton(normalized)
+    except OSError:
+        return True  # a hostname, not an IP literal
+    return packed[0] != 127
 
 
 class Ipv6ConnectHandler(BaseHTTPRequestHandler):
@@ -66,11 +129,13 @@ class Ipv6ConnectHandler(BaseHTTPRequestHandler):
                 pass
 
     def do_CONNECT(self):
-        host, _, port = self.path.partition(":")
         try:
-            port = int(port)
+            host, port = parse_target(self.path)
         except ValueError:
             self.send_error(400)
+            return
+        if not is_allowed(host):
+            self.send_error(403)
             return
         upstream = self._dial(host, port)
         if upstream is None:
