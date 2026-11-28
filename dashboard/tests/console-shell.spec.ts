@@ -12,7 +12,7 @@ async function chooseConsoleLayout(page: import('@playwright/test').Page): Promi
   await page.getByRole('link', {name: 'Appearance', exact: true}).click();
   await page.getByRole('button', {name: /^Console/}).click();
   await expect(page.locator('html')).toHaveAttribute('data-layout', 'console');
-  await page.getByRole('link', {name: 'Home', exact: true}).click();
+  await page.getByRole('link', {name: 'Overview', exact: true}).click();
 }
 
 test('console Overview shows the Signal Console identity and keeps real connection controls', async ({page}) => {
@@ -76,7 +76,7 @@ test('console stays readable when the light scheme is selected', async ({page}) 
   await page.getByRole('link', {name: 'Appearance', exact: true}).click();
   await page.locator('.schemes').getByRole('button', {name: 'Light', exact: true}).click();
   await expect(page.locator('html')).toHaveAttribute('data-scheme', 'light');
-  for (const name of ['Home', 'Profiles', 'Providers', 'Connectivity', 'Settings', 'Appearance']) {
+  for (const name of ['Overview', 'Routes', 'Providers', 'Network', 'Settings', 'Appearance']) {
     await page.getByRole('link', {name, exact: true}).click();
     expect((await new AxeBuilder({page}).analyze()).violations).toEqual([]);
   }

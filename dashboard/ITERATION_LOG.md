@@ -161,5 +161,82 @@ User rejection: "ngl the UI is not looking better i was talking about the comple
   profile picker; only Activity marked SAMPLE DATA. P3 carried: DM Sans declared
   not loaded; grid hidden under main. Next pick: port Routes + relabel rail.
 - C1 council complete: R1 (A FAIL-P1 / B PASS) → R2 (A PASS / B PASS), P1 fixed
-  red-first. Ready to commit + PR; do not merge without CI + clean council.
+  red-first. Committed/pushed as d87f457 on PR #337 (ready for review, NOT merged).
+
+### Iteration C2 — console Routes screen + prototype rail labels
+- Scope (reversible): relabel the rail ONLY under `data-layout=console` to
+  Overview / Routes / Providers / Network / Settings (Appearance stays reachable
+  so the preset can be exited). Hrefs/ids unchanged; other layouts keep old labels.
+  Port the prototype's Routes screen: segmented routing-mode control, domain add
+  form, domain list with Remove, LOCAL PROFILE footer (no false per-app claim).
+- Real actions (after council P0/P1 fix): in Tauri the Routes screen reads
+  `engineConfig.routes`, Add calls real `routeAddAction()` (add_route invoke) and
+  Remove calls `routeRemoveAction(id)` (remove_route invoke), with footer
+  "ENGINE ROUTES · FROM ROUTER.JSON". In browser preview it uses browser-safe
+  `controller.setProvider/addDomain/removeDomain` with a LOCAL PROFILE footer.
+  Routing-mode keeps `data-action=routing-mode` and `aria-pressed` from real state.
+- RED (verbatim /tmp/c2-red.log): `4 failed`. (1) `expect(locator).toHaveAttribute(expected) failed — Locator: locator('#nav').getByRole('link', { name: 'Overview', exact: true }) — Expected: "#home" — Timeout: 5000ms — Error: element(s) not found` at console-routes.spec.ts:26:69; (2)(3)(4) `Test timeout of 30000ms exceeded. Error: locator.click: Test timeout of 30000ms exceeded. Call log: - waiting for locator('#nav').getByRole('link', { name: 'Routes', exact: true })` at :36/:58/:75.
+- GREEN (verbatim /tmp/c2-green-final.log): `8 passed (12.8s)` — 4 new Routes tests + 4 C1 shell tests.
+- Full suite (verbatim /tmp/c2-full.log): `80 passed (1.6m)`. `npx tsc --noEmit`: clean (TSC_EXIT=0) after two type fixes (String(mode), non-null dataset.domain).
+- Visual /tmp/c2-routes.png: black canvas, PR breadcrumb "Proxy Router / Routes",
+  h1 Routes, mode segmented control, input + provider combobox + lime Add route,
+  3 domain rows with Remove, LOCAL PROFILE footer — matches UI-R5-ROUTES structure.
+- Diff: main.ts (nav label spans, consoleNavLabel helper, consoleRoutesPage fn,
+  render label/crumb/dispatch, 2 click actions), console.css (segmented/add-form/
+  custom-select/responsive styles), console-shell.spec.ts (console labels), NEW
+  tests/console-routes.spec.ts (4 tests). Council: PENDING (2 rounds x 2 seats).
+- Next picks if clean: port Providers and Network into console identity; header
+  profile picker; load DM Sans; reveal schematic grid under main.
+
+### Iteration C2 council gate
+- R1 seat A (ses_ddcdbbe7cffe1B4gOAINXGKVjF): **FAIL**. Confirmed rail relabel is
+  console-scoped, non-console labels restore, CSS fully scoped, aria-pressed real,
+  browser add/remove persists; own run `8 passed (13.5s)`, tsc 0. P0: shipped Tauri
+  Add/Remove only mutated LocalController localStorage, and Tauri sync() does not
+  copy profiles back (main.ts:115-117), so rows never updated while the toast
+  claimed success — silent no-op. P1: provider selector decorative; add handler
+  read only #route-domain (main.ts:1150-1153). P2: console.css:118 hides
+  #prototype-badge; footer hardcoded 'SELECTIVE ROUTING' for every mode. P3: no
+  Axe/mobile test on Routes. Next pick: Tauri-aware helper + wire provider.
+- R1 seat B (ses_ddcdbbe75ffe0BR4R6nlSvdEHt): **FAIL**. Same dead provider picker
+  (P1). P2: no form semantics / Enter-to-submit (prototype uses form#add-route).
+  P3: no empty state; document.title/#page-label/#view-title still say 'Profiles'
+  on console Routes; cosmetic drift. Confirmed 4+4 tests pass, Axe 0, mobile clean.
+  Next pick: wire #route-provider into add or remove the picker.
+- P0/P1 fix (red-first): NEW tests/console-routes-desktop.spec.ts simulates Tauri
+  via addInitScript + __TAURI_INTERNALS__.invoke mock (get_config/get_live_status/
+  get_routing/get_dashboard_state/add_route/remove_route). RED /tmp/c2-p0-red.log
+  `1 failed` — `expect(locator).toContainText(expected) failed — Locator:
+  locator('.console-foot') — Expected substring: "ENGINE ROUTES" — Received string:
+  "LOCAL PROFILE · SELECTIVE ROUTING"` at console-routes-desktop.spec.ts:58:47.
+  Fix: consoleRoutesPage() now branches on isTauri() — engine routes/ids + provider
+  note in Tauri, preview domains otherwise; add is a real `<form>` submit wired to
+  consoleRouteAdd() which calls routeAddAction() in Tauri and setProvider+addDomain
+  in preview; Remove uses routeRemoveAction(id) in Tauri; empty state added.
+  GREEN /tmp/c2-p0-green.log `1 passed (3.5s)`; full /tmp/c2-full-fixed.log
+  `81 passed (1.5m)`; `npx tsc --noEmit` TSC_EXIT=0.
+- R2 seat A (ses_ddcdbbe7cffe1B4gOAINXGKVjF): **PASS**, no P0/P1. Own run
+  `9 passed (14.0s)`, TSC_EXIT=0; full `81 passed (1.5m)`. Verified P0/P1 fixed
+  at source: isTauri branch (main.ts:354-355), engine routes (362-369),
+  console-route-remove → routeRemoveAction → remove_route (1177,1462-1470),
+  form submit → consoleRouteAdd → routeAddAction → add_route (383,396,1286,
+  1447-1459); refreshStatus → refreshEngineData → refreshEngineConfig (884,
+  902-904) repaints rows; Rust commands persist router.json (main.rs:494-500,
+  625-670). Test asserts actual add_route/remove_route payloads incl. provider
+  proton and id r2. P2 carried: browser preview setProvider reassigns whole
+  active profile; #prototype-badge hidden in console; footer hardcodes
+  SELECTIVE ROUTING. P3 carried: no Axe/mobile run on Routes screen.
+  Next pick: per-domain provider in browser preview (or hide picker in preview).
+- R2 seat B (ses_ddcdbbe75ffe0BR4R6nlSvdEHt): **PASS**, no P0/P1. Independent
+  `1 passed (3.4s)` desktop mock test (add_route provider proton, remove_route id
+  r2), `8 passed (11.2s)` browser specs, Axe 0 on Routes/all console pages incl.
+  light scheme + mobile, tsc exit 0. Confirmed real form submit (main.ts:383,1286)
+  and empty state (371). P3 carried: provider options show raw ids instead of
+  friendly names (358-361); document.title still 'Profiles' on console Routes
+  (755,757,759); preview provider choice reassigns whole profile (395-399);
+  cosmetic drift. Next pick: map provider ids to friendly display names while
+  keeping ids as option values.
+- C2 council complete: R1 (A FAIL-P0/P1 / B FAIL-P1) → P0/P1 fixed red-first →
+  R2 (A PASS / B PASS). Ready to commit + push; do not merge without CI + clean
+  council.
 

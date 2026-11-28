@@ -246,6 +246,92 @@ html[data-layout="console"][data-scheme="light"]:has(.polished-preview) {
   color: var(--console-muted);
 }
 
+/* Routes screen — segmented mode control and destination rules. */
+:root[data-layout="console"] .seg {
+  display: flex;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--console-line);
+  border-radius: 10px;
+  background: #0b0d08;
+  width: fit-content;
+  max-width: 100%;
+}
+:root[data-layout="console"] .seg button {
+  min-height: 34px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--console-muted);
+  font: inherit;
+  font-size: .82rem;
+  cursor: pointer;
+}
+:root[data-layout="console"] .seg button[aria-pressed="true"] {
+  background: var(--console-accent);
+  color: #000;
+  font-weight: 700;
+}
+:root[data-layout="console"] .console-route-add {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) minmax(130px, .55fr) auto;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+}
+:root[data-layout="console"] .console-route-add .select-trigger {
+  min-height: 40px;
+  padding: 0 12px;
+  border: 1px solid var(--console-line);
+  border-radius: 8px;
+  background: #0b0d08;
+  color: #fff;
+  font: inherit;
+  font-size: .84rem;
+}
+:root[data-layout="console"] .console-route-add input,
+:root[data-layout="console"] .console-route-add select {
+  min-height: 40px;
+  padding: 0 12px;
+  border: 1px solid var(--console-line);
+  border-radius: 8px;
+  background: #0b0d08;
+  color: #fff;
+  font: inherit;
+  font-size: .84rem;
+}
+:root[data-layout="console"] .console-route-add .btn.primary {
+  min-height: 40px;
+  padding: 0 16px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--console-accent);
+  color: #000;
+  font: inherit;
+  font-size: .84rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+:root[data-layout="console"] .console-route-rows .row { align-items: center; }
+:root[data-layout="console"] .console-row-note {
+  display: block;
+  margin-top: 2px;
+  font-size: .68rem;
+  color: var(--console-muted);
+}
+:root[data-layout="console"] .console-route-rows .btn.sm.danger {
+  min-height: 32px;
+  padding: 0 10px;
+  border: 1px solid color-mix(in srgb, #ff6b6b 40%, transparent);
+  border-radius: 7px;
+  background: transparent;
+  color: #ff9a9a;
+  font: inherit;
+  font-size: .76rem;
+  cursor: pointer;
+}
+:root[data-layout="console"] .console-route-rows .btn.sm.danger:hover { background: color-mix(in srgb, #ff6b6b 16%, transparent); }
+
 @media (max-width: 1100px) {
   :root[data-layout="console"] .g-hero { grid-template-columns: minmax(220px, 1fr) minmax(0, 1.6fr); }
   :root[data-layout="console"] .g-2 { grid-template-columns: 1fr; }
@@ -267,4 +353,7 @@ html[data-layout="console"][data-scheme="light"]:has(.polished-preview) {
   :root[data-layout="console"] .rail nav { display: none; }
   :root[data-layout="console"] .rail:has(#menu[aria-expanded="true"]) nav { display: grid; }
   :root[data-layout="console"] main { overflow: visible; }
+  :root[data-layout="console"] .console-route-add { grid-template-columns: 1fr; }
+  :root[data-layout="console"] .seg { width: 100%; }
+  :root[data-layout="console"] .seg button { flex: 1; padding: 0 8px; }
 }

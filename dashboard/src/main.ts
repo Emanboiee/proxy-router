@@ -67,7 +67,7 @@ const accents: { id: Accent; name: string; colour: string }[] = [
   { id: 'moss', name: 'Moss', colour: '#a8ddb0' }, { id: 'iris', name: 'Iris', colour: '#c9b7ff' },
 ];
 
-app.innerHTML = `<aside class="rail"><header><img class="rail-logo" src="/gremlin-cat-goblin-cat.gif" alt="" width="32" height="32" decoding="async"><strong>proxy router</strong><button id="menu" aria-expanded="false" aria-controls="nav">Menu</button></header><nav id="nav" aria-label="Primary">${pages.map(item => `<a href="#${item.toLowerCase()}">${item}</a>`).join('')}</nav><div class="rail-status"><span class="status-dot" aria-hidden="true"></span><span id="rail-status">Local controller</span></div></aside><div class="workspace"><div class="topbar" role="banner"><span class="console-crumb" aria-hidden="true"><span class="crumb-badge">PR</span><span class="crumb-text">Proxy Router <span class="crumb-sep">/</span> <span id="crumb-page">Overview</span></span></span><span class="view-heading" aria-hidden="true"><span id="view-breadcrumb" class="eyebrow">Overview</span><span id="view-title">Home</span></span><span id="page-label">Home</span><span class="topbar-actions"><span class="badge" id="prototype-badge">Local prototype</span><span id="toast" role="status" aria-live="polite"></span></span></div><main id="main" tabindex="-1"></main><footer><span>Local data · router changes stay behind the controller</span><button id="preview" type="button">Preview states</button></footer></div><dialog id="preview-dialog" aria-labelledby="dialog-title"><form method="dialog"><h2 id="dialog-title">Preview a connection state</h2><p>These examples review the interface. They do not change your network or VPN.</p><label for="scenario">Connection state</label><select id="scenario">${states.map(item => `<option value="${item}">${copy[item][0]}</option>`).join('')}</select><div class="dialog-actions"><button value="cancel" autofocus>Cancel</button><button value="apply" class="primary">Show preview</button></div></form></dialog><dialog id="import-dialog" aria-labelledby="import-title"><form id="import-form" method="dialog"><h2 id="import-title">Import a profile</h2><p>Paste a proxy-router profile export. It is saved locally on this computer.</p><label for="profile-json">Profile JSON</label><textarea id="profile-json" rows="8" required placeholder="Profile export JSON"></textarea><div class="dialog-actions"><button value="cancel">Cancel</button><button value="import" class="primary">Import profile</button></div></form></dialog><dialog id="profile-dialog" aria-labelledby="profile-dialog-title"></dialog><dialog id="provider-dialog" aria-labelledby="provider-dialog-title"></dialog>`;
+app.innerHTML = `<aside class="rail"><header><img class="rail-logo" src="/gremlin-cat-goblin-cat.gif" alt="" width="32" height="32" decoding="async"><strong>proxy router</strong><button id="menu" aria-expanded="false" aria-controls="nav">Menu</button></header><nav id="nav" aria-label="Primary">${pages.map(item => `<a href="#${item.toLowerCase()}"><span class="nav-label" data-label="${item}" data-console-label="${consoleNavLabel(item)}">${item}</span></a>`).join('')}</nav><div class="rail-status"><span class="status-dot" aria-hidden="true"></span><span id="rail-status">Local controller</span></div></aside><div class="workspace"><div class="topbar" role="banner"><span class="console-crumb" aria-hidden="true"><span class="crumb-badge">PR</span><span class="crumb-text">Proxy Router <span class="crumb-sep">/</span> <span id="crumb-page">Overview</span></span></span><span class="view-heading" aria-hidden="true"><span id="view-breadcrumb" class="eyebrow">Overview</span><span id="view-title">Home</span></span><span id="page-label">Home</span><span class="topbar-actions"><span class="badge" id="prototype-badge">Local prototype</span><span id="toast" role="status" aria-live="polite"></span></span></div><main id="main" tabindex="-1"></main><footer><span>Local data · router changes stay behind the controller</span><button id="preview" type="button">Preview states</button></footer></div><dialog id="preview-dialog" aria-labelledby="dialog-title"><form method="dialog"><h2 id="dialog-title">Preview a connection state</h2><p>These examples review the interface. They do not change your network or VPN.</p><label for="scenario">Connection state</label><select id="scenario">${states.map(item => `<option value="${item}">${copy[item][0]}</option>`).join('')}</select><div class="dialog-actions"><button value="cancel" autofocus>Cancel</button><button value="apply" class="primary">Show preview</button></div></form></dialog><dialog id="import-dialog" aria-labelledby="import-title"><form id="import-form" method="dialog"><h2 id="import-title">Import a profile</h2><p>Paste a proxy-router profile export. It is saved locally on this computer.</p><label for="profile-json">Profile JSON</label><textarea id="profile-json" rows="8" required placeholder="Profile export JSON"></textarea><div class="dialog-actions"><button value="cancel">Cancel</button><button value="import" class="primary">Import profile</button></div></form></dialog><dialog id="profile-dialog" aria-labelledby="profile-dialog-title"></dialog><dialog id="provider-dialog" aria-labelledby="provider-dialog-title"></dialog>`;
 app.insertAdjacentHTML('beforeend', '<dialog id="server-dialog" aria-labelledby="server-dialog-title"><div class="server-dialog-heading"><h2 id="server-dialog-title">Installed servers</h2><button type="button" data-action="close-servers">Close</button></div><label for="server-search">Search installed servers</label><input id="server-search" type="search" placeholder="Server name"><div id="server-inventory"></div><p id="server-dialog-feedback" role="status"></p></dialog>');
 const serverDialog=document.querySelector<HTMLDialogElement>('#server-dialog')!;
 serverDialog.addEventListener('close',()=>{ const opener=serverDialogOpener?.isConnected?serverDialogOpener:main.querySelector<HTMLElement>('[data-action="manage-servers"]'); opener?.focus(); });
@@ -338,6 +338,66 @@ function consoleHomePage(): string {
       </section>
     </div>
   </section>`;
+}
+
+/** The console renames app pages to the redesign's information architecture. */
+function consoleNavLabel(item: string): string {
+  return item === 'Home' ? 'Overview' : item === 'Profiles' ? 'Routes' : item === 'Connectivity' ? 'Network' : item;
+}
+
+/**
+ * Signal Console Routes — the desktop app reads and writes real engine routes;
+ * the browser preview uses the active profile's domain list. Either way these
+ * are destination rules, never per-application routing.
+ */
+function consoleRoutesPage(): string {
+  const live = isTauri();
+  const engineRoutes = live && Array.isArray(engineConfig?.routes) ? engineConfig!.routes! : [];
+  const domains = live ? [] : activeProfile()?.domains ?? [];
+  const mode = String(routingState?.mode ?? engineConfig?.routing?.mode ?? 'default');
+  const providerChoices = live
+    ? Object.keys(engineConfig?.providers ?? {})
+    : snapshot.providers.map(provider => provider.id);
+  const providerOptions = providerChoices.map(id => `<option value="${esc(id)}">${esc(id)}</option>`).join('');
+  const rows = live
+    ? engineRoutes.map(route => {
+      const id = String(route.id ?? '');
+      const routeDomains = Array.isArray(route.domains) ? route.domains as string[] : [];
+      const label = routeDomains.join(', ') || id;
+      return `<li class="row"><span class="fav" aria-hidden="true">${esc(label[0] ?? '?')}</span><div class="grow"><strong>${esc(label)}</strong><span class="console-row-note mono">${esc(String(route.provider ?? 'direct'))}</span></div><button type="button" class="btn sm danger" data-action="console-route-remove" data-route-id="${esc(id)}" aria-label="Remove ${esc(label)}">Remove</button></li>`;
+    })
+    : domains.map(domain => `<li class="row"><span class="fav" aria-hidden="true">${esc(domain[0] ?? '?')}</span><div class="grow"><strong>${esc(domain)}</strong><span class="console-row-note mono">${esc(activeProvider()?.name ?? 'direct')}</span></div><button type="button" class="btn sm danger" data-action="console-domain-remove" data-domain="${esc(domain)}" aria-label="Remove ${esc(domain)}">Remove</button></li>`);
+  const count = live ? engineRoutes.length : domains.length;
+  const rowsMarkup = rows.length ? rows.join('') : '<li class="row muted">No routed domains. Add one above.</li>';
+  return `<section class="page-section console-page" data-state="${previewState}">
+    <div class="console-head">
+      <h1 class="console-title" tabindex="-1">Routes</h1>
+      <p class="console-status-line mono">${esc(mode)} · ${count} routed domains</p>
+    </div>
+    <section class="card"><div class="card-h"><h2 id="routing-mode-label">Routing mode</h2></div>
+      <div class="seg" role="group" aria-labelledby="routing-mode-label">
+        ${(['safe-list', 'vpn-list', 'default'] as const).map(value => `<button type="button" data-action="routing-mode" data-mode="${value}" aria-pressed="${mode === value}">${value === 'safe-list' ? 'Safe list' : value === 'vpn-list' ? 'VPN list' : 'Default'}</button>`).join('')}
+      </div>
+    </section>
+    <section class="card"><div class="card-h"><h2>Routed domains (${count})</h2></div>
+      <form class="console-route-add" data-console-route-form><label class="sr-only" for="route-domain">Domain to route</label><input id="route-domain" type="text" placeholder="example.com" autocomplete="off" spellcheck="false"><label class="sr-only" for="route-provider">Provider</label><select id="route-provider">${providerOptions}</select><button type="submit" class="btn primary">Add route</button></form>
+      <ul class="list console-route-rows">${rowsMarkup}</ul>
+      <div class="console-foot"><span>${live ? 'ENGINE ROUTES · FROM ROUTER.JSON' : 'LOCAL PROFILE · SELECTIVE ROUTING'}</span></div>
+    </section>
+  </section>`;
+}
+
+/** One submit path for both modes: the desktop app writes the engine, preview writes the profile. */
+async function consoleRouteAdd(): Promise<void> {
+  const domain = document.querySelector<HTMLInputElement>('#route-domain')?.value.trim() ?? '';
+  const provider = document.querySelector<HTMLSelectElement>('#route-provider')?.value ?? '';
+  if (!domain) { announce('Enter a domain to route'); return; }
+  if (!provider) { announce('Pick a provider for the route'); return; }
+  if (isTauri()) { await routeAddAction(); return; }
+  void perform(async () => {
+    if (provider !== activeProfile()?.providerId) await controller.setProvider(provider);
+    return controller.addDomain(domain);
+  });
 }
 
 function homeConnectionControls(): string {
@@ -691,10 +751,11 @@ function render(options?: { background?: boolean }): void {
   app.dataset.state = previewState;
   app.dataset.page = page.toLowerCase();
   if (!isTauri() && lastTrayState !== previewState) { lastTrayState = previewState; setTrayStatus(previewState); }
+  const consoleLayout = snapshot.theme.layout === 'console';
   document.querySelector('#page-label')!.textContent = page;
   document.querySelector('#view-breadcrumb')!.textContent = page === 'Home' ? 'Overview' : 'Proxy Router';
   document.querySelector('#view-title')!.textContent = page;
-  document.querySelector('#crumb-page')!.textContent = page === 'Home' ? 'Overview' : page;
+  document.querySelector('#crumb-page')!.textContent = consoleLayout ? consoleNavLabel(page) : page === 'Home' ? 'Overview' : page;
   document.title = `${page} — Proxy router`;
   document.querySelector('#rail-status')!.textContent = busy ? 'Saving…' : previewState === 'failed' ? 'Controller unavailable' : `${previewState[0].toUpperCase()}${previewState.slice(1)}`;
   const nav = document.querySelector<HTMLElement>('#nav')!;
@@ -703,6 +764,11 @@ function render(options?: { background?: boolean }): void {
     link.classList.toggle('current', current);
     if (current) link.setAttribute('aria-current', 'page');
     else link.removeAttribute('aria-current');
+    const label = link.querySelector<HTMLElement>('.nav-label');
+    if (label) {
+      const next = consoleLayout ? label.dataset.consoleLabel : label.dataset.label;
+      if (next && label.textContent !== next) label.textContent = next;
+    }
   });
   const headingFocused = document.activeElement === main.querySelector('h1');
   const focused = document.activeElement instanceof HTMLElement
@@ -717,10 +783,9 @@ function render(options?: { background?: boolean }): void {
   const editing = options?.background && (focused || draft || main.querySelector('[data-network-draft="true"]') !== null
     || main.querySelector('[aria-expanded="true"][aria-haspopup="listbox"]') !== null);
   if (!editing) {
-    const consoleLayout = snapshot.theme.layout === 'console';
     const markup = page === 'Home'
       ? (consoleLayout ? consoleHomePage() : homePage())
-      : page === 'Profiles' ? profilesPage() : page === 'Providers' ? providersPage() : page === 'Connectivity' ? connectivityPage() : page === 'Settings' ? settingsPage() + diagnosticsSettings() : appearancePage();
+      : page === 'Profiles' ? (consoleLayout ? consoleRoutesPage() : profilesPage()) : page === 'Providers' ? providersPage() : page === 'Connectivity' ? connectivityPage() : page === 'Settings' ? settingsPage() + diagnosticsSettings() : appearancePage();
     if (!options?.background || markup !== renderedPageMarkup) {
       const scrollTop = main.scrollTop;
       const scrollLeft = main.scrollLeft;
@@ -1108,6 +1173,8 @@ app.addEventListener('click', event => {
   else if (action === 'routing-mode' && target.dataset.mode) void routingModeAction(target.dataset.mode);
   else if (action === 'route-add') void routeAddAction();
   else if (action === 'route-remove' && target.dataset.routeId) void routeRemoveAction(target.dataset.routeId);
+  else if (action === 'console-domain-remove' && target.dataset.domain) void perform(() => controller.removeDomain(target.dataset.domain!));
+  else if (action === 'console-route-remove' && target.dataset.routeId) void routeRemoveAction(target.dataset.routeId!);
   else if (action === 'network-remove-mapping') void networkRemoveMapping(target.dataset.networkSsid);
   else if (action === 'theme-layout' && target.dataset.layout) void perform(() => controller.updateTheme({ layout: target.dataset.layout as LayoutPreset }));
   else if (action === 'theme-scheme' && target.dataset.scheme) void perform(() => controller.updateTheme({ scheme: target.dataset.scheme as Scheme }));
@@ -1216,6 +1283,7 @@ app.addEventListener('input', event => {
 });
 app.addEventListener('submit', event => {
   const form = event.target as HTMLFormElement; if (form.id === 'domain-form') { event.preventDefault(); const domain = formInput(form, 'domain'); void perform(() => controller.addDomain(domain)); }
+  if (form.dataset.consoleRouteForm !== undefined) { event.preventDefault(); void consoleRouteAdd(); }
   if (form.id === 'provider-form') {
     event.preventDefault();
     const name = formInput(form, 'name'); const kind = formInput(form, 'kind') as ProviderKind; const context = form.dataset.providerContext === 'profile' ? 'profile' : 'providers';
