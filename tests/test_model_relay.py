@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import http.client
 import json
+import socket
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -88,6 +90,17 @@ def relay_path():
         s.server_close()
     for t in threads:
         t.join(timeout=3)
+
+
+def test_partial_request_headers_close_within_header_budget(relay_path):
+    """A client that never finishes HTTP headers must not hold a relay thread."""
+    request, *_ = relay_path
+    request.relay.header_timeout = 0.3
+    with socket.create_connection(request.relay.server_address, timeout=2) as conn:
+        conn.sendall(b'POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n')
+        started = time.monotonic()
+        assert conn.recv(1) == b''
+        assert time.monotonic() - started < 2
 
 
 def test_429s_rotate_and_replay_same_model_before_streaming(relay_path):
