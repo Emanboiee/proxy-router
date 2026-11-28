@@ -120,6 +120,16 @@ def test_readme_mentions_every_top_level_command(cmd):
     )
 
 
+def test_readme_documents_vpn_capture_as_mutation_and_fast_status():
+    readme = _readme()
+    assert "vpn capture routes" in readme
+    assert "vpn capture ruleset" in readme
+    assert "dump the TUN route rules" not in readme
+    assert "set TUN capture to route rules and reload" in readme
+    assert "status --fast" in readme
+    assert "status --json --fast" in readme
+
+
 def test_readme_no_longer_claims_stdlib_only():
     readme = _readme()
     assert "stdlib only — no pip install" not in readme

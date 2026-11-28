@@ -137,8 +137,8 @@ logs/                       sing-box runtime logs and rotations (gitignored)
 ./router.py vpn off              # stop the TUN, back to proxy mode
 ./router.py vpn restart          # stop + re-enter TUN through the installed helper
 ./router.py vpn status           # show current mode and liveness
-./router.py vpn capture routes   # dump the TUN route rules sing-box is using
-./router.py vpn capture ruleset  # dump the selective ruleset capture config
+./router.py vpn capture routes   # set TUN capture to route rules and reload the running engine
+./router.py vpn capture ruleset  # set TUN capture to selective ruleset mode and reload the engine
 ./router.py routing show         # effective routing mode + lists (JSON + human)
 ./router.py routing set --mode vpn-list        # switch routing mode (safe-list | vpn-list | default)
 ./router.py routing set --mode safe-list --default-provider proton
@@ -184,6 +184,8 @@ logs/                       sing-box runtime logs and rotations (gitignored)
 ./router.py egress check [--provider <name>] [--json]  # read-only live check: exit 1 ONLY when an active exit is DEAD
 ./router.py egress sweep [provider] [--json] [--allow-tun]  # full-pool sweep; --allow-tun acknowledges a TUN interruption
 ./router.py status --json         # machine-readable status for scripts/Hermes
+./router.py status --fast         # skip privileged helper/launchd probes (human output fails closed in tun)
+./router.py status --json --fast  # fast machine-readable status; GUI/tray keep base up(tun) behavior
 ./router.py setup                  # custom setup TUI
 ./router.py setup --guide all      # print Proton + WARP guides
 ./router.py setup --preset         # enable OpenCode->Proton and Roblox->WARP presets
