@@ -1,6 +1,6 @@
 # REFACTOR PLAN: decompose router.py and centralize the runtime schema
 
-Issue: #66 (P2 maintainability) · Status: DESIGN ONLY — no code has moved.
+Issue: #66 (P2 maintainability) · Status: IN PROGRESS — leaf modules listed below have been extracted; router.py is guarded by the shrinking line cap in tests/test_architecture_guards.py.
 Author: lane F, proxy-router-six-lanes-20260823 (nonce PR6L-0823)
 
 ## Problem
