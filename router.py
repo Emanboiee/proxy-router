@@ -5259,6 +5259,16 @@ def _status_report(*, fast: bool = False) -> tuple[int, str]:
         return engine_mode_consistent(skip_helper=True) if fast else engine_mode_consistent()
 
     if mode == "tun":
+        if fast:
+            # #285/#340: in fast mode the privileged helper probe is skipped,
+            # so the RUNNING engine's actual mode cannot be verified. Local
+            # signals (PID file, generated config) both flip to tun before a
+            # switch completes, so a proxy-mode engine left running after a
+            # failed switch would look like up(tun). Fail closed instead of
+            # claiming an unverified up state; full status remains authoritative.
+            if _engine_alive():
+                return 1, "down (running engine mode unverified in fast status; run 'status' without --fast)"
+            return 1, "down (mode set to tun; run 'vpn on')"
         if _engine_alive() and _engine_mode_consistent():
             return 0, "up (tun)"
         if _engine_alive():

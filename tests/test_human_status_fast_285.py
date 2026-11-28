@@ -62,3 +62,36 @@ def test_human_status_without_fast_keeps_full_path(tmp_path, monkeypatch):
     rc, captured = _drive(router, monkeypatch, ["router.py", "status"])
     assert rc == 0
     assert captured["fast"] is False, "plain `status` must keep the full check"
+
+
+def test_fast_tun_fails_closed_on_unverified_running_mode(tmp_path, monkeypatch):
+    """#340 P1: fast status must never claim up(tun) without the privileged
+    check that proves the RUNNING engine is actually tun mode. A proxy-mode
+    engine left running after a failed tun switch has mode file + generated
+    config flipped to tun, so local signals alone cannot be trusted.
+    """
+    router = load_router(tmp_path)
+    monkeypatch.setattr(router.sys, "platform", "darwin")
+    monkeypatch.setattr(router, "_effective_uid", lambda: 501)
+    monkeypatch.setattr(router, "_pid_matches", lambda pid: True)
+    monkeypatch.setattr(router.os, "kill", lambda pid, sig: None)
+
+    probes = []
+
+    def fake_probe():
+        probes.append(1)
+        # Helper reports the RUNNING engine is proxy mode (failed tun switch).
+        return {"installed": True, "running": True, "mode": "proxy"}
+
+    monkeypatch.setattr(router, "_probe_helper_status", fake_probe)
+
+    router.MODE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    router.MODE_FILE.write_text("tun")
+    router.PID_FILE.write_text("4242")
+    router.SING_BOX_CONFIG.write_text(
+        '{"inbounds": [{"type": "tun"}]}')
+
+    rc, line = router._status_report(fast=True)
+    assert rc == 1, "fast tun status must fail closed, not report up"
+    assert "unverified" in line.lower(), f"expected uncertainty in state line, got {line!r}"
+    assert probes == [], "fast status must not probe the privileged helper"
