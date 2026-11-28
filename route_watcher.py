@@ -623,6 +623,19 @@ def _network_check_hop(root: Path) -> None:
         )
 
 
+def _prune_last_targets(last_target: dict[str, float], domains: tuple[str, ...]) -> None:
+    """Drop hosts no longer covered by a configured domain (#315).
+
+    ``last_target`` is fed by log events seen under earlier router configs, so
+    it grew without bound. Bounding it to the live domain set removes only
+    entries the probe loop would skip once idle anyway; active hosts (including
+    subdomains) are kept, so probe and restore decisions are unchanged.
+    """
+    for host in list(last_target):
+        if not any(domain_matches(host, domain) for domain in domains):
+            del last_target[host]
+
+
 def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = time.sleep) -> int:
     root = Path(root).resolve()
     domains = critical_domains(root)
@@ -668,6 +681,7 @@ def worker(root: Path, interval: float = DEFAULT_INTERVAL, *, sleep: Callable = 
             # target set each tick so transparent capture starts observing a
             # newly configured domain without requiring a router restart.
             domains = critical_domains(root)
+            _prune_last_targets(last_target, domains)
             router_port(root)
             # Probe one representative per configured lane even before a slow
             # connection timeout produces its first log line.
